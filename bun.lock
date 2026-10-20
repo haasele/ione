@@ -16,6 +16,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@ione/core": "workspace:*",
+        "@ione/ui-kit": "workspace:*",
         "better-sqlite3": "13.0.3",
       },
       "devDependencies": {
@@ -32,6 +33,13 @@
     "packages/core": {
       "name": "@ione/core",
       "version": "0.1.0",
+    },
+    "packages/ui-kit": {
+      "name": "@ione/ui-kit",
+      "version": "0.1.0",
+      "peerDependencies": {
+        "svelte": "^5.57.2",
+      },
     },
   },
   "trustedDependencies": [
@@ -85,6 +93,8 @@
     "@ione/core": ["@ione/core@workspace:packages/core"],
 
     "@ione/desktop": ["@ione/desktop@workspace:apps/desktop"],
+
+    "@ione/ui-kit": ["@ione/ui-kit@workspace:packages/ui-kit"],
 
     "@isaacs/fs-minipass": ["@isaacs/fs-minipass@4.0.1", "", { "dependencies": { "minipass": "^7.0.4" } }, "sha512-wgm9Ehl2jpeqP3zw/7mo3kRHFp5MEDhqAdwy1fTGkHAwnkGOVsgpvQhL8B5n1qlb01jV3n/bI0ZfZp5lWA1k4w=="],
 

@@ -1,6 +1,7 @@
 # Architecture & dependency decisions
 
-Status: Phase 1-2 implemented. Verified against npm/GitHub on 2026-10-20.
+Status: Phases 1-3 implemented, Phase 4 core helpers in place. Verified against
+npm/GitHub on 2026-10-20.
 
 Every runtime/build dependency is listed below with version, license, and the
 reason it is present. Packages marked **planned** are not installed yet and
@@ -22,10 +23,12 @@ MUST be re-checked before the phase that adds them.
 | `@types/better-sqlite3` | 9.6.0 | MIT | Type definitions; better-sqlite3 does not ship its own. No newer typings exist. |
 | `@electron/rebuild` | 4.2.1 | MIT | Mandated native-module fallback. Script `rebuild:native` rebuilds better-sqlite3 if the N-API prebuild ever fails to load. |
 | `@types/node` | 24.19.2 | MIT | Node 24 typings matching Electron 44's runtime. |
+| `@ione/ui-kit` | workspace | internal | Shared `VirtualList` (fixed-row windowing, no external virtualization package) and `IconButton` for the chrome UI. |
 
-No UI, virtualization, drag-and-drop, RSS, adblock, or extension package is
-installed in Phase 1-2. The first three are Phase 3+ decisions; RSS and
-extensions are Phase 5-6.
+No third-party UI, virtualization, drag-and-drop, RSS, adblock, or extension
+package is installed in Phase 1-3. Virtualization is a ~100-line Svelte 5
+windowed list; DnD will use native pointer events. RSS and extensions are
+Phase 5-6.
 
 ### Electron binary installation
 Electron 44 no longer ships a package postinstall script. The root
@@ -42,7 +45,8 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
 | `electron-chrome-context-menu` | (same repo) | Same repo license family | Phase 5. |
 | `@ghostery/adblocker-electron` | 2.20.1 | MPL-2.0 | Fallback/complement if uBO is unreliable; Phase 5. |
 | `electron-builder` | 26.15.3 | MIT | Phase 7 packaging only. |
-| `@playwright/test` | 1.64.1 | Apache-2.0 | Electron smoke/E2E later. Phase 1-2 uses a dependency-free Electron smoke mode so the gate does not need browser downloads. |
+| `@playwright/test` | 1.64.1 | Apache-2.0 | Electron smoke/E2E later. Phase 1-3 uses a dependency-free Electron smoke mode so the gate does not need browser downloads. |
+| `fast-xml-parser` | 5.11.2 | MIT | Phase 6 RSS parser; maintained, dual ESM/CJS, typed, parser-level entity/depth limits. RSS/Atom/JSON-Feed normalizer still to be written. |
 
 ## Architecture decisions
 
@@ -102,6 +106,23 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
 - Initial bootstrap: one space (`Home`) and one blank tab if the DB has no
   spaces. No network page is loaded during smoke tests.
 
+### Chrome UI (Phase 3)
+- One Svelte chrome view with: space switcher (create/remove/isolated login
+  partition), address bar, global essentials, pinned tabs, and a virtualized
+  regular-tab list.
+- `@ione/ui-kit` owns the fixed-row `VirtualList` and `IconButton`. Only rows
+  in/around the viewport exist in the DOM; tab keys are entity ids and the list
+  binds to the parent height.
+- Space theme maps to the `--accent` custom properties without re-rendering
+  the tab data.
+- New typed commands: create/update/remove/activate space, add/remove
+  essential, pin/unpin/reset tab. All are validated in main and flow through
+  the core reducer and diff pipeline.
+- Essentials are global metadata rows; opening one creates a normal tab (and
+  therefore a `WebContentsView` only on demand).
+- Pinned tabs remain tabs with `pinned:true`/`pinnedUrl`; reset re-navigates to
+  the stored pinned URL. Pinned tabs render in a separate fixed section.
+
 ### Ordering
 - Tabs, folders, spaces, and essentials use fractional index strings
   (`order`). Inserts take a key strictly between neighbors, so reordering
@@ -127,18 +148,32 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
 - `backgroundThrottling` stays at Electron defaults; tab sleeping is a later
   explicit lifecycle feature rather than a hidden throttling hack.
 
-## Phase 1-2 scope ledger
+## Scope ledger
 
-Implemented: monorepo scaffold, hardened window, chrome `WebContentsView`,
-one lazily created tab `WebContentsView`, URL bar, core model/reducers/folder
-tree/fractional ordering/URL normalization/session normalization, SQLite
-migrations/repository/write-behind, versioned diff IPC and Svelte diff
-application, unit tests and Electron smoke mode.
+### Phase 1-2 (implemented)
+Monorepo scaffold, hardened window, chrome `WebContentsView`, lazily created
+tab `WebContentsView`, URL bar, core model/reducers/folder tree/fractional
+ordering/URL normalization/session normalization, SQLite migrations/repository/
+write-behind, versioned diff IPC and Svelte diff application, unit tests and
+Electron smoke mode.
 
-Not in this phase (still required by the overall plan): full sidebar UI with
-virtual list/spaces/essentials (Phase 3), DnD/pinned reset/session restore
-UI/tab sleeping (Phase 4), extensions/Web Store/adblock (Phase 5), RSS
-(Phase 6), theme polish/perf/packaging (Phase 7).
+### Phase 3 (implemented)
+Space switcher with create/remove and optional isolated session partition,
+global essentials (add/open/remove), pinned tabs with pin/unpin/reset, a
+virtualized regular-tab sidebar via `@ione/ui-kit`, themed accents, typed IPC
+for all of the above, and smoke coverage that exercises the interactions and
+verifies the persisted rows.
+
+### Phase 4 groundwork (in place, UI/lifecycle next)
+Core `shouldSleepTab` policy, `prepareLazyRestore`, `keyBetweenSiblings`, and
+sleeping-aware tab/space activation with tests are committed/prepared; the
+main-process sleep manager, folder/DnD UI, and scroll restore land in Phase 4.
+
+### Still later
+Full nested folder UI + native pointer DnD + tab sleeping/session restore
+(Phase 4), extensions/Web Store/adblock (Phase 5), RSS (Phase 6), command
+palette/navigation basics/find/downloads/permission prompts, theme polish,
+perf measurements, Playwright E2E, and packaging (Phase 7).
 
 ## Verification gates
 
@@ -148,20 +183,20 @@ UI/tab sleeping (Phase 4), extensions/Web Store/adblock (Phase 5), RSS
 - `bun run smoke` must print `IONE_SMOKE_READY` and exit 0 (needs a display or
   Xvfb on Linux).
 
-### Last verified (2026-10-20)
+### Last verified (2026-10-20, after Phase 3)
 
-- `bun run typecheck`: 0 errors, 0 warnings (svelte-check: 100 files).
-- `bun run test:core`: 6 files, 182 tests passed.
-- `bun run test`: 9 files, 197 tests passed.
+- `bun run typecheck`: 0 errors, 0 warnings (svelte-check: 110 files).
+- `bun run test:core`: 7 files, 219 tests passed.
+- `bun run test`: 10 files, 234 tests passed.
 - `bun run build`: main/preload/renderer bundles produced; built CSP is
   `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
   img-src 'self' data: https:; object-src 'none'; base-uri 'none';
   form-action 'none'; frame-src 'none'; connect-src 'self'`.
-- `DISPLAY=:99 bun run smoke`: `IONE_SMOKE_READY` with
-  `hasBridge=true`, `hasAddress=true`, `tabRows=1`, after an IPC navigation to
-  a loopback page the tab title/address updated to `Smoke Page` and the SQLite
-  row `tabs.url`/`tabs.title` plus `app_state.activeTabId` were verified after
-  process exit. The smoke screenshot is `/tmp/ione-smoke-chrome.png`.
+- `DISPLAY=:99 bun run smoke`: `IONE_SMOKE_READY` with the typed bridge,
+  address bar, essentials add, IPC navigation, pin, reset-to-pinned, space
+  creation, a new tab, virtual list present, and persisted SQLite rows:
+  3 tabs, 2 spaces, 1 pinned tab, 1 essential, active space Home. Screenshot:
+  `/tmp/ione-smoke-chrome.png`.
 - `electron-vite dev --noSandbox --remoteDebuggingPort 9333` under Xvfb:
   chrome target loaded from `http://localhost:5173/`, typed bridge present,
   address bar and tab row rendered, Vite HMR client connected without CSP

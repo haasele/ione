@@ -1,4 +1,4 @@
-import type { BrowserSnapshot, DiffBatch, Tab } from '@ione/core'
+import type { BrowserSnapshot, DiffBatch, Essential, Space, Tab } from '@ione/core'
 
 /** IPC channel names. Keep in one place so main/preload cannot drift. */
 export const IPC = {
@@ -8,12 +8,39 @@ export const IPC = {
   createTab: 'ione:create-tab',
   closeTab: 'ione:close-tab',
   activateTab: 'ione:activate-tab',
-  activateSpace: 'ione:activate-space'
+  activateSpace: 'ione:activate-space',
+  createSpace: 'ione:create-space',
+  updateSpace: 'ione:update-space',
+  removeSpace: 'ione:remove-space',
+  addEssential: 'ione:add-essential',
+  removeEssential: 'ione:remove-essential',
+  pinTab: 'ione:pin-tab',
+  unpinTab: 'ione:unpin-tab',
+  resetPinnedTab: 'ione:reset-pinned-tab'
 } as const
 
 export interface NavigateResult {
   tabId: string
   url: string
+}
+
+export interface CreateSpaceInput {
+  name: string
+  icon: string
+  theme: string
+  /** Optional isolated login session. Stored without the persist: prefix. */
+  partitionId?: string
+}
+
+export interface UpdateSpaceInput {
+  name?: string
+  icon?: string
+  theme?: string
+}
+
+export interface CreateEssentialInput {
+  url: string
+  title?: string
 }
 
 /**
@@ -29,4 +56,13 @@ export interface DesktopApi {
   closeTab(tabId: string): Promise<void>
   activateTab(tabId: string): Promise<void>
   activateSpace(spaceId: string): Promise<void>
+  createSpace(input: CreateSpaceInput): Promise<Space>
+  updateSpace(spaceId: string, patch: UpdateSpaceInput): Promise<void>
+  removeSpace(spaceId: string): Promise<void>
+  addEssential(input: CreateEssentialInput): Promise<Essential>
+  removeEssential(essentialId: string): Promise<void>
+  pinTab(tabId: string): Promise<void>
+  unpinTab(tabId: string): Promise<void>
+  /** Returns null when the tab is not pinned or has no pinned URL. */
+  resetPinnedTab(tabId: string): Promise<NavigateResult | null>
 }

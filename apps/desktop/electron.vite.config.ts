@@ -4,6 +4,7 @@ import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import type { Plugin } from 'vite'
 
 const coreEntry = resolve(__dirname, '../../packages/core/src/index.ts')
+const uiKitEntry = resolve(__dirname, '../../packages/ui-kit/src/index.ts')
 
 const CSP_DIRECTIVES = [
   "default-src 'self'",
@@ -44,7 +45,8 @@ export default defineConfig({
     resolve: { alias: { '@ione/core': coreEntry } }
   },
   renderer: {
-    resolve: { alias: { '@ione/core': coreEntry } },
+    resolve: { alias: { '@ione/core': coreEntry, '@ione/ui-kit': uiKitEntry } },
+    server: { fs: { allow: [resolve(__dirname, '../..')] } },
     plugins: [svelte(), cspPlugin()]
   }
 })

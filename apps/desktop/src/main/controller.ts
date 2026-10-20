@@ -5,13 +5,21 @@ import {
   isSafeNavigationUrl,
   normalizeAddress,
   reduce,
+  sortByOrder,
   tabsInSpace,
   type BrowserAction,
   type BrowserSnapshot,
+  type Essential,
+  type Space,
   type StateDiff,
   type Tab,
   type TabPatch
 } from '@ione/core'
+import type {
+  CreateEssentialInput,
+  CreateSpaceInput,
+  UpdateSpaceInput
+} from '../shared/ipc'
 import type { WriteBehindPersistence } from './persistence/write-behind'
 
 export type DiffSink = (diffs: StateDiff[], fromVersion: number, toVersion: number) => void
@@ -122,6 +130,89 @@ export class BrowserController {
 
   activateSpace(spaceId: string): void {
     this.dispatch({ type: 'space.activate', id: spaceId })
+  }
+
+  createSpace(input: CreateSpaceInput): Space {
+    const last = sortByOrder(Object.values(this.stateValue.spaces)).at(-1)
+    const space: Space = {
+      id: randomUUID(),
+      name: input.name.trim(),
+      icon: input.icon.trim(),
+      theme: input.theme.trim(),
+      order: generateKeyBetween(last?.order ?? null, null)
+    }
+    const partitionId = input.partitionId?.trim()
+    if (partitionId) space.partitionId = partitionId
+
+    this.dispatch({ type: 'space.add', space })
+    this.dispatch({ type: 'space.activate', id: space.id })
+    return this.stateValue.spaces[space.id] ?? space
+  }
+
+  updateSpace(id: string, patch: UpdateSpaceInput): void {
+    this.dispatch({ type: 'space.update', id, patch })
+  }
+
+  removeSpace(id: string): void {
+    this.dispatch({ type: 'space.remove', id })
+  }
+
+  addEssential(input: CreateEssentialInput): Essential {
+    const normalized = normalizeAddress(input.url)
+    if (
+      !normalized ||
+      normalized.kind !== 'url' ||
+      normalized.url === 'about:blank' ||
+      !isSafeNavigationUrl(normalized.url)
+    ) {
+      throw new Error(`Refusing to add an unsafe essential URL: ${input.url}`)
+    }
+
+    let hostname = ''
+    try {
+      hostname = new URL(normalized.url).hostname.replace(/^www\./, '')
+    } catch {
+      hostname = ''
+    }
+    const title = input.title?.trim() || hostname || normalized.url
+
+    const last = sortByOrder(Object.values(this.stateValue.essentials)).at(-1)
+    const essential: Essential = {
+      id: randomUUID(),
+      url: normalized.url,
+      title,
+      favicon: '',
+      order: generateKeyBetween(last?.order ?? null, null)
+    }
+
+    this.dispatch({ type: 'essential.add', essential })
+    return this.stateValue.essentials[essential.id] ?? essential
+  }
+
+  removeEssential(id: string): void {
+    this.dispatch({ type: 'essential.remove', id })
+  }
+
+  pinTab(tabId: string): void {
+    this.dispatch({ type: 'tab.pin', id: tabId })
+  }
+
+  unpinTab(tabId: string): void {
+    this.dispatch({ type: 'tab.unpin', id: tabId })
+  }
+
+  /**
+   * Restores a pinned tab's URL in state and returns the navigation plan for
+   * the window to execute. Returns null when the tab is not resettable.
+   */
+  resetPinnedTab(tabId: string): NavigatePlan | null {
+    if (!Object.hasOwn(this.stateValue.tabs, tabId)) return null
+    const tab = this.stateValue.tabs[tabId]
+    if (!tab || !tab.pinned || tab.pinnedUrl === undefined) return null
+
+    const plan = { tabId, url: tab.pinnedUrl }
+    this.dispatch({ type: 'tab.resetToPinned', id: tabId })
+    return plan
   }
 
   /**

@@ -93,6 +93,14 @@ interface ChromeProbe {
   title: string
   address: string
   navUrl: string | null
+  essentialCount: number
+  essentialTitle: string
+  pinnedCount: number
+  resetAddress: string
+  spaceCount: number
+  activeSpaceName: string
+  tabListPresent: boolean
+  virtualListPresent: boolean
 }
 
 function onChromeReady(dbPath: string): void {
@@ -110,26 +118,34 @@ function onChromeReady(dbPath: string): void {
 async function runSmokeProbe(dbPath: string): Promise<void> {
   if (!controller || !chromeWindow) return
 
-  const activeTabId = controller.snapshot.activeTabId
-  if (!chromeWindow.hasAttachedTab(activeTabId)) {
+  const initialActiveTabId = controller.snapshot.activeTabId
+  if (!chromeWindow.hasAttachedTab(initialActiveTabId)) {
     failSmoke('IONE_SMOKE_FAILED active tab view not attached')
     return
   }
 
   const probe = await probeChrome()
   const expectedUrl = process.env['IONE_SMOKE_URL'] ?? null
-  const navigationOk =
+  const phase3Ok =
     expectedUrl === null ||
     (probe !== null &&
       probe.navUrl === expectedUrl &&
       probe.title === 'Smoke Page' &&
-      probe.address === expectedUrl)
+      probe.address === expectedUrl &&
+      probe.essentialCount >= 1 &&
+      probe.essentialTitle.includes('Smoke Essential') &&
+      probe.pinnedCount >= 1 &&
+      probe.resetAddress === expectedUrl &&
+      probe.spaceCount >= 2 &&
+      probe.activeSpaceName === 'Home' &&
+      probe.tabListPresent &&
+      probe.virtualListPresent)
   if (
     !probe ||
     !probe.hasBridge ||
     !probe.hasAddress ||
     probe.tabRows < 1 ||
-    !navigationOk
+    !phase3Ok
   ) {
     failSmoke(`IONE_SMOKE_FAILED chrome probe ${JSON.stringify(probe)}`)
     return
@@ -152,7 +168,8 @@ async function runSmokeProbe(dbPath: string): Promise<void> {
   }
   console.log(
     `IONE_SMOKE_READY ${JSON.stringify({
-      activeTabId,
+      activeTabId: controller.snapshot.activeTabId,
+      activeSpaceId: controller.snapshot.activeSpaceId,
       version: controller.snapshot.version,
       dbPath,
       probe,
@@ -170,13 +187,43 @@ async function probeChrome(): Promise<ChromeProbe | null> {
       (async () => {
         const targetUrl = ${JSON.stringify(targetUrl)}
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-        const readyStarted = Date.now()
-        while (Date.now() - readyStarted < 5000) {
-          const address = document.querySelector('.address-input')
-          const rows = document.querySelectorAll('.tab-row').length
-          if (address && rows > 0) break
-          await sleep(50)
+        const waitFor = async (predicate, timeout = 5000) => {
+          const started = Date.now()
+          while (Date.now() - started < timeout) {
+            if (predicate()) return true
+            await sleep(50)
+          }
+          return false
         }
+        const addressValue = () =>
+          document.querySelector('[data-testid="address-input"]')?.value ?? ''
+        const spaceTitle = () =>
+          document.querySelector('.space-title')?.textContent?.trim() ?? ''
+        const activeTitle = () =>
+          (
+            document.querySelector(
+              '[data-testid="tab-row"].active .tab-title, [data-testid="pinned-tab"].active .tab-title'
+            )?.textContent ?? ''
+          ).trim()
+
+        const initial = await window.ione.getSnapshot()
+        const homeSpaceId = initial.activeSpaceId
+        const homeSpaceName = initial.spaces[homeSpaceId]?.name ?? ''
+        await waitFor(
+          () =>
+            document.querySelector('[data-testid="address-input"]') !== null &&
+            document.querySelectorAll('[data-testid="tab-row"], [data-testid="pinned-tab"]').length > 0
+        )
+
+        let essentialError = null
+        if (targetUrl) {
+          try {
+            await window.ione.addEssential({ url: targetUrl, title: 'Smoke Essential' })
+          } catch (error) {
+            essentialError = String(error)
+          }
+        }
+        await waitFor(() => document.querySelectorAll('[data-testid="essential-tile"]').length > 0)
 
         let navUrl = null
         if (targetUrl) {
@@ -186,21 +233,98 @@ async function probeChrome(): Promise<ChromeProbe | null> {
           } catch (error) {
             navUrl = 'ERROR: ' + String(error)
           }
-          const navStarted = Date.now()
-          while (Date.now() - navStarted < 5000) {
-            const title = document.querySelector('.tab-title')?.textContent?.trim()
-            if (title === 'Smoke Page') break
-            await sleep(50)
+        }
+        await waitFor(
+          () => activeTitle() === 'Smoke Page' && addressValue() === targetUrl,
+          7000
+        )
+
+        let pinError = null
+        const beforePin = await window.ione.getSnapshot()
+        const pinnedTabId = beforePin.activeTabId
+        if (pinnedTabId) {
+          try {
+            await window.ione.pinTab(pinnedTabId)
+          } catch (error) {
+            pinError = String(error)
+          }
+        }
+        await waitFor(() => document.querySelectorAll('[data-testid="pinned-tab"]').length > 0)
+
+        let resetError = null
+        let resetAddress = ''
+        if (targetUrl && pinnedTabId) {
+          try {
+            await window.ione.navigate('about:blank')
+            await waitFor(() => addressValue() === 'about:blank')
+            await window.ione.resetPinnedTab(pinnedTabId)
+            await waitFor(() => addressValue() === targetUrl, 7000)
+            resetAddress = addressValue()
+          } catch (error) {
+            resetError = String(error)
           }
         }
 
+        let createSpaceError = null
+        let smokeSpaceId = null
+        try {
+          const space = await window.ione.createSpace({
+            name: 'Smoke Space',
+            icon: 'S',
+            theme: 'ocean'
+          })
+          smokeSpaceId = space.id
+        } catch (error) {
+          createSpaceError = String(error)
+        }
+        await waitFor(
+          () =>
+            document.querySelectorAll('[data-testid="space-chip"]').length >= 2 &&
+            spaceTitle() === 'Smoke Space'
+        )
+        if (targetUrl) {
+          await window.ione.createTab(targetUrl)
+          await waitFor(
+            () =>
+              document.querySelectorAll('[data-testid="tab-row"]').length >= 1 &&
+              spaceTitle() === 'Smoke Space'
+          )
+          await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+        }
+
+        await window.ione.activateSpace(homeSpaceId)
+        await waitFor(() => spaceTitle() === homeSpaceName)
+        if (targetUrl) {
+          await window.ione.createTab(targetUrl)
+          await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+        }
+        await waitFor(() => document.querySelector('[role="list"]') !== null)
+
+        const final = await window.ione.getSnapshot()
+        const essentialTitle =
+          document.querySelector('[data-testid="essential-tile"] .essential-title')?.textContent?.trim() ?? ''
         return {
           hasBridge: typeof window.ione === 'object' && window.ione !== null,
-          hasAddress: document.querySelector('.address-input') !== null,
-          tabRows: document.querySelectorAll('.tab-row').length,
-          title: document.querySelector('.tab-title')?.textContent?.trim() ?? '',
-          address: document.querySelector('.address-input')?.value ?? '',
-          navUrl
+          hasAddress: document.querySelector('[data-testid="address-input"]') !== null,
+          tabRows: document.querySelectorAll('[data-testid="tab-row"]').length,
+          title: activeTitle(),
+          address: addressValue(),
+          navUrl,
+          essentialCount: document.querySelectorAll('[data-testid="essential-tile"]').length,
+          essentialTitle,
+          essentialError,
+          pinnedCount: document.querySelectorAll('[data-testid="pinned-tab"]').length,
+          pinError,
+          resetAddress,
+          resetError,
+          spaceCount: document.querySelectorAll('[data-testid="space-chip"]').length,
+          activeSpaceName: final.spaces[final.activeSpaceId]?.name ?? '',
+          activeSpaceId: final.activeSpaceId,
+          homeSpaceId,
+          smokeSpaceId,
+          createSpaceError,
+          tabListPresent: document.querySelector('[data-testid="tab-list"]') !== null,
+          virtualListPresent: document.querySelector('[data-testid="tab-list"] [role="list"]') !== null
         }
       })()
     `)
@@ -212,7 +336,18 @@ async function probeChrome(): Promise<ChromeProbe | null> {
       tabRows: typeof record['tabRows'] === 'number' ? record['tabRows'] : 0,
       title: typeof record['title'] === 'string' ? record['title'] : '',
       address: typeof record['address'] === 'string' ? record['address'] : '',
-      navUrl: typeof record['navUrl'] === 'string' ? record['navUrl'] : null
+      navUrl: typeof record['navUrl'] === 'string' ? record['navUrl'] : null,
+      essentialCount:
+        typeof record['essentialCount'] === 'number' ? record['essentialCount'] : 0,
+      essentialTitle:
+        typeof record['essentialTitle'] === 'string' ? record['essentialTitle'] : '',
+      pinnedCount: typeof record['pinnedCount'] === 'number' ? record['pinnedCount'] : 0,
+      resetAddress: typeof record['resetAddress'] === 'string' ? record['resetAddress'] : '',
+      spaceCount: typeof record['spaceCount'] === 'number' ? record['spaceCount'] : 0,
+      activeSpaceName:
+        typeof record['activeSpaceName'] === 'string' ? record['activeSpaceName'] : '',
+      tabListPresent: record['tabListPresent'] === true,
+      virtualListPresent: record['virtualListPresent'] === true
     }
   } catch (error) {
     console.error('[smoke] chrome probe failed', error)

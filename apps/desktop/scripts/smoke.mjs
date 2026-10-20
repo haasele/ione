@@ -134,18 +134,64 @@ child.on('exit', (code, signal) => {
   try {
     const Sqlite = require('better-sqlite3')
     const db = new Sqlite(dbPath, { readonly: true, fileMustExist: true })
-    const tab = db.prepare('SELECT url, title FROM tabs LIMIT 1').get()
+    const tabCount = db.prepare('SELECT COUNT(*) AS n FROM tabs').get()
+    const spaceCount = db.prepare('SELECT COUNT(*) AS n FROM spaces').get()
+    const pinnedCount = db
+      .prepare('SELECT COUNT(*) AS n FROM tabs WHERE pinned = 1')
+      .get()
+    const essential = db.prepare('SELECT url, title FROM essentials LIMIT 1').get()
+    const activeSpaceRow = db
+      .prepare("SELECT value FROM app_state WHERE key = 'activeSpaceId'")
+      .get()
     const activeTabRow = db
       .prepare("SELECT value FROM app_state WHERE key = 'activeTabId'")
       .get()
+    const activeSpace =
+      activeSpaceRow && typeof activeSpaceRow.value === 'string'
+        ? db.prepare('SELECT name FROM spaces WHERE id = ?').get(activeSpaceRow.value)
+        : undefined
+    const activeTab =
+      activeTabRow && typeof activeTabRow.value === 'string'
+        ? db
+            .prepare(
+              'SELECT tabs.url, tabs.title, spaces.name AS space_name FROM tabs JOIN spaces ON spaces.id = tabs.space_id WHERE tabs.id = ?'
+            )
+            .get(activeTabRow.value)
+        : undefined
     db.close()
-    if (!tab || tab.url !== smokeUrl || tab.title !== 'Smoke Page') {
-      stderr += `\n[smoke] persisted tab mismatch: ${JSON.stringify(tab)}`
+
+    if (!tabCount || tabCount.n < 3) {
+      stderr += `\n[smoke] expected at least 3 persisted tabs, got ${JSON.stringify(tabCount)}`
       finish(1, '')
       return
     }
-    if (!activeTabRow || typeof activeTabRow.value !== 'string' || activeTabRow.value === '') {
-      stderr += '\n[smoke] active tab session was not persisted'
+    if (!spaceCount || spaceCount.n < 2) {
+      stderr += `\n[smoke] expected 2 persisted spaces, got ${JSON.stringify(spaceCount)}`
+      finish(1, '')
+      return
+    }
+    if (!pinnedCount || pinnedCount.n < 1) {
+      stderr += `\n[smoke] pinned tab was not persisted: ${JSON.stringify(pinnedCount)}`
+      finish(1, '')
+      return
+    }
+    if (!essential || essential.url !== smokeUrl || essential.title !== 'Smoke Essential') {
+      stderr += `\n[smoke] essential mismatch: ${JSON.stringify(essential)}`
+      finish(1, '')
+      return
+    }
+    if (!activeSpace || activeSpace.name !== 'Home') {
+      stderr += `\n[smoke] active space mismatch: ${JSON.stringify(activeSpace)}`
+      finish(1, '')
+      return
+    }
+    if (
+      !activeTab ||
+      activeTab.url !== smokeUrl ||
+      activeTab.title !== 'Smoke Page' ||
+      activeTab.space_name !== 'Home'
+    ) {
+      stderr += `\n[smoke] active tab mismatch: ${JSON.stringify(activeTab)}`
       finish(1, '')
       return
     }
@@ -157,6 +203,6 @@ child.on('exit', (code, signal) => {
 
   finish(
     0,
-    `[smoke] app started, rendered chrome, navigated via IPC, persisted state, screenshot: ${screenshotPath}`
+    `[smoke] app started, sidebar/essentials/pinned/spaces rendered, reset pinned, persisted state, screenshot: ${screenshotPath}`
   )
 })

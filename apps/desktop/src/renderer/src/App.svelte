@@ -1,21 +1,66 @@
 <script lang="ts">
   import { onMount } from 'svelte'
+  import { IconButton, VirtualList } from '@ione/ui-kit'
   import { activeTabOf, applyDiffBatch, sortByOrder, tabsInSpace } from '@ione/core'
-  import type { BrowserSnapshot, DiffBatch, Space, Tab } from '@ione/core'
+  import type { BrowserSnapshot, DiffBatch, Essential, Space, Tab } from '@ione/core'
+  import type { CreateEssentialInput, CreateSpaceInput } from '../../shared/ipc'
+  import AddressBar from './components/AddressBar.svelte'
+  import Essentials from './components/Essentials.svelte'
+  import Icon from './components/Icon.svelte'
+  import SpaceSwitcher from './components/SpaceSwitcher.svelte'
+  import TabRow from './components/TabRow.svelte'
 
-  const FALLBACK_TITLE = 'New Tab'
+  interface ThemeAccent {
+    accent: string
+    soft: string
+    border: string
+  }
+
+  interface VirtualTabList {
+    scrollToIndex(index: number): void
+  }
+
+  const DEFAULT_THEME: ThemeAccent = {
+    accent: '#8ab4f8',
+    soft: 'rgba(138, 180, 248, 0.16)',
+    border: 'rgba(138, 180, 248, 0.35)'
+  }
+
+  const THEME_ACCENTS: Record<string, ThemeAccent> = {
+    default: DEFAULT_THEME,
+    ocean: {
+      accent: '#6fd3ff',
+      soft: 'rgba(111, 211, 255, 0.16)',
+      border: 'rgba(111, 211, 255, 0.35)'
+    },
+    forest: {
+      accent: '#7fd6a2',
+      soft: 'rgba(127, 214, 162, 0.16)',
+      border: 'rgba(127, 214, 162, 0.35)'
+    },
+    rose: {
+      accent: '#f49ac1',
+      soft: 'rgba(244, 154, 193, 0.16)',
+      border: 'rgba(244, 154, 193, 0.35)'
+    },
+    amber: {
+      accent: '#f2c46d',
+      soft: 'rgba(242, 196, 109, 0.16)',
+      border: 'rgba(242, 196, 109, 0.35)'
+    }
+  }
+
+  function themeFor(name: string | undefined): ThemeAccent {
+    if (!name || !Object.hasOwn(THEME_ACCENTS, name)) return DEFAULT_THEME
+    return THEME_ACCENTS[name] ?? DEFAULT_THEME
+  }
 
   let snapshot = $state<BrowserSnapshot | null>(null)
   let loading = $state(true)
   let loadError = $state<string | null>(null)
   let status = $state<string | null>(null)
 
-  let urlDraft = $state('')
-  let urlFocused = $state(false)
-  let committedUrl = $state<string | null>(null)
-  let addressInput = $state<HTMLInputElement | null>(null)
-
-  let failedFavicons = $state<Record<string, string>>({})
+  let virtualTabs = $state<VirtualTabList | null>(null)
 
   // Non-reactive coordination state for snapshot fetching.
   let syncToken = 0
@@ -23,21 +68,23 @@
   let syncQueued = false
   let pendingBatches = false
 
-  const activeSpaceId = $derived(snapshot ? snapshot.activeSpaceId : null)
   const activeSpace = $derived(snapshot ? (snapshot.spaces[snapshot.activeSpaceId] ?? null) : null)
   const activeTab = $derived(snapshot ? activeTabOf(snapshot) : null)
+  const activeTheme = $derived(themeFor(activeSpace?.theme))
+
   const sortedSpaces = $derived(snapshot ? sortByOrder(Object.values(snapshot.spaces)) : [])
+  const essentials = $derived(
+    snapshot ? sortByOrder(Object.values(snapshot.essentials)) : ([] as Essential[])
+  )
   const tabs = $derived(snapshot ? tabsInSpace(snapshot, snapshot.activeSpaceId) : [])
+  const pinnedTabs = $derived(tabs.filter((tab) => tab.pinned))
+  const unpinnedTabs = $derived(tabs.filter((tab) => !tab.pinned))
 
   $effect(() => {
-    const tabUrl = activeTab ? activeTab.url : ''
-    if (committedUrl !== null && tabUrl === committedUrl) {
-      committedUrl = null
-      return
-    }
-    if (!urlFocused) {
-      urlDraft = committedUrl ?? tabUrl
-    }
+    const activeId = activeTab?.id
+    if (!activeId) return
+    const index = unpinnedTabs.findIndex((tab) => tab.id === activeId)
+    if (index >= 0) virtualTabs?.scrollToIndex(index)
   })
 
   onMount(() => {
@@ -57,6 +104,14 @@
     if (error instanceof Error && error.message.trim()) return error.message
     if (typeof error === 'string' && error.trim()) return error
     return 'Something went wrong.'
+  }
+
+  function reportError(error: unknown): void {
+    status = errorMessage(error)
+  }
+
+  function reportBlocked(): void {
+    status = 'Navigation was blocked for that address.'
   }
 
   function handleDiffBatch(batch: DiffBatch): void {
@@ -139,83 +194,12 @@
     void loadInitial()
   }
 
-  function labelFor(tab: Tab): string {
-    const title = tab.title.trim()
-    if (title) return title
-    const url = tab.url.trim()
-    if (url) return url
-    return FALLBACK_TITLE
-  }
-
-  function fallbackLetter(tab: Tab): string {
-    const match = labelFor(tab).match(/[a-z0-9]/i)
-    return (match?.[0] ?? '?').toUpperCase()
-  }
-
-  function safeFavicon(raw: string): string | null {
-    const value = raw.trim()
-    if (!value) return null
-    if (/^data:image\//i.test(value)) return value
-
-    try {
-      const parsed = new URL(value)
-      if (parsed.protocol === 'https:') return value
-    } catch {
-      return null
-    }
-
-    return null
-  }
-
-  function faviconFor(tab: Tab): string | null {
-    const source = safeFavicon(tab.favicon)
-    if (!source) return null
-    return failedFavicons[tab.id] === source ? null : source
-  }
-
-  function handleFaviconError(tab: Tab): void {
-    const source = safeFavicon(tab.favicon)
-    if (source) failedFavicons[tab.id] = source
-  }
-
-  function spaceGlyph(space: Space): string {
-    const icon = space.icon.trim()
-    if (icon && Array.from(icon).length <= 2) return icon
-    const name = space.name.trim()
-    return name ? name.charAt(0).toUpperCase() : '•'
-  }
-
-  function handleSubmit(event: SubmitEvent): void {
-    event.preventDefault()
-    void navigateDraft()
-  }
-
-  async function navigateDraft(): Promise<void> {
-    const input = urlDraft.trim()
-    if (!input) return
-
-    status = null
-    try {
-      const result = await window.ione.navigate(input)
-      if (!result) {
-        status = 'Navigation was blocked for that address.'
-      } else {
-        committedUrl = result.url
-        urlDraft = result.url
-      }
-    } catch (error) {
-      status = errorMessage(error)
-    } finally {
-      addressInput?.blur()
-    }
-  }
-
   async function activateTab(tabId: string): Promise<void> {
     status = null
     try {
       await window.ione.activateTab(tabId)
     } catch (error) {
-      status = errorMessage(error)
+      reportError(error)
     }
   }
 
@@ -224,16 +208,16 @@
     try {
       await window.ione.closeTab(tabId)
     } catch (error) {
-      status = errorMessage(error)
+      reportError(error)
     }
   }
 
-  async function createTab(): Promise<void> {
+  async function createTab(url?: string): Promise<void> {
     status = null
     try {
-      await window.ione.createTab()
+      await window.ione.createTab(url)
     } catch (error) {
-      status = errorMessage(error)
+      reportError(error)
     }
   }
 
@@ -242,20 +226,91 @@
     try {
       await window.ione.activateSpace(spaceId)
     } catch (error) {
-      status = errorMessage(error)
+      reportError(error)
     }
   }
 
-  function handleAddressFocus(): void {
-    urlFocused = true
+  async function createSpace(input: CreateSpaceInput): Promise<boolean> {
+    status = null
+    try {
+      await window.ione.createSpace(input)
+      return true
+    } catch (error) {
+      reportError(error)
+      return false
+    }
   }
 
-  function handleAddressBlur(): void {
-    urlFocused = false
+  async function removeSpace(spaceId: string): Promise<boolean> {
+    status = null
+    try {
+      await window.ione.removeSpace(spaceId)
+      return true
+    } catch (error) {
+      reportError(error)
+      return false
+    }
+  }
+
+  async function addEssential(input: CreateEssentialInput): Promise<boolean> {
+    status = null
+    try {
+      await window.ione.addEssential(input)
+      return true
+    } catch (error) {
+      reportError(error)
+      return false
+    }
+  }
+
+  async function removeEssential(essentialId: string): Promise<void> {
+    status = null
+    try {
+      await window.ione.removeEssential(essentialId)
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
+  async function pinTab(tabId: string): Promise<void> {
+    status = null
+    try {
+      await window.ione.pinTab(tabId)
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
+  async function unpinTab(tabId: string): Promise<void> {
+    status = null
+    try {
+      await window.ione.unpinTab(tabId)
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
+  async function resetPinnedTab(tabId: string): Promise<void> {
+    status = null
+    try {
+      const result = await window.ione.resetPinnedTab(tabId)
+      if (!result) status = 'No pinned URL to restore for that tab.'
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
+  function spaceName(space: Space | null): string {
+    return space?.name.trim() || 'Tabs'
   }
 </script>
 
-<div class="chrome">
+<div
+  class="chrome"
+  style:--accent={activeTheme.accent}
+  style:--accent-soft={activeTheme.soft}
+  style:--accent-border={activeTheme.border}
+>
   <header class="chrome-header">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true">i</span>
@@ -263,22 +318,13 @@
     </div>
 
     {#if snapshot}
-      <nav class="spaces" aria-label="Spaces">
-        {#each sortedSpaces as space (space.id)}
-          <button
-            class="space-chip"
-            class:active={space.id === activeSpaceId}
-            type="button"
-            aria-label={`Switch to ${space.name}`}
-            aria-current={space.id === activeSpaceId ? 'true' : undefined}
-            title={space.name}
-            onclick={() => void activateSpace(space.id)}
-          >
-            <span class="space-icon" aria-hidden="true">{spaceGlyph(space)}</span>
-            <span class="space-name">{space.name}</span>
-          </button>
-        {/each}
-      </nav>
+      <SpaceSwitcher
+        spaces={sortedSpaces}
+        activeSpaceId={snapshot.activeSpaceId}
+        onactivate={(spaceId) => void activateSpace(spaceId)}
+        oncreate={createSpace}
+        onremove={removeSpace}
+      />
     {/if}
   </header>
 
@@ -293,116 +339,101 @@
       </button>
     </div>
   {:else if snapshot}
-    <form class="url-form" onsubmit={handleSubmit}>
-      <input
-        class="address-input"
-        bind:this={addressInput}
-        bind:value={urlDraft}
-        type="text"
-        aria-label="Address"
-        placeholder="Search or enter address"
-        autocomplete="off"
-        spellcheck="false"
-        onfocus={handleAddressFocus}
-        onblur={handleAddressBlur}
-      />
-      <button class="go-button" type="submit" aria-label="Navigate">
-        <span aria-hidden="true">↵</span>
-      </button>
-    </form>
+    <AddressBar
+      activeTab={activeTab}
+      onclear={() => (status = null)}
+      onerror={reportError}
+      onblocked={reportBlocked}
+    />
 
     {#if status}
       <div class="status" role="alert">
         <span class="status-message">{status}</span>
-        <button
-          class="status-dismiss"
-          type="button"
-          aria-label="Dismiss message"
-          onclick={() => {
-            status = null
-          }}
-        >
-          <span aria-hidden="true">×</span>
-        </button>
+        <IconButton label="Dismiss message" title="Dismiss" size="sm" variant="danger" onclick={() => (status = null)}>
+          <Icon name="close" size={12} />
+        </IconButton>
       </div>
+    {/if}
+
+    <Essentials
+      {essentials}
+      onopen={(url) => void createTab(url)}
+      onadd={addEssential}
+      onremove={(essentialId) => void removeEssential(essentialId)}
+    />
+
+    {#if pinnedTabs.length > 0}
+      <section class="pinned-section" aria-label="Pinned tabs">
+        <div class="section-head">
+          <h2 class="section-title">Pinned</h2>
+          <span class="section-count">{pinnedTabs.length}</span>
+        </div>
+        <div class="pinned-list">
+          {#each pinnedTabs as tab (tab.id)}
+            <TabRow
+              {tab}
+              active={tab.id === activeTab?.id}
+              testid="pinned-tab"
+              onactivate={(tabId) => void activateTab(tabId)}
+              onclose={(tabId) => void closeTab(tabId)}
+              onunpin={(tabId) => void unpinTab(tabId)}
+              onreset={(tabId) => void resetPinnedTab(tabId)}
+            />
+          {/each}
+        </div>
+      </section>
     {/if}
 
     <section class="tabs" aria-label="Tabs">
       <div class="tabs-toolbar">
-        <h2 class="space-title">{activeSpace?.name ?? 'Tabs'}</h2>
-        <button class="new-tab" type="button" aria-label="New tab" onclick={() => void createTab()}>
-          <span aria-hidden="true">+</span>
-        </button>
+        <div class="tabs-heading">
+          <h2 class="space-title" title={spaceName(activeSpace)}>{spaceName(activeSpace)}</h2>
+          <span class="section-count">{tabs.length}</span>
+        </div>
+        <span class="new-tab" data-testid="new-tab">
+          <IconButton label="New tab" title="New tab" size="sm" variant="soft" onclick={() => void createTab()}>
+            <Icon name="plus" size={13} />
+          </IconButton>
+        </span>
       </div>
 
-      {#if tabs.length === 0}
-        <div class="center-state empty-state">
-          <p class="state-detail">No tabs in this space</p>
-          <button
-            class="primary-button"
-            type="button"
-            aria-label="New tab"
-            onclick={() => void createTab()}
+      <div class="tab-list" data-testid="tab-list">
+        {#if tabs.length === 0}
+          <div class="center-state empty-state">
+            <p class="state-detail">No tabs in this space</p>
+            <button
+              class="primary-button"
+              type="button"
+              aria-label="New tab"
+              data-testid="new-tab-empty"
+              onclick={() => void createTab()}
+            >
+              New Tab
+            </button>
+          </div>
+        {:else if unpinnedTabs.length === 0}
+          <p class="empty-hint">Only pinned tabs</p>
+        {:else}
+          <VirtualList
+            bind:this={virtualTabs}
+            items={unpinnedTabs}
+            itemHeight={38}
+            ariaLabel="Open tabs"
+            getKey={(tab: Tab) => tab.id}
           >
-            New Tab
-          </button>
-        </div>
-      {:else}
-        <ol class="tab-list">
-          {#each tabs as tab (tab.id)}
-            {@const favicon = faviconFor(tab)}
-            {@const label = labelFor(tab)}
-            <li class="tab-row" class:active={tab.id === activeTab?.id}>
-              <button
-                class="tab-main"
-                type="button"
-                aria-label={`Activate ${label}${tab.pinned ? ' (pinned)' : ''}`}
-                aria-current={tab.id === activeTab?.id ? 'true' : undefined}
-                title={label}
-                onclick={() => void activateTab(tab.id)}
-              >
-                {#if favicon}
-                  <img
-                    class="favicon"
-                    src={favicon}
-                    alt=""
-                    aria-hidden="true"
-                    onerror={() => handleFaviconError(tab)}
-                  />
-                {:else}
-                  <span class="favicon favicon-fallback" aria-hidden="true">
-                    {fallbackLetter(tab)}
-                  </span>
-                {/if}
-                <span class="tab-title">{label}</span>
-                {#if tab.pinned}
-                  <span class="pin" title="Pinned" aria-hidden="true">
-                    <svg viewBox="0 0 16 16" width="12" height="12" focusable="false">
-                      <path
-                        d="M9.4 1.3a1 1 0 0 1 1.4 0l3.9 3.9a1 1 0 0 1-.3 1.6l-2.1.8-2.6 2.6-.5 3.5a.7.7 0 0 1-1.2.4L4.4 10.5l-3 3a.7.7 0 0 1-1-1l3-3L-.4 5.9a.7.7 0 0 1 .4-1.2l3.5-.5L6.1 1.6Z"
-                        transform="translate(1.5 1.5) scale(0.85)"
-                        fill="currentColor"
-                      />
-                    </svg>
-                  </span>
-                {/if}
-              </button>
-              <button
-                class="tab-close"
-                type="button"
-                aria-label={`Close ${label}`}
-                title={`Close ${label}`}
-                onclick={(event) => {
-                  event.stopPropagation()
-                  void closeTab(tab.id)
-                }}
-              >
-                <span aria-hidden="true">×</span>
-              </button>
-            </li>
-          {/each}
-        </ol>
-      {/if}
+            {#snippet children(tab: Tab)}
+              <TabRow
+                {tab}
+                active={tab.id === activeTab?.id}
+                testid="tab-row"
+                onactivate={(tabId) => void activateTab(tabId)}
+                onclose={(tabId) => void closeTab(tabId)}
+                onpin={(tabId) => void pinTab(tabId)}
+              />
+            {/snippet}
+          </VirtualList>
+        {/if}
+      </div>
     </section>
   {/if}
 </div>

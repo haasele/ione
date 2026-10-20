@@ -1,0 +1,14 @@
+{
+  "name": "@ione/ui-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "svelte": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*"
+  },
+  "peerDependencies": {
+    "svelte": "^5.57.2"
+  }
+}
