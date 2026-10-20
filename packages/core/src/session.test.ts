@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { BrowserSnapshot, Folder, Space, Tab } from './model'
-import { normalizeSnapshot } from './session'
+import { normalizeSnapshot, prepareLazyRestore } from './session'
 
 function space(id: string, order: string): Space {
   return { id, name: id, icon: 'circle', theme: 'system', order }
@@ -175,5 +175,80 @@ describe('normalizeSnapshot', () => {
     const twice = normalizeSnapshot(once)
     expect(twice).toEqual(once)
     expect(twice).not.toBe(once)
+  })
+})
+
+describe('prepareLazyRestore', () => {
+  it('sleeps every tab except the valid active tab', () => {
+    const state = repairedSnapshot()
+    state.activeSpaceId = 's1'
+    state.activeTabId = 't2'
+    const result = prepareLazyRestore(state)
+    expect(result.activeSpaceId).toBe('s1')
+    expect(result.activeTabId).toBe('t2')
+    expect(result.tabs.t1?.sleeping).toBe(true)
+    expect(result.tabs.t2?.sleeping).toBe(false)
+    expect(result.tabs.foreignTab?.sleeping).toBe(true)
+    expect(result.tabs.lostTab?.sleeping).toBe(true)
+  })
+
+  it('sleeps every tab when the active tab is null', () => {
+    const state = repairedSnapshot()
+    state.activeSpaceId = 's1'
+    state.activeTabId = null
+    const result = prepareLazyRestore(state)
+    expect(result.activeTabId).toBeNull()
+    expect(Object.values(result.tabs).every((tab) => tab.sleeping)).toBe(true)
+  })
+
+  it('sleeps every tab when the active tab is unknown', () => {
+    const state = repairedSnapshot()
+    state.activeSpaceId = 's1'
+    state.activeTabId = 'ghost'
+    const result = prepareLazyRestore(state)
+    expect(result.activeTabId).toBe('ghost')
+    expect(Object.values(result.tabs).every((tab) => tab.sleeping)).toBe(true)
+  })
+
+  it('sleeps every tab when the active tab belongs to another space', () => {
+    const state = repairedSnapshot()
+    state.activeSpaceId = 's1'
+    state.activeTabId = 'foreignTab'
+    const result = prepareLazyRestore(state)
+    expect(result.tabs.foreignTab?.sleeping).toBe(true)
+    expect(Object.values(result.tabs).every((tab) => tab.sleeping)).toBe(true)
+  })
+
+  it('wakes the active tab even when it was persisted as sleeping', () => {
+    const state = repairedSnapshot()
+    state.activeSpaceId = 's1'
+    state.activeTabId = 't1'
+    state.tabs.t1 = { ...state.tabs.t1!, sleeping: true }
+    state.tabs.t2 = { ...state.tabs.t2!, sleeping: false }
+    const result = prepareLazyRestore(state)
+    expect(result.tabs.t1?.sleeping).toBe(false)
+    expect(result.tabs.t2?.sleeping).toBe(true)
+  })
+
+  it('preserves version and data without mutating the input', () => {
+    const state = repairedSnapshot()
+    state.activeSpaceId = 's1'
+    state.activeTabId = 't1'
+    state.tabs.t1 = { ...state.tabs.t1!, sleeping: false }
+    const before = structuredClone(state)
+    const result = prepareLazyRestore(state)
+
+    expect(state).toEqual(before)
+    expect(result).not.toBe(state)
+    expect(result.tabs).not.toBe(state.tabs)
+    expect(result.spaces).toEqual(state.spaces)
+    expect(result.folders).toEqual(state.folders)
+    expect(result.essentials).toEqual(state.essentials)
+
+    for (const tab of Object.values(result.tabs)) {
+      expect(tab).not.toBe(state.tabs[tab.id])
+      expect({ ...tab, sleeping: state.tabs[tab.id]!.sleeping }).toEqual(state.tabs[tab.id])
+    }
+    expect(result.version).toBe(state.version)
   })
 })

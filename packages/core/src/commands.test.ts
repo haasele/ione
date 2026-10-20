@@ -203,11 +203,43 @@ describe('space actions', () => {
     expect(diffTypes(result.diffs)).toEqual(['session.activeSpace', 'session.activeTab'])
   })
 
+  it('wakes the most recent tab when switching to its space', () => {
+    const state = baseSnapshot()
+    state.tabs.t4 = { ...state.tabs.t4!, sleeping: true }
+    const result = run(state, { type: 'space.activate', id: 's2' })
+    expect(result.state.tabs.t4?.sleeping).toBe(false)
+    expect(result.state.activeTabId).toBe('t4')
+    expect(diffTypes(result.diffs)).toEqual([
+      'tab.upsert',
+      'session.activeSpace',
+      'session.activeTab'
+    ])
+    expect(result.diffs[0]).toEqual({
+      type: 'tab.upsert',
+      tab: expect.objectContaining({ id: 't4', sleeping: false })
+    })
+  })
+
+  it('leaves an awake most recent tab untouched when switching spaces', () => {
+    const result = run(baseSnapshot(), { type: 'space.activate', id: 's2' })
+    expect(diffTypes(result.diffs)).not.toContain('tab.upsert')
+    expect(result.state.tabs.t4).toEqual(baseSnapshot().tabs.t4)
+  })
+
   it('treats activating the active space as a no-op', () => {
     const state = baseSnapshot()
     const result = reduce(state, { type: 'space.activate', id: 's1' })
     expect(result.state).toBe(state)
     expect(result.diffs).toEqual([])
+  })
+
+  it('does not wake tabs when the active space is already selected', () => {
+    const state = baseSnapshot()
+    state.tabs.t2 = { ...state.tabs.t2!, sleeping: true }
+    const result = reduce(state, { type: 'space.activate', id: 's1' })
+    expect(result.state).toBe(state)
+    expect(result.diffs).toEqual([])
+    expect(result.state.tabs.t2?.sleeping).toBe(true)
   })
 
   it('rejects activating an unknown space', () => {
@@ -331,6 +363,27 @@ describe('tab actions', () => {
     const result = reduce(state, { type: 'tab.activate', id: 't2', at })
     expect(result.state).toBe(state)
     expect(result.diffs).toEqual([])
+  })
+
+  it('wakes an active sleeping tab even with an unchanged timestamp', () => {
+    const state = baseSnapshot()
+    const at = state.tabs.t2?.lastActive ?? 0
+    state.tabs.t2 = { ...state.tabs.t2!, sleeping: true }
+    const result = run(state, { type: 'tab.activate', id: 't2', at })
+    expect(result.state.tabs.t2).toMatchObject({ lastActive: at, sleeping: false })
+    expect(diffTypes(result.diffs)).toEqual(['tab.upsert'])
+  })
+
+  it('wakes a sleeping tab when activating it in another space', () => {
+    const state = baseSnapshot()
+    state.tabs.t4 = { ...state.tabs.t4!, sleeping: true }
+    const result = run(state, { type: 'tab.activate', id: 't4', at: T0 + 99 })
+    expect(result.state.tabs.t4).toMatchObject({ lastActive: T0 + 99, sleeping: false })
+    expect(diffTypes(result.diffs)).toEqual([
+      'tab.upsert',
+      'session.activeSpace',
+      'session.activeTab'
+    ])
   })
 
   it('rejects activating an unknown tab', () => {

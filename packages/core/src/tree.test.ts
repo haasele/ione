@@ -6,7 +6,8 @@ import {
   getFolderTabs,
   getOrderedSiblings,
   getTabSiblings,
-  isFolderDescendant
+  isFolderDescendant,
+  keyBetweenSiblings
 } from './tree'
 
 function folder(overrides: Partial<Folder> & Pick<Folder, 'id' | 'spaceId' | 'order'>): Folder {
@@ -166,5 +167,98 @@ describe('getFolderPath', () => {
     const path = getFolderPath(cyclic, 'a')
     expect(path.length).toBeLessThanOrEqual(2)
     expect(new Set(path.map((item) => item.id)).size).toBe(path.length)
+  })
+})
+
+describe('keyBetweenSiblings', () => {
+  interface Sibling {
+    id: string
+    order: string
+  }
+
+  function siblings(): Sibling[] {
+    return [
+      { id: 'first', order: 'a' },
+      { id: 'middle', order: 'b' },
+      { id: 'last', order: 'c' }
+    ]
+  }
+
+  it('generates a key before the first sibling', () => {
+    const key = keyBetweenSiblings(siblings(), 'first')
+    expect(key < 'a').toBe(true)
+  })
+
+  it('generates a key between the previous sibling and the target', () => {
+    const middle = keyBetweenSiblings(siblings(), 'middle')
+    expect(middle > 'a' && middle < 'b').toBe(true)
+
+    const last = keyBetweenSiblings(siblings(), 'last')
+    expect(last > 'b' && last < 'c').toBe(true)
+  })
+
+  it('appends after the last sibling when beforeId is null', () => {
+    const key = keyBetweenSiblings(siblings(), null)
+    expect(key > 'c').toBe(true)
+  })
+
+  it('appends after the last sibling when beforeId is missing', () => {
+    const key = keyBetweenSiblings(siblings(), 'ghost')
+    expect(key > 'c').toBe(true)
+  })
+
+  it('returns the initial key for an empty list', () => {
+    expect(keyBetweenSiblings([], null)).toBe('V')
+    expect(keyBetweenSiblings([], 'ghost')).toBe('V')
+  })
+
+  it('ignores the excluded sibling in both ordering and bounds', () => {
+    const moving = keyBetweenSiblings(siblings(), 'last', 'middle')
+    expect(moving > 'a' && moving < 'c').toBe(true)
+
+    const afterWithoutExcludedLast = keyBetweenSiblings(siblings(), null, 'last')
+    expect(afterWithoutExcludedLast > 'b' && afterWithoutExcludedLast < 'c').toBe(true)
+  })
+
+  it('treats an excluded beforeId as missing and appends', () => {
+    const key = keyBetweenSiblings(siblings(), 'last', 'last')
+    expect(key > 'b').toBe(true)
+    expect(key < 'c').toBe(true)
+  })
+
+  it('sorts unsorted siblings before computing bounds', () => {
+    const shuffled: Sibling[] = [
+      { id: 'last', order: 'c' },
+      { id: 'first', order: 'a' },
+      { id: 'middle', order: 'b' }
+    ]
+    const key = keyBetweenSiblings(shuffled, 'middle')
+    expect(key > 'a' && key < 'b').toBe(true)
+  })
+
+  it('produces distinct strictly ordered keys for every insertion point', () => {
+    const list = siblings()
+    const keys = [
+      keyBetweenSiblings(list, 'first'),
+      keyBetweenSiblings(list, 'middle'),
+      keyBetweenSiblings(list, 'last'),
+      keyBetweenSiblings(list, null)
+    ]
+    expect(new Set(keys).size).toBe(keys.length)
+    expect([...keys].sort()).toEqual(keys)
+
+    for (const key of keys) {
+      expect(list.map((sibling) => sibling.order)).not.toContain(key)
+    }
+  })
+
+  it('never mutates the sibling list', () => {
+    const list = siblings()
+    const snapshot = structuredClone(list)
+    const reference = list
+    keyBetweenSiblings(list, 'middle')
+    keyBetweenSiblings(list, null, 'first')
+    expect(list).toBe(reference)
+    expect(list).toEqual(snapshot)
   })
 })

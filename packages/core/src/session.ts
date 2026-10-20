@@ -4,8 +4,9 @@
  * acyclic, and the active selection points at live entities.
  */
 
+import { cloneSnapshot } from './diff'
 import type { BrowserSnapshot, Folder, Tab } from './model'
-import { mostRecentTabInSpace, sortByOrder } from './model'
+import { activeTabOf, mostRecentTabInSpace, sortByOrder } from './model'
 
 const RESERVED_OBJECT_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
@@ -96,4 +97,20 @@ export function normalizeSnapshot(input: BrowserSnapshot): BrowserSnapshot {
   }
 
   return normalized
+}
+
+/**
+ * Prepares a persisted snapshot for lazy restore: every tab is marked
+ * sleeping except the valid active tab of the active space, which keeps a
+ * live view. Version and all other data are preserved; the input is untouched.
+ */
+export function prepareLazyRestore(input: BrowserSnapshot): BrowserSnapshot {
+  const snapshot = cloneSnapshot(input)
+  const activeId = activeTabOf(input)?.id ?? null
+  const tabs: Record<string, Tab> = {}
+  for (const tab of Object.values(snapshot.tabs)) {
+    tabs[tab.id] = { ...tab, sleeping: tab.id !== activeId }
+  }
+  snapshot.tabs = tabs
+  return snapshot
 }

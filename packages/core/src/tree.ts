@@ -4,8 +4,9 @@
  * non-existent so a corrupt snapshot cannot produce a foreign folder list.
  */
 
+import { generateKeyBetween } from './fractional-index'
 import { sortByOrder } from './model'
-import type { Folder, Tab } from './model'
+import type { Folder, Ordered, Tab } from './model'
 
 function normalizeParent(parentId: string | null | undefined): string | null {
   return parentId === undefined || parentId === null || parentId === '' ? null : parentId
@@ -99,4 +100,41 @@ export function getFolderPath(folders: Record<string, Folder>, folderId: string)
     cursor = parentId === null ? undefined : folders[parentId]
   }
   return path.reverse()
+}
+
+function orderedId(item: unknown): string | undefined {
+  if (typeof item !== 'object' || item === null || !('id' in item)) return undefined
+  const id = item.id
+  return typeof id === 'string' ? id : undefined
+}
+
+/**
+ * Generates a fractional key for a new sibling inserted before `beforeId`.
+ * `excludeId` removes the item being moved/re-keyed from the calculation.
+ * Missing or null `beforeId` appends after the last remaining sibling.
+ * The input list is never mutated.
+ */
+export function keyBetweenSiblings<T extends Ordered>(
+  siblings: readonly T[],
+  beforeId: string | null,
+  excludeId?: string
+): string {
+  const ordered = sortByOrder(
+    excludeId === undefined
+      ? siblings
+      : siblings.filter((sibling) => orderedId(sibling) !== excludeId)
+  )
+  const targetIndex =
+    beforeId === null
+      ? -1
+      : ordered.findIndex((sibling) => orderedId(sibling) === beforeId)
+
+  if (targetIndex === -1) {
+    const last = ordered[ordered.length - 1]
+    return generateKeyBetween(last ? last.order : null, null)
+  }
+
+  const upper = ordered[targetIndex]!.order
+  const lower = targetIndex > 0 ? ordered[targetIndex - 1]!.order : null
+  return generateKeyBetween(lower, upper)
 }

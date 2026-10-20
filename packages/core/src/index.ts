@@ -12,8 +12,11 @@ export {
   getFolderTabs,
   getOrderedSiblings,
   getTabSiblings,
-  isFolderDescendant
+  isFolderDescendant,
+  keyBetweenSiblings
 } from './tree'
 export { isSafeNavigationUrl, normalizeAddress } from './url'
 export type { NormalizedAddress } from './url'
-export { normalizeSnapshot } from './session'
+export { normalizeSnapshot, prepareLazyRestore } from './session'
+export { shouldSleepTab } from './sleep'
+export type { SleepPolicyArgs } from './sleep'

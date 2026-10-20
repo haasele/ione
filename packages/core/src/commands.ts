@@ -263,6 +263,11 @@ export function reduce(state: BrowserSnapshot, action: BrowserAction): ReduceRes
         next.activeSpaceId = action.id
         const recent = mostRecentTabInSpace(next, action.id)
         next.activeTabId = recent ? recent.id : null
+        if (recent?.sleeping) {
+          const woken: Tab = { ...recent, sleeping: false }
+          next.tabs[woken.id] = woken
+          diffs.push({ type: 'tab.upsert', tab: woken })
+        }
       }
       break
     }
@@ -319,11 +324,12 @@ export function reduce(state: BrowserSnapshot, action: BrowserAction): ReduceRes
         throw new DomainError('tab.activate requires a finite timestamp')
       }
       const changed =
+        tab.sleeping ||
         tab.lastActive !== action.at ||
         next.activeSpaceId !== tab.spaceId ||
         next.activeTabId !== tab.id
       if (changed) {
-        const updated: Tab = { ...tab, lastActive: action.at }
+        const updated: Tab = { ...tab, lastActive: action.at, sleeping: false }
         next.tabs[updated.id] = updated
         next.activeSpaceId = tab.spaceId
         next.activeTabId = tab.id
