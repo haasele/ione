@@ -1,0 +1,27 @@
+{
+  "name": "ione",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "bun@1.4.3",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "typecheck": "bun run typecheck:node && bun run typecheck:svelte",
+    "typecheck:node": "tsc -p packages/core/tsconfig.json --noEmit && tsc -p apps/desktop/tsconfig.node.json --noEmit",
+    "typecheck:svelte": "svelte-check --tsconfig apps/desktop/tsconfig.renderer.json --fail-on-warnings",
+    "postinstall": "bun run --cwd apps/desktop install:electron",
+    "test": "vitest run",
+    "test:core": "vitest run packages/core",
+    "test:watch": "vitest",
+    "dev": "bun run --cwd apps/desktop dev",
+    "build": "bun run --cwd apps/desktop build",
+    "start": "bun run --cwd apps/desktop start",
+    "smoke": "bun run --cwd apps/desktop smoke"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "svelte-check": "4.7.7",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5"
+  },
+  "trustedDependencies": ["electron", "better-sqlite3", "esbuild", "@electron/rebuild"]
+}
