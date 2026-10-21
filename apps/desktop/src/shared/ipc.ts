@@ -30,7 +30,12 @@ export const IPC = {
   updateFolder: 'ione:update-folder',
   removeFolder: 'ione:remove-folder',
   moveFolder: 'ione:move-folder',
-  moveTab: 'ione:move-tab'
+  moveTab: 'ione:move-tab',
+  listExtensions: 'ione:list-extensions',
+  installExtension: 'ione:install-extension',
+  uninstallExtension: 'ione:uninstall-extension',
+  getAdblockState: 'ione:get-adblock-state',
+  setAdblockEnabled: 'ione:set-adblock-enabled'
 } as const
 
 export interface NavigateResult {
@@ -80,6 +85,23 @@ export interface MoveTabInput {
   beforeTabId?: string | null
 }
 
+export interface ExtensionInfo {
+  id: string
+  name: string
+  version: string
+  manifestVersion: number
+  popupUrl: string | null
+  optionsUrl: string | null
+  hasWebRequestBlocking: boolean
+}
+
+export interface AdblockState {
+  enabled: boolean
+  ready: boolean
+  skippedForExtension: boolean
+  error: string | null
+}
+
 /**
  * Typed contextBridge surface exposed as `window.ione`.
  * Types only cross the bridge; no Node objects are exposed.
@@ -108,4 +130,9 @@ export interface DesktopApi {
   removeFolder(folderId: string): Promise<void>
   moveFolder(folderId: string, target: MoveFolderInput): Promise<void>
   moveTab(tabId: string, target: MoveTabInput): Promise<void>
+  listExtensions(): Promise<ExtensionInfo[]>
+  installExtension(extensionId: string): Promise<ExtensionInfo>
+  uninstallExtension(extensionId: string): Promise<void>
+  getAdblockState(): Promise<AdblockState>
+  setAdblockEnabled(enabled: boolean): Promise<AdblockState>
 }

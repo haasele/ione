@@ -1,5 +1,6 @@
 import { ipcMain, type IpcMainInvokeEvent } from 'electron'
 import type { BrowserSnapshot, Essential, Folder, FolderKind, Space, Tab } from '@ione/core'
+import type { AdblockState, ExtensionInfo } from '../shared/ipc'
 import {
   IPC,
   type CreateEssentialInput,
@@ -13,8 +14,15 @@ import {
 } from '../shared/ipc'
 import type { BrowserController } from './controller'
 import type { ChromeWindow } from './chrome-window'
+import type { ExtensionService } from './extensions'
+import type { AdblockService } from './adblock'
 
-export function registerIpc(controller: BrowserController, chromeWindow: ChromeWindow): void {
+export function registerIpc(
+  controller: BrowserController,
+  chromeWindow: ChromeWindow,
+  extensionService: ExtensionService,
+  adblockService: AdblockService
+): void {
   const assertTrusted = (event: IpcMainInvokeEvent): void => {
     if (!chromeWindow.isChromeSender(event.sender)) {
       throw new Error('IPC rejected: sender is not the chrome view')
@@ -147,6 +155,44 @@ export function registerIpc(controller: BrowserController, chromeWindow: ChromeW
     const tabId = assertId(rawTabId, 'tabId')
     controller.moveTab(tabId, assertMoveTabInput(rawTarget))
   })
+
+  ipcMain.handle(IPC.listExtensions, (event): ExtensionInfo[] => {
+    assertTrusted(event)
+    return extensionService.list()
+  })
+
+  ipcMain.handle(IPC.installExtension, async (event, rawId: unknown): Promise<ExtensionInfo> => {
+    assertTrusted(event)
+    const id = assertExtensionId(rawId)
+    adblockService.prepareForExtensionInstall()
+    try {
+      const info = await extensionService.install(id)
+      adblockService.handleExtensionChange()
+      return info
+    } catch (error) {
+      adblockService.handleExtensionChange()
+      throw error
+    }
+  })
+
+  ipcMain.handle(IPC.uninstallExtension, async (event, rawId: unknown): Promise<void> => {
+    assertTrusted(event)
+    await extensionService.uninstall(assertExtensionId(rawId))
+  })
+
+  ipcMain.handle(IPC.getAdblockState, (event): AdblockState => {
+    assertTrusted(event)
+    return adblockService.getState()
+  })
+
+  ipcMain.handle(
+    IPC.setAdblockEnabled,
+    async (event, rawEnabled: unknown): Promise<AdblockState> => {
+      assertTrusted(event)
+      if (typeof rawEnabled !== 'boolean') throw new TypeError('enabled must be a boolean')
+      return adblockService.setEnabled(rawEnabled)
+    }
+  )
 }
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
@@ -251,6 +297,12 @@ function assertCreateEssentialInput(value: unknown): CreateEssentialInput {
   const rawTitle = readOwn(record, 'title')
   if (rawTitle === undefined) return { url }
   return { url, title: assertString(rawTitle, 'title', 256) }
+}
+
+function assertExtensionId(value: unknown): string {
+  const id = assertString(value, 'extensionId', 128)
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new TypeError('invalid extension id')
+  return id
 }
 
 function assertId(value: unknown, field: string): string {

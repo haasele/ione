@@ -6,6 +6,8 @@ import {
   type CreateFolderInput,
   type CreateSpaceInput,
   type DesktopApi,
+  type AdblockState,
+  type ExtensionInfo,
   type MoveFolderInput,
   type MoveTabInput,
   type NavigateResult,
@@ -39,6 +41,14 @@ const api: DesktopApi = {
   unpinTab: (tabId: string): Promise<void> => ipcRenderer.invoke(IPC.unpinTab, tabId),
   resetPinnedTab: (tabId: string): Promise<NavigateResult | null> =>
     ipcRenderer.invoke(IPC.resetPinnedTab, tabId),
+  listExtensions: (): Promise<ExtensionInfo[]> => ipcRenderer.invoke(IPC.listExtensions),
+  installExtension: (extensionId: string): Promise<ExtensionInfo> =>
+    ipcRenderer.invoke(IPC.installExtension, extensionId),
+  uninstallExtension: (extensionId: string): Promise<void> =>
+    ipcRenderer.invoke(IPC.uninstallExtension, extensionId),
+  getAdblockState: (): Promise<AdblockState> => ipcRenderer.invoke(IPC.getAdblockState),
+  setAdblockEnabled: (enabled: boolean): Promise<AdblockState> =>
+    ipcRenderer.invoke(IPC.setAdblockEnabled, enabled),
   createTabInFolder: (folderId: string | null, input?: string): Promise<Tab> =>
     ipcRenderer.invoke(IPC.createTabInFolder, folderId, input),
   createFolder: (input: CreateFolderInput): Promise<Folder> =>

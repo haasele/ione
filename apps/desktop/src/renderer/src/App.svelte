@@ -12,6 +12,7 @@
   } from '../../shared/ipc'
   import AddressBar from './components/AddressBar.svelte'
   import Essentials from './components/Essentials.svelte'
+  import ExtensionsPanel from './components/ExtensionsPanel.svelte'
   import Icon from './components/Icon.svelte'
   import SidebarTree from './components/SidebarTree.svelte'
   import SpaceSwitcher from './components/SpaceSwitcher.svelte'
@@ -62,6 +63,7 @@
   let loading = $state(true)
   let loadError = $state<string | null>(null)
   let status = $state<string | null>(null)
+  let extensionsOpen = $state(false)
 
   // Non-reactive coordination state for snapshot fetching.
   let syncToken = 0
@@ -348,9 +350,21 @@
   style:--accent-border={activeTheme.border}
 >
   <header class="chrome-header">
-    <div class="brand">
-      <span class="brand-mark" aria-hidden="true">i</span>
-      <span>Ione</span>
+    <div class="header-top">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">i</span>
+        <span>Ione</span>
+      </div>
+      <span class="extensions-button" data-testid="extensions-button">
+        <IconButton
+          label="Extensions and ad blocking"
+          title="Extensions"
+          size="sm"
+          onclick={() => (extensionsOpen = true)}
+        >
+          <Icon name="extensions" size={13} />
+        </IconButton>
+      </span>
     </div>
 
     {#if snapshot}
@@ -431,6 +445,16 @@
       onupdatefolder={(folderId, patch) => void updateFolder(folderId, patch)}
       onremovefolder={(folderId) => void removeFolder(folderId)}
       onmovetab={(tabId, target) => void moveTab(tabId, target)}
+    />
+  {/if}
+
+  {#if extensionsOpen}
+    <ExtensionsPanel
+      onclose={() => (extensionsOpen = false)}
+      onopenurl={(url) => {
+        extensionsOpen = false
+        void createTab(url)
+      }}
     />
   {/if}
 </div>

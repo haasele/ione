@@ -35,6 +35,16 @@ function parseAboutUrl(candidate: string): string | null {
   }
 }
 
+function parseExtensionUrl(candidate: string): string | null {
+  try {
+    const url = new URL(candidate)
+    if (url.protocol !== 'chrome-extension:' || url.hostname.length === 0) return null
+    return url.href
+  } catch {
+    return null
+  }
+}
+
 function searchFor(input: string, searchBase: string): NormalizedAddress {
   return { url: `${searchBase}${encodeURIComponent(input)}`, kind: 'search' }
 }
@@ -75,6 +85,10 @@ export function normalizeAddress(
     const url = parseAboutUrl(trimmed)
     return url === null ? searchFor(trimmed, searchBase) : { url, kind: 'url' }
   }
+  if (scheme === 'chrome-extension') {
+    const url = parseExtensionUrl(trimmed)
+    return url === null ? searchFor(trimmed, searchBase) : { url, kind: 'url' }
+  }
 
   if (LOCALHOST.test(trimmed) || IPV4.test(trimmed) || HOST_WITH_PORT.test(trimmed)) {
     const url = parseWebUrl(`http://${trimmed}`)
@@ -97,6 +111,7 @@ export function isSafeNavigationUrl(url: string): boolean {
   try {
     const parsed = new URL(url)
     if (parsed.protocol === 'about:') return parsed.pathname === 'blank'
+    if (parsed.protocol === 'chrome-extension:') return parsed.hostname.length > 0
     return parsed.protocol === 'http:' || parsed.protocol === 'https:'
   } catch {
     return false

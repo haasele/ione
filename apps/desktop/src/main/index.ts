@@ -1,5 +1,5 @@
 import { writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type Database from 'better-sqlite3'
 import { app, dialog } from 'electron'
 import { DiffBatcher } from '@ione/core'
@@ -10,12 +10,16 @@ import { registerIpc } from './ipc'
 import { WriteBehindPersistence } from './persistence/write-behind'
 import { hardenApp } from './security'
 import { parseTabSleepEnv, TabSleepManager } from './sleep-manager'
+import { ExtensionService } from './extensions'
+import { AdblockService } from './adblock'
 
 const isSmokeTest = process.argv.includes('--smoke-test')
 
 let database: Database.Database | null = null
 let controller: BrowserController | null = null
 let chromeWindow: ChromeWindow | null = null
+let extensionService: ExtensionService | null = null
+let adblockService: AdblockService | null = null
 let sleepManager: TabSleepManager | null = null
 let batcher: DiffBatcher | null = null
 let smokeTimer: NodeJS.Timeout | null = null
@@ -74,6 +78,18 @@ function start(): void {
       onReady: () => onChromeReady(dbPath)
     })
 
+    extensionService = new ExtensionService({
+      controller,
+      tabViews: chromeWindow.tabViews,
+      window: chromeWindow.window,
+      extensionsPath: isSmokeTest
+        ? join(dirname(dbPath), 'Extensions')
+        : undefined,
+      offline: isSmokeTest,
+      onChange: () => adblockService?.handleExtensionChange()
+    })
+    adblockService = new AdblockService(extensionService)
+
     sleepManager = new TabSleepManager({
       controller,
       tabViews: chromeWindow.tabViews,
@@ -81,13 +97,13 @@ function start(): void {
     })
 
     chromeWindow.reconcile(controller.snapshot)
-    registerIpc(controller, chromeWindow)
+    registerIpc(controller, chromeWindow, extensionService, adblockService)
     chromeWindow.load()
 
     if (isSmokeTest) {
       smokeTimer = setTimeout(() => {
         failSmoke('IONE_SMOKE_TIMEOUT')
-      }, 20_000)
+      }, smokeTimeoutMs())
     }
   } catch (error) {
     failStartup(error)
@@ -112,6 +128,20 @@ interface ChromeProbe {
   folderError: string | null
   dragIntoFolder: boolean
   sleepCycleOk: boolean
+  adblockReady: boolean
+  adblockEnabled: boolean
+  adblockSkipped: boolean
+  adblockError: string | null
+  extensionCount: number
+  extensionNames: string
+  extensionName: string
+  extensionPopupTitle: string
+  extensionError: string | null
+  installedExtensionName: string
+  installedPopupTitle: string
+  installError: string | null
+  extensionsPanelWorks: boolean
+  extensionRows: number
   tabListPresent: boolean
   virtualListPresent: boolean
 }
@@ -123,12 +153,29 @@ function onChromeReady(dbPath: string): void {
   // begin in both smoke and normal runs.
   sleepManager?.start()
 
-  if (!isSmokeTest) {
-    chromeWindow.focus()
-    return
-  }
+  if (!isSmokeTest) chromeWindow.focus()
+  void initializeServices(dbPath)
+}
 
-  void runSmokeProbe(dbPath)
+async function initializeServices(dbPath: string): Promise<void> {
+  try {
+    await extensionService?.initialize()
+  } catch (error) {
+    console.error('[startup] extension initialization failed', error)
+  }
+  try {
+    await adblockService?.initialize()
+  } catch (error) {
+    console.error('[startup] adblock initialization failed', error)
+  }
+  const loadedExtensions = extensionService?.list() ?? []
+  if (loadedExtensions.length > 0) {
+    console.log(
+      '[extensions] loaded',
+      loadedExtensions.map((extension) => `${extension.name}@${extension.version}`)
+    )
+  }
+  if (isSmokeTest) await runSmokeProbe(dbPath)
 }
 
 async function runSmokeProbe(dbPath: string): Promise<void> {
@@ -142,6 +189,23 @@ async function runSmokeProbe(dbPath: string): Promise<void> {
 
   const probe = await probeChrome()
   const expectedUrl = process.env['IONE_SMOKE_URL'] ?? null
+  const expectExtension = process.env['IONE_SMOKE_EXTENSIONS'] === '1'
+  const installExtensionId = process.env['IONE_SMOKE_INSTALL_EXTENSION_ID'] ?? null
+  const extensionOk =
+    (!expectExtension ||
+      (probe !== null &&
+        probe.extensionCount >= 1 &&
+        probe.extensionName === 'Ione Smoke Extension' &&
+        probe.extensionPopupTitle === 'Ione Fixture Popup' &&
+        probe.extensionError === null)) &&
+    (installExtensionId === null ||
+      (probe !== null &&
+        probe.installError === null &&
+        probe.installedExtensionName.length > 0 &&
+        probe.extensionCount >= 1 &&
+        probe.extensionsPanelWorks &&
+        probe.extensionRows >= 1))
+  const adblockOk = probe?.adblockReady === true && probe?.extensionsPanelWorks === true
   const phase3Ok =
     expectedUrl === null ||
     (probe !== null &&
@@ -159,6 +223,8 @@ async function runSmokeProbe(dbPath: string): Promise<void> {
       probe.folderError === null &&
       probe.dragIntoFolder &&
       probe.sleepCycleOk &&
+      extensionOk &&
+      adblockOk &&
       probe.tabListPresent &&
       probe.virtualListPresent)
   if (
@@ -203,10 +269,14 @@ async function runSmokeProbe(dbPath: string): Promise<void> {
 async function probeChrome(): Promise<ChromeProbe | null> {
   if (!chromeWindow) return null
   const targetUrl = process.env['IONE_SMOKE_URL'] ?? null
+  const expectExtension = process.env['IONE_SMOKE_EXTENSIONS'] === '1'
+  const installExtensionId = process.env['IONE_SMOKE_INSTALL_EXTENSION_ID'] ?? null
   try {
     const raw: unknown = await chromeWindow.chromeView.webContents.executeJavaScript(`
       (async () => {
         const targetUrl = ${JSON.stringify(targetUrl)}
+        const expectExtension = ${JSON.stringify(expectExtension)}
+        const installExtensionId = ${JSON.stringify(installExtensionId)}
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
         const waitFor = async (predicate, timeout = 5000) => {
           const started = Date.now()
@@ -469,6 +539,93 @@ async function probeChrome(): Promise<ChromeProbe | null> {
           }
         }
 
+        let extensionError = null
+        let extensionCount = 0
+        let extensionNames = ''
+        let extensionName = ''
+        let extensionPopupTitle = ''
+        let installedExtensionName = ''
+        let installedPopupTitle = ''
+        let installError = null
+        if (installExtensionId) {
+          try {
+            const beforeInstall = await window.ione.getSnapshot()
+            const installed = await window.ione.installExtension(installExtensionId)
+            installedExtensionName = installed && installed.name ? installed.name : 'missing-name'
+            if (installed.popupUrl) {
+              const extensionTab = await window.ione.createTab(installed.popupUrl)
+              await waitFor(() => activeTitle().length > 0 && activeTitle() !== 'New Tab', 10000)
+              installedPopupTitle = activeTitle()
+              await window.ione.closeTab(extensionTab.id)
+              if (beforeInstall.activeTabId) {
+                await window.ione.activateTab(beforeInstall.activeTabId)
+              }
+              await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+            }
+          } catch (error) {
+            installError = String(error)
+          }
+        }
+        let extensions = await window.ione.listExtensions()
+        extensionCount = extensions.length
+        extensionNames = extensions
+          .map((extension) => extension.name + '@' + extension.version)
+          .join(', ')
+        const fixture = extensions.find(
+          (extension) => extension.name === 'Ione Smoke Extension'
+        )
+        if (fixture) extensionName = fixture.name
+        if (expectExtension) {
+          if (!fixture) {
+            extensionError = 'fixture extension not loaded'
+          } else if (!fixture.popupUrl) {
+            extensionError = 'fixture extension has no popup'
+          } else {
+            try {
+              const beforeExtension = await window.ione.getSnapshot()
+              const extensionTab = await window.ione.createTab(fixture.popupUrl)
+              await waitFor(() => activeTitle() === 'Ione Fixture Popup', 7000)
+              extensionPopupTitle = activeTitle()
+              if (extensionPopupTitle !== 'Ione Fixture Popup') {
+                extensionError = 'extension popup did not load'
+              }
+              await window.ione.closeTab(extensionTab.id)
+              if (beforeExtension.activeTabId) {
+                await window.ione.activateTab(beforeExtension.activeTabId)
+              }
+              await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+            } catch (error) {
+              extensionError = String(error)
+            }
+          }
+        }
+        const adblock = await window.ione.getAdblockState()
+
+        let extensionsPanelWorks = false
+        let extensionRows = 0
+        const extensionsButton = document.querySelector(
+          '[data-testid="extensions-button"] button'
+        )
+        if (extensionsButton instanceof HTMLElement) {
+          extensionsButton.click()
+          extensionsPanelWorks = await waitFor(
+            () => document.querySelector('[data-testid="extensions-panel"]') !== null
+          )
+          if (extensionsPanelWorks) {
+            if (extensionCount > 0) {
+              await waitFor(
+                () => document.querySelectorAll('[data-testid="extension-row"]').length > 0
+              )
+            }
+            extensionRows = document.querySelectorAll('[data-testid="extension-row"]').length
+            const closeButton = document.querySelector('[aria-label="Close extensions"]')
+            if (closeButton instanceof HTMLElement) closeButton.click()
+            await waitFor(
+              () => document.querySelector('[data-testid="extensions-panel"]') === null
+            )
+          }
+        }
+
         const final = await window.ione.getSnapshot()
         const essentialTitle =
           document.querySelector('[data-testid="essential-tile"] .essential-title')?.textContent?.trim() ?? ''
@@ -499,6 +656,20 @@ async function probeChrome(): Promise<ChromeProbe | null> {
           folderError,
           dragIntoFolder,
           sleepCycleOk,
+          adblockReady: adblock.ready,
+          adblockEnabled: adblock.enabled,
+          adblockSkipped: adblock.skippedForExtension,
+          adblockError: adblock.error,
+          extensionCount,
+          extensionNames,
+          extensionName,
+          extensionPopupTitle,
+          extensionError,
+          installedExtensionName,
+          installedPopupTitle,
+          installError,
+          extensionsPanelWorks,
+          extensionRows,
           tabListPresent: document.querySelector('[data-testid="tab-list"]') !== null,
           virtualListPresent: document.querySelector('[data-testid="tab-list"] [role="list"]') !== null
         }
@@ -527,6 +698,29 @@ async function probeChrome(): Promise<ChromeProbe | null> {
       folderError: typeof record['folderError'] === 'string' ? record['folderError'] : null,
       dragIntoFolder: record['dragIntoFolder'] === true,
       sleepCycleOk: record['sleepCycleOk'] === true,
+      adblockReady: record['adblockReady'] === true,
+      adblockEnabled: record['adblockEnabled'] === true,
+      adblockSkipped: record['adblockSkipped'] === true,
+      adblockError:
+        typeof record['adblockError'] === 'string' ? record['adblockError'] : null,
+      extensionCount: typeof record['extensionCount'] === 'number' ? record['extensionCount'] : 0,
+      extensionNames: typeof record['extensionNames'] === 'string' ? record['extensionNames'] : '',
+      extensionName: typeof record['extensionName'] === 'string' ? record['extensionName'] : '',
+      extensionPopupTitle:
+        typeof record['extensionPopupTitle'] === 'string' ? record['extensionPopupTitle'] : '',
+      extensionError:
+        typeof record['extensionError'] === 'string' ? record['extensionError'] : null,
+      installedExtensionName:
+        typeof record['installedExtensionName'] === 'string'
+          ? record['installedExtensionName']
+          : '',
+      installedPopupTitle:
+        typeof record['installedPopupTitle'] === 'string'
+          ? record['installedPopupTitle']
+          : '',
+      installError: typeof record['installError'] === 'string' ? record['installError'] : null,
+      extensionsPanelWorks: record['extensionsPanelWorks'] === true,
+      extensionRows: typeof record['extensionRows'] === 'number' ? record['extensionRows'] : 0,
       tabListPresent: record['tabListPresent'] === true,
       virtualListPresent: record['virtualListPresent'] === true
     }
@@ -554,6 +748,11 @@ async function captureChromeScreenshot(path: string): Promise<void> {
   }
 }
 
+function smokeTimeoutMs(): number {
+  const raw = Number(process.env['IONE_SMOKE_TIMEOUT_MS'])
+  return Number.isFinite(raw) && raw >= 1000 ? raw : 20_000
+}
+
 function failSmoke(message: string): void {
   console.error(message)
   app.exit(1)
@@ -564,6 +763,10 @@ function failSmoke(message: string): void {
 function failStartup(error: unknown): void {
   const message = error instanceof Error ? (error.stack ?? error.message) : String(error)
   console.error('[startup] failed', error)
+  if (isSmokeTest) {
+    failSmoke(`IONE_SMOKE_STARTUP_FAILED ${message}`)
+    return
+  }
   dialog.showErrorBox('Ione failed to start', message)
   app.exit(1)
 }
@@ -597,6 +800,10 @@ function shutdown(): void {
 
   sleepManager?.stop()
   sleepManager = null
+
+  adblockService?.dispose()
+  adblockService = null
+  extensionService = null
 
   try {
     controller?.dispose()

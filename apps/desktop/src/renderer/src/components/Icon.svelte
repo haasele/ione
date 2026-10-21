@@ -7,6 +7,7 @@
     | 'plus'
     | 'trash'
     | 'arrow'
+    | 'extensions'
 
   interface Props {
     name: IconName
@@ -37,6 +38,13 @@
       stroke="currentColor"
       stroke-width="1.6"
       stroke-linecap="round"
+    />
+  {:else if name === 'extensions'}
+    <path
+      d="M2.5 6.2h2.1a1.7 1.7 0 1 1 0 3.4H2.5v3.6h3.6v-2.1a1.7 1.7 0 1 1 3.4 0v2.1h3.6V9.6h-2.1a1.7 1.7 0 1 1 0-3.4h2.1V2.5H9.5v2.1a1.7 1.7 0 1 1-3.4 0V2.5H2.5v3.7Z"
+      stroke="currentColor"
+      stroke-width="1.25"
+      stroke-linejoin="round"
     />
   {:else if name === 'arrow'}
     <path

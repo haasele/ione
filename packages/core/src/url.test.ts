@@ -16,6 +16,7 @@ describe('normalizeAddress', () => {
     ['127.0.0.1:3000', 'http://127.0.0.1:3000/', 'url'],
     ['127.0.0.1', 'http://127.0.0.1/', 'url'],
     ['about:blank', 'about:blank', 'url'],
+    ['chrome-extension://abcdefghijklmnopabcdefghijklmnop/popup.html', 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/popup.html', 'url'],
     ['about:config', `${SEARCH_BASE}about%3Aconfig`, 'search'],
     ['about:srcdoc', `${SEARCH_BASE}about%3Asrcdoc`, 'search'],
     ['hello world', `${SEARCH_BASE}hello%20world`, 'search'],
@@ -55,7 +56,8 @@ describe('isSafeNavigationUrl', () => {
   it.each([
     'https://example.com',
     'http://localhost:5173/',
-    'about:blank'
+    'about:blank',
+    'chrome-extension://abcdefghijklmnopabcdefghijklmnop/popup.html'
   ])('accepts %j', (url) => {
     expect(isSafeNavigationUrl(url)).toBe(true)
   })

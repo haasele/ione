@@ -54,7 +54,8 @@ const child = spawn(
       IONE_SMOKE_SCREENSHOT: screenshotPath,
       IONE_SMOKE_URL: smokeUrl,
       IONE_TAB_SLEEP_MS: '250',
-      IONE_TAB_SLEEP_TICK_MS: '200'
+      IONE_TAB_SLEEP_TICK_MS: '200',
+      IONE_ADBLOCK: process.env.IONE_ADBLOCK ?? 'off'
     },
     stdio: ['ignore', 'pipe', 'pipe']
   }
@@ -85,11 +86,12 @@ const finish = (code, message) => {
   if (!child.killed) child.kill('SIGKILL')
 }
 
+const timeoutMs = Number(process.env.IONE_SMOKE_TIMEOUT_MS ?? 30_000) + 10_000
 const timeout = setTimeout(() => {
   if (settled) return
-  console.error('[smoke] timed out after 30s')
+  console.error(`[smoke] timed out after ${Math.round(timeoutMs / 1000)}s`)
   finish(1, '')
-}, 30_000)
+}, timeoutMs)
 
 child.stdout.setEncoding('utf8')
 child.stderr.setEncoding('utf8')

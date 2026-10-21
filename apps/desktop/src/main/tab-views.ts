@@ -1,5 +1,19 @@
-import { session, WebContentsView, type BaseWindow, type WebPreferences } from 'electron'
+import {
+  session,
+  WebContentsView,
+  type BaseWindow,
+  type ContextMenuParams,
+  type MenuItem,
+  type WebContents,
+  type WebPreferences
+} from 'electron'
+import buildChromeContextMenu from 'electron-chrome-context-menu'
 import { isSafeNavigationUrl, type BrowserSnapshot, type Tab, type TabPatch } from '@ione/core'
+import {
+  BROWSER_SESSION_PARTITION,
+  browserSession,
+  hardenSession
+} from './browser-session'
 
 export interface TabViewManagerOptions {
   window: BaseWindow
@@ -8,12 +22,21 @@ export interface TabViewManagerOptions {
   onOpenInNewTab: (url: string) => void
 }
 
+export interface TabExtensionBridge {
+  addTab(tab: WebContents, window: BaseWindow): void
+  removeTab(tab: WebContents): void
+  selectTab(tab: WebContents): void
+  getContextMenuItems(tab: WebContents, params: ContextMenuParams): MenuItem[]
+}
+
 interface ManagedTabView {
   view: WebContentsView
   /** Target currently being loaded; prevents a duplicate load on tab creation. */
   loadingUrl: string | null
   /** Scroll offset to restore after the first successful load, then cleared. */
   restoreScrollY: number
+  /** True when this view lives in the extension-enabled browser session. */
+  extensionManaged: boolean
 }
 
 /** Upper bound for reading scrollY from a renderer that may be unresponsive. */
@@ -41,6 +64,7 @@ export class TabViewManager {
   private attachedManaged: ManagedTabView | null = null
   private disposed = false
   private popupTimes: number[] = []
+  private extensionBridge: TabExtensionBridge | null = null
 
   constructor(options: TabViewManagerOptions) {
     this.window = options.window
@@ -82,6 +106,9 @@ export class TabViewManager {
       this.window.contentView.addChildView(managed.view)
       this.attachedId = active.id
       this.attachedManaged = managed
+      if (managed.extensionManaged) {
+        this.extensionBridge?.selectTab(managed.view.webContents)
+      }
     }
     managed.view.setBounds(this.contentBounds())
   }
@@ -110,6 +137,28 @@ export class TabViewManager {
 
   hasAttachedView(tabId: string): boolean {
     return this.attachedId === tabId
+  }
+
+  setExtensionBridge(bridge: TabExtensionBridge | null): void {
+    this.extensionBridge = bridge
+    if (!bridge) return
+    for (const managed of this.views.values()) {
+      if (managed.extensionManaged) bridge.addTab(managed.view.webContents, this.window)
+    }
+    if (this.attachedManaged?.extensionManaged) {
+      bridge.selectTab(this.attachedManaged.view.webContents)
+    }
+  }
+
+  getWebContents(tabId: string): WebContents | null {
+    return this.views.get(tabId)?.view.webContents ?? null
+  }
+
+  tabIdForContents(contents: WebContents): string | null {
+    for (const [tabId, managed] of this.views) {
+      if (managed.view.webContents === contents) return tabId
+    }
+    return null
   }
 
   hasView(tabId: string): boolean {
@@ -149,6 +198,9 @@ export class TabViewManager {
     this.disposed = true
     for (const [id, managed] of [...this.views]) {
       this.views.delete(id)
+      if (managed.extensionManaged && !managed.view.webContents.isDestroyed()) {
+        this.extensionBridge?.removeTab(managed.view.webContents)
+      }
       this.removeAttachedView(managed)
       this.closeManagedView(managed)
     }
@@ -168,13 +220,16 @@ export class TabViewManager {
 
   private createView(tab: Tab, partitionId: string | undefined): ManagedTabView {
     const webPreferences: WebPreferences = { ...TAB_WEB_PREFERENCES }
+    let extensionManaged = false
     if (partitionId && /^[A-Za-z0-9_-]{1,64}$/.test(partitionId)) {
       const partition = `persist:${partitionId}`
       webPreferences.partition = partition
       // Apply the same deny-by-default permission policy to isolated spaces.
       hardenSession(session.fromPartition(partition))
     } else {
-      hardenSession(session.defaultSession)
+      webPreferences.partition = BROWSER_SESSION_PARTITION
+      extensionManaged = true
+      hardenSession(browserSession())
     }
 
     const initialUrl = isSafeNavigationUrl(tab.url) ? tab.url : 'about:blank'
@@ -183,15 +238,35 @@ export class TabViewManager {
     view.setBorderRadius(10)
 
     const contents = view.webContents
+    if (extensionManaged) this.extensionBridge?.addTab(contents, this.window)
+    contents.on('context-menu', (_event, params) => {
+      const extensionItems = extensionManaged
+        ? (this.extensionBridge?.getContextMenuItems(contents, params) ?? [])
+        : []
+      const menu = buildChromeContextMenu({
+        params,
+        webContents: contents,
+        extensionMenuItems: extensionItems,
+        openLink: (url) => {
+          if (isSafeNavigationUrl(url)) this.onOpenInNewTab(url)
+        }
+      })
+      menu.popup({ window: this.window })
+    })
     const restoreScrollY =
       Number.isFinite(tab.scrollY) && tab.scrollY > 0 ? Math.floor(tab.scrollY) : 0
-    const managed: ManagedTabView = { view, loadingUrl: initialUrl, restoreScrollY }
+    const managed: ManagedTabView = {
+      view,
+      loadingUrl: initialUrl,
+      restoreScrollY,
+      extensionManaged
+    }
 
     contents.setWindowOpenHandler(({ url, disposition }) => {
       if (
         !this.disposed &&
         disposition !== 'background-tab' &&
-        isSafeNavigationUrl(url) &&
+        isContentNavigationAllowed(url, contents) &&
         this.allowPopup()
       ) {
         this.onOpenInNewTab(url)
@@ -200,10 +275,10 @@ export class TabViewManager {
     })
     contents.on('will-attach-webview', (event) => event.preventDefault())
     contents.on('will-navigate', (event, url) => {
-      if (!isSafeNavigationUrl(url)) event.preventDefault()
+      if (!isContentNavigationAllowed(url, contents)) event.preventDefault()
     })
     contents.on('will-redirect', (event, url) => {
-      if (!isSafeNavigationUrl(url)) event.preventDefault()
+      if (!isContentNavigationAllowed(url, contents)) event.preventDefault()
     })
     contents.on('will-prevent-unload', (event) => event.preventDefault())
 
@@ -260,6 +335,9 @@ export class TabViewManager {
 
   private retireView(tabId: string, managed: ManagedTabView): void {
     this.views.delete(tabId)
+    if (managed.extensionManaged && !managed.view.webContents.isDestroyed()) {
+      this.extensionBridge?.removeTab(managed.view.webContents)
+    }
     if (this.disposed || this.attachedManaged !== managed) {
       this.closeManagedView(managed)
       return
@@ -350,7 +428,24 @@ export class TabViewManager {
   }
 }
 
-function hardenSession(target: Electron.Session): void {
-  target.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
-  target.setPermissionCheckHandler(() => false)
+
+
+/**
+ * Normal pages may not navigate to privileged chrome-extension:// pages.
+ * Extension pages themselves may navigate within the extension scheme.
+ */
+function isContentNavigationAllowed(url: string, contents: WebContents): boolean {
+  if (!isSafeNavigationUrl(url)) return false
+  let target: URL
+  try {
+    target = new URL(url)
+  } catch {
+    return false
+  }
+  if (target.protocol !== 'chrome-extension:') return true
+  try {
+    return new URL(contents.getURL()).protocol === 'chrome-extension:'
+  } catch {
+    return false
+  }
 }

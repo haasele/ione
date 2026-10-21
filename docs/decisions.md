@@ -1,6 +1,6 @@
 # Architecture & dependency decisions
 
-Status: Phases 1-4 implemented. Verified against npm/GitHub on 2026-10-20/21.
+Status: Phases 1-5 implemented. Verified against npm/GitHub on 2026-10-20/21.
 
 Every runtime/build dependency is listed below with version, license, and the
 reason it is present. Packages marked **planned** are not installed yet and
@@ -23,6 +23,10 @@ MUST be re-checked before the phase that adds them.
 | `@electron/rebuild` | 4.2.1 | MIT | Mandated native-module fallback. Script `rebuild:native` rebuilds better-sqlite3 if the N-API prebuild ever fails to load. |
 | `@types/node` | 24.19.2 | MIT | Node 24 typings matching Electron 44's runtime. |
 | `@ione/ui-kit` | workspace | internal | Shared `VirtualList` (fixed-row windowing, no external virtualization package) and `IconButton` for the chrome UI. |
+| `electron-chrome-extensions` | 4.9.0 | GPL-3.0 **or** Patron-License-2020-11-19 | Chrome `chrome.*` API bridge. Repo tests Electron 44. Distribution requires GPLv3 compliance or a Patron license; see licensing decision below. |
+| `electron-chrome-web-store` | 0.13.0 | MIT | Programmatic CWS install/uninstall, CRX3 unpacking, extension path loading. Uses a private CWS endpoint/API; treated as a compatibility risk. |
+| `electron-chrome-context-menu` | 1.1.0 | MIT | Native Chrome-like context menu, including extension context items. npm build is old but its deprecated navigation calls still exist in Electron 44. |
+| `@ghostery/adblocker-electron` | 2.20.1 | MPL-2.0 | Built-in network + cosmetic filtering, fallback/complement when uBO is unavailable. Preload package is MPL-2.0 transitive. |
 
 No third-party UI, virtualization, drag-and-drop, RSS, adblock, or extension
 package is installed in Phase 1-3. Virtualization is a ~100-line Svelte 5
@@ -39,10 +43,6 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
 
 | Package | Latest checked | License | Notes / risk |
 | --- | --- | --- | --- |
-| `electron-chrome-extensions` | 4.9.0 | Dual GPL-3.0 / patron license (NOT MIT) | Explicit gap from the plan. MV3/API coverage MUST be tested in Phase 5 against uBlock Origin and Bitwarden. A GPL-compatible licensing decision is required before shipping. |
-| `electron-chrome-web-store` | (same repo) | Dual GPL-3.0 / patron license | Phase 5. Same licensing constraint. |
-| `electron-chrome-context-menu` | (same repo) | Same repo license family | Phase 5. |
-| `@ghostery/adblocker-electron` | 2.20.1 | MPL-2.0 | Fallback/complement if uBO is unreliable; Phase 5. |
 | `electron-builder` | 26.15.3 | MIT | Phase 7 packaging only. |
 | `@playwright/test` | 1.64.1 | Apache-2.0 | Electron smoke/E2E later. Phase 1-3 uses a dependency-free Electron smoke mode so the gate does not need browser downloads. |
 | `fast-xml-parser` | 5.11.2 | MIT | Phase 6 RSS parser; maintained, dual ESM/CJS, typed, parser-level entity/depth limits. RSS/Atom/JSON-Feed normalizer still to be written. |
@@ -57,6 +57,9 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
   rectangle. This keeps all chrome in one Svelte UI/view and avoids
   click-blocking overlays that a full-window transparent chrome view would
   create.
+- Chrome UI uses `session.defaultSession`; web content, extensions and the
+  adblocker use `persist:browser`. Isolated space partitions use their own
+  sessions and intentionally do not receive extensions in Phase 5.
 - No `<webview>`, no `BrowserView`.
 
 ### Security
@@ -81,6 +84,43 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
 - `ELECTRON_RENDERER_URL` is honored only in unpackaged builds and only for
   loopback http URLs. Packaged builds ignore it.
 
+### Extensions and ad blocking (Phase 5)
+- `ExtensionService` owns the `ElectronChromeExtensions` bridge in
+  `persist:browser`, including `chrome.tabs`, webRequest, context menus,
+  popups/actions, and extension-created tabs routed back through the core
+  controller/reducer.
+- `installChromeWebStore` loads persisted CWS extensions at startup (deferred
+  until after the chrome's first load). `IONE_EXTENSION_DIRS` loads unpacked
+  directories for development/testing. The Extensions panel can install by
+  CWS id, uninstall, and open an extension's popup/options page in a tab.
+- Web pages may not navigate to privileged chrome-extension:// pages; only
+  extension pages themselves may navigate within the extension scheme.
+  Extension pages are opened by the shell/user via tabs.
+- Extension action toolbar (`<browser-action-list>`) is not rendered yet;
+  popups are reachable from the Extensions panel. chrome.windows.create is
+  unsupported (multi-window is out of scope), and permission prompts are
+  denied.
+- The built-in Ghostery blocker initializes after first paint, caches its
+  serialized engine under userData, and is enabled by default
+  (`IONE_ADBLOCK=off` disables it). It is skipped when an extension declares
+  `webRequestBlocking` (uBO). Before installing an extension, built-in
+  webRequest listeners are removed so they cannot clobber the extension's
+  listeners.
+- Known API gaps documented from the Phase 5 smoke: uBO 1.75.0 (MV2) loads;
+  Bitwarden 2026.10.0 (MV3) installs from CWS and background service worker
+  registration fails with ManifestError status 2, and its popup page returns
+  ERR_FAILED. Permissions `contextMenus`, `sidePanel`, `webNavigation`,
+  `notifications`, and `privacy` are unknown to Electron 44. `chrome.identity`,
+  `storage.session`, MV3 `webRequest` dispatch, and DNR static rule loading
+  remain gaps. uBO is no longer available on the CWS; side-load the GitHub
+  1.75.0 ZIP.
+- Licensing decision: the extension bridge is constructed with
+  `license: 'GPL-3.0'` by default (override with
+  `IONE_EXTENSION_LICENSE=Patron-License-2020-11-19` only with a valid Patron
+  subscription). Any distributed Ione build that links this package must be
+  GPLv3-compatible or covered by the Patron license. The current repository is
+  private development code; this decision must be revisited before a public
+  binary release.
 ### State and IPC
 - The main process owns the single source of truth: an in-memory
   `BrowserSnapshot` (normalized maps) backed by SQLite.
@@ -193,10 +233,17 @@ the active tab's WebContents. Smoke covers folder creation, collapse, tab
 create in folder, move out/back, pointer DnD into a folder, sleep/wake, and
 persisted folder/sleep state.
 
+### Phase 5 (implemented, with documented extension gaps)
+Extension bridge and CWS installer, extension panel (list/install/remove/open
+popup/options), lazy built-in adblock with cache and extension-conflict guard,
+context-menu integration, uBO and Bitwarden smoke checks. Bitwarden's MV3
+service worker/popup remain broken; uBO MV2 loads and forces the built-in
+blocker to yield.
+
 ### Still later
-Extensions/Web Store/adblock (Phase 5), RSS (Phase 6), command palette/
-navigation basics/find/downloads/permission prompts, theme polish, perf
-measurements, Playwright E2E, and packaging (Phase 7).
+RSS (Phase 6), command palette/navigation basics/find/downloads/permission
+prompts, theme polish, perf measurements, Playwright E2E, and packaging
+(Phase 7).
 
 ## Verification gates
 
@@ -208,9 +255,9 @@ measurements, Playwright E2E, and packaging (Phase 7).
 
 ### Last verified (2026-10-20, after Phase 3)
 
-- `bun run typecheck`: 0 errors, 0 warnings (svelte-check: 112 files).
-- `bun run test:core`: 7 files, 219 tests passed.
-- `bun run test`: 12 files, 243 tests passed.
+- `bun run typecheck`: 0 errors, 0 warnings (svelte-check: 113 files).
+- `bun run test:core`: 7 files, 221 tests passed.
+- `bun run test`: 12 files, 245 tests passed. (No new test files; two URL cases added.)
 - `bun run build`: main/preload/renderer bundles produced; built CSP is
   `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
   img-src 'self' data: https:; object-src 'none'; base-uri 'none';
@@ -226,6 +273,24 @@ measurements, Playwright E2E, and packaging (Phase 7).
   chrome target loaded from `http://localhost:5173/`, typed bridge present,
   address bar and tab row rendered, Vite HMR client connected without CSP
   errors.
+### Phase 5 extension/adblock evidence (2026-10-21)
+
+- Fixture extension via `IONE_EXTENSION_DIRS` loaded (`Ione Smoke Extension`
+  1.0.0); popup rendered as `Ione Fixture Popup`; Extensions panel showed one
+  row; adblock IPC reported ready.
+- uBlock Origin 1.75.0 loaded from the GitHub MV2 ZIP; Extensions list reported
+  `uBlock Origin@1.75.0`; with `IONE_ADBLOCK=on`, built-in adblock reported
+  `skipped=true` because uBO declares `webRequestBlocking`.
+- Bitwarden 2026.10.0 installed through the Chrome Web Store installer
+  (`nngceckbapebfimnlniiiahkandclblb`); list reported the name/version. Loading
+  its `popup/index.html` failed (ERR_FAILED) and the main log reported
+  `Service worker registration failed. Status code: 2` plus unknown
+  `contextMenus`, `sidePanel`, `webNavigation`, `notifications`, `privacy`
+  permissions. This is a documented compatibility gap, not claimed working.
+- Built-in adblock enabled with an environment without blocking extensions;
+  the cached 6.8 MB engine reported matches for `doubleclick.net` and
+  `google-analytics.com` and no match for `example.com/app.js`.
+
 - The smoke harness uses `--no-sandbox` because this Linux container has
   neither a SUID Chromium sandbox nor unprivileged user namespaces. The
   application itself never passes `--no-sandbox`; smoke-only evidence is not a
@@ -233,9 +298,14 @@ measurements, Playwright E2E, and packaging (Phase 7).
 
 ## Open risks / handoff
 
-- Electron extension packages are GPL-3.0/patron-licensed, not MIT. Phase 5
-  needs an explicit licensing decision before integration.
-- Playwright is not installed yet; Phase 1-2 uses the dependency-free smoke
+- Electron-chrome-extensions is GPL-3.0/Patron-licensed. A distributed Ione
+  binary must be GPLv3-compatible or covered by a Patron subscription.
+- Bitwarden MV3 service worker/popup is broken in Electron 44; uBO MV2 is not
+  available from the CWS (side-load the GitHub ZIP) and uBO disables the
+  built-in blocker while loaded.
+- Extension action toolbar is not rendered; popups are opened from the
+  Extensions panel. Isolated space partitions have no extension APIs.
+- Playwright is not installed yet; Phase 1-5 use the dependency-free smoke
   harness. Browser E2E coverage starts when Playwright is added.
 - RSS, adblock/extensions, downloads/permission-prompt UI, command palette,
   find-in-page, perf measurements, Playwright E2E, and packaging are later.
