@@ -18,7 +18,11 @@
     "dev": "bun run --cwd apps/desktop dev",
     "build": "bun run --cwd apps/desktop build",
     "start": "bun run --cwd apps/desktop start",
-    "smoke": "bun run --cwd apps/desktop smoke"
+    "smoke": "bun run --cwd apps/desktop smoke",
+    "perf": "bun run --cwd apps/desktop perf",
+    "test:e2e": "bun run --cwd apps/desktop test:e2e",
+    "package": "bun run --cwd apps/desktop package",
+    "package:linux": "bun run --cwd apps/desktop package:linux"
   },
   "devDependencies": {
     "@types/node": "24.19.2",

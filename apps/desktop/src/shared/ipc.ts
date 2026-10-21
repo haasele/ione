@@ -37,7 +37,21 @@ export const IPC = {
   installExtension: 'ione:install-extension',
   uninstallExtension: 'ione:uninstall-extension',
   getAdblockState: 'ione:get-adblock-state',
-  setAdblockEnabled: 'ione:set-adblock-enabled'
+  setAdblockEnabled: 'ione:set-adblock-enabled',
+  navigateBack: 'ione:navigate-back',
+  navigateForward: 'ione:navigate-forward',
+  reloadTab: 'ione:reload-tab',
+  stopLoading: 'ione:stop-loading',
+  findInPage: 'ione:find-in-page',
+  stopFindInPage: 'ione:stop-find-in-page',
+  setSidebarWidth: 'ione:set-sidebar-width',
+  listDownloads: 'ione:list-downloads',
+  cancelDownload: 'ione:cancel-download',
+  openDownload: 'ione:open-download',
+  showDownload: 'ione:show-download',
+  downloadsChanged: 'ione:downloads-changed',
+  permissionRequest: 'ione:permission-request',
+  respondPermission: 'ione:respond-permission'
 } as const
 
 export interface NavigateResult {
@@ -98,6 +112,31 @@ export interface ExtensionInfo {
   hasWebRequestBlocking: boolean
 }
 
+export interface FindResult {
+  matches: number
+  activeMatch: number
+}
+
+export type DownloadState = 'progressing' | 'completed' | 'cancelled' | 'interrupted'
+
+export interface DownloadInfo {
+  id: string
+  filename: string
+  url: string
+  state: DownloadState
+  receivedBytes: number
+  totalBytes: number
+  savePath: string
+  startedAt: number
+}
+
+export interface PermissionRequestInfo {
+  id: string
+  permission: string
+  origin: string
+  tabId: string | null
+}
+
 export interface AdblockState {
   enabled: boolean
   ready: boolean
@@ -140,4 +179,18 @@ export interface DesktopApi {
   uninstallExtension(extensionId: string): Promise<void>
   getAdblockState(): Promise<AdblockState>
   setAdblockEnabled(enabled: boolean): Promise<AdblockState>
+  navigateBack(): Promise<void>
+  navigateForward(): Promise<void>
+  reloadTab(): Promise<void>
+  stopLoading(): Promise<void>
+  findInPage(query: string, forward?: boolean): Promise<FindResult | null>
+  stopFindInPage(): Promise<void>
+  setSidebarWidth(width: number): Promise<void>
+  listDownloads(): Promise<DownloadInfo[]>
+  onDownloads(listener: (downloads: DownloadInfo[]) => void): () => void
+  cancelDownload(id: string): Promise<void>
+  openDownload(id: string): Promise<void>
+  showDownloadInFolder(id: string): Promise<void>
+  onPermissionRequest(listener: (request: PermissionRequestInfo) => void): () => void
+  respondPermission(requestId: string, allow: boolean): Promise<void>
 }

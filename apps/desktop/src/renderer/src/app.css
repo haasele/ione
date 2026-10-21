@@ -318,3 +318,149 @@ select:focus-visible {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Header actions / compact / light --------------------------------------- */
+
+.header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 1px;
+}
+
+.downloads-button {
+  position: relative;
+  display: inline-flex;
+}
+
+.action-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg);
+  pointer-events: none;
+}
+
+.chrome.light {
+  color-scheme: light;
+  --bg: #f3f5f8;
+  --bg-elevated: #ffffff;
+  --bg-hover: #e9edf2;
+  --bg-active: #dce2ea;
+  --border: #d6dce4;
+  --text: #1f242c;
+  --text-muted: #59616d;
+  --text-faint: #828b97;
+  --danger: #b3261e;
+  --danger-soft: rgba(179, 38, 30, 0.08);
+  --danger-border: rgba(179, 38, 30, 0.22);
+  --shadow: 0 1px 0 rgba(0, 0, 0, 0.02);
+  background:
+    radial-gradient(120% 55% at 100% 0%, #ffffff 0%, rgba(243, 245, 248, 0) 62%),
+    var(--bg);
+}
+
+.chrome.compact {
+  gap: 6px;
+  padding: max(8px, env(safe-area-inset-top)) 6px max(8px, env(safe-area-inset-bottom));
+}
+
+.chrome.compact .header-top {
+  justify-content: center;
+}
+
+.chrome.compact .brand {
+  padding: 0;
+}
+
+.chrome.compact .brand > span:last-child,
+.chrome.compact .command-button,
+.chrome.compact .downloads-button,
+.chrome.compact .theme-button,
+.chrome.compact .extensions-button,
+.chrome.compact .url-form,
+.chrome.compact .status,
+.chrome.compact .section-head,
+.chrome.compact .tabs-toolbar,
+.chrome.compact .row-actions,
+.chrome.compact .tab-title,
+.chrome.compact .feed-copy,
+.chrome.compact .folder-name,
+.chrome.compact .folder-count,
+.chrome.compact .space-name,
+.chrome.compact .space-remove,
+.chrome.compact .pinned-mark {
+  display: none;
+}
+
+.chrome.compact .space-switcher {
+  gap: 3px;
+}
+
+.chrome.compact .space-chips {
+  justify-content: center;
+}
+
+.chrome.compact .space-chip {
+  width: 32px;
+  max-width: 32px;
+  padding: 4px;
+  justify-content: center;
+}
+
+.chrome.compact .essential-grid {
+  grid-template-columns: 1fr;
+}
+
+.chrome.compact .essential-title,
+.chrome.compact .tile-remove,
+.chrome.compact .empty-hint {
+  display: none;
+}
+
+.chrome.compact .essential-tile {
+  min-height: 44px;
+}
+
+.chrome.compact .essential-scroll {
+  max-height: 180px;
+}
+
+.chrome.compact .pinned-list {
+  max-height: none;
+}
+
+.chrome.compact .tab-row,
+.chrome.compact .feed-row,
+.chrome.compact .folder-row {
+  justify-content: center;
+  padding-left: 0 !important;
+  padding-right: 0;
+}
+
+.chrome.compact .tab-main {
+  flex: 0 0 auto;
+  justify-content: center;
+  width: 100%;
+  padding: 0;
+}
+
+.chrome.compact .folder-toggle {
+  width: 20px;
+}
+
+.chrome.compact .folder-row {
+  gap: 0;
+}
+
+.chrome.compact .tab-list {
+  padding-right: 0;
+}
+
+.chrome.compact .feed-row .unread-dot {
+  margin-right: 2px;
+}

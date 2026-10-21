@@ -9,10 +9,12 @@ import {
 } from 'electron'
 import buildChromeContextMenu from 'electron-chrome-context-menu'
 import { isSafeNavigationUrl, type BrowserSnapshot, type Tab, type TabPatch } from '@ione/core'
+import type { FindResult } from '../shared/ipc'
 import {
   BROWSER_SESSION_PARTITION,
   browserSession,
-  hardenSession
+  hardenSession,
+  type PermissionHandler
 } from './browser-session'
 
 export interface TabViewManagerOptions {
@@ -20,6 +22,7 @@ export interface TabViewManagerOptions {
   sidebarWidth: number
   onTabEvent: (tabId: string, patch: TabPatch) => void
   onOpenInNewTab: (url: string) => void
+  requestPermission?: PermissionHandler
 }
 
 export interface TabExtensionBridge {
@@ -56,9 +59,10 @@ const TAB_WEB_PREFERENCES: WebPreferences = {
 
 export class TabViewManager {
   private readonly window: BaseWindow
-  private readonly sidebarWidth: number
+  private sidebarWidth: number
   private readonly onTabEvent: TabViewManagerOptions['onTabEvent']
   private readonly onOpenInNewTab: TabViewManagerOptions['onOpenInNewTab']
+  private readonly requestPermission: PermissionHandler | undefined
   private readonly views = new Map<string, ManagedTabView>()
   private attachedId: string | null = null
   private attachedManaged: ManagedTabView | null = null
@@ -71,6 +75,7 @@ export class TabViewManager {
     this.sidebarWidth = options.sidebarWidth
     this.onTabEvent = options.onTabEvent
     this.onOpenInNewTab = options.onOpenInNewTab
+    this.requestPermission = options.requestPermission
   }
 
   reconcile(snapshot: BrowserSnapshot): void {
@@ -111,6 +116,66 @@ export class TabViewManager {
       }
     }
     managed.view.setBounds(this.contentBounds())
+  }
+
+  setSidebarWidth(width: number): void {
+    this.sidebarWidth = Math.max(64, Math.min(420, Math.round(width)))
+    this.layout()
+  }
+
+  goBack(): void {
+    const contents = this.attachedManaged?.view.webContents
+    if (!contents || contents.isDestroyed() || !contents.navigationHistory.canGoBack()) return
+    contents.navigationHistory.goBack()
+  }
+
+  goForward(): void {
+    const contents = this.attachedManaged?.view.webContents
+    if (!contents || contents.isDestroyed() || !contents.navigationHistory.canGoForward()) return
+    contents.navigationHistory.goForward()
+  }
+
+  reload(): void {
+    const contents = this.attachedManaged?.view.webContents
+    if (contents && !contents.isDestroyed()) contents.reload()
+  }
+
+  stopLoading(): void {
+    const contents = this.attachedManaged?.view.webContents
+    if (contents && !contents.isDestroyed()) contents.stop()
+  }
+
+  async findInPage(query: string, forward = true): Promise<FindResult | null> {
+    const contents = this.attachedManaged?.view.webContents
+    if (!contents || contents.isDestroyed() || query.length === 0) return null
+
+    return new Promise<FindResult | null>((resolve) => {
+      let requestId = -1
+      let settled = false
+      const finish = (result: FindResult | null): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        contents.removeListener('found-in-page', onFound)
+        resolve(result)
+      }
+      const onFound = (
+        _event: Electron.Event,
+        result: Electron.FoundInPageResult
+      ): void => {
+        if (result.requestId !== requestId) return
+        finish({ matches: result.matches, activeMatch: result.activeMatchOrdinal })
+      }
+      const timer = setTimeout(() => finish(null), 2000)
+      timer.unref()
+      contents.on('found-in-page', onFound)
+      requestId = contents.findInPage(query, { forward })
+    })
+  }
+
+  stopFindInPage(): void {
+    const contents = this.attachedManaged?.view.webContents
+    if (contents && !contents.isDestroyed()) contents.stopFindInPage('clearSelection')
   }
 
   navigate(tabId: string, url: string): void {
@@ -225,11 +290,11 @@ export class TabViewManager {
       const partition = `persist:${partitionId}`
       webPreferences.partition = partition
       // Apply the same deny-by-default permission policy to isolated spaces.
-      hardenSession(session.fromPartition(partition))
+      hardenSession(session.fromPartition(partition), this.requestPermission)
     } else {
       webPreferences.partition = BROWSER_SESSION_PARTITION
       extensionManaged = true
-      hardenSession(browserSession())
+      hardenSession(browserSession(), this.requestPermission)
     }
 
     const initialUrl = isSafeNavigationUrl(tab.url) ? tab.url : 'about:blank'

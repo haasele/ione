@@ -13,8 +13,13 @@ import { parseTabSleepEnv, TabSleepManager } from './sleep-manager'
 import { ExtensionService } from './extensions'
 import { AdblockService } from './adblock'
 import { FeedService } from './feed-service'
+import { DownloadService } from './downloads'
+import { PermissionRequestService } from './permissions'
 
 const isSmokeTest = process.argv.includes('--smoke-test')
+const appStartedAt = Date.now()
+let perfBatchCount = 0
+let perfDiffCount = 0
 
 let database: Database.Database | null = null
 let controller: BrowserController | null = null
@@ -22,6 +27,8 @@ let chromeWindow: ChromeWindow | null = null
 let extensionService: ExtensionService | null = null
 let adblockService: AdblockService | null = null
 let feedService: FeedService | null = null
+let downloadService: DownloadService | null = null
+let permissionService: PermissionRequestService | null = null
 let sleepManager: TabSleepManager | null = null
 let batcher: DiffBatcher | null = null
 let smokeTimer: NodeJS.Timeout | null = null
@@ -53,6 +60,8 @@ function start(): void {
     const persistence = new WriteBehindPersistence(initialized.repository)
 
     batcher = new DiffBatcher((batch) => {
+      perfBatchCount += 1
+      perfDiffCount += batch.diffs.length
       chromeWindow?.sendDiffs(batch)
     })
 
@@ -67,6 +76,11 @@ function start(): void {
       }
     )
 
+    permissionService = new PermissionRequestService((request) => {
+      chromeWindow?.sendPermissionRequest(request)
+    })
+    const permissions = permissionService
+
     chromeWindow = new ChromeWindow({
       preloadPath: join(__dirname, '../preload/index.js'),
       rendererUrl: devRendererUrl(),
@@ -77,8 +91,19 @@ function start(): void {
       onOpenInNewTab: (url) => {
         controller?.createTab(url)
       },
+      requestPermission: (permission, origin, contents) =>
+        permissions.request(
+          permission,
+          origin,
+          chromeWindow?.tabViews.tabIdForContents(contents) ?? null
+        ),
       onReady: () => onChromeReady(dbPath)
     })
+
+    downloadService = new DownloadService((downloads) => {
+      chromeWindow?.sendDownloads(downloads)
+    })
+    downloadService.initialize()
 
     extensionService = new ExtensionService({
       controller,
@@ -91,7 +116,11 @@ function start(): void {
       onChange: () => adblockService?.handleExtensionChange()
     })
     adblockService = new AdblockService(extensionService)
-    feedService = new FeedService(controller)
+    feedService = new FeedService(controller, {
+      workerPath: app.isPackaged
+        ? join(process.resourcesPath, 'app.asar.unpacked/out/main/feed-worker.js')
+        : join(__dirname, 'feed-worker.js')
+    })
 
     sleepManager = new TabSleepManager({
       controller,
@@ -105,7 +134,9 @@ function start(): void {
       chromeWindow,
       extensionService,
       adblockService,
-      feedService
+      feedService,
+      downloadService,
+      permissionService
     )
     chromeWindow.load()
 
@@ -157,6 +188,17 @@ interface ChromeProbe {
   feedRead: boolean
   feedEtag: string
   feedError: string | null
+  downloadRows: number
+  downloadsPanelWorks: boolean
+  permissionPromptShown: boolean
+  permissionAddress: string
+  permissionPageTitle: string
+  permissionDenied: boolean
+  paletteWorks: boolean
+  themeToggleWorks: boolean
+  compactToggleWorks: boolean
+  findWorks: boolean
+  navigationWorks: boolean
   tabListPresent: boolean
   virtualListPresent: boolean
 }
@@ -195,7 +237,57 @@ async function initializeServices(dbPath: string): Promise<void> {
       loadedExtensions.map((extension) => `${extension.name}@${extension.version}`)
     )
   }
+  if (process.env['IONE_PERF_MODE'] === '1') {
+    await runPerfMode()
+    return
+  }
   if (isSmokeTest) await runSmokeProbe(dbPath)
+}
+
+async function runPerfMode(): Promise<void> {
+  if (!controller || !chromeWindow) return
+  const chromeReadyAt = Date.now()
+  const targetTabs = Math.max(1, Math.min(100, Number(process.env['IONE_PERF_TABS'] ?? 1)))
+  const wantsSleeping = process.env['IONE_PERF_SLEEP'] === '1'
+  const currentTabs = Object.keys(controller.snapshot.tabs).length
+
+  for (let index = currentTabs; index < targetTabs; index += 1) {
+    controller.createTab('about:blank')
+  }
+
+  if (wantsSleeping) {
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const snapshot = controller.snapshot
+      const sleeping = Object.values(snapshot.tabs).filter((tab) => tab.sleeping).length
+      if (sleeping >= Object.keys(snapshot.tabs).length - 1) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500))
+
+  const snapshot = controller.snapshot
+  const metrics = app.getAppMetrics()
+  const workingSetKb = metrics.reduce((total, metric) => total + metric.memory.workingSetSize, 0)
+  console.log(
+    `IONE_PERF_RESULT ${JSON.stringify({
+      tabs: Object.keys(snapshot.tabs).length,
+      sleepingTabs: Object.values(snapshot.tabs).filter((tab) => tab.sleeping).length,
+      startupToChromeReadyMs: chromeReadyAt - appStartedAt,
+      scenarioMs: Date.now() - chromeReadyAt,
+      workingSetMb: Math.round(workingSetKb / 1024),
+      mainRssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      rendererProcesses: metrics.filter((metric) => metric.type === 'Tab').length,
+      processes: metrics.map((metric) => ({
+        type: metric.type,
+        workingSetMb: Math.round(metric.memory.workingSetSize / 1024)
+      })),
+      diffBatches: perfBatchCount,
+      diffs: perfDiffCount,
+      version: snapshot.version
+    })}`
+  )
+  setTimeout(() => app.quit(), 200)
 }
 
 async function runSmokeProbe(dbPath: string): Promise<void> {
@@ -205,6 +297,19 @@ async function runSmokeProbe(dbPath: string): Promise<void> {
   if (!chromeWindow.hasAttachedTab(initialActiveTabId)) {
     failSmoke('IONE_SMOKE_FAILED active tab view not attached')
     return
+  }
+
+  const downloadUrl = process.env['IONE_SMOKE_DOWNLOAD_URL'] ?? null
+  if (downloadUrl && downloadService && initialActiveTabId) {
+    const contents = chromeWindow.tabViews.getWebContents(initialActiveTabId)
+    contents?.downloadURL(downloadUrl)
+    const started = Date.now()
+    while (
+      !downloadService.list().some((download) => download.state === 'completed') &&
+      Date.now() - started < 5000
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
   }
 
   const probe = await probeChrome()
@@ -227,6 +332,22 @@ async function runSmokeProbe(dbPath: string): Promise<void> {
         probe.extensionRows >= 1))
   const adblockOk = probe?.adblockReady === true && probe?.extensionsPanelWorks === true
   const feedUrl = process.env['IONE_SMOKE_FEED_URL'] ?? null
+  const permissionUrl = process.env['IONE_SMOKE_PERMISSION_URL'] ?? null
+  const downloadsOk =
+    downloadUrl === null ||
+    (probe !== null && probe.downloadRows >= 1 && probe.downloadsPanelWorks)
+  const permissionsOk =
+    permissionUrl === null ||
+    (probe !== null && probe.permissionPromptShown && probe.permissionDenied)
+  const phase7Ok =
+    probe !== null &&
+    probe.paletteWorks &&
+    probe.themeToggleWorks &&
+    probe.compactToggleWorks &&
+    probe.findWorks &&
+    probe.navigationWorks &&
+    downloadsOk &&
+    permissionsOk
   const feedOk =
     feedUrl === null ||
     (probe !== null &&
@@ -256,6 +377,7 @@ async function runSmokeProbe(dbPath: string): Promise<void> {
       extensionOk &&
       adblockOk &&
       feedOk &&
+      phase7Ok &&
       probe.tabListPresent &&
       probe.virtualListPresent)
   if (
@@ -303,6 +425,7 @@ async function probeChrome(): Promise<ChromeProbe | null> {
   const expectExtension = process.env['IONE_SMOKE_EXTENSIONS'] === '1'
   const installExtensionId = process.env['IONE_SMOKE_INSTALL_EXTENSION_ID'] ?? null
   const feedUrl = process.env['IONE_SMOKE_FEED_URL'] ?? null
+  const permissionUrl = process.env['IONE_SMOKE_PERMISSION_URL'] ?? null
   try {
     const raw: unknown = await chromeWindow.chromeView.webContents.executeJavaScript(`
       (async () => {
@@ -310,6 +433,7 @@ async function probeChrome(): Promise<ChromeProbe | null> {
         const expectExtension = ${JSON.stringify(expectExtension)}
         const installExtensionId = ${JSON.stringify(installExtensionId)}
         const feedUrl = ${JSON.stringify(feedUrl)}
+        const permissionUrl = ${JSON.stringify(permissionUrl)}
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
         const waitFor = async (predicate, timeout = 5000) => {
           const started = Date.now()
@@ -735,6 +859,151 @@ async function probeChrome(): Promise<ChromeProbe | null> {
           }
         }
 
+        let downloadRows = 0
+        let downloadsPanelWorks = false
+        const downloadsButton = document.querySelector('[data-testid="downloads-button"] button')
+        if (downloadsButton instanceof HTMLElement) {
+          downloadsButton.click()
+          downloadsPanelWorks = await waitFor(
+            () => document.querySelector('[data-testid="downloads-panel"]') !== null
+          )
+          if (downloadsPanelWorks) {
+            await waitFor(
+              () => document.querySelectorAll('[data-testid="download-row"]').length > 0,
+              5000
+            )
+            downloadRows = document.querySelectorAll('[data-testid="download-row"]').length
+            const closeDownloads = document.querySelector('[aria-label="Close downloads"]')
+            if (closeDownloads instanceof HTMLElement) closeDownloads.click()
+            await waitFor(
+              () => document.querySelector('[data-testid="downloads-panel"]') === null
+            )
+          }
+        }
+
+        let permissionPromptShown = false
+        let permissionDenied = false
+        let permissionAddress = ''
+        let permissionPageTitle = ''
+        if (permissionUrl && targetUrl) {
+          try {
+            await window.ione.navigate(permissionUrl)
+            await waitFor(() => activeTitle() === 'Permission Page', 7000)
+            permissionPageTitle = activeTitle()
+            permissionAddress = addressValue()
+            permissionPromptShown = await waitFor(
+              () => document.querySelector('[data-testid="permission-prompt"]') !== null,
+              10000
+            )
+            if (permissionPromptShown) {
+              const deny = document.querySelector('[data-testid="permission-deny"]')
+              if (deny instanceof HTMLElement) deny.click()
+              await waitFor(
+                () => document.querySelector('[data-testid="permission-prompt"]') === null,
+                5000
+              )
+              permissionDenied =
+                document.querySelector('[data-testid="permission-prompt"]') === null
+            }
+            await window.ione.navigate(targetUrl)
+            await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+          } catch (error) {
+            permissionDenied = false
+          }
+        }
+
+        let paletteWorks = false
+        const commandButton = document.querySelector('[data-testid="command-button"] button')
+        if (commandButton instanceof HTMLElement) {
+          commandButton.click()
+          paletteWorks = await waitFor(
+            () => document.querySelector('[data-testid="command-palette"]') !== null
+          )
+          if (paletteWorks) {
+            const commandInput = document.querySelector('[data-testid="command-input"]')
+            if (commandInput instanceof HTMLInputElement) {
+              commandInput.value = 'reload'
+              commandInput.dispatchEvent(new Event('input', { bubbles: true }))
+              await waitFor(
+                () => document.querySelectorAll('[data-testid="command-item"]').length > 0
+              )
+              commandInput.dispatchEvent(
+                new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })
+              )
+            }
+            await waitFor(
+              () => document.querySelector('[data-testid="command-palette"]') === null
+            )
+            paletteWorks =
+              document.querySelector('[data-testid="command-palette"]') === null
+          }
+        }
+
+        let themeToggleWorks = false
+        const themeButton = document.querySelector('[data-testid="theme-toggle"] button')
+        if (themeButton instanceof HTMLElement) {
+          themeButton.click()
+          await waitFor(() => document.querySelector('.chrome.light') !== null)
+          const wentLight = document.querySelector('.chrome.light') !== null
+          themeButton.click()
+          await waitFor(() => document.querySelector('.chrome.light') === null)
+          themeToggleWorks = wentLight && document.querySelector('.chrome.light') === null
+        }
+
+        let compactToggleWorks = false
+        const compactButton = document.querySelector('[data-testid="compact-toggle"] button')
+        if (compactButton instanceof HTMLElement) {
+          compactButton.click()
+          await waitFor(() => document.querySelector('.chrome.compact') !== null)
+          const wentCompact = document.querySelector('.chrome.compact') !== null
+          compactButton.click()
+          await waitFor(() => document.querySelector('.chrome.compact') === null)
+          compactToggleWorks = wentCompact && document.querySelector('.chrome.compact') === null
+        }
+
+        let findWorks = false
+        window.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true })
+        )
+        const findReady = await waitFor(
+          () => document.querySelector('[data-testid="find-bar"]') !== null
+        )
+        if (findReady) {
+          const findInput = document.querySelector('[data-testid="find-input"]')
+          if (findInput instanceof HTMLInputElement) {
+            findInput.value = 'Ione'
+            findInput.dispatchEvent(new Event('input', { bubbles: true }))
+            findInput.dispatchEvent(
+              new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })
+            )
+            findWorks = await waitFor(() => {
+              const value =
+                document.querySelector('[data-testid="find-count"]')?.textContent?.trim() ?? ''
+              return value.length > 0 && value !== '0/0'
+            })
+          }
+          const closeFind = document.querySelector('[aria-label="Close find bar"]')
+          if (closeFind instanceof HTMLElement) closeFind.click()
+          await waitFor(() => document.querySelector('[data-testid="find-bar"]') === null)
+        }
+
+        let navigationWorks = false
+        if (targetUrl) {
+          await window.ione.navigate(targetUrl + 'feed-article?nav=1')
+          await waitFor(() => activeTitle() === 'Feed Article', 7000)
+          const backButton = document.querySelector('[data-testid="back-button"] button')
+          if (backButton instanceof HTMLElement) backButton.click()
+          await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+          const backWorked = activeTitle() === 'Smoke Page'
+          const forwardButton = document.querySelector('[data-testid="forward-button"] button')
+          if (forwardButton instanceof HTMLElement) forwardButton.click()
+          await waitFor(() => activeTitle() === 'Feed Article', 7000)
+          const forwardWorked = activeTitle() === 'Feed Article'
+          navigationWorks = backWorked && forwardWorked
+          await window.ione.navigate(targetUrl)
+          await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+        }
+
         const final = await window.ione.getSnapshot()
         const essentialTitle =
           document.querySelector('[data-testid="essential-tile"] .essential-title')?.textContent?.trim() ?? ''
@@ -785,6 +1054,17 @@ async function probeChrome(): Promise<ChromeProbe | null> {
           feedRead,
           feedEtag,
           feedError,
+          downloadRows,
+          downloadsPanelWorks,
+          permissionPromptShown,
+          permissionDenied,
+          permissionAddress,
+          permissionPageTitle,
+          paletteWorks,
+          themeToggleWorks,
+          compactToggleWorks,
+          findWorks,
+          navigationWorks,
           tabListPresent: document.querySelector('[data-testid="tab-list"]') !== null,
           virtualListPresent: document.querySelector('[data-testid="tab-list"] [role="list"]') !== null
         }
@@ -842,6 +1122,19 @@ async function probeChrome(): Promise<ChromeProbe | null> {
       feedRead: record['feedRead'] === true,
       feedEtag: typeof record['feedEtag'] === 'string' ? record['feedEtag'] : '',
       feedError: typeof record['feedError'] === 'string' ? record['feedError'] : null,
+      downloadRows: typeof record['downloadRows'] === 'number' ? record['downloadRows'] : 0,
+      downloadsPanelWorks: record['downloadsPanelWorks'] === true,
+      permissionPromptShown: record['permissionPromptShown'] === true,
+      permissionDenied: record['permissionDenied'] === true,
+      permissionAddress:
+        typeof record['permissionAddress'] === 'string' ? record['permissionAddress'] : '',
+      permissionPageTitle:
+        typeof record['permissionPageTitle'] === 'string' ? record['permissionPageTitle'] : '',
+      paletteWorks: record['paletteWorks'] === true,
+      themeToggleWorks: record['themeToggleWorks'] === true,
+      compactToggleWorks: record['compactToggleWorks'] === true,
+      findWorks: record['findWorks'] === true,
+      navigationWorks: record['navigationWorks'] === true,
       tabListPresent: record['tabListPresent'] === true,
       virtualListPresent: record['virtualListPresent'] === true
     }
@@ -926,6 +1219,10 @@ function shutdown(): void {
   adblockService = null
   feedService?.stop()
   feedService = null
+  downloadService?.dispose()
+  downloadService = null
+  permissionService?.dispose()
+  permissionService = null
   extensionService = null
 
   try {

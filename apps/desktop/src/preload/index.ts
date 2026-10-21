@@ -7,7 +7,10 @@ import {
   type CreateSpaceInput,
   type DesktopApi,
   type AdblockState,
+  type DownloadInfo,
   type ExtensionInfo,
+  type FindResult,
+  type PermissionRequestInfo,
   type MoveFolderInput,
   type MoveTabInput,
   type NavigateResult,
@@ -53,6 +56,36 @@ const api: DesktopApi = {
   getAdblockState: (): Promise<AdblockState> => ipcRenderer.invoke(IPC.getAdblockState),
   setAdblockEnabled: (enabled: boolean): Promise<AdblockState> =>
     ipcRenderer.invoke(IPC.setAdblockEnabled, enabled),
+  navigateBack: (): Promise<void> => ipcRenderer.invoke(IPC.navigateBack),
+  navigateForward: (): Promise<void> => ipcRenderer.invoke(IPC.navigateForward),
+  reloadTab: (): Promise<void> => ipcRenderer.invoke(IPC.reloadTab),
+  stopLoading: (): Promise<void> => ipcRenderer.invoke(IPC.stopLoading),
+  findInPage: (query: string, forward?: boolean): Promise<FindResult | null> =>
+    ipcRenderer.invoke(IPC.findInPage, query, forward),
+  stopFindInPage: (): Promise<void> => ipcRenderer.invoke(IPC.stopFindInPage),
+  setSidebarWidth: (width: number): Promise<void> =>
+    ipcRenderer.invoke(IPC.setSidebarWidth, width),
+  listDownloads: (): Promise<DownloadInfo[]> => ipcRenderer.invoke(IPC.listDownloads),
+  onDownloads: (listener: (downloads: DownloadInfo[]) => void): (() => void) => {
+    const wrapped = (_event: IpcRendererEvent, downloads: DownloadInfo[]): void =>
+      listener(downloads)
+    ipcRenderer.on(IPC.downloadsChanged, wrapped)
+    return () => ipcRenderer.removeListener(IPC.downloadsChanged, wrapped)
+  },
+  cancelDownload: (id: string): Promise<void> => ipcRenderer.invoke(IPC.cancelDownload, id),
+  openDownload: (id: string): Promise<void> => ipcRenderer.invoke(IPC.openDownload, id),
+  showDownloadInFolder: (id: string): Promise<void> =>
+    ipcRenderer.invoke(IPC.showDownload, id),
+  onPermissionRequest: (
+    listener: (request: PermissionRequestInfo) => void
+  ): (() => void) => {
+    const wrapped = (_event: IpcRendererEvent, request: PermissionRequestInfo): void =>
+      listener(request)
+    ipcRenderer.on(IPC.permissionRequest, wrapped)
+    return () => ipcRenderer.removeListener(IPC.permissionRequest, wrapped)
+  },
+  respondPermission: (requestId: string, allow: boolean): Promise<void> =>
+    ipcRenderer.invoke(IPC.respondPermission, requestId, allow),
   createTabInFolder: (folderId: string | null, input?: string): Promise<Tab> =>
     ipcRenderer.invoke(IPC.createTabInFolder, folderId, input),
   createFolder: (input: CreateFolderInput): Promise<Folder> =>

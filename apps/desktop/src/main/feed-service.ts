@@ -61,6 +61,7 @@ export class FeedService {
 
   async initialize(): Promise<void> {
     if (this.started) return
+    if (process.env['IONE_FEEDS'] === 'off') return
     this.started = true
     this.startWorker()
     this.ensureStates()

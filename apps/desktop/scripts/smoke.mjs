@@ -7,7 +7,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const require = createRequire(import.meta.url)
-const electronBinary = require('electron')
+const electronBinary = process.env.IONE_ELECTRON_BINARY || require('electron')
+const packagedBinary = Boolean(process.env.IONE_ELECTRON_BINARY)
 const appRoot = dirname(dirname(fileURLToPath(import.meta.url)))
 const workDir = mkdtempSync(join(tmpdir(), 'ione-smoke-'))
 const dbPath = join(workDir, 'smoke.sqlite')
@@ -43,6 +44,21 @@ const pageServer = createServer((request, response) => {
     response.end(rss(origin))
     return
   }
+  if (request.url === '/download') {
+    response.writeHead(200, {
+      'content-type': 'text/plain; charset=utf-8',
+      'content-disposition': 'attachment; filename="ione-smoke.txt"'
+    })
+    response.end('ione smoke download\n')
+    return
+  }
+  if (request.url === '/permission') {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    response.end(
+      "<!doctype html><html><head><title>Permission Page</title></head><body><h1>Permission</h1><script>console.log('permission page mediaDevices', typeof navigator.mediaDevices); Notification.requestPermission().then((value) => console.log('notification permission', value)).catch((e) => console.log('notification error', e.name, e.message))</script></body></html>"
+    )
+    return
+  }
   if (request.url?.startsWith('/feed-article')) {
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
     response.end(
@@ -65,11 +81,13 @@ if (!pageAddress || typeof pageAddress === 'string') {
 }
 const smokeUrl = `http://127.0.0.1:${pageAddress.port}/`
 const feedUrl = `${smokeUrl}feed.xml`
+const downloadUrl = `${smokeUrl}download`
+const downloadDir = join(workDir, 'Downloads')
 
 const child = spawn(
   electronBinary,
   [
-    appRoot,
+    ...(packagedBinary ? [] : [appRoot]),
     '--smoke-test',
     // This environment cannot use the SUID/user-namespace sandbox. The flag is
     // confined to the smoke harness; app code never disables sandboxing.
@@ -84,6 +102,9 @@ const child = spawn(
       IONE_SMOKE_SCREENSHOT: screenshotPath,
       IONE_SMOKE_URL: smokeUrl,
       IONE_SMOKE_FEED_URL: feedUrl,
+      IONE_SMOKE_DOWNLOAD_URL: downloadUrl,
+      IONE_SMOKE_PERMISSION_URL: `${smokeUrl}permission`,
+      IONE_DOWNLOAD_DIR: downloadDir,
       IONE_TAB_SLEEP_MS: '250',
       IONE_TAB_SLEEP_TICK_MS: '200',
       IONE_ADBLOCK: process.env.IONE_ADBLOCK ?? 'off'
@@ -288,8 +309,14 @@ child.on('exit', (code, signal) => {
     return
   }
 
+  if (!existsSync(join(workDir, 'Downloads', 'ione-smoke.txt'))) {
+    stderr += '\n[smoke] downloaded file was not written to the configured directory'
+    finish(1, '')
+    return
+  }
+
   finish(
     0,
-    `[smoke] app started, tree/folders/DnD/sleep/feed/extension state persisted, screenshot: ${screenshotPath}`
+    `[smoke] app started, tree/folders/DnD/sleep/feed/extension/download/permission state persisted, screenshot: ${screenshotPath}`
   )
 })

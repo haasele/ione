@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Tab } from '@ione/core'
+  import { IconButton } from '@ione/ui-kit'
   import Icon from './Icon.svelte'
 
   interface Props {
@@ -7,9 +8,12 @@
     onclear: () => void
     onerror: (error: unknown) => void
     onblocked: () => void
+    onback: () => void
+    onforward: () => void
+    onreload: () => void
   }
 
-  let { activeTab, onclear, onerror, onblocked }: Props = $props()
+  let { activeTab, onclear, onerror, onblocked, onback, onforward, onreload }: Props = $props()
 
   let draft = $state('')
   let focused = $state(false)
@@ -54,6 +58,23 @@
 </script>
 
 <form class="url-form" onsubmit={handleSubmit}>
+  <span class="nav-actions">
+    <span data-testid="back-button">
+      <IconButton label="Back" title="Back" size="sm" onclick={onback}>
+        <Icon name="back" size={12} />
+      </IconButton>
+    </span>
+    <span data-testid="forward-button">
+      <IconButton label="Forward" title="Forward" size="sm" onclick={onforward}>
+        <Icon name="forward" size={12} />
+      </IconButton>
+    </span>
+    <span data-testid="reload-button">
+      <IconButton label="Reload" title="Reload" size="sm" onclick={onreload}>
+        <Icon name="reload" size={12} />
+      </IconButton>
+    </span>
+  </span>
   <input
     class="address-input"
     data-testid="address-input"
@@ -92,6 +113,13 @@
   .url-form:focus-within {
     border-color: var(--accent-border, rgba(138, 180, 248, 0.35));
     box-shadow: 0 0 0 3px var(--accent-soft, rgba(138, 180, 248, 0.16));
+  }
+
+  .nav-actions {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 0;
   }
 
   .address-input {

@@ -7,12 +7,19 @@
     CreateEssentialInput,
     CreateFolderInput,
     CreateSpaceInput,
+    DownloadInfo,
     MoveTabInput,
+    PermissionRequestInfo,
     UpdateFolderInput
   } from '../../shared/ipc'
+  import type { PaletteCommand } from './lib/palette'
   import AddressBar from './components/AddressBar.svelte'
+  import CommandPalette from './components/CommandPalette.svelte'
+  import DownloadsPanel from './components/DownloadsPanel.svelte'
+  import FindBar from './components/FindBar.svelte'
   import Essentials from './components/Essentials.svelte'
   import ExtensionsPanel from './components/ExtensionsPanel.svelte'
+  import PermissionPrompt from './components/PermissionPrompt.svelte'
   import Icon from './components/Icon.svelte'
   import SidebarTree from './components/SidebarTree.svelte'
   import SpaceSwitcher from './components/SpaceSwitcher.svelte'
@@ -64,6 +71,13 @@
   let loadError = $state<string | null>(null)
   let status = $state<string | null>(null)
   let extensionsOpen = $state(false)
+  let downloadsOpen = $state(false)
+  let paletteOpen = $state(false)
+  let findOpen = $state(false)
+  let compact = $state(false)
+  let light = $state(false)
+  let downloads = $state<DownloadInfo[]>([])
+  let permissionRequest = $state<PermissionRequestInfo | null>(null)
 
   // Non-reactive coordination state for snapshot fetching.
   let syncToken = 0
@@ -83,18 +97,119 @@
     snapshot ? tabsInSpace(snapshot, snapshot.activeSpaceId).filter((tab) => tab.pinned) : []
   )
 
+  const paletteCommands = $derived.by<PaletteCommand[]>(() => {
+    const commands: PaletteCommand[] = [
+      { id: 'new-tab', label: 'New tab', detail: 'Ctrl+T', run: () => void createTab() },
+      { id: 'reload', label: 'Reload tab', run: reloadTab },
+      { id: 'back', label: 'Go back', run: goBack },
+      { id: 'forward', label: 'Go forward', run: goForward },
+      { id: 'find', label: 'Find in page', detail: 'Ctrl+F', run: () => (findOpen = true) },
+      {
+        id: 'compact',
+        label: compact ? 'Exit compact mode' : 'Enter compact mode',
+        run: () => setCompact(!compact)
+      },
+      {
+        id: 'theme',
+        label: light ? 'Switch to dark theme' : 'Switch to light theme',
+        run: toggleTheme
+      },
+      { id: 'extensions', label: 'Extensions and ad blocking', run: () => (extensionsOpen = true) },
+      { id: 'downloads', label: 'Downloads', detail: 'Ctrl+Shift+J', run: () => (downloadsOpen = true) }
+    ]
+
+    if (snapshot) {
+      for (const space of sortByOrder(Object.values(snapshot.spaces))) {
+        commands.push({
+          id: `space:${space.id}`,
+          label: `Switch space: ${space.name}`,
+          detail: space.id === snapshot.activeSpaceId ? 'active' : undefined,
+          keywords: 'space',
+          run: () => void activateSpace(space.id)
+        })
+      }
+      for (const tab of tabsInSpace(snapshot, snapshot.activeSpaceId)) {
+        const label = tab.title.trim() || tab.url.trim() || 'New Tab'
+        commands.push({
+          id: `tab:${tab.id}`,
+          label: `Switch tab: ${label}`,
+          detail: tab.pinned ? 'pinned' : undefined,
+          keywords: 'tab',
+          run: () => void activateTab(tab.id)
+        })
+      }
+    }
+    return commands
+  })
+
   onMount(() => {
     const unsubscribe = window.ione.onDiffs(handleDiffBatch)
+    const unsubscribeDownloads = window.ione.onDownloads((list) => {
+      downloads = list
+    })
+    const unsubscribePermission = window.ione.onPermissionRequest((request) => {
+      permissionRequest = request
+    })
     void loadInitial()
+    void window.ione
+      .listDownloads()
+      .then((list) => (downloads = list))
+      .catch(() => undefined)
+
+    compact = localStorage.getItem('ione.compact') === '1'
+    light = localStorage.getItem('ione.theme') === 'light'
+    void window.ione.setSidebarWidth(compact ? 96 : 320).catch(() => undefined)
+    window.addEventListener('keydown', handleShortcut)
 
     return () => {
       unsubscribe()
+      unsubscribeDownloads()
+      unsubscribePermission()
+      window.removeEventListener('keydown', handleShortcut)
       // Invalidate any fetch that resolves after teardown.
       syncToken += 1
       syncInFlight = false
       syncQueued = false
     }
   })
+
+  function handleShortcut(event: KeyboardEvent): void {
+    const mod = event.metaKey || event.ctrlKey
+    if (!mod) return
+    const key = event.key.toLowerCase()
+    if (key === 'k' || (key === 'p' && event.shiftKey)) {
+      event.preventDefault()
+      paletteOpen = true
+      findOpen = false
+    } else if (key === 'f') {
+      event.preventDefault()
+      findOpen = true
+      paletteOpen = false
+    } else if (key === 't') {
+      event.preventDefault()
+      void createTab()
+    } else if (key === 'w') {
+      event.preventDefault()
+      if (activeTab) void closeTab(activeTab.id)
+    } else if (key === 'e' && event.shiftKey) {
+      event.preventDefault()
+      extensionsOpen = true
+    } else if (key === 'j' && event.shiftKey) {
+      event.preventDefault()
+      downloadsOpen = true
+    }
+  }
+
+  function setCompact(next: boolean): void {
+    compact = next
+    localStorage.setItem('ione.compact', next ? '1' : '0')
+    void window.ione.setSidebarWidth(next ? 96 : 320).catch((error) => reportError(error))
+  }
+
+  function toggleTheme(): void {
+    light = !light
+    localStorage.setItem('ione.theme', light ? 'light' : 'dark')
+  }
 
   function errorMessage(error: unknown): string {
     if (error instanceof Error && error.message.trim()) return error.message
@@ -224,6 +339,18 @@
     } catch (error) {
       reportError(error)
     }
+  }
+
+  function goBack(): void {
+    void window.ione.navigateBack().catch(reportError)
+  }
+
+  function goForward(): void {
+    void window.ione.navigateForward().catch(reportError)
+  }
+
+  function reloadTab(): void {
+    void window.ione.reloadTab().catch(reportError)
   }
 
   async function createSpace(input: CreateSpaceInput): Promise<boolean> {
@@ -364,6 +491,8 @@
 
 <div
   class="chrome"
+  class:compact
+  class:light
   style:--accent={activeTheme.accent}
   style:--accent-soft={activeTheme.soft}
   style:--accent-border={activeTheme.border}
@@ -374,16 +503,61 @@
         <span class="brand-mark" aria-hidden="true">i</span>
         <span>Ione</span>
       </div>
-      <span class="extensions-button" data-testid="extensions-button">
-        <IconButton
-          label="Extensions and ad blocking"
-          title="Extensions"
-          size="sm"
-          onclick={() => (extensionsOpen = true)}
-        >
-          <Icon name="extensions" size={13} />
-        </IconButton>
-      </span>
+      <div class="header-actions">
+        <span class="command-button" data-testid="command-button">
+          <IconButton
+            label="Command palette"
+            title="Command palette (Ctrl+K)"
+            size="sm"
+            onclick={() => (paletteOpen = true)}
+          >
+            <Icon name="command" size={13} />
+          </IconButton>
+        </span>
+        <span class="downloads-button" data-testid="downloads-button">
+          <IconButton
+            label="Downloads"
+            title="Downloads"
+            size="sm"
+            onclick={() => (downloadsOpen = true)}
+          >
+            <Icon name="download" size={13} />
+          </IconButton>
+          {#if downloads.some((download) => download.state === 'progressing')}
+            <span class="action-dot" aria-hidden="true"></span>
+          {/if}
+        </span>
+        <span class="theme-button" data-testid="theme-toggle">
+          <IconButton
+            label={light ? 'Switch to dark theme' : 'Switch to light theme'}
+            title={light ? 'Dark theme' : 'Light theme'}
+            size="sm"
+            onclick={toggleTheme}
+          >
+            <Icon name={light ? 'moon' : 'sun'} size={13} />
+          </IconButton>
+        </span>
+        <span class="compact-button" data-testid="compact-toggle">
+          <IconButton
+            label={compact ? 'Exit compact mode' : 'Enter compact mode'}
+            title={compact ? 'Expand sidebar' : 'Compact sidebar'}
+            size="sm"
+            onclick={() => setCompact(!compact)}
+          >
+            <Icon name="compact" size={13} />
+          </IconButton>
+        </span>
+        <span class="extensions-button" data-testid="extensions-button">
+          <IconButton
+            label="Extensions and ad blocking"
+            title="Extensions"
+            size="sm"
+            onclick={() => (extensionsOpen = true)}
+          >
+            <Icon name="extensions" size={13} />
+          </IconButton>
+        </span>
+      </div>
     </div>
 
     {#if snapshot}
@@ -413,7 +587,14 @@
       onclear={() => (status = null)}
       onerror={reportError}
       onblocked={reportBlocked}
+      onback={goBack}
+      onforward={goForward}
+      onreload={reloadTab}
     />
+
+    {#if findOpen}
+      <FindBar onclose={() => (findOpen = false)} />
+    {/if}
 
     {#if status}
       <div class="status" role="alert">
@@ -476,6 +657,21 @@
         extensionsOpen = false
         void createTab(url)
       }}
+    />
+  {/if}
+
+  {#if paletteOpen}
+    <CommandPalette commands={paletteCommands} onclose={() => (paletteOpen = false)} />
+  {/if}
+
+  {#if downloadsOpen}
+    <DownloadsPanel {downloads} onclose={() => (downloadsOpen = false)} />
+  {/if}
+
+  {#if permissionRequest}
+    <PermissionPrompt
+      request={permissionRequest}
+      onclose={() => (permissionRequest = null)}
     />
   {/if}
 </div>

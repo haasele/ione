@@ -1,6 +1,11 @@
 import { ipcMain, type IpcMainInvokeEvent } from 'electron'
 import type { BrowserSnapshot, Essential, Folder, FolderKind, Space, Tab } from '@ione/core'
-import type { AdblockState, ExtensionInfo } from '../shared/ipc'
+import type {
+  AdblockState,
+  DownloadInfo,
+  ExtensionInfo,
+  FindResult,
+} from '../shared/ipc'
 import {
   IPC,
   type CreateEssentialInput,
@@ -17,13 +22,17 @@ import type { ChromeWindow } from './chrome-window'
 import type { ExtensionService } from './extensions'
 import type { AdblockService } from './adblock'
 import type { FeedService } from './feed-service'
+import type { DownloadService } from './downloads'
+import type { PermissionRequestService } from './permissions'
 
 export function registerIpc(
   controller: BrowserController,
   chromeWindow: ChromeWindow,
   extensionService: ExtensionService,
   adblockService: AdblockService,
-  feedService: FeedService
+  feedService: FeedService,
+  downloadService: DownloadService,
+  permissionService: PermissionRequestService
 ): void {
   const assertTrusted = (event: IpcMainInvokeEvent): void => {
     if (!chromeWindow.isChromeSender(event.sender)) {
@@ -205,6 +214,78 @@ export function registerIpc(
       assertTrusted(event)
       if (typeof rawEnabled !== 'boolean') throw new TypeError('enabled must be a boolean')
       return adblockService.setEnabled(rawEnabled)
+    }
+  )
+
+  ipcMain.handle(IPC.navigateBack, (event): void => {
+    assertTrusted(event)
+    chromeWindow.goBack()
+  })
+
+  ipcMain.handle(IPC.navigateForward, (event): void => {
+    assertTrusted(event)
+    chromeWindow.goForward()
+  })
+
+  ipcMain.handle(IPC.reloadTab, (event): void => {
+    assertTrusted(event)
+    chromeWindow.reload()
+  })
+
+  ipcMain.handle(IPC.stopLoading, (event): void => {
+    assertTrusted(event)
+    chromeWindow.stopLoading()
+  })
+
+  ipcMain.handle(
+    IPC.findInPage,
+    async (event, rawQuery: unknown, rawForward: unknown): Promise<FindResult | null> => {
+      assertTrusted(event)
+      const query = assertString(rawQuery, 'query', 1024)
+      const forward = rawForward === undefined ? true : rawForward === true
+      return chromeWindow.findInPage(query, forward)
+    }
+  )
+
+  ipcMain.handle(IPC.stopFindInPage, (event): void => {
+    assertTrusted(event)
+    chromeWindow.stopFindInPage()
+  })
+
+  ipcMain.handle(IPC.setSidebarWidth, (event, rawWidth: unknown): void => {
+    assertTrusted(event)
+    if (typeof rawWidth !== 'number' || !Number.isFinite(rawWidth)) {
+      throw new TypeError('width must be a finite number')
+    }
+    chromeWindow.setSidebarWidth(rawWidth)
+  })
+
+  ipcMain.handle(IPC.listDownloads, (event): DownloadInfo[] => {
+    assertTrusted(event)
+    return downloadService.list()
+  })
+
+  ipcMain.handle(IPC.cancelDownload, (event, rawId: unknown): void => {
+    assertTrusted(event)
+    downloadService.cancel(assertId(rawId, 'downloadId'))
+  })
+
+  ipcMain.handle(IPC.openDownload, async (event, rawId: unknown): Promise<void> => {
+    assertTrusted(event)
+    await downloadService.open(assertId(rawId, 'downloadId'))
+  })
+
+  ipcMain.handle(IPC.showDownload, (event, rawId: unknown): void => {
+    assertTrusted(event)
+    downloadService.showInFolder(assertId(rawId, 'downloadId'))
+  })
+
+  ipcMain.handle(
+    IPC.respondPermission,
+    (event, rawId: unknown, rawAllow: unknown): void => {
+      assertTrusted(event)
+      if (typeof rawAllow !== 'boolean') throw new TypeError('allow must be a boolean')
+      permissionService.respond(assertId(rawId, 'permissionId'), rawAllow)
     }
   )
 }

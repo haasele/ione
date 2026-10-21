@@ -9,3 +9,6 @@ coverage/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+test-results/
+playwright-report/
+blob-report/

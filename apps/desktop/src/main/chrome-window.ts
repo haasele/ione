@@ -2,7 +2,8 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { BaseWindow, WebContentsView, type WebContents, type WebPreferences } from 'electron'
 import type { BrowserSnapshot, DiffBatch, TabPatch } from '@ione/core'
-import { IPC } from '../shared/ipc'
+import { IPC, type DownloadInfo, type PermissionRequestInfo } from '../shared/ipc'
+import type { PermissionHandler } from './browser-session'
 import { TabViewManager } from './tab-views'
 
 const SIDEBAR_WIDTH = 320
@@ -26,6 +27,7 @@ export interface ChromeWindowOptions {
   onTabEvent: (tabId: string, patch: TabPatch) => void
   onOpenInNewTab: (url: string) => void
   onReady?: () => void
+  requestPermission?: PermissionHandler
 }
 
 export class ChromeWindow {
@@ -68,7 +70,8 @@ export class ChromeWindow {
       window: this.window,
       sidebarWidth: SIDEBAR_WIDTH,
       onTabEvent: options.onTabEvent,
-      onOpenInNewTab: options.onOpenInNewTab
+      onOpenInNewTab: options.onOpenInNewTab,
+      requestPermission: options.requestPermission
     })
 
     this.hardenChrome()
@@ -105,6 +108,47 @@ export class ChromeWindow {
 
   navigateTab(tabId: string, url: string): void {
     this.tabViews.navigate(tabId, url)
+  }
+
+  setSidebarWidth(width: number): void {
+    this.tabViews.setSidebarWidth(width)
+    this.layout()
+  }
+
+  goBack(): void {
+    this.tabViews.goBack()
+  }
+
+  goForward(): void {
+    this.tabViews.goForward()
+  }
+
+  reload(): void {
+    this.tabViews.reload()
+  }
+
+  stopLoading(): void {
+    this.tabViews.stopLoading()
+  }
+
+  findInPage(query: string, forward = true): Promise<import('../shared/ipc').FindResult | null> {
+    return this.tabViews.findInPage(query, forward)
+  }
+
+  stopFindInPage(): void {
+    this.tabViews.stopFindInPage()
+  }
+
+  sendDownloads(downloads: DownloadInfo[]): void {
+    if (this.disposed) return
+    const contents = this.chromeView.webContents
+    if (!contents.isDestroyed()) contents.send(IPC.downloadsChanged, downloads)
+  }
+
+  sendPermissionRequest(request: PermissionRequestInfo): void {
+    if (this.disposed) return
+    const contents = this.chromeView.webContents
+    if (!contents.isDestroyed()) contents.send(IPC.permissionRequest, request)
   }
 
   sendDiffs(batch: DiffBatch): void {

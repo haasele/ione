@@ -295,38 +295,12 @@
   }
 
   .folder-row:hover .row-actions,
-  .folder-row:focus-within .feed-error {
-    display: grid;
-    flex: 0 0 auto;
-    place-items: center;
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    background: var(--danger-soft, rgba(242, 139, 130, 0.12));
-    color: var(--danger, #f28b82);
-    font-size: 10px;
-    font-weight: 700;
-  }
-
-  .row-actions {
+  .folder-row:focus-within .row-actions {
     opacity: 1;
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .feed-error {
-    display: grid;
-    flex: 0 0 auto;
-    place-items: center;
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    background: var(--danger-soft, rgba(242, 139, 130, 0.12));
-    color: var(--danger, #f28b82);
-    font-size: 10px;
-    font-weight: 700;
-  }
-
-  .row-actions {
+    .row-actions {
       transition-duration: 0.01ms !important;
     }
   }

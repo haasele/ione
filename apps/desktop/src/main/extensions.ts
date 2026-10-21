@@ -12,7 +12,7 @@ import {
   uninstallExtension as uninstallFromStore
 } from 'electron-chrome-web-store'
 import type { ExtensionInfo } from '../shared/ipc'
-import { browserSession, hardenSession } from './browser-session'
+import { browserSession } from './browser-session'
 import type { BrowserController } from './controller'
 import type { TabExtensionBridge, TabViewManager } from './tab-views'
 
@@ -55,7 +55,6 @@ export class ExtensionService {
       options.extensionsPath ?? join(app.getPath('userData'), 'Extensions')
     this.offline = options.offline ?? false
     this.onChange = options.onChange
-    hardenSession(this.session)
 
     const license: ExtensionLicense =
       options.license ??
@@ -114,6 +113,7 @@ export class ExtensionService {
   async initialize(): Promise<void> {
     if (this.initialized) return
     this.initialized = true
+    if (process.env['IONE_EXTENSIONS'] === 'off') return
 
     try {
       await installChromeWebStore({

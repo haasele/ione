@@ -1,12 +1,12 @@
 # Architecture & dependency decisions
 
-Status: Phases 1-6 implemented. Verified against npm/GitHub on 2026-10-20/21.
+Status: Phases 1-7 implemented. Verified against npm/GitHub on 2026-10-20/21.
 
 Every runtime/build dependency is listed below with version, license, and the
 reason it is present. Packages marked **planned** are not installed yet and
 MUST be re-checked before the phase that adds them.
 
-## Installed now (Phase 1-2)
+## Installed now (Phases 1-7)
 
 | Package | Version | License | Why |
 | --- | --- | --- | --- |
@@ -28,11 +28,11 @@ MUST be re-checked before the phase that adds them.
 | `electron-chrome-context-menu` | 1.1.0 | MIT | Native Chrome-like context menu, including extension context items. npm build is old but its deprecated navigation calls still exist in Electron 44. |
 | `@ghostery/adblocker-electron` | 2.20.1 | MPL-2.0 | Built-in network + cosmetic filtering, fallback/complement when uBO is unavailable. Preload package is MPL-2.0 transitive. |
 | `fast-xml-parser` | 5.11.2 | MIT | RSS/Atom XML parsing in `@ione/rss`; dual ESM/CJS, typed, entity/depth controls. |
+| `@playwright/test` | 1.64.1 | Apache-2.0 | Electron E2E via `chromium.connectOverCDP`; no Playwright browser download required. |
+| `electron-builder` | 26.15.3 | MIT | Linux packaging (`dist/linux-unpacked` verified). Internal workspace packages are devDependencies because Vite bundles them. |
 
-No third-party UI, virtualization, drag-and-drop, RSS, adblock, or extension
-package is installed in Phase 1-3. Virtualization is a ~100-line Svelte 5
-windowed list; DnD will use native pointer events. RSS and extensions are
-Phase 5-6.
+No third-party UI/virtualization/DnD package is installed. Virtualization is a
+Svelte 5 windowed list; DnD uses native pointer events.
 
 ### Electron binary installation
 Electron 44 no longer ships a package postinstall script. The root
@@ -42,18 +42,17 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
 
 ## Researched, not installed yet
 
-| Package | Latest checked | License | Notes / risk |
-| --- | --- | --- | --- |
-| `electron-builder` | 26.15.3 | MIT | Phase 7 packaging only. |
-| `@playwright/test` | 1.64.1 | Apache-2.0 | Electron smoke/E2E later. Phase 1-3 uses a dependency-free Electron smoke mode so the gate does not need browser downloads. |
+None for Phases 1-7. Future virtualization/DnD libraries, extension API
+shims, and packaging targets must be added here before use.
 
 ## Architecture decisions
 
 ### Process/view layout
 - `BaseWindow` + two kinds of `WebContentsView`: exactly one chrome view and
   one view per tab (created lazily, only the active tab is attached).
-- The chrome view is the vertical sidebar (320 px) and contains the URL bar,
-  tab list, and future command palette. The active tab occupies the remaining
+- The chrome view is the vertical sidebar (320 px normal / 96 px compact)
+  and contains the URL bar, tab tree, command palette, downloads, permissions,
+  and extensions. The active tab occupies the remaining
   rectangle. This keeps all chrome in one Svelte UI/view and avoids
   click-blocking overlays that a full-window transparent chrome view would
   create.
@@ -61,6 +60,33 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
   adblocker use `persist:browser`. Isolated space partitions use their own
   sessions and intentionally do not receive extensions in Phase 5.
 - No `<webview>`, no `BrowserView`.
+
+### Shell basics, palette and packaging (Phase 7)
+- Navigation uses `navigationHistory` (back/forward) and reload/stop; find in
+  page resolves `found-in-page` with a 2 s timeout. The chrome UI exposes nav
+  buttons, Ctrl/Cmd+T/W/F/K, and a command palette with dynamic space/tab
+  commands.
+- Downloads are tracked from the `will-download` event in `persist:browser`;
+  files save to the Downloads directory or `IONE_DOWNLOAD_DIR`, shown in a
+  panel with progress/cancel/open/folder actions.
+- Permission requests are routed per content session to a single chrome prompt
+  (30 s timeout, deny on timeout/close). `setPermissionCheckHandler` exposes
+  promptable permissions without pre-granting them; unsupported permissions
+  stay denied.
+- Compact mode resizes the chrome view via IPC (96 px, icons only) and persists
+  in localStorage. A light theme overrides CSS variables; the active space
+  still controls the accent.
+- Performance mode (`IONE_PERF_MODE=1` + `IONE_PERF_TABS`) measures startup to
+  chrome first paint and summed `app.getAppMetrics()` working set. Results are
+  in `docs/perf.md`; current 50-tab sleeping working set is ~629 MB, startup
+  ~200-250 ms on Xvfb.
+- Playwright E2E connects over CDP to the built Electron app (the BaseWindow +
+  WebContentsView layout has no BrowserWindow for `_electron.firstWindow`).
+- electron-builder packages `out/`, runtime node_modules, and asar-unpacks the
+  feed worker, better-sqlite3, and extension/adblock preload packages. The
+  packaged `dist/linux-unpacked/ione` binary passed the full smoke flow,
+  including an unpacked extension popup. Packaging is currently a Linux `dir`
+  target; AppImage/signing/notarization are future work.
 
 ### Security
 - All renderer views: `contextIsolation: true`, `sandbox: true`,
@@ -230,8 +256,9 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
   code.
 - The smoke harness also passes `--disable-dev-shm-usage` for container CI.
 - No `--disable-web-security`, no remote module, no experimental flag.
-- `backgroundThrottling` stays at Electron defaults; tab sleeping is a later
-  explicit lifecycle feature rather than a hidden throttling hack.
+- `backgroundThrottling` stays at Electron defaults; tab sleeping is the
+  explicit lifecycle feature described above rather than a hidden throttling
+  hack.
 
 ## Scope ledger
 
@@ -272,9 +299,11 @@ feed-item diffs, nested RSS folder UI with unread/read state, refresh, feed
 errors, and virtual feed rows. Smoke covers create RSS folder, fetch, 304
 refresh, open item as a tab, mark read, and persisted SQLite state.
 
-### Still later
-Command palette/navigation basics/find/downloads/permission prompts, theme
-polish, perf measurements, Playwright E2E, and packaging (Phase 7).
+### Phase 7 (implemented)
+Command palette, keyboard shortcuts, back/forward/reload/stop, find in page,
+downloads tracking/panel, permission prompt UI, compact sidebar and light
+theme, performance harness (`docs/perf.md`), Playwright Electron E2E, and an
+electron-builder Linux unpacked package.
 
 ## Verification gates
 
@@ -283,12 +312,17 @@ polish, perf measurements, Playwright E2E, and packaging (Phase 7).
 - `bun run build` must succeed.
 - `bun run smoke` must print `IONE_SMOKE_READY` and exit 0 (needs a display or
   Xvfb on Linux).
+- `bun run test:e2e` (Playwright/CDP) must pass.
+- `bun run package` must produce a launchable `dist/linux-unpacked/ione`.
+- `bun run perf` must regenerate `docs/perf.md`; the 50-tab sleeping case must
+  stay well under 3 GB.
 
-### Last verified (2026-10-20, after Phase 3)
+### Last verified (2026-10-21, after Phase 7)
 
-- `bun run typecheck`: 0 errors, 0 warnings (svelte-check: 115 files).
+- `bun run typecheck`: 0 errors, 0 warnings (svelte-check: 120 files).
 - `bun run test:core`: 7 files, 225 tests passed.
 - `bun run test`: 13 files, 256 tests passed.
+- `bun run test:e2e`: 1 Playwright CDP test passed (chrome render, navigation, command palette, compact toggle).
 - `bun run build`: main/preload/renderer bundles produced; built CSP is
   `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
   img-src 'self' data: https:; object-src 'none'; base-uri 'none';
@@ -296,10 +330,14 @@ polish, perf measurements, Playwright E2E, and packaging (Phase 7).
 - `DISPLAY=:99 bun run smoke`: `IONE_SMOKE_READY` with typed bridge, address
   bar, essentials, pin/reset, space creation, folder creation + nested move,
   tab creation inside a folder, collapse/expand, move out, **synthetic pointer
-  drag back into the folder**, sleep/wake of an inactive tab, 2 folder rows,
-  3 visible tab rows, and persisted SQLite state (5 tabs, 2 spaces, 2 folders,
-  1 sleeping tab, active tab in a folder). Screenshot:
+  drag back into the folder**, sleep/wake of an inactive tab, folder rows,
+  persisted SQLite state (5 tabs, 2 spaces, 3 folders, 1 sleeping tab, active
+  tab in a folder), RSS folder + 2 feed items with a 304 refresh/read item,
+  download file, permission deny prompt, command palette, theme/compact toggles,
+  find matches, and back/forward navigation. Screenshot:
   `/tmp/ione-smoke-chrome.png`.
+- Packaged `dist/linux-unpacked/ione` passed the same smoke flow and the
+  unpacked-extension fixture flow.
 - `electron-vite dev --noSandbox --remoteDebuggingPort 9333` under Xvfb:
   chrome target loaded from `http://localhost:5173/`, typed bridge present,
   address bar and tab row rendered, Vite HMR client connected without CSP
@@ -332,6 +370,18 @@ polish, perf measurements, Playwright E2E, and packaging (Phase 7).
 - `bun run test` covers parser RSS2/Atom/RSS1/JSON/entity handling, reducer
   feed actions/cleanup, and SQLite feed round-trip/diff persistence.
 
+### Phase 7 shell/package evidence (2026-10-21)
+
+- `bun run smoke` verified downloads (saved to `IONE_DOWNLOAD_DIR`), permission
+  prompt (Notification request, deny), command palette, light/dark toggle,
+  compact toggle, find-in-page count, and back/forward buttons alongside all
+  earlier phase checks.
+- `bun run test:e2e` passed one Playwright CDP test against the built app.
+- `bun run package` produced `apps/desktop/dist/linux-unpacked/ione` (318 MB);
+  the packaged binary passed the full smoke flow and a fixture-extension flow.
+- `bun run perf` produced `docs/perf.md`: startup 207-252 ms; 50 awake tabs
+  4.6 GB; 50 tabs with 49 sleeping 629 MB working set.
+
 - The smoke harness uses `--no-sandbox` because this Linux container has
   neither a SUID Chromium sandbox nor unprivileged user namespaces. The
   application itself never passes `--no-sandbox`; smoke-only evidence is not a
@@ -348,12 +398,19 @@ polish, perf measurements, Playwright E2E, and packaging (Phase 7).
   Extensions panel. Isolated space partitions have no extension APIs.
 - RSS worker crashes are logged but not auto-restarted; OPML/media/full-text
   extraction and cross-device read sync are out of scope.
-- Playwright is not installed yet; Phase 1-6 use the dependency-free smoke
-  harness. Browser E2E coverage starts when Playwright is added.
-- RSS, adblock/extensions, downloads/permission-prompt UI, command palette,
-  find-in-page, perf measurements, Playwright E2E, and packaging are later.
+- Playwright is installed; the E2E test uses CDP because there is no
+  BrowserWindow. Extend it as UI flows grow.
+- Packaging is a Linux unpacked directory only; no AppImage/installer/signing
+  and the container cannot validate the Chromium OS sandbox. Verify those on a
+  normal desktop.
+- CPU/IPC message-rate profiling is limited to diff batch counts; a detailed
+  tracing pass remains future work.
+- Permission prompts are one-at-a-time and deny on timeout; there is no
+  persisted per-origin permission policy yet.
+- Download tracking is attached to `persist:browser`; downloads initiated in an
+  isolated space partition are not shown in the panel.
 - Scroll restore is best-effort (captured on detach/sleep, 500 ms query
   timeout); it is not captured on abrupt process kill.
 - This container cannot exercise the Chromium OS sandbox; verify the packaged
-  app's sandbox installation on a normal Linux desktop during Phase 7.
+  app's sandbox installation on a normal Linux desktop before release.
 
