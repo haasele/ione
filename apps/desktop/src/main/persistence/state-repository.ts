@@ -2,6 +2,8 @@ import {
   mostRecentTabInSpace,
   type BrowserSnapshot,
   type Essential,
+  type FeedItem,
+  type FeedState,
   type Folder,
   type FolderKind,
   type Space,
@@ -53,6 +55,34 @@ interface TabRow {
   sort_key: string
 }
 
+interface FeedStateRow {
+  folder_id: string
+  fetch_url: string
+  etag: string | null
+  last_modified: string | null
+  last_checked_at: number
+  last_success_at: number
+  next_poll_at: number
+  consecutive_failures: number
+  last_error: string | null
+  title: string | null
+  site_url: string | null
+}
+
+interface FeedItemRow {
+  id: string
+  folder_id: string
+  guid: string | null
+  url: string
+  title: string
+  author: string
+  summary: string
+  published_at: number | null
+  fetched_at: number
+  read: number
+  starred: number
+}
+
 interface AppStateRow {
   key: string
   value: string
@@ -101,12 +131,17 @@ export class StateRepository {
   private readonly loadFolders: Database.Statement
   private readonly loadTabs: Database.Statement
   private readonly loadAppState: Database.Statement
+  private readonly loadFeedStates: Database.Statement
+  private readonly loadFeedItems: Database.Statement
 
   private readonly deleteTabs: Database.Statement
   private readonly deleteFolders: Database.Statement
   private readonly deleteSpaces: Database.Statement
   private readonly deleteEssentials: Database.Statement
   private readonly deleteAppState: Database.Statement
+  private readonly deleteFeedItems: Database.Statement
+  private readonly deleteFeedStates: Database.Statement
+  private readonly deleteFeedItemsByFolder: Database.Statement
 
   private readonly insertSpace: Database.Statement
   private readonly insertEssential: Database.Statement
@@ -118,6 +153,10 @@ export class StateRepository {
   private readonly upsertFolder: Database.Statement
   private readonly upsertTab: Database.Statement
   private readonly upsertAppState: Database.Statement
+  private readonly upsertFeedState: Database.Statement
+  private readonly upsertFeedItem: Database.Statement
+  private readonly removeFeedState: Database.Statement
+  private readonly removeFeedItem: Database.Statement
 
   private readonly removeTab: Database.Statement
   private readonly removeFolder: Database.Statement
@@ -132,12 +171,19 @@ export class StateRepository {
     this.loadFolders = db.prepare('SELECT * FROM folders ORDER BY space_id, sort_key')
     this.loadTabs = db.prepare('SELECT * FROM tabs ORDER BY space_id, sort_key')
     this.loadAppState = db.prepare('SELECT key, value FROM app_state')
+    this.loadFeedStates = db.prepare('SELECT * FROM feed_state ORDER BY folder_id')
+    this.loadFeedItems = db.prepare(
+      'SELECT * FROM feed_items ORDER BY folder_id, published_at DESC, id'
+    )
 
     this.deleteTabs = db.prepare('DELETE FROM tabs')
     this.deleteFolders = db.prepare('DELETE FROM folders')
     this.deleteSpaces = db.prepare('DELETE FROM spaces')
     this.deleteEssentials = db.prepare('DELETE FROM essentials')
     this.deleteAppState = db.prepare('DELETE FROM app_state')
+    this.deleteFeedItems = db.prepare('DELETE FROM feed_items')
+    this.deleteFeedStates = db.prepare('DELETE FROM feed_state')
+    this.deleteFeedItemsByFolder = db.prepare('DELETE FROM feed_items WHERE folder_id = ?')
 
     this.insertSpace = db.prepare(
       `INSERT INTO spaces (id, name, icon, theme, partition_id, sort_key)
@@ -213,6 +259,43 @@ export class StateRepository {
       `INSERT INTO app_state (key, value) VALUES (?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`
     )
+    this.upsertFeedState = db.prepare(
+      `INSERT INTO feed_state
+         (folder_id, fetch_url, etag, last_modified, last_checked_at,
+          last_success_at, next_poll_at, consecutive_failures, last_error,
+          title, site_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(folder_id) DO UPDATE SET
+         fetch_url = excluded.fetch_url,
+         etag = excluded.etag,
+         last_modified = excluded.last_modified,
+         last_checked_at = excluded.last_checked_at,
+         last_success_at = excluded.last_success_at,
+         next_poll_at = excluded.next_poll_at,
+         consecutive_failures = excluded.consecutive_failures,
+         last_error = excluded.last_error,
+         title = excluded.title,
+         site_url = excluded.site_url`
+    )
+    this.upsertFeedItem = db.prepare(
+      `INSERT INTO feed_items
+         (id, folder_id, guid, url, title, author, summary, published_at,
+          fetched_at, read, starred)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         folder_id = excluded.folder_id,
+         guid = excluded.guid,
+         url = excluded.url,
+         title = excluded.title,
+         author = excluded.author,
+         summary = excluded.summary,
+         published_at = excluded.published_at,
+         fetched_at = excluded.fetched_at,
+         read = excluded.read,
+         starred = excluded.starred`
+    )
+    this.removeFeedState = db.prepare('DELETE FROM feed_state WHERE folder_id = ?')
+    this.removeFeedItem = db.prepare('DELETE FROM feed_items WHERE id = ?')
 
     this.removeTab = db.prepare('DELETE FROM tabs WHERE id = ?')
     this.removeFolder = db.prepare('DELETE FROM folders WHERE id = ?')
@@ -289,6 +372,44 @@ export class StateRepository {
       tabs[tab.id] = tab
     }
 
+    const feedStates: Record<string, FeedState> = {}
+    for (const row of this.loadFeedStates.all() as unknown as FeedStateRow[]) {
+      if (RESERVED_OBJECT_KEYS.has(row.folder_id) || !own(folders, row.folder_id)) continue
+      const state: FeedState = {
+        folderId: row.folder_id,
+        fetchUrl: row.fetch_url,
+        lastCheckedAt: row.last_checked_at,
+        lastSuccessAt: row.last_success_at,
+        nextPollAt: row.next_poll_at,
+        consecutiveFailures: row.consecutive_failures
+      }
+      if (row.etag !== null) state.etag = row.etag
+      if (row.last_modified !== null) state.lastModified = row.last_modified
+      if (row.last_error !== null) state.lastError = row.last_error
+      if (row.title !== null) state.title = row.title
+      if (row.site_url !== null) state.siteUrl = row.site_url
+      feedStates[state.folderId] = state
+    }
+
+    const feedItems: Record<string, FeedItem> = {}
+    for (const row of this.loadFeedItems.all() as unknown as FeedItemRow[]) {
+      if (RESERVED_OBJECT_KEYS.has(row.id) || !own(folders, row.folder_id)) continue
+      const item: FeedItem = {
+        id: row.id,
+        folderId: row.folder_id,
+        url: row.url,
+        title: row.title,
+        author: row.author,
+        summary: row.summary,
+        publishedAt: row.published_at,
+        fetchedAt: row.fetched_at,
+        read: row.read !== 0,
+        starred: row.starred !== 0
+      }
+      if (row.guid !== null) item.guid = row.guid
+      feedItems[item.id] = item
+    }
+
     const appState = new Map<string, string>()
     for (const row of this.loadAppState.all() as unknown as AppStateRow[]) {
       appState.set(row.key, row.value)
@@ -303,6 +424,8 @@ export class StateRepository {
       activeSpaceId: '',
       activeTabId: null
     }
+    if (Object.keys(feedItems).length > 0) snapshot.feedItems = feedItems
+    if (Object.keys(feedStates).length > 0) snapshot.feedStates = feedStates
 
     const storedSpaceId = appState.get('activeSpaceId')
     const storedSpace = storedSpaceId === undefined ? undefined : own(spaces, storedSpaceId)
@@ -330,6 +453,8 @@ export class StateRepository {
   saveSnapshot(snapshot: BrowserSnapshot): void {
     this.db.transaction(() => {
       this.deleteTabs.run()
+      this.deleteFeedItems.run()
+      this.deleteFeedStates.run()
       this.deleteFolders.run()
       this.deleteSpaces.run()
       this.deleteEssentials.run()
@@ -369,6 +494,38 @@ export class StateRepository {
         )
       }
 
+      for (const state of Object.values(snapshot.feedStates ?? {})) {
+        this.upsertFeedState.run(
+          state.folderId,
+          state.fetchUrl,
+          state.etag ?? null,
+          state.lastModified ?? null,
+          state.lastCheckedAt,
+          state.lastSuccessAt,
+          state.nextPollAt,
+          state.consecutiveFailures,
+          state.lastError ?? null,
+          state.title ?? null,
+          state.siteUrl ?? null
+        )
+      }
+
+      for (const item of Object.values(snapshot.feedItems ?? {})) {
+        this.upsertFeedItem.run(
+          item.id,
+          item.folderId,
+          item.guid ?? null,
+          item.url,
+          item.title,
+          item.author,
+          item.summary,
+          item.publishedAt,
+          item.fetchedAt,
+          item.read ? 1 : 0,
+          item.starred ? 1 : 0
+        )
+      }
+
       for (const tab of Object.values(snapshot.tabs)) {
         this.insertTab.run(
           tab.id,
@@ -405,6 +562,7 @@ export class StateRepository {
       const removedEssentials = new Set<string>()
       const removedFolders = new Set<string>()
       const removedTabs = new Set<string>()
+      const feedOps: StateDiff[] = []
 
       for (const diff of diffs) {
         switch (diff.type) {
@@ -435,6 +593,13 @@ export class StateRepository {
           case 'session.activeSpace':
           case 'session.activeTab':
             // Session keys are always written from the final snapshot below.
+            break
+          case 'feed.state':
+          case 'feed.state.remove':
+          case 'feed.items.replace':
+          case 'feed.item.upsert':
+          case 'feed.item.remove':
+            feedOps.push(diff)
             break
         }
       }
@@ -473,6 +638,67 @@ export class StateRepository {
         )
       }
 
+      for (const op of feedOps) {
+        switch (op.type) {
+          case 'feed.state':
+            this.upsertFeedState.run(
+              op.state.folderId,
+              op.state.fetchUrl,
+              op.state.etag ?? null,
+              op.state.lastModified ?? null,
+              op.state.lastCheckedAt,
+              op.state.lastSuccessAt,
+              op.state.nextPollAt,
+              op.state.consecutiveFailures,
+              op.state.lastError ?? null,
+              op.state.title ?? null,
+              op.state.siteUrl ?? null
+            )
+            break
+          case 'feed.state.remove':
+            this.removeFeedState.run(op.folderId)
+            break
+          case 'feed.items.replace':
+            this.deleteFeedItemsByFolder.run(op.folderId)
+            for (const item of op.items) {
+              this.upsertFeedItem.run(
+                item.id,
+                item.folderId,
+                item.guid ?? null,
+                item.url,
+                item.title,
+                item.author,
+                item.summary,
+                item.publishedAt,
+                item.fetchedAt,
+                item.read ? 1 : 0,
+                item.starred ? 1 : 0
+              )
+            }
+            break
+          case 'feed.item.upsert':
+            this.upsertFeedItem.run(
+              op.item.id,
+              op.item.folderId,
+              op.item.guid ?? null,
+              op.item.url,
+              op.item.title,
+              op.item.author,
+              op.item.summary,
+              op.item.publishedAt,
+              op.item.fetchedAt,
+              op.item.read ? 1 : 0,
+              op.item.starred ? 1 : 0
+            )
+            break
+          case 'feed.item.remove':
+            this.removeFeedItem.run(op.id)
+            break
+          default:
+            break
+        }
+      }
+
       for (const tab of tabs.values()) {
         this.upsertTab.run(
           tab.id,
@@ -491,7 +717,11 @@ export class StateRepository {
       }
 
       for (const id of removedTabs) this.removeTab.run(id)
-      for (const id of removedFolders) this.removeFolder.run(id)
+      for (const id of removedFolders) {
+        this.deleteFeedItemsByFolder.run(id)
+        this.removeFeedState.run(id)
+        this.removeFolder.run(id)
+      }
       for (const id of removedSpaces) this.removeSpace.run(id)
       for (const id of removedEssentials) this.removeEssential.run(id)
 

@@ -12,6 +12,7 @@ import { hardenApp } from './security'
 import { parseTabSleepEnv, TabSleepManager } from './sleep-manager'
 import { ExtensionService } from './extensions'
 import { AdblockService } from './adblock'
+import { FeedService } from './feed-service'
 
 const isSmokeTest = process.argv.includes('--smoke-test')
 
@@ -20,6 +21,7 @@ let controller: BrowserController | null = null
 let chromeWindow: ChromeWindow | null = null
 let extensionService: ExtensionService | null = null
 let adblockService: AdblockService | null = null
+let feedService: FeedService | null = null
 let sleepManager: TabSleepManager | null = null
 let batcher: DiffBatcher | null = null
 let smokeTimer: NodeJS.Timeout | null = null
@@ -89,6 +91,7 @@ function start(): void {
       onChange: () => adblockService?.handleExtensionChange()
     })
     adblockService = new AdblockService(extensionService)
+    feedService = new FeedService(controller)
 
     sleepManager = new TabSleepManager({
       controller,
@@ -97,7 +100,13 @@ function start(): void {
     })
 
     chromeWindow.reconcile(controller.snapshot)
-    registerIpc(controller, chromeWindow, extensionService, adblockService)
+    registerIpc(
+      controller,
+      chromeWindow,
+      extensionService,
+      adblockService,
+      feedService
+    )
     chromeWindow.load()
 
     if (isSmokeTest) {
@@ -142,6 +151,12 @@ interface ChromeProbe {
   installError: string | null
   extensionsPanelWorks: boolean
   extensionRows: number
+  feedFolderId: string | null
+  feedItemCount: number
+  feedOpenTitle: string
+  feedRead: boolean
+  feedEtag: string
+  feedError: string | null
   tabListPresent: boolean
   virtualListPresent: boolean
 }
@@ -167,6 +182,11 @@ async function initializeServices(dbPath: string): Promise<void> {
     await adblockService?.initialize()
   } catch (error) {
     console.error('[startup] adblock initialization failed', error)
+  }
+  try {
+    await feedService?.initialize()
+  } catch (error) {
+    console.error('[startup] feed initialization failed', error)
   }
   const loadedExtensions = extensionService?.list() ?? []
   if (loadedExtensions.length > 0) {
@@ -206,6 +226,16 @@ async function runSmokeProbe(dbPath: string): Promise<void> {
         probe.extensionsPanelWorks &&
         probe.extensionRows >= 1))
   const adblockOk = probe?.adblockReady === true && probe?.extensionsPanelWorks === true
+  const feedUrl = process.env['IONE_SMOKE_FEED_URL'] ?? null
+  const feedOk =
+    feedUrl === null ||
+    (probe !== null &&
+      probe.feedFolderId !== null &&
+      probe.feedItemCount >= 2 &&
+      probe.feedOpenTitle === 'Feed Article' &&
+      probe.feedRead &&
+      probe.feedEtag.length > 0 &&
+      probe.feedError === null)
   const phase3Ok =
     expectedUrl === null ||
     (probe !== null &&
@@ -225,6 +255,7 @@ async function runSmokeProbe(dbPath: string): Promise<void> {
       probe.sleepCycleOk &&
       extensionOk &&
       adblockOk &&
+      feedOk &&
       probe.tabListPresent &&
       probe.virtualListPresent)
   if (
@@ -271,12 +302,14 @@ async function probeChrome(): Promise<ChromeProbe | null> {
   const targetUrl = process.env['IONE_SMOKE_URL'] ?? null
   const expectExtension = process.env['IONE_SMOKE_EXTENSIONS'] === '1'
   const installExtensionId = process.env['IONE_SMOKE_INSTALL_EXTENSION_ID'] ?? null
+  const feedUrl = process.env['IONE_SMOKE_FEED_URL'] ?? null
   try {
     const raw: unknown = await chromeWindow.chromeView.webContents.executeJavaScript(`
       (async () => {
         const targetUrl = ${JSON.stringify(targetUrl)}
         const expectExtension = ${JSON.stringify(expectExtension)}
         const installExtensionId = ${JSON.stringify(installExtensionId)}
+        const feedUrl = ${JSON.stringify(feedUrl)}
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
         const waitFor = async (predicate, timeout = 5000) => {
           const started = Date.now()
@@ -478,6 +511,82 @@ async function probeChrome(): Promise<ChromeProbe | null> {
           }
         }
 
+        let feedFolderId = null
+        let feedItemCount = 0
+        let feedOpenTitle = ''
+        let feedRead = false
+        let feedEtag = ''
+        let feedError = null
+        if (feedUrl && targetUrl) {
+          try {
+            const feedFolder = await window.ione.createFolder({
+              spaceId: homeSpaceId,
+              name: 'Smoke Feed',
+              kind: 'rss',
+              feedUrl
+            })
+            feedFolderId = feedFolder.id
+            await waitFor(
+              () =>
+                document.querySelector(
+                  '[data-testid="folder-row"][data-folder-id="' + feedFolder.id + '"]'
+                ) !== null
+            )
+            await window.ione.refreshFeed(feedFolder.id)
+            const feedSnap = await waitForSnapshot(
+              (value) =>
+                Object.values(value.feedItems ?? {}).filter(
+                  (item) => item.folderId === feedFolder.id
+                ).length >= 2,
+              10000
+            )
+            if (!feedSnap) {
+              feedError = 'feed items were not loaded'
+            } else {
+              const folderItems = Object.values(feedSnap.feedItems ?? {}).filter(
+                (item) => item.folderId === feedFolder.id
+              )
+              feedItemCount = folderItems.length
+              feedEtag = feedSnap.feedStates?.[feedFolder.id]?.etag ?? ''
+              await window.ione.refreshFeed(feedFolder.id)
+
+              const rowReady = await waitFor(
+                () => document.querySelector('[data-testid="feed-item"]') !== null
+              )
+              if (!rowReady) {
+                feedError = 'feed rows were not rendered'
+              } else {
+                const feedRow = document.querySelector('[data-testid="feed-item"]')
+                const feedItemId =
+                  feedRow instanceof HTMLElement ? feedRow.dataset.feedItemId : undefined
+                if (!(feedRow instanceof HTMLElement) || !feedItemId) {
+                  feedError = 'feed row has no id'
+                } else {
+                  const beforeOpen = await window.ione.getSnapshot()
+                  const feedButton = feedRow.querySelector('button')
+                  if (feedButton instanceof HTMLElement) feedButton.click()
+                  await waitFor(() => activeTitle() === 'Feed Article', 10000)
+                  feedOpenTitle = activeTitle()
+                  const readSnap = await waitForSnapshot(
+                    (value) => value.feedItems?.[feedItemId]?.read === true,
+                    5000
+                  )
+                  feedRead = readSnap !== null
+                  if (feedOpenTitle !== 'Feed Article') feedError = 'feed article did not open'
+                  const afterRead = await window.ione.getSnapshot()
+                  if (afterRead.activeTabId) await window.ione.closeTab(afterRead.activeTabId)
+                  if (beforeOpen.activeTabId) {
+                    await window.ione.activateTab(beforeOpen.activeTabId)
+                  }
+                  await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+                }
+              }
+            }
+          } catch (error) {
+            feedError = String(error)
+          }
+        }
+
         let createSpaceError = null
         let smokeSpaceId = null
         try {
@@ -670,6 +779,12 @@ async function probeChrome(): Promise<ChromeProbe | null> {
           installError,
           extensionsPanelWorks,
           extensionRows,
+          feedFolderId,
+          feedItemCount,
+          feedOpenTitle,
+          feedRead,
+          feedEtag,
+          feedError,
           tabListPresent: document.querySelector('[data-testid="tab-list"]') !== null,
           virtualListPresent: document.querySelector('[data-testid="tab-list"] [role="list"]') !== null
         }
@@ -721,6 +836,12 @@ async function probeChrome(): Promise<ChromeProbe | null> {
       installError: typeof record['installError'] === 'string' ? record['installError'] : null,
       extensionsPanelWorks: record['extensionsPanelWorks'] === true,
       extensionRows: typeof record['extensionRows'] === 'number' ? record['extensionRows'] : 0,
+      feedFolderId: typeof record['feedFolderId'] === 'string' ? record['feedFolderId'] : null,
+      feedItemCount: typeof record['feedItemCount'] === 'number' ? record['feedItemCount'] : 0,
+      feedOpenTitle: typeof record['feedOpenTitle'] === 'string' ? record['feedOpenTitle'] : '',
+      feedRead: record['feedRead'] === true,
+      feedEtag: typeof record['feedEtag'] === 'string' ? record['feedEtag'] : '',
+      feedError: typeof record['feedError'] === 'string' ? record['feedError'] : null,
       tabListPresent: record['tabListPresent'] === true,
       virtualListPresent: record['virtualListPresent'] === true
     }
@@ -803,6 +924,8 @@ function shutdown(): void {
 
   adblockService?.dispose()
   adblockService = null
+  feedService?.stop()
+  feedService = null
   extensionService = null
 
   try {

@@ -23,7 +23,7 @@ describe('migrate', () => {
   it('creates the schema and records the schema version', () => {
     const db = memoryDatabase()
 
-    expect(db.pragma('user_version', { simple: true })).toBe(1)
+    expect(db.pragma('user_version', { simple: true })).toBe(2)
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1)
 
     const tables = (
@@ -34,7 +34,15 @@ describe('migrate', () => {
         .all() as Array<{ name: string }>
     ).map((row) => row.name)
 
-    expect(tables).toEqual(['app_state', 'essentials', 'folders', 'spaces', 'tabs'])
+    expect(tables).toEqual([
+      'app_state',
+      'essentials',
+      'feed_items',
+      'feed_state',
+      'folders',
+      'spaces',
+      'tabs'
+    ])
 
     const indexes = (
       db
@@ -42,7 +50,13 @@ describe('migrate', () => {
         .all() as Array<{ name: string }>
     ).map((row) => row.name)
 
-    expect(indexes).toEqual(['idx_folders_space_parent_sort', 'idx_tabs_folder', 'idx_tabs_space_sort'])
+    expect(indexes).toEqual([
+      'idx_feed_items_folder_date',
+      'idx_feed_state_next_poll',
+      'idx_folders_space_parent_sort',
+      'idx_tabs_folder',
+      'idx_tabs_space_sort'
+    ])
   })
 
   it('is idempotent and preserves existing rows', () => {
@@ -52,7 +66,7 @@ describe('migrate', () => {
     migrate(db)
     migrate(db)
 
-    expect(db.pragma('user_version', { simple: true })).toBe(1)
+    expect(db.pragma('user_version', { simple: true })).toBe(2)
     expect(db.prepare('SELECT COUNT(*) AS count FROM spaces').get()).toEqual({ count: 1 })
   })
 

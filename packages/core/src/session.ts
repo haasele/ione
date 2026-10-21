@@ -5,7 +5,7 @@
  */
 
 import { cloneSnapshot } from './diff'
-import type { BrowserSnapshot, Folder, Tab } from './model'
+import type { BrowserSnapshot, FeedItem, FeedState, Folder, Tab } from './model'
 import { activeTabOf, mostRecentTabInSpace, sortByOrder } from './model'
 
 const RESERVED_OBJECT_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
@@ -67,12 +67,29 @@ export function normalizeSnapshot(input: BrowserSnapshot): BrowserSnapshot {
     tabs[tab.id] = { ...tab }
   }
 
+  const feedItems: Record<string, FeedItem> = {}
+  for (const item of Object.values(input.feedItems ?? {})) {
+    if (RESERVED_OBJECT_KEYS.has(item.id)) continue
+    const folder = own(folders, item.folderId)
+    if (!folder || folder.kind !== 'rss') continue
+    feedItems[item.id] = { ...item }
+  }
+
+  const feedStates: Record<string, FeedState> = {}
+  for (const state of Object.values(input.feedStates ?? {})) {
+    const folder = own(folders, state.folderId)
+    if (!folder || folder.kind !== 'rss') continue
+    feedStates[state.folderId] = { ...state }
+  }
+
   const normalized: BrowserSnapshot = {
     version: normalizeVersion(input.version),
     spaces,
     essentials,
     folders,
     tabs,
+    feedItems,
+    feedStates,
     activeSpaceId: '',
     activeTabId: null
   }

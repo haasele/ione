@@ -12,6 +12,8 @@ import {
   type BrowserAction,
   type BrowserSnapshot,
   type Essential,
+  type FeedItem,
+  type FeedState,
   type Folder,
   type Space,
   type StateDiff,
@@ -153,15 +155,25 @@ export class BrowserController {
     }
 
     const siblings = getFolderChildren(this.stateValue.folders, input.spaceId, parentId)
+    const kind = input.kind ?? 'normal'
+    const feedUrl = input.feedUrl?.trim()
+    if (feedUrl) {
+      if (kind !== 'rss') throw new Error('feedUrl requires an RSS folder')
+      const parsed = new URL(feedUrl)
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error('Feed URL must be http(s)')
+      }
+    }
     const folder: Folder = {
       id: randomUUID(),
       spaceId: input.spaceId,
       name: input.name.trim(),
       collapsed: false,
-      kind: input.kind ?? 'normal',
+      kind,
       order: keyBetweenSiblings(siblings, null)
     }
     if (parentId !== null) folder.parentId = parentId
+    if (feedUrl) folder.feedUrl = feedUrl
 
     this.dispatch({ type: 'folder.add', folder })
     return this.stateValue.folders[folder.id] ?? folder
@@ -282,6 +294,25 @@ export class BrowserController {
 
   removeEssential(id: string): void {
     this.dispatch({ type: 'essential.remove', id })
+  }
+
+  setFeedItems(folderId: string, items: FeedItem[]): void {
+    this.dispatch({ type: 'feed.setItems', folderId, items })
+  }
+
+  updateFeedItem(
+    id: string,
+    patch: { read?: boolean; starred?: boolean }
+  ): void {
+    this.dispatch({ type: 'feed.updateItem', id, patch })
+  }
+
+  setFeedState(state: FeedState): void {
+    this.dispatch({ type: 'feed.setState', state })
+  }
+
+  removeFeedState(folderId: string): void {
+    this.dispatch({ type: 'feed.removeState', folderId })
   }
 
   pinTab(tabId: string): void {

@@ -1,4 +1,4 @@
-import type { Essential, Folder, Space, Tab } from './model'
+import type { Essential, FeedItem, FeedState, Folder, Space, Tab } from './model'
 
 export type SpacePatch = Partial<Pick<Space, 'name' | 'icon' | 'theme' | 'order'>> & {
   /** `null` clears the partition. */
@@ -39,3 +39,7 @@ export type BrowserAction =
   | { type: 'essential.add'; essential: Essential }
   | { type: 'essential.update'; id: string; patch: EssentialPatch }
   | { type: 'essential.remove'; id: string }
+  | { type: 'feed.setItems'; folderId: string; items: FeedItem[] }
+  | { type: 'feed.updateItem'; id: string; patch: { read?: boolean; starred?: boolean } }
+  | { type: 'feed.setState'; state: FeedState }
+  | { type: 'feed.removeState'; folderId: string }

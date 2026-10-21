@@ -1,4 +1,12 @@
-import type { BrowserSnapshot, Essential, Folder, Space, Tab } from './model'
+import type {
+  BrowserSnapshot,
+  Essential,
+  FeedItem,
+  FeedState,
+  Folder,
+  Space,
+  Tab
+} from './model'
 
 /**
  * Entity diffs are complete entity values, not JSON patches. This keeps the
@@ -15,6 +23,11 @@ export type StateDiff =
   | { type: 'tab.remove'; id: string }
   | { type: 'session.activeSpace'; spaceId: string }
   | { type: 'session.activeTab'; tabId: string | null }
+  | { type: 'feed.state'; state: FeedState }
+  | { type: 'feed.state.remove'; folderId: string }
+  | { type: 'feed.items.replace'; folderId: string; items: FeedItem[] }
+  | { type: 'feed.item.upsert'; item: FeedItem }
+  | { type: 'feed.item.remove'; id: string }
 
 export interface DiffBatch {
   /** Snapshot version this batch applies to. */
@@ -57,6 +70,30 @@ export function applyDiff(snapshot: BrowserSnapshot, diff: StateDiff): void {
     case 'session.activeTab':
       snapshot.activeTabId = diff.tabId
       break
+    case 'feed.state':
+      snapshot.feedStates ??= {}
+      snapshot.feedStates[diff.state.folderId] = diff.state
+      break
+    case 'feed.state.remove':
+      if (snapshot.feedStates) delete snapshot.feedStates[diff.folderId]
+      break
+    case 'feed.items.replace': {
+      const items: Record<string, FeedItem> = {}
+      for (const item of diff.items) items[item.id] = item
+      const next: Record<string, FeedItem> = {}
+      for (const [id, item] of Object.entries(snapshot.feedItems ?? {})) {
+        if (item.folderId !== diff.folderId) next[id] = item
+      }
+      snapshot.feedItems = { ...next, ...items }
+      break
+    }
+    case 'feed.item.upsert':
+      snapshot.feedItems ??= {}
+      snapshot.feedItems[diff.item.id] = diff.item
+      break
+    case 'feed.item.remove':
+      if (snapshot.feedItems) delete snapshot.feedItems[diff.id]
+      break
   }
 }
 
@@ -78,6 +115,8 @@ export function cloneSnapshot(snapshot: BrowserSnapshot): BrowserSnapshot {
     essentials: { ...snapshot.essentials },
     folders: { ...snapshot.folders },
     tabs: { ...snapshot.tabs },
+    feedItems: snapshot.feedItems ? { ...snapshot.feedItems } : undefined,
+    feedStates: snapshot.feedStates ? { ...snapshot.feedStates } : undefined,
     activeSpaceId: snapshot.activeSpaceId,
     activeTabId: snapshot.activeTabId
   }

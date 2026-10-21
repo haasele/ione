@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte'
   import { VirtualList } from '@ione/ui-kit'
   import { getFolderChildren, sortByOrder } from '@ione/core'
-  import type { BrowserSnapshot, Folder, Tab } from '@ione/core'
+  import type { BrowserSnapshot, FeedItem, Folder, Tab } from '@ione/core'
   import type {
     CreateFolderInput,
     MoveTabInput,
@@ -10,6 +10,7 @@
   } from '../../../shared/ipc'
   import Icon from './Icon.svelte'
   import FolderRow from './FolderRow.svelte'
+  import FeedItemRow from './FeedItemRow.svelte'
   import TabRow from './TabRow.svelte'
   import { IconButton } from '@ione/ui-kit'
 
@@ -31,7 +32,14 @@
     depth: number
   }
 
-  type TreeRow = TreeFolderRow | TreeTabRow
+  interface TreeFeedRow {
+    kind: 'feed'
+    key: string
+    item: FeedItem
+    depth: number
+  }
+
+  type TreeRow = TreeFolderRow | TreeTabRow | TreeFeedRow
 
   interface FolderDropTarget {
     kind: 'folder'
@@ -74,6 +82,8 @@
     onupdatefolder: (folderId: string, patch: UpdateFolderInput) => void | Promise<void>
     onremovefolder: (folderId: string) => void
     onmovetab: (tabId: string, target: MoveTabInput) => void
+    onrefreshfeed: (folderId: string) => void
+    onopenfeeditem: (item: FeedItem) => void
   }
 
   let {
@@ -86,7 +96,9 @@
     oncreatefolder,
     onupdatefolder,
     onremovefolder,
-    onmovetab
+    onmovetab,
+    onrefreshfeed,
+    onopenfeeditem
   }: Props = $props()
 
   function folderIdOf(tab: Tab): string | null {
@@ -96,6 +108,7 @@
   function buildRows(
     folders: Record<string, Folder>,
     tabs: readonly Tab[],
+    feedItems: readonly FeedItem[],
     spaceId: string
   ): TreeRow[] {
     const rows: TreeRow[] = []
@@ -105,6 +118,16 @@
       return sortByOrder(tabs.filter((tab) => folderIdOf(tab) === folderId))
     }
 
+    function feedFor(folderId: string): FeedItem[] {
+      return feedItems
+        .filter((item) => item.folderId === folderId)
+        .sort((left, right) => {
+          const leftDate = left.publishedAt ?? left.fetchedAt
+          const rightDate = right.publishedAt ?? right.fetchedAt
+          return rightDate - leftDate || left.id.localeCompare(right.id)
+        })
+    }
+
     function walk(folder: Folder, depth: number): void {
       if (visited.has(folder.id)) return
       visited.add(folder.id)
@@ -112,6 +135,11 @@
       if (folder.collapsed) return
       for (const child of getFolderChildren(folders, spaceId, folder.id)) {
         walk(child, depth + 1)
+      }
+      if (folder.kind === 'rss') {
+        for (const item of feedFor(folder.id)) {
+          rows.push({ kind: 'feed', key: `feed:${item.id}`, item, depth: depth + 1 })
+        }
       }
       for (const tab of tabsFor(folder.id)) {
         rows.push({ kind: 'tab', key: `tab:${tab.id}`, tab, depth: depth + 1 })
@@ -141,13 +169,24 @@
       (folder) => folder.spaceId === snapshot.activeSpaceId
     )
   )
-  const rows = $derived(buildRows(snapshot.folders, visibleTabs, snapshot.activeSpaceId))
+  const allFeedItems = $derived(
+    Object.values(snapshot.feedItems ?? {}).filter((item) => {
+      const folder = snapshot.folders[item.folderId]
+      return folder?.spaceId === snapshot.activeSpaceId
+    })
+  )
+  const rows = $derived(
+    buildRows(snapshot.folders, visibleTabs, allFeedItems, snapshot.activeSpaceId)
+  )
 
   const folderTabCounts = $derived.by(() => {
     const counts = new Map<string, number>()
     for (const tab of allTabs) {
       const folderId = folderIdOf(tab)
       if (folderId !== null) counts.set(folderId, (counts.get(folderId) ?? 0) + 1)
+    }
+    for (const item of allFeedItems) {
+      counts.set(item.folderId, (counts.get(item.folderId) ?? 0) + 1)
     }
     return counts
   })
@@ -164,6 +203,7 @@
   let folderFormParentId = $state<string | null>(null)
   let folderFormSpaceId = $state<string | null>(null)
   let folderFormName = $state('')
+  let folderFormFeedUrl = $state('')
   let folderSubmitting = $state(false)
   let folderInput = $state<HTMLInputElement | null>(null)
 
@@ -177,6 +217,7 @@
     folderFormParentId = parentId
     folderFormSpaceId = snapshot.activeSpaceId
     folderFormName = ''
+    folderFormFeedUrl = ''
     queueMicrotask(() => folderInput?.focus())
   }
 
@@ -186,6 +227,7 @@
     folderFormParentId = null
     folderFormSpaceId = null
     folderFormName = ''
+    folderFormFeedUrl = ''
   }
 
   $effect(() => {
@@ -194,6 +236,7 @@
       folderFormParentId = null
       folderFormSpaceId = null
       folderFormName = ''
+      folderFormFeedUrl = ''
     }
   })
 
@@ -219,6 +262,11 @@
 
       const input: CreateFolderInput = { spaceId: snapshot.activeSpaceId, name }
       if (parentId !== null) input.parentId = parentId
+      const feedUrl = folderFormFeedUrl.trim()
+      if (feedUrl) {
+        input.kind = 'rss'
+        input.feedUrl = feedUrl
+      }
       const folder = await oncreatefolder(input)
       if (folder) {
         folderSubmitting = false
@@ -497,6 +545,16 @@
           autocomplete="off"
           required
         />
+        <input
+          class="folder-input feed-input"
+          bind:value={folderFormFeedUrl}
+          type="text"
+          placeholder="RSS feed URL (optional)"
+          aria-label="RSS feed URL"
+          autocomplete="off"
+          spellcheck="false"
+          data-testid="folder-feed-input"
+        />
         <button class="primary-button folder-submit" type="submit" disabled={folderSubmitting}>
           Create
         </button>
@@ -536,13 +594,17 @@
                   folder={row.folder}
                   depth={row.depth}
                   tabCount={folderTabCounts.get(row.folder.id) ?? 0}
+                  feedState={snapshot.feedStates?.[row.folder.id]}
                   dropInside={dropTarget?.kind === 'folder' && dropTarget.folderId === row.folder.id}
+                  onrefresh={onrefreshfeed}
                   ontoggle={handleToggleFolder}
                   onnewtab={(folderId) => oncreatetab(folderId)}
                   onnewfolder={(folderId) => openFolderForm(folderId)}
                   onrename={handleRenameFolder}
                   onremove={(folderId) => onremovefolder(folderId)}
                 />
+              {:else if row.kind === 'feed'}
+                <FeedItemRow item={row.item} depth={row.depth} onopen={onopenfeeditem} />
               {:else}
                 <TabRow
                   tab={row.tab}
@@ -605,6 +667,10 @@
     color: var(--text, #e8eaed);
     font-size: 12px;
     user-select: text;
+  }
+
+  .folder-input.feed-input {
+    flex: 1 1 46%;
   }
 
   .folder-input:focus {

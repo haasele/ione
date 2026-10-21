@@ -3,7 +3,15 @@ import type { BrowserAction } from './actions'
 import { DomainError, reduce } from './commands'
 import type { StateDiff } from './diff'
 import { applyDiff, cloneSnapshot } from './diff'
-import type { BrowserSnapshot, Essential, Folder, Space, Tab } from './model'
+import type {
+  BrowserSnapshot,
+  Essential,
+  FeedItem,
+  FeedState,
+  Folder,
+  Space,
+  Tab
+} from './model'
 
 const T0 = 1_700_000_000_000
 
@@ -722,6 +730,122 @@ describe('essential actions', () => {
 
   it('rejects removing an unknown essential', () => {
     expectRejected(baseSnapshot(), { type: 'essential.remove', id: 'nope' })
+  })
+})
+
+describe('feed actions', () => {
+  function rssState(): BrowserSnapshot {
+    const state = baseSnapshot()
+    state.folders.fr = folder({
+      id: 'fr',
+      spaceId: 's1',
+      order: 'z',
+      kind: 'rss',
+      feedUrl: 'https://feed.example/rss'
+    })
+    return state
+  }
+
+  function feedItem(id: string, folderId = 'fr', read = false): FeedItem {
+    return {
+      id,
+      folderId,
+      url: `https://feed.example/${id}`,
+      title: `Item ${id}`,
+      author: '',
+      summary: '',
+      publishedAt: T0,
+      fetchedAt: T0,
+      read,
+      starred: false
+    }
+  }
+
+  function feedState(folderId = 'fr'): FeedState {
+    return {
+      folderId,
+      fetchUrl: 'https://feed.example/rss',
+      lastCheckedAt: T0,
+      lastSuccessAt: T0,
+      nextPollAt: T0 + 1000,
+      consecutiveFailures: 0
+    }
+  }
+
+  it('replaces feed items atomically and preserves version/diff invariants', () => {
+    const first = run(rssState(), {
+      type: 'feed.setItems',
+      folderId: 'fr',
+      items: [feedItem('a'), feedItem('b')]
+    })
+    expect(first.state.feedItems?.a?.title).toBe('Item a')
+    expect(first.state.feedItems?.b?.folderId).toBe('fr')
+    expect(diffTypes(first.diffs)).toEqual(['feed.items.replace'])
+
+    const second = run(first.state, {
+      type: 'feed.setItems',
+      folderId: 'fr',
+      items: [feedItem('c')]
+    })
+    expect(second.state.feedItems?.a).toBeUndefined()
+    expect(second.state.feedItems?.c).toBeDefined()
+  })
+
+  it('updates read/starred state and set/remove feed state', () => {
+    let state = run(rssState(), {
+      type: 'feed.setItems',
+      folderId: 'fr',
+      items: [feedItem('a')]
+    }).state
+    const updated = run(state, {
+      type: 'feed.updateItem',
+      id: 'a',
+      patch: { read: true, starred: true }
+    })
+    expect(updated.state.feedItems?.a).toMatchObject({ read: true, starred: true })
+    state = updated.state
+
+    const withState = run(state, { type: 'feed.setState', state: feedState() })
+    expect(withState.state.feedStates?.fr?.fetchUrl).toBe('https://feed.example/rss')
+    const removed = run(withState.state, { type: 'feed.removeState', folderId: 'fr' })
+    expect(removed.state.feedStates?.fr).toBeUndefined()
+  })
+
+  it('rejects feed items for non-RSS folders and duplicate item ids', () => {
+    expectRejected(baseSnapshot(), {
+      type: 'feed.setItems',
+      folderId: 'f1',
+      items: [feedItem('a', 'f1')]
+    })
+    expectRejected(rssState(), {
+      type: 'feed.setItems',
+      folderId: 'fr',
+      items: [feedItem('a'), feedItem('a')]
+    })
+  })
+
+  it('drops cached feed data when folders, spaces or feed URLs are removed', () => {
+    const seed = rssState()
+    seed.feedItems = { a: feedItem('a'), b: feedItem('b') }
+    seed.feedStates = { fr: feedState() }
+
+    const folderRemoved = run(seed, { type: 'folder.remove', id: 'fr' })
+    expect(folderRemoved.state.feedItems?.a).toBeUndefined()
+    expect(folderRemoved.state.feedStates?.fr).toBeUndefined()
+    expect(diffTypes(folderRemoved.diffs)).toContain('feed.items.replace')
+    expect(diffTypes(folderRemoved.diffs)).toContain('feed.state.remove')
+
+    const urlChanged = run(seed, {
+      type: 'folder.update',
+      id: 'fr',
+      patch: { feedUrl: 'https://feed.example/new' }
+    })
+    expect(urlChanged.state.feedItems?.a).toBeUndefined()
+    expect(urlChanged.state.feedStates?.fr).toBeUndefined()
+
+    const spaceRemoved = run(seed, { type: 'space.remove', id: 's1' })
+    expect(spaceRemoved.state.feedItems?.a).toBeUndefined()
+    expect(spaceRemoved.state.feedStates?.fr).toBeUndefined()
   })
 })
 

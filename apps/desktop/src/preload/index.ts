@@ -41,6 +41,10 @@ const api: DesktopApi = {
   unpinTab: (tabId: string): Promise<void> => ipcRenderer.invoke(IPC.unpinTab, tabId),
   resetPinnedTab: (tabId: string): Promise<NavigateResult | null> =>
     ipcRenderer.invoke(IPC.resetPinnedTab, tabId),
+  refreshFeed: (folderId: string): Promise<void> =>
+    ipcRenderer.invoke(IPC.refreshFeed, folderId),
+  markFeedRead: (itemId: string): Promise<void> =>
+    ipcRenderer.invoke(IPC.markFeedRead, itemId),
   listExtensions: (): Promise<ExtensionInfo[]> => ipcRenderer.invoke(IPC.listExtensions),
   installExtension: (extensionId: string): Promise<ExtensionInfo> =>
     ipcRenderer.invoke(IPC.installExtension, extensionId),

@@ -62,6 +62,43 @@ const MIGRATIONS: ReadonlyArray<(db: Database.Database) => void> = [
         ON folders(space_id, parent_id, sort_key);
       CREATE INDEX IF NOT EXISTS idx_tabs_folder ON tabs(folder_id);
     `)
+  },
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS feed_state (
+        folder_id TEXT PRIMARY KEY NOT NULL
+          REFERENCES folders(id) ON DELETE CASCADE,
+        fetch_url TEXT NOT NULL,
+        etag TEXT,
+        last_modified TEXT,
+        last_checked_at INTEGER NOT NULL,
+        last_success_at INTEGER NOT NULL,
+        next_poll_at INTEGER NOT NULL,
+        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        title TEXT,
+        site_url TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS feed_items (
+        id TEXT PRIMARY KEY NOT NULL,
+        folder_id TEXT NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+        guid TEXT,
+        url TEXT NOT NULL,
+        title TEXT NOT NULL,
+        author TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        published_at INTEGER,
+        fetched_at INTEGER NOT NULL,
+        read INTEGER NOT NULL DEFAULT 0,
+        starred INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_feed_items_folder_date
+        ON feed_items(folder_id, published_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_feed_state_next_poll
+        ON feed_state(next_poll_at);
+    `)
   }
 ]
 

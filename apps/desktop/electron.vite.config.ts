@@ -5,6 +5,7 @@ import type { Plugin } from 'vite'
 
 const coreEntry = resolve(__dirname, '../../packages/core/src/index.ts')
 const uiKitEntry = resolve(__dirname, '../../packages/ui-kit/src/index.ts')
+const rssEntry = resolve(__dirname, '../../packages/rss/src/index.ts')
 
 const CSP_DIRECTIVES = [
   "default-src 'self'",
@@ -37,8 +38,18 @@ function cspPlugin(): Plugin {
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin({ exclude: ['@ione/core'] })],
-    resolve: { alias: { '@ione/core': coreEntry } }
+    plugins: [
+      externalizeDepsPlugin({ exclude: ['@ione/core', '@ione/rss', 'fast-xml-parser'] })
+    ],
+    resolve: { alias: { '@ione/core': coreEntry, '@ione/rss': rssEntry } },
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve(__dirname, 'src/main/index.ts'),
+          'feed-worker': resolve(__dirname, 'src/main/feed-worker.ts')
+        }
+      }
+    }
   },
   preload: {
     plugins: [externalizeDepsPlugin({ exclude: ['@ione/core'] })],

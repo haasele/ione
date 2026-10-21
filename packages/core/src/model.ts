@@ -59,6 +59,34 @@ export interface Tab {
   order: string
 }
 
+export interface FeedItem {
+  id: string
+  folderId: string
+  guid?: string
+  url: string
+  title: string
+  author: string
+  summary: string
+  publishedAt: number | null
+  fetchedAt: number
+  read: boolean
+  starred: boolean
+}
+
+export interface FeedState {
+  folderId: string
+  fetchUrl: string
+  etag?: string
+  lastModified?: string
+  lastCheckedAt: number
+  lastSuccessAt: number
+  nextPollAt: number
+  consecutiveFailures: number
+  lastError?: string
+  title?: string
+  siteUrl?: string
+}
+
 export interface BrowserSnapshot {
   /** Monotonic state version. Incremented once per reducer call. */
   version: number
@@ -66,6 +94,8 @@ export interface BrowserSnapshot {
   essentials: Record<string, Essential>
   folders: Record<string, Folder>
   tabs: Record<string, Tab>
+  feedItems?: Record<string, FeedItem>
+  feedStates?: Record<string, FeedState>
   activeSpaceId: string
   activeTabId: string | null
 }

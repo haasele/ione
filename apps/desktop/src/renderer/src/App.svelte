@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import { IconButton } from '@ione/ui-kit'
   import { activeTabOf, applyDiffBatch, sortByOrder, tabsInSpace } from '@ione/core'
-  import type { BrowserSnapshot, DiffBatch, Essential, Folder } from '@ione/core'
+  import type { BrowserSnapshot, DiffBatch, Essential, FeedItem, Folder } from '@ione/core'
   import type {
     CreateEssentialInput,
     CreateFolderInput,
@@ -305,6 +305,25 @@
     }
   }
 
+  async function refreshFeed(folderId: string): Promise<void> {
+    status = null
+    try {
+      await window.ione.refreshFeed(folderId)
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
+  async function openFeedItem(item: FeedItem): Promise<void> {
+    status = null
+    try {
+      await window.ione.createTab(item.url)
+      await window.ione.markFeedRead(item.id)
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
   async function createFolder(input: CreateFolderInput): Promise<Folder | null> {
     status = null
     try {
@@ -445,6 +464,8 @@
       onupdatefolder={(folderId, patch) => void updateFolder(folderId, patch)}
       onremovefolder={(folderId) => void removeFolder(folderId)}
       onmovetab={(tabId, target) => void moveTab(tabId, target)}
+      onrefreshfeed={(folderId) => void refreshFeed(folderId)}
+      onopenfeeditem={(item) => void openFeedItem(item)}
     />
   {/if}
 

@@ -8,7 +8,15 @@ import type { BrowserAction, EssentialPatch, FolderPatch, SpacePatch, TabPatch }
 import type { StateDiff } from './diff'
 import { cloneSnapshot } from './diff'
 import { generateKeyBetween } from './fractional-index'
-import type { BrowserSnapshot, Essential, Folder, Space, Tab } from './model'
+import type {
+  BrowserSnapshot,
+  Essential,
+  FeedItem,
+  FeedState,
+  Folder,
+  Space,
+  Tab
+} from './model'
 import { compareOrder, mostRecentTabInSpace, sortByOrder } from './model'
 import { getFolderTabs, isFolderDescendant } from './tree'
 
@@ -180,6 +188,37 @@ function finish(
   return { state: next, diffs }
 }
 
+function clearFeedForFolders(
+  next: BrowserSnapshot,
+  diffs: StateDiff[],
+  folderIds: Iterable<string>
+): void {
+  const ids = new Set(folderIds)
+  const items = { ...(next.feedItems ?? {}) }
+  const changedFolders = new Set<string>()
+  for (const [id, item] of Object.entries(items)) {
+    if (!ids.has(item.folderId)) continue
+    delete items[id]
+    changedFolders.add(item.folderId)
+  }
+  if (changedFolders.size > 0) {
+    next.feedItems = items
+    for (const folderId of changedFolders) {
+      diffs.push({ type: 'feed.items.replace', folderId, items: [] })
+    }
+  }
+
+  const states = { ...(next.feedStates ?? {}) }
+  let statesChanged = false
+  for (const folderId of ids) {
+    if (!Object.hasOwn(states, folderId)) continue
+    delete states[folderId]
+    diffs.push({ type: 'feed.state.remove', folderId })
+    statesChanged = true
+  }
+  if (statesChanged) next.feedStates = states
+}
+
 export function reduce(state: BrowserSnapshot, action: BrowserAction): ReduceResult {
   const next = cloneSnapshot(state)
   const diffs: StateDiff[] = []
@@ -226,6 +265,7 @@ export function reduce(state: BrowserSnapshot, action: BrowserAction): ReduceRes
       const removedFolders = Object.values(next.folders).filter(
         (folder) => folder.spaceId === space.id
       )
+      clearFeedForFolders(next, diffs, removedFolders.map((folder) => folder.id))
       const depthOf = new Map(
         removedFolders.map((folder) => [folder.id, folderDepth(next.folders, folder.id)])
       )
@@ -426,6 +466,9 @@ export function reduce(state: BrowserSnapshot, action: BrowserAction): ReduceRes
       const current = requireFolder(next, action.id)
       const updated = applyFolderPatch(current, action.patch)
       if (!shallowEqual(current, updated)) {
+        if ((current.feedUrl ?? null) !== (updated.feedUrl ?? null)) {
+          clearFeedForFolders(next, diffs, [current.id])
+        }
         next.folders[updated.id] = updated
         diffs.push({ type: 'folder.upsert', folder: updated })
       }
@@ -473,6 +516,7 @@ export function reduce(state: BrowserSnapshot, action: BrowserAction): ReduceRes
 
       const parentId = folder.parentId ?? null
       const promotion = parentId !== null && own(next.folders, parentId) ? parentId : null
+      clearFeedForFolders(next, diffs, removedIds)
 
       const survivors = sortByOrder(
         Object.values(next.tabs).filter(
@@ -519,6 +563,72 @@ export function reduce(state: BrowserSnapshot, action: BrowserAction): ReduceRes
       for (const removed of removedFolders) {
         delete next.folders[removed.id]
         diffs.push({ type: 'folder.remove', id: removed.id })
+      }
+      break
+    }
+
+    case 'feed.setItems': {
+      const folder = requireFolder(next, action.folderId)
+      if (folder.kind !== 'rss') throw new DomainError('Feed items require an RSS folder')
+      const ids = new Set<string>()
+      const items: FeedItem[] = []
+      for (const item of action.items) {
+        const stored = { ...item }
+        assertSafeId(stored.id, 'feedItem.id')
+        assertNonEmpty(stored.url, 'feedItem.url')
+        assertNonEmpty(stored.title, 'feedItem.title')
+        if (stored.folderId !== folder.id) {
+          throw new DomainError(`Feed item ${stored.id} belongs to another folder`)
+        }
+        if (ids.has(stored.id)) throw new DomainError(`Duplicate feed item: ${stored.id}`)
+        if (stored.publishedAt !== null && !Number.isFinite(stored.publishedAt)) {
+          throw new DomainError('feedItem.publishedAt must be finite or null')
+        }
+        if (!Number.isFinite(stored.fetchedAt)) {
+          throw new DomainError('feedItem.fetchedAt must be finite')
+        }
+        ids.add(stored.id)
+        items.push(stored)
+      }
+
+      const feedItems = { ...(next.feedItems ?? {}) }
+      for (const [id, item] of Object.entries(feedItems)) {
+        if (item.folderId === folder.id) delete feedItems[id]
+      }
+      for (const item of items) feedItems[item.id] = item
+      next.feedItems = feedItems
+      diffs.push({ type: 'feed.items.replace', folderId: folder.id, items })
+      break
+    }
+
+    case 'feed.updateItem': {
+      const current = own(next.feedItems ?? {}, action.id)
+      if (!current) throw new DomainError(`Unknown feed item: ${action.id}`)
+      const updated: FeedItem = { ...current }
+      if (action.patch.read !== undefined) updated.read = action.patch.read
+      if (action.patch.starred !== undefined) updated.starred = action.patch.starred
+      if (!shallowEqual(current, updated)) {
+        next.feedItems = { ...(next.feedItems ?? {}), [updated.id]: updated }
+        diffs.push({ type: 'feed.item.upsert', item: updated })
+      }
+      break
+    }
+
+    case 'feed.setState': {
+      const folder = requireFolder(next, action.state.folderId)
+      if (folder.kind !== 'rss') throw new DomainError('Feed state requires an RSS folder')
+      const state: FeedState = { ...action.state }
+      next.feedStates = { ...(next.feedStates ?? {}), [state.folderId]: state }
+      diffs.push({ type: 'feed.state', state })
+      break
+    }
+
+    case 'feed.removeState': {
+      const states = { ...(next.feedStates ?? {}) }
+      if (Object.hasOwn(states, action.folderId)) {
+        delete states[action.folderId]
+        next.feedStates = states
+        diffs.push({ type: 'feed.state.remove', folderId: action.folderId })
       }
       break
     }

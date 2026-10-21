@@ -1,6 +1,6 @@
 # Architecture & dependency decisions
 
-Status: Phases 1-5 implemented. Verified against npm/GitHub on 2026-10-20/21.
+Status: Phases 1-6 implemented. Verified against npm/GitHub on 2026-10-20/21.
 
 Every runtime/build dependency is listed below with version, license, and the
 reason it is present. Packages marked **planned** are not installed yet and
@@ -27,6 +27,7 @@ MUST be re-checked before the phase that adds them.
 | `electron-chrome-web-store` | 0.13.0 | MIT | Programmatic CWS install/uninstall, CRX3 unpacking, extension path loading. Uses a private CWS endpoint/API; treated as a compatibility risk. |
 | `electron-chrome-context-menu` | 1.1.0 | MIT | Native Chrome-like context menu, including extension context items. npm build is old but its deprecated navigation calls still exist in Electron 44. |
 | `@ghostery/adblocker-electron` | 2.20.1 | MPL-2.0 | Built-in network + cosmetic filtering, fallback/complement when uBO is unavailable. Preload package is MPL-2.0 transitive. |
+| `fast-xml-parser` | 5.11.2 | MIT | RSS/Atom XML parsing in `@ione/rss`; dual ESM/CJS, typed, entity/depth controls. |
 
 No third-party UI, virtualization, drag-and-drop, RSS, adblock, or extension
 package is installed in Phase 1-3. Virtualization is a ~100-line Svelte 5
@@ -45,7 +46,6 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
 | --- | --- | --- | --- |
 | `electron-builder` | 26.15.3 | MIT | Phase 7 packaging only. |
 | `@playwright/test` | 1.64.1 | Apache-2.0 | Electron smoke/E2E later. Phase 1-3 uses a dependency-free Electron smoke mode so the gate does not need browser downloads. |
-| `fast-xml-parser` | 5.11.2 | MIT | Phase 6 RSS parser; maintained, dual ESM/CJS, typed, parser-level entity/depth limits. RSS/Atom/JSON-Feed normalizer still to be written. |
 
 ## Architecture decisions
 
@@ -183,6 +183,31 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
   query is in flight.
 - Cleanup: the sleep interval is unref'd and stopped before persistence flush.
 
+### RSS / live folders (Phase 6)
+- `@ione/rss` is a framework-free parser/normalizer for RSS 2.0, RSS 1.0
+  (RDF), Atom, and JSON Feed. It resolves relative item links, strips HTML to
+  plain summaries, caps strings/items, and parses with `processEntities:false`.
+- Fetching/parsing runs in an Electron `utilityProcess` (`out/main/feed-worker.js`,
+  CJS) with a 20 s timeout, 5 MiB decoded cap, manual redirects (max 5, no
+  HTTPS→HTTP downgrade), conditional `If-None-Match`/`If-Modified-Since`, and
+  `Retry-After`. It never opens SQLite.
+- Main `FeedService` owns scheduling, backoff (equal jitter, max 6 h), cache
+  writes, and read/star preservation. Poll interval defaults to 15 min; due
+  checks run every 30 s with at most 3 concurrent fetches.
+- Migration 2 adds `feed_state` (validators, fetch URL, next poll, failures,
+  title/site) and `feed_items` (stable sha256 ids, folder FK, title/author/
+  summary/published/fetched/read/starred). Diffs are `feed.state`,
+  `feed.state.remove`, `feed.items.replace`, `feed.item.upsert`, and
+  `feed.item.remove`. Folder/space removal and feed URL changes clear cached
+  feed data in the reducer.
+- RSS folders render as virtual rows with unread dots, relative dates, refresh,
+  and feed errors; opening an item creates one normal tab and marks the item
+  read. A folder-create form accepts an optional feed URL and creates an RSS
+  folder. Feed items are not tabs/WebContentsViews.
+- Limits/gaps: no OPML import/export, media enclosures, full-text extraction,
+  cross-device read sync, or worker auto-restart after a crash. Item bodies are
+  stored as plain text, not raw HTML.
+
 ### Ordering
 - Tabs, folders, spaces, and essentials use fractional index strings
   (`order`). Inserts take a key strictly between neighbors, so reordering
@@ -240,10 +265,16 @@ context-menu integration, uBO and Bitwarden smoke checks. Bitwarden's MV3
 service worker/popup remain broken; uBO MV2 loads and forces the built-in
 blocker to yield.
 
+### Phase 6 (implemented)
+RSS/Atom/JSON parser package, utility-process fetcher with conditional GET,
+redirect/size/entity limits, SQLite feed cache migration, scheduler/backoff,
+feed-item diffs, nested RSS folder UI with unread/read state, refresh, feed
+errors, and virtual feed rows. Smoke covers create RSS folder, fetch, 304
+refresh, open item as a tab, mark read, and persisted SQLite state.
+
 ### Still later
-RSS (Phase 6), command palette/navigation basics/find/downloads/permission
-prompts, theme polish, perf measurements, Playwright E2E, and packaging
-(Phase 7).
+Command palette/navigation basics/find/downloads/permission prompts, theme
+polish, perf measurements, Playwright E2E, and packaging (Phase 7).
 
 ## Verification gates
 
@@ -255,9 +286,9 @@ prompts, theme polish, perf measurements, Playwright E2E, and packaging
 
 ### Last verified (2026-10-20, after Phase 3)
 
-- `bun run typecheck`: 0 errors, 0 warnings (svelte-check: 113 files).
-- `bun run test:core`: 7 files, 221 tests passed.
-- `bun run test`: 12 files, 245 tests passed. (No new test files; two URL cases added.)
+- `bun run typecheck`: 0 errors, 0 warnings (svelte-check: 115 files).
+- `bun run test:core`: 7 files, 225 tests passed.
+- `bun run test`: 13 files, 256 tests passed.
 - `bun run build`: main/preload/renderer bundles produced; built CSP is
   `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
   img-src 'self' data: https:; object-src 'none'; base-uri 'none';
@@ -291,6 +322,16 @@ prompts, theme polish, perf measurements, Playwright E2E, and packaging
   the cached 6.8 MB engine reported matches for `doubleclick.net` and
   `google-analytics.com` and no match for `example.com/app.js`.
 
+### Phase 6 RSS evidence (2026-10-21)
+
+- Smoke feed served with ETag `"ione-smoke-v1"`; an RSS folder was created,
+  two items parsed, a second fetch returned 304, the unread item opened as a
+  normal tab titled `Feed Article`, and read state changed. SQLite contained
+  the RSS folder, feed state with the ETag, two feed items, and a read item.
+  Screenshot: `/tmp/ione-smoke-chrome.png`.
+- `bun run test` covers parser RSS2/Atom/RSS1/JSON/entity handling, reducer
+  feed actions/cleanup, and SQLite feed round-trip/diff persistence.
+
 - The smoke harness uses `--no-sandbox` because this Linux container has
   neither a SUID Chromium sandbox nor unprivileged user namespaces. The
   application itself never passes `--no-sandbox`; smoke-only evidence is not a
@@ -305,7 +346,9 @@ prompts, theme polish, perf measurements, Playwright E2E, and packaging
   built-in blocker while loaded.
 - Extension action toolbar is not rendered; popups are opened from the
   Extensions panel. Isolated space partitions have no extension APIs.
-- Playwright is not installed yet; Phase 1-5 use the dependency-free smoke
+- RSS worker crashes are logged but not auto-restarted; OPML/media/full-text
+  extraction and cross-device read sync are out of scope.
+- Playwright is not installed yet; Phase 1-6 use the dependency-free smoke
   harness. Browser E2E coverage starts when Playwright is added.
 - RSS, adblock/extensions, downloads/permission-prompt UI, command palette,
   find-in-page, perf measurements, Playwright E2E, and packaging are later.

@@ -154,6 +154,106 @@ describe('StateRepository', () => {
     expect(loaded.tabs.t2 && 'pinnedUrl' in loaded.tabs.t2).toBe(false)
   })
 
+  it('round-trips feed state, validators and items', () => {
+    const { repository } = createRepository()
+    const snapshot = baseSnapshot()
+    snapshot.feedStates = {
+      child: {
+        folderId: 'child',
+        fetchUrl: 'https://feed.example/rss',
+        etag: '"v1"',
+        lastModified: 'Tue, 20 Oct 2026 10:00:00 GMT',
+        lastCheckedAt: 10,
+        lastSuccessAt: 11,
+        nextPollAt: 12,
+        consecutiveFailures: 2,
+        lastError: 'timeout'
+      }
+    }
+    snapshot.feedItems = {
+      i1: {
+        id: 'i1',
+        folderId: 'child',
+        guid: 'guid-1',
+        url: 'https://feed.example/post',
+        title: 'Post',
+        author: 'Ada',
+        summary: 'Summary',
+        publishedAt: 1_700_000_000_000,
+        fetchedAt: 1_700_000_000_100,
+        read: true,
+        starred: false
+      }
+    }
+
+    repository.saveSnapshot(snapshot)
+    const loaded = repository.loadSnapshot()
+    expect(loaded?.feedStates?.child).toMatchObject({
+      folderId: 'child',
+      etag: '"v1"',
+      lastModified: 'Tue, 20 Oct 2026 10:00:00 GMT',
+      consecutiveFailures: 2,
+      lastError: 'timeout'
+    })
+    expect(loaded?.feedItems?.i1).toMatchObject({
+      guid: 'guid-1',
+      folderId: 'child',
+      read: true,
+      starred: false
+    })
+  })
+
+  it('applies feed item replacement and state removal diffs', () => {
+    const { repository } = createRepository()
+    const base = baseSnapshot()
+    repository.saveSnapshot(base)
+    const state = {
+      folderId: 'child',
+      fetchUrl: 'https://feed.example/rss',
+      lastCheckedAt: 20,
+      lastSuccessAt: 20,
+      nextPollAt: 30,
+      consecutiveFailures: 0
+    }
+    const item = {
+      id: 'i1',
+      folderId: 'child',
+      url: 'https://feed.example/post',
+      title: 'Post',
+      author: '',
+      summary: '',
+      publishedAt: null,
+      fetchedAt: 20,
+      read: false,
+      starred: false
+    }
+    const withFeed: BrowserSnapshot = {
+      ...base,
+      feedStates: { child: state },
+      feedItems: { i1: item }
+    }
+
+    repository.applyDiffs(
+      [
+        { type: 'feed.state', state },
+        { type: 'feed.items.replace', folderId: 'child', items: [item] }
+      ],
+      withFeed
+    )
+    expect(repository.loadSnapshot()?.feedItems?.i1?.title).toBe('Post')
+
+    repository.applyDiffs(
+      [
+        { type: 'feed.items.replace', folderId: 'child', items: [] },
+        { type: 'feed.state.remove', folderId: 'child' }
+      ],
+      { ...withFeed, feedItems: {}, feedStates: {} }
+    )
+    const loaded = repository.loadSnapshot()
+    expect(loaded?.feedItems?.i1).toBeUndefined()
+    expect(loaded?.feedStates?.child).toBeUndefined()
+  })
+
   it('replaces state and preserves an explicitly null active tab', () => {
     const { repository } = createRepository()
     repository.saveSnapshot(baseSnapshot())

@@ -31,6 +31,8 @@ export const IPC = {
   removeFolder: 'ione:remove-folder',
   moveFolder: 'ione:move-folder',
   moveTab: 'ione:move-tab',
+  refreshFeed: 'ione:refresh-feed',
+  markFeedRead: 'ione:mark-feed-read',
   listExtensions: 'ione:list-extensions',
   installExtension: 'ione:install-extension',
   uninstallExtension: 'ione:uninstall-extension',
@@ -67,6 +69,7 @@ export interface CreateFolderInput {
   parentId?: string | null
   name: string
   kind?: FolderKind
+  feedUrl?: string
 }
 
 export interface UpdateFolderInput {
@@ -130,6 +133,8 @@ export interface DesktopApi {
   removeFolder(folderId: string): Promise<void>
   moveFolder(folderId: string, target: MoveFolderInput): Promise<void>
   moveTab(tabId: string, target: MoveTabInput): Promise<void>
+  refreshFeed(folderId: string): Promise<void>
+  markFeedRead(itemId: string): Promise<void>
   listExtensions(): Promise<ExtensionInfo[]>
   installExtension(extensionId: string): Promise<ExtensionInfo>
   uninstallExtension(extensionId: string): Promise<void>

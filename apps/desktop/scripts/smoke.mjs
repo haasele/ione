@@ -20,7 +20,36 @@ if (!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
   process.exit(2)
 }
 
-const pageServer = createServer((_request, response) => {
+const rss = (origin) => `<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel>
+<title>Ione Smoke Feed</title>
+<link>${origin}</link>
+<item><title>Feed Item One</title><link>${origin}feed-article?item=1</link><guid>feed-1</guid><description>First smoke item</description><pubDate>Tue, 20 Oct 2026 12:00:00 GMT</pubDate></item>
+<item><title>Feed Item Two</title><link>${origin}feed-article?item=2</link><guid>feed-2</guid><description>Second smoke item</description><pubDate>Mon, 19 Oct 2026 12:00:00 GMT</pubDate></item>
+</channel></rss>`
+
+const pageServer = createServer((request, response) => {
+  const origin = `http://${request.headers.host ?? '127.0.0.1'}/`
+  if (request.url === '/feed.xml') {
+    if (request.headers['if-none-match'] === '"ione-smoke-v1"') {
+      response.writeHead(304, { etag: '"ione-smoke-v1"' })
+      response.end()
+      return
+    }
+    response.writeHead(200, {
+      'content-type': 'application/rss+xml; charset=utf-8',
+      etag: '"ione-smoke-v1"'
+    })
+    response.end(rss(origin))
+    return
+  }
+  if (request.url?.startsWith('/feed-article')) {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    response.end(
+      '<!doctype html><html><head><title>Feed Article</title></head><body><h1>Feed article</h1></body></html>'
+    )
+    return
+  }
   response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
   response.end(
     '<!doctype html><html><head><title>Smoke Page</title></head><body><h1>Ione smoke</h1></body></html>'
@@ -35,6 +64,7 @@ if (!pageAddress || typeof pageAddress === 'string') {
   throw new Error('smoke page server did not expose a TCP port')
 }
 const smokeUrl = `http://127.0.0.1:${pageAddress.port}/`
+const feedUrl = `${smokeUrl}feed.xml`
 
 const child = spawn(
   electronBinary,
@@ -53,6 +83,7 @@ const child = spawn(
       IONE_DB_PATH: dbPath,
       IONE_SMOKE_SCREENSHOT: screenshotPath,
       IONE_SMOKE_URL: smokeUrl,
+      IONE_SMOKE_FEED_URL: feedUrl,
       IONE_TAB_SLEEP_MS: '250',
       IONE_TAB_SLEEP_TICK_MS: '200',
       IONE_ADBLOCK: process.env.IONE_ADBLOCK ?? 'off'
@@ -171,6 +202,12 @@ child.on('exit', (code, signal) => {
     const sleepingCount = db
       .prepare('SELECT COUNT(*) AS n FROM tabs WHERE sleeping = 1')
       .get()
+    const rssFolder = db
+      .prepare("SELECT id FROM folders WHERE kind = 'rss' AND feed_url IS NOT NULL LIMIT 1")
+      .get()
+    const feedState = db.prepare('SELECT folder_id, etag FROM feed_state LIMIT 1').get()
+    const feedItemCount = db.prepare('SELECT COUNT(*) AS n FROM feed_items').get()
+    const feedReadCount = db.prepare('SELECT COUNT(*) AS n FROM feed_items WHERE read = 1').get()
     db.close()
 
     if (!tabCount || tabCount.n < 5) {
@@ -208,6 +245,26 @@ child.on('exit', (code, signal) => {
       finish(1, '')
       return
     }
+    if (!rssFolder) {
+      stderr += '\n[smoke] RSS folder was not persisted'
+      finish(1, '')
+      return
+    }
+    if (!feedState || feedState.folder_id !== rssFolder.id || feedState.etag !== '"ione-smoke-v1"') {
+      stderr += `\n[smoke] feed state mismatch: ${JSON.stringify(feedState)}`
+      finish(1, '')
+      return
+    }
+    if (!feedItemCount || feedItemCount.n < 2) {
+      stderr += `\n[smoke] feed items were not persisted: ${JSON.stringify(feedItemCount)}`
+      finish(1, '')
+      return
+    }
+    if (!feedReadCount || feedReadCount.n < 1) {
+      stderr += `\n[smoke] feed read state was not persisted: ${JSON.stringify(feedReadCount)}`
+      finish(1, '')
+      return
+    }
     if (!activeSpace || activeSpace.name !== 'Home') {
       stderr += `\n[smoke] active space mismatch: ${JSON.stringify(activeSpace)}`
       finish(1, '')
@@ -233,6 +290,6 @@ child.on('exit', (code, signal) => {
 
   finish(
     0,
-    `[smoke] app started, tree/folders/DnD/sleep/wake persisted, screenshot: ${screenshotPath}`
+    `[smoke] app started, tree/folders/DnD/sleep/feed/extension state persisted, screenshot: ${screenshotPath}`
   )
 })

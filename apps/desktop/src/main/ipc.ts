@@ -16,12 +16,14 @@ import type { BrowserController } from './controller'
 import type { ChromeWindow } from './chrome-window'
 import type { ExtensionService } from './extensions'
 import type { AdblockService } from './adblock'
+import type { FeedService } from './feed-service'
 
 export function registerIpc(
   controller: BrowserController,
   chromeWindow: ChromeWindow,
   extensionService: ExtensionService,
-  adblockService: AdblockService
+  adblockService: AdblockService,
+  feedService: FeedService
 ): void {
   const assertTrusted = (event: IpcMainInvokeEvent): void => {
     if (!chromeWindow.isChromeSender(event.sender)) {
@@ -122,9 +124,11 @@ export function registerIpc(
     }
   )
 
-  ipcMain.handle(IPC.createFolder, (event, rawInput: unknown): Folder => {
+  ipcMain.handle(IPC.createFolder, async (event, rawInput: unknown): Promise<Folder> => {
     assertTrusted(event)
-    return controller.createFolder(assertCreateFolderInput(rawInput))
+    const folder = controller.createFolder(assertCreateFolderInput(rawInput))
+    if (folder.kind === 'rss' && folder.feedUrl) void feedService.refreshNow(folder.id)
+    return folder
   })
 
   ipcMain.handle(
@@ -154,6 +158,16 @@ export function registerIpc(
     assertTrusted(event)
     const tabId = assertId(rawTabId, 'tabId')
     controller.moveTab(tabId, assertMoveTabInput(rawTarget))
+  })
+
+  ipcMain.handle(IPC.refreshFeed, async (event, rawFolderId: unknown): Promise<void> => {
+    assertTrusted(event)
+    await feedService.refreshNow(assertId(rawFolderId, 'folderId'))
+  })
+
+  ipcMain.handle(IPC.markFeedRead, (event, rawItemId: unknown): void => {
+    assertTrusted(event)
+    controller.updateFeedItem(assertId(rawItemId, 'feedItemId'), { read: true })
   })
 
   ipcMain.handle(IPC.listExtensions, (event): ExtensionInfo[] => {
@@ -343,6 +357,10 @@ function assertCreateFolderInput(value: unknown): CreateFolderInput {
   const input: CreateFolderInput = {
     spaceId: assertId(readOwn(record, 'spaceId'), 'spaceId'),
     name: assertFolderName(readOwn(record, 'name'))
+  }
+  const rawFeedUrl = readOwn(record, 'feedUrl')
+  if (rawFeedUrl !== undefined) {
+    input.feedUrl = assertString(rawFeedUrl, 'feedUrl', 8192)
   }
   const rawParentId = readOwn(record, 'parentId')
   if (rawParentId !== undefined) {
