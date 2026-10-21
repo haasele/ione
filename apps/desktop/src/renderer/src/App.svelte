@@ -1,12 +1,19 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { IconButton, VirtualList } from '@ione/ui-kit'
+  import { IconButton } from '@ione/ui-kit'
   import { activeTabOf, applyDiffBatch, sortByOrder, tabsInSpace } from '@ione/core'
-  import type { BrowserSnapshot, DiffBatch, Essential, Space, Tab } from '@ione/core'
-  import type { CreateEssentialInput, CreateSpaceInput } from '../../shared/ipc'
+  import type { BrowserSnapshot, DiffBatch, Essential, Folder } from '@ione/core'
+  import type {
+    CreateEssentialInput,
+    CreateFolderInput,
+    CreateSpaceInput,
+    MoveTabInput,
+    UpdateFolderInput
+  } from '../../shared/ipc'
   import AddressBar from './components/AddressBar.svelte'
   import Essentials from './components/Essentials.svelte'
   import Icon from './components/Icon.svelte'
+  import SidebarTree from './components/SidebarTree.svelte'
   import SpaceSwitcher from './components/SpaceSwitcher.svelte'
   import TabRow from './components/TabRow.svelte'
 
@@ -14,10 +21,6 @@
     accent: string
     soft: string
     border: string
-  }
-
-  interface VirtualTabList {
-    scrollToIndex(index: number): void
   }
 
   const DEFAULT_THEME: ThemeAccent = {
@@ -60,8 +63,6 @@
   let loadError = $state<string | null>(null)
   let status = $state<string | null>(null)
 
-  let virtualTabs = $state<VirtualTabList | null>(null)
-
   // Non-reactive coordination state for snapshot fetching.
   let syncToken = 0
   let syncInFlight = false
@@ -76,16 +77,9 @@
   const essentials = $derived(
     snapshot ? sortByOrder(Object.values(snapshot.essentials)) : ([] as Essential[])
   )
-  const tabs = $derived(snapshot ? tabsInSpace(snapshot, snapshot.activeSpaceId) : [])
-  const pinnedTabs = $derived(tabs.filter((tab) => tab.pinned))
-  const unpinnedTabs = $derived(tabs.filter((tab) => !tab.pinned))
-
-  $effect(() => {
-    const activeId = activeTab?.id
-    if (!activeId) return
-    const index = unpinnedTabs.findIndex((tab) => tab.id === activeId)
-    if (index >= 0) virtualTabs?.scrollToIndex(index)
-  })
+  const pinnedTabs = $derived(
+    snapshot ? tabsInSpace(snapshot, snapshot.activeSpaceId).filter((tab) => tab.pinned) : []
+  )
 
   onMount(() => {
     const unsubscribe = window.ione.onDiffs(handleDiffBatch)
@@ -300,8 +294,50 @@
     }
   }
 
-  function spaceName(space: Space | null): string {
-    return space?.name.trim() || 'Tabs'
+  async function createTabInFolder(folderId: string | null): Promise<void> {
+    status = null
+    try {
+      await window.ione.createTabInFolder(folderId)
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
+  async function createFolder(input: CreateFolderInput): Promise<Folder | null> {
+    status = null
+    try {
+      return await window.ione.createFolder(input)
+    } catch (error) {
+      reportError(error)
+      return null
+    }
+  }
+
+  async function updateFolder(folderId: string, patch: UpdateFolderInput): Promise<void> {
+    status = null
+    try {
+      await window.ione.updateFolder(folderId, patch)
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
+  async function removeFolder(folderId: string): Promise<void> {
+    status = null
+    try {
+      await window.ione.removeFolder(folderId)
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
+  async function moveTab(tabId: string, target: MoveTabInput): Promise<void> {
+    status = null
+    try {
+      await window.ione.moveTab(tabId, target)
+    } catch (error) {
+      reportError(error)
+    }
   }
 </script>
 
@@ -384,56 +420,17 @@
       </section>
     {/if}
 
-    <section class="tabs" aria-label="Tabs">
-      <div class="tabs-toolbar">
-        <div class="tabs-heading">
-          <h2 class="space-title" title={spaceName(activeSpace)}>{spaceName(activeSpace)}</h2>
-          <span class="section-count">{tabs.length}</span>
-        </div>
-        <span class="new-tab" data-testid="new-tab">
-          <IconButton label="New tab" title="New tab" size="sm" variant="soft" onclick={() => void createTab()}>
-            <Icon name="plus" size={13} />
-          </IconButton>
-        </span>
-      </div>
-
-      <div class="tab-list" data-testid="tab-list">
-        {#if tabs.length === 0}
-          <div class="center-state empty-state">
-            <p class="state-detail">No tabs in this space</p>
-            <button
-              class="primary-button"
-              type="button"
-              aria-label="New tab"
-              data-testid="new-tab-empty"
-              onclick={() => void createTab()}
-            >
-              New Tab
-            </button>
-          </div>
-        {:else if unpinnedTabs.length === 0}
-          <p class="empty-hint">Only pinned tabs</p>
-        {:else}
-          <VirtualList
-            bind:this={virtualTabs}
-            items={unpinnedTabs}
-            itemHeight={38}
-            ariaLabel="Open tabs"
-            getKey={(tab: Tab) => tab.id}
-          >
-            {#snippet children(tab: Tab)}
-              <TabRow
-                {tab}
-                active={tab.id === activeTab?.id}
-                testid="tab-row"
-                onactivate={(tabId) => void activateTab(tabId)}
-                onclose={(tabId) => void closeTab(tabId)}
-                onpin={(tabId) => void pinTab(tabId)}
-              />
-            {/snippet}
-          </VirtualList>
-        {/if}
-      </div>
-    </section>
+    <SidebarTree
+      {snapshot}
+      activeTabId={activeTab?.id ?? null}
+      onactivate={(tabId) => void activateTab(tabId)}
+      onclose={(tabId) => void closeTab(tabId)}
+      onpin={(tabId) => void pinTab(tabId)}
+      oncreatetab={(folderId) => void createTabInFolder(folderId)}
+      oncreatefolder={createFolder}
+      onupdatefolder={(folderId, patch) => void updateFolder(folderId, patch)}
+      onremovefolder={(folderId) => void removeFolder(folderId)}
+      onmovetab={(tabId, target) => void moveTab(tabId, target)}
+    />
   {/if}
 </div>

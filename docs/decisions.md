@@ -1,7 +1,6 @@
 # Architecture & dependency decisions
 
-Status: Phases 1-3 implemented, Phase 4 core helpers in place. Verified against
-npm/GitHub on 2026-10-20.
+Status: Phases 1-4 implemented. Verified against npm/GitHub on 2026-10-20/21.
 
 Every runtime/build dependency is listed below with version, license, and the
 reason it is present. Packages marked **planned** are not installed yet and
@@ -106,7 +105,7 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
 - Initial bootstrap: one space (`Home`) and one blank tab if the DB has no
   spaces. No network page is loaded during smoke tests.
 
-### Chrome UI (Phase 3)
+### Chrome UI (Phase 3-4)
 - One Svelte chrome view with: space switcher (create/remove/isolated login
   partition), address bar, global essentials, pinned tabs, and a virtualized
   regular-tab list.
@@ -122,6 +121,27 @@ prebuilt binary on a fresh `bun install`. `electron` remains in
   therefore a `WebContentsView` only on demand).
 - Pinned tabs remain tabs with `pinned:true`/`pinnedUrl`; reset re-navigates to
   the stored pinned URL. Pinned tabs render in a separate fixed section.
+- Nested folders render as a flattened virtualized tree (folders first, then
+  tabs). Collapsed folders hide descendants. Folder CRUD, new-tab-in-folder,
+  rename/delete, and parent moves go through typed IPC + core actions.
+- Tab DnD uses native pointer events (no library): 5px threshold, folder/tab/
+  space/root drop targets, midpoint insertion, a 2px drop indicator, Escape
+  cancel, click suppression, and edge auto-scroll. Pinned tabs are not
+  draggable; dropping into a collapsed folder expands it.
+
+### Tab lifecycle and restore (Phase 4)
+- On startup, `prepareLazyRestore` marks every tab sleeping except the valid
+  active tab; only that tab gets a `WebContentsView`. Background tabs get
+  views on activation and are destroyed by tab sleeping.
+- Sleep policy: default 12 minutes (`IONE_TAB_SLEEP_MS`), checked once a minute
+  (`IONE_TAB_SLEEP_TICK_MS`). Skip active, pinned, sleeping, viewless, audible,
+  DevTools-open, and recently active tabs. Scroll is captured before the view
+  is destroyed; `scrollY` survives restore and is applied after
+  `did-finish-load`.
+- Scroll positions are also captured when the active view is detached. The
+  detach path re-attaches safely if the user switches back while the scroll
+  query is in flight.
+- Cleanup: the sleep interval is unref'd and stopped before persistence flush.
 
 ### Ordering
 - Tabs, folders, spaces, and essentials use fractional index strings
@@ -164,16 +184,19 @@ virtualized regular-tab sidebar via `@ione/ui-kit`, themed accents, typed IPC
 for all of the above, and smoke coverage that exercises the interactions and
 verifies the persisted rows.
 
-### Phase 4 groundwork (in place, UI/lifecycle next)
-Core `shouldSleepTab` policy, `prepareLazyRestore`, `keyBetweenSiblings`, and
-sleeping-aware tab/space activation with tests are committed/prepared; the
-main-process sleep manager, folder/DnD UI, and scroll restore land in Phase 4.
+### Phase 4 (implemented)
+Core sleep policy/lazy restore/sibling order helpers; nested virtualized
+folder tree; folder CRUD and moves; native pointer DnD for tabs across
+folders/spaces; pinned reset (from Phase 3); tab sleeping with audible/
+DevTools/pinned/recent guards; scroll capture+restore; lazy startup with only
+the active tab's WebContents. Smoke covers folder creation, collapse, tab
+create in folder, move out/back, pointer DnD into a folder, sleep/wake, and
+persisted folder/sleep state.
 
 ### Still later
-Full nested folder UI + native pointer DnD + tab sleeping/session restore
-(Phase 4), extensions/Web Store/adblock (Phase 5), RSS (Phase 6), command
-palette/navigation basics/find/downloads/permission prompts, theme polish,
-perf measurements, Playwright E2E, and packaging (Phase 7).
+Extensions/Web Store/adblock (Phase 5), RSS (Phase 6), command palette/
+navigation basics/find/downloads/permission prompts, theme polish, perf
+measurements, Playwright E2E, and packaging (Phase 7).
 
 ## Verification gates
 
@@ -185,17 +208,19 @@ perf measurements, Playwright E2E, and packaging (Phase 7).
 
 ### Last verified (2026-10-20, after Phase 3)
 
-- `bun run typecheck`: 0 errors, 0 warnings (svelte-check: 110 files).
+- `bun run typecheck`: 0 errors, 0 warnings (svelte-check: 112 files).
 - `bun run test:core`: 7 files, 219 tests passed.
-- `bun run test`: 10 files, 234 tests passed.
+- `bun run test`: 12 files, 243 tests passed.
 - `bun run build`: main/preload/renderer bundles produced; built CSP is
   `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
   img-src 'self' data: https:; object-src 'none'; base-uri 'none';
   form-action 'none'; frame-src 'none'; connect-src 'self'`.
-- `DISPLAY=:99 bun run smoke`: `IONE_SMOKE_READY` with the typed bridge,
-  address bar, essentials add, IPC navigation, pin, reset-to-pinned, space
-  creation, a new tab, virtual list present, and persisted SQLite rows:
-  3 tabs, 2 spaces, 1 pinned tab, 1 essential, active space Home. Screenshot:
+- `DISPLAY=:99 bun run smoke`: `IONE_SMOKE_READY` with typed bridge, address
+  bar, essentials, pin/reset, space creation, folder creation + nested move,
+  tab creation inside a folder, collapse/expand, move out, **synthetic pointer
+  drag back into the folder**, sleep/wake of an inactive tab, 2 folder rows,
+  3 visible tab rows, and persisted SQLite state (5 tabs, 2 spaces, 2 folders,
+  1 sleeping tab, active tab in a folder). Screenshot:
   `/tmp/ione-smoke-chrome.png`.
 - `electron-vite dev --noSandbox --remoteDebuggingPort 9333` under Xvfb:
   chrome target loaded from `http://localhost:5173/`, typed bridge present,
@@ -212,8 +237,10 @@ perf measurements, Playwright E2E, and packaging (Phase 7).
   needs an explicit licensing decision before integration.
 - Playwright is not installed yet; Phase 1-2 uses the dependency-free smoke
   harness. Browser E2E coverage starts when Playwright is added.
-- Tab sleeping, DnD/folder UI, RSS, adblock, downloads/permission prompt UI,
-  and packaging are intentionally later phases.
+- RSS, adblock/extensions, downloads/permission-prompt UI, command palette,
+  find-in-page, perf measurements, Playwright E2E, and packaging are later.
+- Scroll restore is best-effort (captured on detach/sleep, 500 ms query
+  timeout); it is not captured on abrupt process kill.
 - This container cannot exercise the Chromium OS sandbox; verify the packaged
   app's sandbox installation on a normal Linux desktop during Phase 7.
 

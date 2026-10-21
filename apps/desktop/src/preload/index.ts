@@ -1,11 +1,15 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
-import type { BrowserSnapshot, DiffBatch, Essential, Space, Tab } from '@ione/core'
+import type { BrowserSnapshot, DiffBatch, Essential, Folder, Space, Tab } from '@ione/core'
 import {
   IPC,
   type CreateEssentialInput,
+  type CreateFolderInput,
   type CreateSpaceInput,
   type DesktopApi,
+  type MoveFolderInput,
+  type MoveTabInput,
   type NavigateResult,
+  type UpdateFolderInput,
   type UpdateSpaceInput
 } from '../shared/ipc'
 
@@ -34,7 +38,19 @@ const api: DesktopApi = {
   pinTab: (tabId: string): Promise<void> => ipcRenderer.invoke(IPC.pinTab, tabId),
   unpinTab: (tabId: string): Promise<void> => ipcRenderer.invoke(IPC.unpinTab, tabId),
   resetPinnedTab: (tabId: string): Promise<NavigateResult | null> =>
-    ipcRenderer.invoke(IPC.resetPinnedTab, tabId)
+    ipcRenderer.invoke(IPC.resetPinnedTab, tabId),
+  createTabInFolder: (folderId: string | null, input?: string): Promise<Tab> =>
+    ipcRenderer.invoke(IPC.createTabInFolder, folderId, input),
+  createFolder: (input: CreateFolderInput): Promise<Folder> =>
+    ipcRenderer.invoke(IPC.createFolder, input),
+  updateFolder: (folderId: string, patch: UpdateFolderInput): Promise<void> =>
+    ipcRenderer.invoke(IPC.updateFolder, folderId, patch),
+  removeFolder: (folderId: string): Promise<void> =>
+    ipcRenderer.invoke(IPC.removeFolder, folderId),
+  moveFolder: (folderId: string, target: MoveFolderInput): Promise<void> =>
+    ipcRenderer.invoke(IPC.moveFolder, folderId, target),
+  moveTab: (tabId: string, target: MoveTabInput): Promise<void> =>
+    ipcRenderer.invoke(IPC.moveTab, tabId, target)
 }
 
 contextBridge.exposeInMainWorld('ione', api)

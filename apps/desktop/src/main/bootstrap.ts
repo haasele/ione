@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import type Database from 'better-sqlite3'
-import { generateKeyBetween, normalizeSnapshot, type BrowserSnapshot } from '@ione/core'
+import {
+  generateKeyBetween,
+  normalizeSnapshot,
+  prepareLazyRestore,
+  type BrowserSnapshot
+} from '@ione/core'
 import { openDatabase } from './persistence/database'
 import { StateRepository } from './persistence/state-repository'
 
@@ -14,7 +19,10 @@ export function initializeState(dbPath: string): InitializedState {
   const db = openDatabase(dbPath)
   const repository = new StateRepository(db)
   const loaded = repository.loadSnapshot()
-  const snapshot = loaded ? normalizeSnapshot(loaded) : createBootstrapSnapshot()
+  const normalized = loaded ? normalizeSnapshot(loaded) : createBootstrapSnapshot()
+  // Lazy restore: only the valid active tab keeps a live WebContents. Version
+  // and all other state are preserved by the core helper.
+  const snapshot = prepareLazyRestore(normalized)
 
   // Persist bootstrap state and any repairs from normalizeSnapshot before the
   // chrome renderer can observe a versioned snapshot.

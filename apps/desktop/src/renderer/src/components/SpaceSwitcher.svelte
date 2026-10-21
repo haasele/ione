@@ -107,6 +107,7 @@
           class="space-chip"
           type="button"
           data-testid="space-chip"
+          data-drop-space-id={space.id}
           aria-label={`Switch to ${space.name}`}
           aria-current={space.id === activeSpaceId ? 'true' : undefined}
           title={space.name}

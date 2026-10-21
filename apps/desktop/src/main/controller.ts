@@ -2,14 +2,17 @@ import { randomUUID } from 'node:crypto'
 import {
   activeTabOf,
   generateKeyBetween,
+  getFolderChildren,
+  getFolderTabs,
   isSafeNavigationUrl,
+  keyBetweenSiblings,
   normalizeAddress,
   reduce,
   sortByOrder,
-  tabsInSpace,
   type BrowserAction,
   type BrowserSnapshot,
   type Essential,
+  type Folder,
   type Space,
   type StateDiff,
   type Tab,
@@ -17,7 +20,11 @@ import {
 } from '@ione/core'
 import type {
   CreateEssentialInput,
+  CreateFolderInput,
   CreateSpaceInput,
+  MoveFolderInput,
+  MoveTabInput,
+  UpdateFolderInput,
   UpdateSpaceInput
 } from '../shared/ipc'
 import type { WriteBehindPersistence } from './persistence/write-behind'
@@ -91,6 +98,20 @@ export class BrowserController {
   }
 
   createTab(input?: string): Tab {
+    return this.createTabInFolder(null, input)
+  }
+
+  /**
+   * Creates a tab at the end of `folderId` (null = active space root).
+   * Collapsed target folders are expanded first so the new tab is visible.
+   */
+  createTabInFolder(folderId: string | null, input?: string): Tab {
+    const folder = folderId === null ? null : this.requireFolder(folderId)
+    const spaceId = folder ? folder.spaceId : this.stateValue.activeSpaceId
+    if (folder?.collapsed) {
+      this.dispatch({ type: 'folder.update', id: folder.id, patch: { collapsed: false } })
+    }
+
     const normalized = normalizeAddress(input ?? '')
     const url =
       normalized &&
@@ -98,9 +119,7 @@ export class BrowserController {
       isSafeNavigationUrl(normalized.url)
         ? normalized.url
         : 'about:blank'
-    const spaceId = this.stateValue.activeSpaceId
-    const siblings = tabsInSpace(this.stateValue, spaceId).filter((tab) => tab.folderId === undefined)
-    const last = siblings.at(-1)
+    const siblings = getFolderTabs(this.stateValue.tabs, spaceId, folderId)
     const now = Date.now()
     const tab: Tab = {
       id: randomUUID(),
@@ -112,12 +131,84 @@ export class BrowserController {
       lastActive: now,
       scrollY: 0,
       sleeping: false,
-      order: generateKeyBetween(last?.order ?? null, null)
+      order: keyBetweenSiblings(siblings, null)
     }
+    if (folderId !== null) tab.folderId = folderId
 
     this.dispatch({ type: 'tab.add', tab })
     this.dispatch({ type: 'tab.activate', id: tab.id, at: now })
     return this.stateValue.tabs[tab.id] ?? tab
+  }
+
+  createFolder(input: CreateFolderInput): Folder {
+    this.requireSpace(input.spaceId)
+    const parentId = input.parentId ?? null
+    if (parentId !== null) {
+      const parent = this.requireFolder(parentId)
+      if (parent.spaceId !== input.spaceId) {
+        throw new Error(
+          `Parent folder ${parent.id} does not belong to space ${input.spaceId}`
+        )
+      }
+    }
+
+    const siblings = getFolderChildren(this.stateValue.folders, input.spaceId, parentId)
+    const folder: Folder = {
+      id: randomUUID(),
+      spaceId: input.spaceId,
+      name: input.name.trim(),
+      collapsed: false,
+      kind: input.kind ?? 'normal',
+      order: keyBetweenSiblings(siblings, null)
+    }
+    if (parentId !== null) folder.parentId = parentId
+
+    this.dispatch({ type: 'folder.add', folder })
+    return this.stateValue.folders[folder.id] ?? folder
+  }
+
+  updateFolder(id: string, patch: UpdateFolderInput): void {
+    this.dispatch({ type: 'folder.update', id, patch })
+  }
+
+  removeFolder(id: string): void {
+    this.dispatch({ type: 'folder.remove', id })
+  }
+
+  moveFolder(id: string, target: MoveFolderInput): void {
+    const folder = this.requireFolder(id)
+    const parentId = target.parentId
+    if (parentId !== null) {
+      const parent = this.requireFolder(parentId)
+      if (parent.spaceId !== folder.spaceId) {
+        throw new Error(`Cannot move folder ${id} across spaces (parent ${parent.id})`)
+      }
+    }
+
+    const siblings = getFolderChildren(this.stateValue.folders, folder.spaceId, parentId)
+    const order = keyBetweenSiblings(siblings, target.beforeFolderId ?? null, id)
+    this.dispatch({ type: 'folder.move', id, parentId, order })
+  }
+
+  moveTab(id: string, target: MoveTabInput): void {
+    if (!Object.hasOwn(this.stateValue.tabs, id)) {
+      throw new Error(`Tab not found: ${id}`)
+    }
+    this.requireSpace(target.spaceId)
+    const folderId = target.folderId
+    if (folderId !== null) {
+      const folder = this.requireFolder(folderId)
+      if (folder.spaceId !== target.spaceId) {
+        throw new Error(`Folder ${folder.id} does not belong to space ${target.spaceId}`)
+      }
+      if (folder.collapsed) {
+        this.dispatch({ type: 'folder.update', id: folder.id, patch: { collapsed: false } })
+      }
+    }
+
+    const siblings = getFolderTabs(this.stateValue.tabs, target.spaceId, folderId)
+    const order = keyBetweenSiblings(siblings, target.beforeTabId ?? null, id)
+    this.dispatch({ type: 'tab.move', id, spaceId: target.spaceId, folderId, order })
   }
 
   closeTab(tabId: string): void {
@@ -278,6 +369,24 @@ export class BrowserController {
 
   dispose(): void {
     this.persistence.dispose()
+  }
+
+  private requireSpace(id: string): Space {
+    if (!Object.hasOwn(this.stateValue.spaces, id)) {
+      throw new Error(`Space not found: ${id}`)
+    }
+    const space = this.stateValue.spaces[id]
+    if (!space) throw new Error(`Space not found: ${id}`)
+    return space
+  }
+
+  private requireFolder(id: string): Folder {
+    if (!Object.hasOwn(this.stateValue.folders, id)) {
+      throw new Error(`Folder not found: ${id}`)
+    }
+    const folder = this.stateValue.folders[id]
+    if (!folder) throw new Error(`Folder not found: ${id}`)
+    return folder
   }
 
   private dispatch(action: BrowserAction): BrowserSnapshot {

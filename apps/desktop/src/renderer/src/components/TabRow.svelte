@@ -8,6 +8,11 @@
     tab: Tab
     active: boolean
     testid?: string
+    depth?: number
+    dnd?: boolean
+    dragging?: boolean
+    dropPosition?: 'before' | 'after' | null
+    onpointerdown?: (event: PointerEvent) => void
     onactivate: (tabId: string) => void
     onclose: (tabId: string) => void
     onpin?: (tabId: string) => void
@@ -19,6 +24,11 @@
     tab,
     active,
     testid = 'tab-row',
+    depth = 0,
+    dnd = false,
+    dragging = false,
+    dropPosition = null,
+    onpointerdown,
     onactivate,
     onclose,
     onpin,
@@ -29,7 +39,22 @@
   const label = $derived(tab.title.trim() || tab.url.trim() || 'New Tab')
 </script>
 
-<div class="tab-row" class:active={active} class:pinned={tab.pinned} data-testid={testid}>
+<div
+  class="tab-row"
+  class:active
+  class:pinned={tab.pinned}
+  class:dragging
+  class:drop-before={dropPosition === 'before'}
+  class:drop-after={dropPosition === 'after'}
+  data-testid={testid}
+  role="group"
+  aria-label={`${label} tab`}
+  data-tab-id={dnd ? tab.id : undefined}
+  data-space-id={dnd ? tab.spaceId : undefined}
+  data-folder-id={dnd ? (tab.folderId ?? '') : undefined}
+  style:padding-left={`${depth * 14}px`}
+  onpointerdown={dnd ? onpointerdown : undefined}
+>
   <button
     class="tab-main"
     type="button"
@@ -89,11 +114,37 @@
 
 <style>
   .tab-row {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 2px;
     height: 38px;
     border-radius: var(--radius-md, 10px);
+  }
+
+  .tab-row.dragging {
+    opacity: 0.55;
+  }
+
+  .tab-row.drop-before::before,
+  .tab-row.drop-after::after {
+    position: absolute;
+    right: 6px;
+    left: 6px;
+    z-index: 2;
+    height: 2px;
+    border-radius: 999px;
+    background: var(--accent, #8ab4f8);
+    content: '';
+    pointer-events: none;
+  }
+
+  .tab-row.drop-before::before {
+    top: 0;
+  }
+
+  .tab-row.drop-after::after {
+    bottom: 0;
   }
 
   .tab-main {

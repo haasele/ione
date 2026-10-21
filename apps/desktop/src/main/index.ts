@@ -9,12 +9,14 @@ import { BrowserController } from './controller'
 import { registerIpc } from './ipc'
 import { WriteBehindPersistence } from './persistence/write-behind'
 import { hardenApp } from './security'
+import { parseTabSleepEnv, TabSleepManager } from './sleep-manager'
 
 const isSmokeTest = process.argv.includes('--smoke-test')
 
 let database: Database.Database | null = null
 let controller: BrowserController | null = null
 let chromeWindow: ChromeWindow | null = null
+let sleepManager: TabSleepManager | null = null
 let batcher: DiffBatcher | null = null
 let smokeTimer: NodeJS.Timeout | null = null
 let shuttingDown = false
@@ -72,6 +74,12 @@ function start(): void {
       onReady: () => onChromeReady(dbPath)
     })
 
+    sleepManager = new TabSleepManager({
+      controller,
+      tabViews: chromeWindow.tabViews,
+      ...parseTabSleepEnv()
+    })
+
     chromeWindow.reconcile(controller.snapshot)
     registerIpc(controller, chromeWindow)
     chromeWindow.load()
@@ -99,6 +107,11 @@ interface ChromeProbe {
   resetAddress: string
   spaceCount: number
   activeSpaceName: string
+  folderCount: number
+  folderTabId: string | null
+  folderError: string | null
+  dragIntoFolder: boolean
+  sleepCycleOk: boolean
   tabListPresent: boolean
   virtualListPresent: boolean
 }
@@ -106,6 +119,9 @@ interface ChromeProbe {
 function onChromeReady(dbPath: string): void {
   if (!controller || !chromeWindow) return
   chromeWindow.reconcile(controller.snapshot)
+  // Views exist by the time the chrome is ready, so background sleeping can
+  // begin in both smoke and normal runs.
+  sleepManager?.start()
 
   if (!isSmokeTest) {
     chromeWindow.focus()
@@ -138,6 +154,11 @@ async function runSmokeProbe(dbPath: string): Promise<void> {
       probe.resetAddress === expectedUrl &&
       probe.spaceCount >= 2 &&
       probe.activeSpaceName === 'Home' &&
+      probe.folderCount >= 2 &&
+      probe.folderTabId !== null &&
+      probe.folderError === null &&
+      probe.dragIntoFolder &&
+      probe.sleepCycleOk &&
       probe.tabListPresent &&
       probe.virtualListPresent)
   if (
@@ -194,6 +215,15 @@ async function probeChrome(): Promise<ChromeProbe | null> {
             await sleep(50)
           }
           return false
+        }
+        const waitForSnapshot = async (predicate, timeout = 7000) => {
+          const started = Date.now()
+          while (Date.now() - started < timeout) {
+            const value = await window.ione.getSnapshot()
+            if (predicate(value)) return value
+            await sleep(50)
+          }
+          return null
         }
         const addressValue = () =>
           document.querySelector('[data-testid="address-input"]')?.value ?? ''
@@ -265,6 +295,119 @@ async function probeChrome(): Promise<ChromeProbe | null> {
           }
         }
 
+        let folderError = null
+        let folderId = null
+        let folderTabId = null
+        let subfolderId = null
+        let dragIntoFolder = false
+        if (targetUrl) {
+          try {
+            const folder = await window.ione.createFolder({
+              spaceId: homeSpaceId,
+              name: 'Smoke Folder'
+            })
+            folderId = folder.id
+            await waitFor(
+              () =>
+                document.querySelector(
+                  '[data-testid="folder-row"][data-folder-id="' + folderId + '"]'
+                ) !== null
+            )
+            const folderTab = await window.ione.createTabInFolder(folderId, targetUrl)
+            folderTabId = folderTab.id
+            await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+
+            let snap = await window.ione.getSnapshot()
+            if (snap.tabs[folderTabId]?.folderId !== folderId) {
+              folderError = 'tab was not created in folder'
+            }
+
+            await window.ione.updateFolder(folderId, { collapsed: true })
+            await waitFor(
+              () => document.querySelector('[data-tab-id="' + folderTabId + '"]') === null
+            )
+            await window.ione.updateFolder(folderId, { collapsed: false })
+            await waitFor(
+              () => document.querySelector('[data-tab-id="' + folderTabId + '"]') !== null
+            )
+
+            await window.ione.moveTab(folderTabId, {
+              spaceId: homeSpaceId,
+              folderId: null,
+              beforeTabId: null
+            })
+            snap = await window.ione.getSnapshot()
+            if (snap.tabs[folderTabId]?.folderId !== undefined) {
+              folderError = 'tab was not moved out of folder'
+            }
+            await waitFor(
+              () => document.querySelector('[data-tab-id="' + folderTabId + '"]') !== null
+            )
+
+            const source = document.querySelector('[data-tab-id="' + folderTabId + '"]')
+            const target = document.querySelector(
+              '[data-testid="folder-row"][data-folder-id="' + folderId + '"]'
+            )
+            if (source instanceof HTMLElement && target instanceof HTMLElement) {
+              const sourceRect = source.getBoundingClientRect()
+              const targetRect = target.getBoundingClientRect()
+              const fromX = sourceRect.left + 24
+              const fromY = sourceRect.top + sourceRect.height / 2
+              const toX = targetRect.left + 24
+              const toY = targetRect.top + targetRect.height / 2
+              source.dispatchEvent(
+                new PointerEvent('pointerdown', {
+                  bubbles: true,
+                  button: 0,
+                  pointerId: 7,
+                  clientX: fromX,
+                  clientY: fromY
+                })
+              )
+              window.dispatchEvent(
+                new PointerEvent('pointermove', {
+                  bubbles: true,
+                  pointerId: 7,
+                  buttons: 1,
+                  clientX: toX,
+                  clientY: toY
+                })
+              )
+              window.dispatchEvent(
+                new PointerEvent('pointerup', {
+                  bubbles: true,
+                  pointerId: 7,
+                  clientX: toX,
+                  clientY: toY
+                })
+              )
+              const dragged = await waitForSnapshot(
+                (value) => value.tabs[folderTabId]?.folderId === folderId,
+                5000
+              )
+              dragIntoFolder = dragged !== null
+            }
+
+            const subfolder = await window.ione.createFolder({
+              spaceId: homeSpaceId,
+              parentId: folderId,
+              name: 'Nested'
+            })
+            subfolderId = subfolder.id
+            await window.ione.moveFolder(subfolderId, { parentId: null })
+            const afterMove = await window.ione.getSnapshot()
+            if (afterMove.folders[subfolderId]?.parentId !== undefined) {
+              folderError = 'folder was not moved to root'
+            }
+            await waitFor(
+              () =>
+                document.querySelectorAll('[data-testid="folder-row"]').length >= 2
+            )
+          } catch (error) {
+            folderError = String(error)
+          }
+        }
+
         let createSpaceError = null
         let smokeSpaceId = null
         try {
@@ -300,6 +443,32 @@ async function probeChrome(): Promise<ChromeProbe | null> {
         }
         await waitFor(() => document.querySelector('[role="list"]') !== null)
 
+        let sleepCycleOk = false
+        if (targetUrl && folderTabId) {
+          const activeNow = await window.ione.getSnapshot()
+          if (activeNow.activeTabId !== folderTabId) {
+            await window.ione.activateTab(folderTabId)
+            await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+          }
+          await window.ione.createTab(targetUrl)
+          await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+          const slept = await waitForSnapshot(
+            (value) => value.tabs[folderTabId]?.sleeping === true,
+            7000
+          )
+          if (slept) {
+            await window.ione.activateTab(folderTabId)
+            const woke = await waitForSnapshot(
+              (value) =>
+                value.tabs[folderTabId]?.sleeping === false &&
+                value.activeTabId === folderTabId,
+              7000
+            )
+            await waitFor(() => activeTitle() === 'Smoke Page', 7000)
+            sleepCycleOk = woke !== null
+          }
+        }
+
         const final = await window.ione.getSnapshot()
         const essentialTitle =
           document.querySelector('[data-testid="essential-tile"] .essential-title')?.textContent?.trim() ?? ''
@@ -323,6 +492,13 @@ async function probeChrome(): Promise<ChromeProbe | null> {
           homeSpaceId,
           smokeSpaceId,
           createSpaceError,
+          folderCount: document.querySelectorAll('[data-testid="folder-row"]').length,
+          folderId,
+          folderTabId,
+          subfolderId,
+          folderError,
+          dragIntoFolder,
+          sleepCycleOk,
           tabListPresent: document.querySelector('[data-testid="tab-list"]') !== null,
           virtualListPresent: document.querySelector('[data-testid="tab-list"] [role="list"]') !== null
         }
@@ -346,6 +522,11 @@ async function probeChrome(): Promise<ChromeProbe | null> {
       spaceCount: typeof record['spaceCount'] === 'number' ? record['spaceCount'] : 0,
       activeSpaceName:
         typeof record['activeSpaceName'] === 'string' ? record['activeSpaceName'] : '',
+      folderCount: typeof record['folderCount'] === 'number' ? record['folderCount'] : 0,
+      folderTabId: typeof record['folderTabId'] === 'string' ? record['folderTabId'] : null,
+      folderError: typeof record['folderError'] === 'string' ? record['folderError'] : null,
+      dragIntoFolder: record['dragIntoFolder'] === true,
+      sleepCycleOk: record['sleepCycleOk'] === true,
       tabListPresent: record['tabListPresent'] === true,
       virtualListPresent: record['virtualListPresent'] === true
     }
@@ -413,6 +594,9 @@ function shutdown(): void {
     clearTimeout(smokeTimer)
     smokeTimer = null
   }
+
+  sleepManager?.stop()
+  sleepManager = null
 
   try {
     controller?.dispose()

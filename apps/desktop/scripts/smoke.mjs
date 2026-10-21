@@ -52,7 +52,9 @@ const child = spawn(
       ...process.env,
       IONE_DB_PATH: dbPath,
       IONE_SMOKE_SCREENSHOT: screenshotPath,
-      IONE_SMOKE_URL: smokeUrl
+      IONE_SMOKE_URL: smokeUrl,
+      IONE_TAB_SLEEP_MS: '250',
+      IONE_TAB_SLEEP_TICK_MS: '200'
     },
     stdio: ['ignore', 'pipe', 'pipe']
   }
@@ -154,14 +156,23 @@ child.on('exit', (code, signal) => {
       activeTabRow && typeof activeTabRow.value === 'string'
         ? db
             .prepare(
-              'SELECT tabs.url, tabs.title, spaces.name AS space_name FROM tabs JOIN spaces ON spaces.id = tabs.space_id WHERE tabs.id = ?'
+              'SELECT tabs.url, tabs.title, tabs.folder_id, tabs.sleeping, spaces.name AS space_name FROM tabs JOIN spaces ON spaces.id = tabs.space_id WHERE tabs.id = ?'
             )
             .get(activeTabRow.value)
         : undefined
+    const folderCount = db.prepare('SELECT COUNT(*) AS n FROM folders').get()
+    const nestedRoot = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM folders WHERE name = 'Nested' AND parent_id IS NULL"
+      )
+      .get()
+    const sleepingCount = db
+      .prepare('SELECT COUNT(*) AS n FROM tabs WHERE sleeping = 1')
+      .get()
     db.close()
 
-    if (!tabCount || tabCount.n < 3) {
-      stderr += `\n[smoke] expected at least 3 persisted tabs, got ${JSON.stringify(tabCount)}`
+    if (!tabCount || tabCount.n < 5) {
+      stderr += `\n[smoke] expected at least 5 persisted tabs, got ${JSON.stringify(tabCount)}`
       finish(1, '')
       return
     }
@@ -180,6 +191,21 @@ child.on('exit', (code, signal) => {
       finish(1, '')
       return
     }
+    if (!folderCount || folderCount.n < 2) {
+      stderr += `\n[smoke] expected 2 persisted folders, got ${JSON.stringify(folderCount)}`
+      finish(1, '')
+      return
+    }
+    if (!nestedRoot || nestedRoot.n < 1) {
+      stderr += `\n[smoke] moved subfolder was not persisted at root: ${JSON.stringify(nestedRoot)}`
+      finish(1, '')
+      return
+    }
+    if (!sleepingCount || sleepingCount.n < 1) {
+      stderr += `\n[smoke] no sleeping tab was persisted: ${JSON.stringify(sleepingCount)}`
+      finish(1, '')
+      return
+    }
     if (!activeSpace || activeSpace.name !== 'Home') {
       stderr += `\n[smoke] active space mismatch: ${JSON.stringify(activeSpace)}`
       finish(1, '')
@@ -189,7 +215,9 @@ child.on('exit', (code, signal) => {
       !activeTab ||
       activeTab.url !== smokeUrl ||
       activeTab.title !== 'Smoke Page' ||
-      activeTab.space_name !== 'Home'
+      activeTab.space_name !== 'Home' ||
+      activeTab.folder_id === null ||
+      activeTab.sleeping !== 0
     ) {
       stderr += `\n[smoke] active tab mismatch: ${JSON.stringify(activeTab)}`
       finish(1, '')
@@ -203,6 +231,6 @@ child.on('exit', (code, signal) => {
 
   finish(
     0,
-    `[smoke] app started, sidebar/essentials/pinned/spaces rendered, reset pinned, persisted state, screenshot: ${screenshotPath}`
+    `[smoke] app started, tree/folders/DnD/sleep/wake persisted, screenshot: ${screenshotPath}`
   )
 })

@@ -1,4 +1,12 @@
-import type { BrowserSnapshot, DiffBatch, Essential, Space, Tab } from '@ione/core'
+import type {
+  BrowserSnapshot,
+  DiffBatch,
+  Essential,
+  Folder,
+  FolderKind,
+  Space,
+  Tab
+} from '@ione/core'
 
 /** IPC channel names. Keep in one place so main/preload cannot drift. */
 export const IPC = {
@@ -16,7 +24,13 @@ export const IPC = {
   removeEssential: 'ione:remove-essential',
   pinTab: 'ione:pin-tab',
   unpinTab: 'ione:unpin-tab',
-  resetPinnedTab: 'ione:reset-pinned-tab'
+  resetPinnedTab: 'ione:reset-pinned-tab',
+  createTabInFolder: 'ione:create-tab-in-folder',
+  createFolder: 'ione:create-folder',
+  updateFolder: 'ione:update-folder',
+  removeFolder: 'ione:remove-folder',
+  moveFolder: 'ione:move-folder',
+  moveTab: 'ione:move-tab'
 } as const
 
 export interface NavigateResult {
@@ -43,6 +57,29 @@ export interface CreateEssentialInput {
   title?: string
 }
 
+export interface CreateFolderInput {
+  spaceId: string
+  parentId?: string | null
+  name: string
+  kind?: FolderKind
+}
+
+export interface UpdateFolderInput {
+  name?: string
+  collapsed?: boolean
+}
+
+export interface MoveFolderInput {
+  parentId: string | null
+  beforeFolderId?: string | null
+}
+
+export interface MoveTabInput {
+  spaceId: string
+  folderId: string | null
+  beforeTabId?: string | null
+}
+
 /**
  * Typed contextBridge surface exposed as `window.ione`.
  * Types only cross the bridge; no Node objects are exposed.
@@ -65,4 +102,10 @@ export interface DesktopApi {
   unpinTab(tabId: string): Promise<void>
   /** Returns null when the tab is not pinned or has no pinned URL. */
   resetPinnedTab(tabId: string): Promise<NavigateResult | null>
+  createTabInFolder(folderId: string | null, input?: string): Promise<Tab>
+  createFolder(input: CreateFolderInput): Promise<Folder>
+  updateFolder(folderId: string, patch: UpdateFolderInput): Promise<void>
+  removeFolder(folderId: string): Promise<void>
+  moveFolder(folderId: string, target: MoveFolderInput): Promise<void>
+  moveTab(tabId: string, target: MoveTabInput): Promise<void>
 }
