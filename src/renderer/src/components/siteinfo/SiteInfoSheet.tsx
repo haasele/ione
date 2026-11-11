@@ -1,0 +1,1852 @@
+import type { JSX, ReactNode, Ref } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  Bell,
+  Camera,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  Clapperboard,
+  ClipboardPaste,
+  Cookie,
+  ExternalLink,
+  Globe,
+  Loader2,
+  LockOpen,
+  MapPin,
+  Mic,
+  MonitorPlay,
+  Music2,
+  Puzzle,
+  Settings,
+  ShieldCheck,
+  Trash2,
+  Volume2,
+  VolumeX,
+  type LucideIcon
+} from 'lucide-react'
+import { siteOriginOf } from '@shared/blocking'
+import type { Tab, UIState } from '@shared/types'
+import { DEFAULT_CONTAINER_ID, PRIVATE_CONTAINER_ID } from '@shared/types'
+import {
+  certificateErrorDetail,
+  certificateFault,
+  cookieBytes,
+  describeSite,
+  formatBytes,
+  permissionLabel,
+  refusedCertificate,
+  securityIndicator,
+  type IndicatorState,
+  type SiteCertificate,
+  type SiteCookie,
+  type SiteDescription,
+  type SiteInfo
+} from '@shared/siteInfo'
+import { describeNetError } from '@shared/zenPages'
+import { cmd } from '@renderer/lib/api'
+import { manageExtension } from '@renderer/lib/extensions/manage'
+import {
+  extensionPageChrome,
+  extensionPageLine,
+  type ExtensionPageChrome
+} from '@renderer/lib/extensions/pages'
+import { useViewport } from '@renderer/lib/formFactor'
+import { mediaOf } from '@renderer/lib/media'
+import { LevelMotion, paintLevels, type LevelState } from '@renderer/lib/motion/levels'
+import { openSettings as openSettingsPage } from '@renderer/lib/pages'
+import {
+  TRACKER_REPORT_EMPTY,
+  TRACKER_REPORT_SETTINGS,
+  TRACKER_REPORT_TITLE,
+  blockedSiteCategoryLabel,
+  trackerReportOrder,
+  trackerReportRows
+} from '@renderer/lib/blockingUi'
+import { privateLockStore } from '@renderer/lib/privateLock'
+import {
+  securityToneClass,
+  securityVerdict,
+  type SecurityTone
+} from '@renderer/lib/securityVerdict'
+import { HELD, focusableIn, returnFocusTo } from '@renderer/lib/popover'
+import { activeTab } from '@renderer/lib/selectors'
+import {
+  SITE_DATA_TEXT,
+  applySiteDataChoice,
+  siteDataChoice,
+  siteDataChoiceOptions,
+  siteDataOverviewLine,
+  siteDataRowLine,
+  type SiteDataChoice
+} from '@renderer/lib/siteDataUi'
+import {
+  dismissSiteInfo,
+  refreshSiteInfo,
+  registerSiteInfoSurface,
+  siteInfoDismissed,
+  siteInfoStore,
+  stepBackSiteInfo
+} from '@renderer/lib/siteInfo'
+import {
+  BACKGROUND_VIDEO_LINE,
+  defaultInForce,
+  type PermissionDefaults,
+  showsBackgroundVideoRow,
+  showsSoundRow,
+  switchOn,
+  switchWrite
+} from '@renderer/lib/siteInfoCopy'
+import { browserStore, overlayAvailable, pushToast, uiStore } from '@renderer/lib/ui'
+import { cn } from '@renderer/lib/utils'
+import { useConfirmKeyboard } from '../dialogs/confirmKeyboard'
+import { V2MenulistSheet } from '../extensions/V2Menulist'
+import { pillChipRows, type PillChipModel, type PillChipRow } from '../phone/pillChips'
+import { BottomSheet, type BottomSheetHandle } from '../sheet/BottomSheet'
+import { Favicon } from '../sidebar/Favicon'
+import { SiteInfoDesktopLayer } from '../siteControls/SiteInfoPopover'
+
+/** Cookies listed before the list folds. */
+const COOKIE_FOLD = 6
+
+/**
+ * The sheet's levels: the root, the four detail levels behind its rows (the tracker report,
+ * PS-33, behind the shield's row among them), and the two confirmations – levels too (§10.4: a
+ * confirmation inside a surface with levels is a level, not a prompt over it; the question stays
+ * in the site's own place, and a sheet over the sheet would spend §9.24's one depth on a
+ * question the sheet can ask itself).
+ */
+type LevelId = 'main' | 'connection' | 'cookies' | 'permissions' | 'trackers' | ConfirmLevel
+/** The confirmation levels: Delete cookies, one level in from the cookies; Delete site data, from the root. */
+type ConfirmLevel = 'clear-cookies' | 'clear-data'
+/** The detail levels with a §9.16 header – the title and the back control. A confirmation carries none (§9.23). */
+type TitledLevel = 'connection' | 'cookies' | 'permissions' | 'trackers'
+const LEVEL_TITLES: Record<TitledLevel, string> = {
+  connection: 'Connection',
+  cookies: 'Cookies and site data',
+  permissions: 'Permissions',
+  trackers: TRACKER_REPORT_TITLE
+}
+const CONFIRM_KINDS: Record<ConfirmLevel, 'cookies' | 'data'> = {
+  'clear-cookies': 'cookies',
+  'clear-data': 'data'
+}
+function isConfirmLevel(id: LevelId): id is ConfirmLevel {
+  return id in CONFIRM_KINDS
+}
+
+/**
+ * Site information: what the browser knows about the site a tab is on – the connection and its
+ * certificate, cookies and stored data, permissions – with the actions to take them away again.
+ * Opens from the site icon in the address pill: on phones a sheet on the shared `BottomSheet`
+ * chassis (this file), on a mouse the §9.20 popover under the pill on `siteInfo.snapshot`
+ * (`siteControls/SiteInfoPopover`). Rows lead into levels (certificate, cookies, permissions)
+ * that push in and pop back on a spring; the system back gesture pops a level before it
+ * dismisses the sheet. Mounted once above whichever shell is up.
+ */
+export function SiteInfoLayer(): JSX.Element | null {
+  const tabId = siteInfoStore.use((s) => s.tabId)
+  const state = browserStore.use((s) => s.state)
+  const viewport = useViewport()
+  const tab = tabId && state ? state.tabs[tabId] : undefined
+  const phone = viewport.formFactor === 'phone'
+  // The tab closed underneath the sheet (the desktop popover plays its exit first).
+  useEffect(() => {
+    if (phone && tabId && !tab) dismissSiteInfo()
+  }, [phone, tabId, tab])
+  if (!state) return null
+  if (!phone) return <SiteInfoDesktopLayer state={state} />
+  if (!tab) return null
+  return <PhoneSheet key={tab.id} tab={tab} state={state} />
+}
+
+// ---------------------------------------------------------------------------
+// Data
+// ---------------------------------------------------------------------------
+
+function useSiteInfo(tab: Tab): { info: SiteInfo | null; loading: boolean } {
+  const revision = siteInfoStore.use((s) => s.revision)
+  // Every change of the page (or an action of the sheet) is a new reading.
+  const key = `${tab.id}|${tab.url}|${revision}|${tab.loading ? 'reloading' : 'settled'}`
+  const [result, setResult] = useState<{ key: string; info: SiteInfo | null } | null>(null)
+  // While a reload we caused is in flight the last reading stays up; read again once it lands.
+  const holdLastReading = tab.loading && result !== null
+  useEffect(() => {
+    if (holdLastReading) return
+    let cancelled = false
+    cmd('site.info', { tabId: tab.id }).then(
+      (info) => {
+        if (!cancelled) setResult({ key, info })
+      },
+      () => {
+        if (!cancelled) setResult({ key, info: null })
+      }
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [key, tab.id, holdLastReading])
+  return { info: result?.info ?? null, loading: result?.key !== key }
+}
+
+// ---------------------------------------------------------------------------
+// Security, as words: the pill's real state (#124) and the certificate exception (#136)
+// ---------------------------------------------------------------------------
+
+type Tone = SecurityTone
+
+interface Security {
+  indicator: IndicatorState
+  tone: Tone
+  /** A word or two for a row's value: "Secure", "Not secure". */
+  short: string
+  /** The headline of the connection level. */
+  headline: string
+  /** The sentence under it. */
+  detail: string
+  /** The certificate to list: the page's, or the one that was refused. */
+  certificate: SiteCertificate | null
+  /** The certificate failed verification and the connection reports as not secure. */
+  certificateError: boolean
+  /**
+   * What is wrong with the certificate, in a word or two, for the title block's line under the
+   * host ("Certificate expired"); only on a certificate error, whose issuer the line never names.
+   */
+  fault?: string
+}
+
+/**
+ * What "not secure" means and asks of the user (ERR-09), on the Connection level's status row:
+ * why in one sentence, then Chrome's page-info advice – "You should not enter any sensitive
+ * information on this site (for example, passwords or credit cards), because it could be stolen
+ * by attackers" – in Ione's voice. Two lines at 13 on a phone: the status row's description
+ * clamps there (§9.33), and a screen reader hears the whole of it on the row's name.
+ */
+const NOT_SECURE_DETAIL =
+  "Anyone on the way can read what you send to this site. Don't enter passwords or card details here."
+
+function securityOf(tab: Tab, info: SiteInfo | null, site: SiteDescription): Security {
+  const error = info?.security.certificateError ?? tab.certificateError ?? null
+  const indicator = securityIndicator(tab.url, tab.errorCode, error).state
+  const mixed = info?.security.mixedContent === true
+  const cert = info?.security.certificate ?? (error ? refusedCertificate(error) : null)
+  switch (indicator) {
+    case 'secure':
+      return mixed
+        ? {
+            indicator,
+            tone: 'warn',
+            short: 'Partly secure',
+            headline: 'Connection is partly secure',
+            detail:
+              'The page is encrypted, but some of what it loaded came over a plain connection.',
+            certificate: cert,
+            certificateError: false
+          }
+        : {
+            indicator,
+            // Neutral, not ok (v2 §9.19): "secure" is the state of nearly every page, and a
+            // colour that is always on says nothing – the lock on the pill, in this title block
+            // and on the Connection row is the surface's own ink, as Firefox's, Zen's, Safari's
+            // and Chrome's have been since the green lock was retired. `--v2-ok` is for a check
+            // that passed or a result the user asked for; partly secure and insecure keep the
+            // warn ink, a failed certificate and a dangerous site the danger ink.
+            tone: 'neutral',
+            short: 'Secure',
+            headline: 'Connection is secure',
+            detail: 'Everything you send to this site is encrypted on the way.',
+            certificate: cert,
+            certificateError: false
+          }
+    case 'certificate-error':
+      return {
+        indicator,
+        tone: 'danger',
+        short: 'Not secure',
+        headline: 'Connection is not secure',
+        detail: error
+          ? `${certificateErrorDetail(error)} ${describeNetError(error.code, '')}`.trim()
+          : 'The certificate this site sent could not be verified.',
+        certificate: cert,
+        certificateError: true,
+        // The fault by the error's code, or by the failed load's when the core reported the code
+        // alone; the certificate's dates tell expired from not yet valid.
+        fault: certificateFault(error?.code ?? tab.errorCode, error?.certificate ?? null)
+      }
+    case 'dangerous':
+      return {
+        indicator,
+        tone: 'danger',
+        short: 'Dangerous',
+        headline: 'Dangerous site',
+        detail:
+          'Safe Browsing found this site to be dangerous and blocked the page. Attackers here might try to steal your information.',
+        certificate: null,
+        certificateError: false
+      }
+    case 'insecure':
+      return {
+        indicator,
+        tone: 'warn',
+        short: 'Not secure',
+        headline: 'Connection is not secure',
+        detail: NOT_SECURE_DETAIL,
+        certificate: null,
+        certificateError: false
+      }
+    case 'local':
+      return {
+        indicator,
+        tone: 'neutral',
+        short: site.scheme === 'file' ? 'Local file' : 'Local',
+        headline: site.scheme === 'file' ? 'Local file' : 'Local site',
+        detail: 'Served from this device; nothing crosses the network.',
+        certificate: null,
+        certificateError: false
+      }
+    case 'extension':
+      return {
+        indicator,
+        tone: 'neutral',
+        short: 'Extension page',
+        headline: 'Extension page',
+        detail: 'A page of an installed extension; no site is involved.',
+        certificate: null,
+        certificateError: false
+      }
+    case 'internal':
+      return {
+        indicator,
+        tone: 'neutral',
+        short: tab.errorCode !== null ? 'Not loaded' : 'Ione page',
+        headline: tab.errorCode !== null ? 'The page could not be loaded' : 'Part of Ione',
+        detail:
+          tab.errorCode !== null
+            ? describeNetError(tab.errorCode, 'The page could not be loaded.')
+            : 'Built into the browser; no site is involved.',
+        certificate: null,
+        certificateError: false
+      }
+    default:
+      return {
+        indicator,
+        tone: 'neutral',
+        short: '',
+        headline: 'Connection',
+        detail: '',
+        certificate: null,
+        certificateError: false
+      }
+  }
+}
+
+/**
+ * The connection's glyph: a puzzle piece for an extension's page, a globe off the web, else the
+ * verdict's own (`securityVerdict`, the glyph the phone pill's slot draws for the same state,
+ * ERR-09): the closed lock for an encrypted connection with nothing mixed in (its tone is
+ * neutral, §9.19), the open lock for partly secure and insecure, the triangle for a certificate
+ * that failed, the shield for a dangerous site.
+ */
+function securityGlyph(
+  security: Security,
+  props: { className?: string; strokeWidth?: number } = {}
+): JSX.Element {
+  if (security.indicator === 'extension') return <Puzzle {...props} aria-hidden />
+  if (security.indicator === 'internal' || security.indicator === 'local')
+    return <Globe {...props} aria-hidden />
+  const Glyph = securityVerdict(security.indicator, security.tone === 'warn')?.glyph ?? LockOpen
+  return <Glyph {...props} aria-hidden />
+}
+
+const toneClass = securityToneClass
+
+/** A permission's glyph, from the catalogue the browser prompts for. */
+function permissionGlyph(permission: string, props: { className?: string } = {}): JSX.Element {
+  const Icon = PERMISSION_ICONS[permission] ?? ShieldCheck
+  return <Icon {...props} aria-hidden />
+}
+
+const PERMISSION_ICONS: Record<string, LucideIcon> = {
+  camera: Camera,
+  microphone: Mic,
+  media: Camera,
+  geolocation: MapPin,
+  notifications: Bell,
+  midi: Music2,
+  'clipboard-read': ClipboardPaste,
+  openExternal: ExternalLink,
+  mediaKeySystem: Clapperboard
+}
+
+function isPrivateTab(tab: Tab, state: UIState): boolean {
+  return tab.containerId === PRIVATE_CONTAINER_ID || state.window.kind === 'private'
+}
+
+// ---------------------------------------------------------------------------
+// Levels: one spring, two panes at a time
+// ---------------------------------------------------------------------------
+
+interface Levels {
+  motion: LevelMotion
+  /** Discrete state (stack, direction, phase); `t` is read from `motion.current` per frame. */
+  state: LevelState
+  level: LevelId
+  /** Called on every frame of the motion, after `motion.current` is updated. */
+  onFrame: (listener: () => void) => () => void
+}
+
+function useLevels(): Levels {
+  const [state, setState] = useState<LevelState | null>(null)
+  const engine = useMemo(() => {
+    const listeners = new Set<() => void>()
+    const motion = new LevelMotion('main', (s) => {
+      for (const l of listeners) l()
+      // Only a discrete change re-renders; the frames of `t` are painted directly.
+      setState((prev) =>
+        prev &&
+        prev.stack === s.stack &&
+        prev.from === s.from &&
+        prev.to === s.to &&
+        prev.phase === s.phase
+          ? prev
+          : s
+      )
+    })
+    return { motion, listeners }
+  }, [])
+  const { motion } = engine
+  useEffect(() => () => motion.dispose(), [motion])
+  const onFrame = useCallback(
+    (listener: () => void) => {
+      engine.listeners.add(listener)
+      return () => {
+        engine.listeners.delete(listener)
+      }
+    },
+    [engine]
+  )
+  const current = state ?? motion.current
+  // The level the surface shows or is heading to: the target of a push, the parent of a pop.
+  const level = current.to as LevelId
+  return { motion, state: current, level, onFrame }
+}
+
+/**
+ * The focus as a level is entered (§9.22, §10.4): `at` takes it – a confirmation's own held
+ * container (`tabIndex -1`, the element the keyboard is sent to and cannot reach by Tab, so the
+ * chassis draws no ring on it and no verb is preselected), a plain level's first row, or the
+ * sheet's root when the level offers no control. Returns the opener – whatever held the focus as
+ * the level came, a row of the level beneath – and not `body`, for `releaseFocus` at the leave.
+ * The prompt primitive's own hold and return (`dialogs/ConfirmDialog.tsx`) are its panel's mount
+ * and unmount; a level stays mounted through its slide in both directions, so the same two steps
+ * are taken here at the push and the pop, on the same predicate, and the keyboard rule itself is
+ * the primitive's hook (`useConfirmKeyboard`) – nothing of the contract lives twice.
+ */
+function holdFocus(pane: HTMLElement, at: HTMLElement): HTMLElement | null {
+  const active = document.activeElement
+  const opener =
+    active instanceof HTMLElement && active !== document.body && !pane.contains(active)
+      ? active
+      : null
+  at.focus({ preventScroll: true })
+  return opener
+}
+
+/**
+ * The return as a level leaves (§9.5, one hop down): `target` gets the keyboard back through
+ * `returnFocusTo`, which waits for an `inert` to lift and never lets the focus fall to `body`.
+ * Only a focus the leave loses is given back – one still in the pane leaving, fallen to `body`,
+ * parked on a held container (`HELD`: at no control), or under an `inert` or `[data-leaving]`
+ * subtree; one the user has already placed elsewhere is left alone, and a target gone from the
+ * document gets nothing.
+ */
+function releaseFocus(pane: HTMLElement, target: HTMLElement | null): void {
+  if (!target?.isConnected) return
+  const now = document.activeElement
+  const lost =
+    !now ||
+    now === document.body ||
+    pane.contains(now) ||
+    now.matches(HELD) ||
+    now.closest('[inert], [data-leaving]') !== null
+  if (lost) returnFocusTo(target)
+}
+
+const LEVEL_IDS: readonly LevelId[] = [
+  'main',
+  'connection',
+  'cookies',
+  'permissions',
+  'trackers',
+  'clear-cookies',
+  'clear-data'
+]
+
+function usePaneRegistry(): {
+  panes: Map<LevelId, HTMLElement>
+  register: (id: LevelId) => (el: HTMLElement | null) => void
+} {
+  return useMemo(() => {
+    const panes = new Map<LevelId, HTMLElement>()
+    // One callback per pane for the life of the sheet: a new one each render would have React
+    // detach and re-attach every pane on every commit.
+    const callbacks = new Map<LevelId, (el: HTMLElement | null) => void>(
+      LEVEL_IDS.map((id) => [
+        id,
+        (el: HTMLElement | null): void => {
+          if (el) panes.set(id, el)
+          else panes.delete(id)
+        }
+      ])
+    )
+    return { panes, register: (id: LevelId) => callbacks.get(id)! }
+  }, [])
+}
+
+// ---------------------------------------------------------------------------
+// Phone: a sheet on the chassis
+// ---------------------------------------------------------------------------
+
+/**
+ * The hold of a switch row of the sheet (§10.4): a row `earned` by the tab's state or a stored
+ * answer is kept for the life of the sheet once earned – a press that forgets the only stored
+ * reason for it (Sound's on on a quiet tab, Background video's off on a page without video)
+ * must not take the row away under the finger that did it (Chrome's page info keeps a row
+ * through its reset until the bubble closes). The hold is the ORIGIN's, not the tab's: the sheet
+ * stays up through a same-tab navigation, and a page of another origin under it has to earn the
+ * row itself – the hold drops the moment the origin under the sheet changes, and is not parked
+ * for the origin left behind. The origin the hold names after this render is `origin` while it
+ * earns or keeps the row, none once another origin is under the sheet; stored from the render
+ * that decides it (React's "adjusting state while rendering"), the same value twice no store.
+ */
+function useHeldRow(earned: boolean, origin: string): boolean {
+  const [held, setHeld] = useState<string | null>(null)
+  const next = earned || held === origin ? origin : null
+  if (next !== held) setHeld(next)
+  return next !== null
+}
+
+function PhoneSheet({ tab, state }: { tab: Tab; state: UIState }): JSX.Element {
+  const sheet = useRef<BottomSheetHandle>(null)
+  const trackRef = useRef<HTMLDivElement>(null)
+  const { info, loading } = useSiteInfo(tab)
+  const levels = useLevels()
+  const { panes, register } = usePaneRegistry()
+  // The per-site cookie picker (§9.13 under a finger): a sheet over this one while it is up.
+  const [picker, setPicker] = useState(false)
+  // A sheet stacked on this one (§9.24) answers Escape and the back gesture itself.
+  const stacked = picker
+  const stackedRef = useRef(stacked)
+  useEffect(() => {
+    stackedRef.current = stacked
+  }, [stacked])
+  const [allCookies, setAllCookies] = useState(false)
+
+  const paint = useCallback((): void => {
+    const track = trackRef.current
+    if (!track) return
+    paintLevels(levels.motion, panes, track.offsetWidth)
+  }, [levels.motion, panes])
+  useLayoutEffect(paint)
+  useEffect(() => levels.onFrame(paint), [levels, paint])
+
+  // The keyboard through the levels (§9.22, §10.4; the #392 / #401 rulings). Entering a level
+  // takes the focus off the row that opened it – left there, it would sit in the pane leaving,
+  // hidden from assistive technology and then from view – and remembers the row as the level's
+  // opener (`holdFocus`). A confirmation level holds its container, as the prompt does:
+  // `role="alertdialog"`, `tabIndex -1`, no ring, no verb preselected; its Enter and Tab are the
+  // primitive's own hook (`ConfirmPane`). A plain detail level lands on its first row – §10.4's
+  // pushed-level sentence, the lead's ruling on W5-17: a list sheet's rows land on the first
+  // row, the desktop `Level`'s parity – or parks on the sheet's own held container when it has
+  // none to offer (Connection), which takes no ring. Leaving a level by Cancel, Escape, the back
+  // control or the back gesture is one hop back: the keyboard returns to the opener
+  // (`releaseFocus`: only a focus the leave loses is moved). A confirmation answered by its verb
+  // parks on the sheet instead – the row it was asked from may go with what it removed. Every
+  // route that pops a level runs through `leave`.
+  const openers = useRef(new Map<LevelId, HTMLElement | null>())
+  const answered = useRef(false)
+  const sheetRoot = useCallback(
+    (): HTMLElement | null => trackRef.current?.closest<HTMLElement>('.zen-sheet') ?? null,
+    []
+  )
+  const enter = useCallback(
+    (id: LevelId): void => {
+      const { motion } = levels
+      if (motion.level === id) return
+      // The frame is painted in the push: the pane arriving is in the document before the focus moves.
+      motion.push(id)
+      const pane = panes.get(id)
+      if (!pane) return
+      const landing = isConfirmLevel(id) ? pane : (focusableIn(pane)[0] ?? sheetRoot() ?? pane)
+      openers.current.set(id, holdFocus(pane, landing))
+    },
+    [levels, panes, sheetRoot]
+  )
+  const leave = useCallback(
+    (commit: () => boolean): void => {
+      const { motion } = levels
+      if (motion.depth === 0) return
+      const id = motion.level as LevelId
+      if (!commit()) return
+      const pane = panes.get(id)
+      const opener = answered.current ? null : (openers.current.get(id) ?? null)
+      answered.current = false
+      openers.current.delete(id)
+      if (pane) releaseFocus(pane, opener ?? sheetRoot())
+    },
+    [levels, panes, sheetRoot]
+  )
+
+  // What this module needs of the mounted surface: the chassis owns the sheet's motion, the
+  // component its levels. The back gesture peeks and pops a level; on the root it pulls the
+  // sheet down through the chassis, as every other sheet's does.
+  useEffect(() => {
+    const { motion } = levels
+    registerSiteInfoSurface({
+      depth: () => motion.depth,
+      pop: () => leave(() => motion.pop()),
+      dismiss: () => sheet.current?.dismiss(),
+      backProgress: (p) => {
+        if (motion.depth > 0) motion.backProgress(p)
+        else sheet.current?.backProgress(p)
+      },
+      backCommit: () => {
+        if (motion.depth > 0) {
+          leave(() => {
+            if (motion.current.phase === 'back') motion.backCommit()
+            else motion.pop()
+            return true
+          })
+        } else sheet.current?.commitBack()
+      },
+      backCancel: () => {
+        if (motion.depth > 0) motion.backCancel()
+        else sheet.current?.cancelBack()
+      }
+    })
+    return () => registerSiteInfoSurface(null)
+  }, [levels, leave])
+
+  // Escape (hardware keyboards exist on tablets): one level up, or away – from a confirmation
+  // level, one hop back to the row that asked (§10.4). A picker sheet stacked on this one
+  // answers its own Escape first (§9.24).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key !== 'Escape' || stackedRef.current) return
+      e.preventDefault()
+      e.stopImmediatePropagation()
+      stepBackSiteInfo()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [])
+
+  const site = describeSite(tab.url)
+  const security = securityOf(tab, info, site)
+  const actions = useActions(tab, site, state.permissionDefaults)
+  // A page of an extension (v2 §10.1 applied to extension pages): the sheet says whose page it
+  // is and leads to the extension's details in Settings, in place of the site's rows.
+  const extension =
+    site.state === 'extension' ? extensionPageChrome(tab.url, state.extensions) : null
+  const level = levels.level
+  const push = enter
+  const pop = (): void => leave(() => levels.motion.pop())
+  /** The pane is in the track's flow or on its way out; every other pane is `hidden`. */
+  const inPlay = (id: LevelId): boolean => id === levels.state.from || id === levels.state.to
+  /** The detail level whose header the sheet wears; none on the root or a confirmation. */
+  const titled: TitledLevel | null = level !== 'main' && !isConfirmLevel(level) ? level : null
+  const cookies = info?.cookies.items ?? []
+  const siteName = site.site || site.host
+  /** The verb of a confirmation level: the level pops, then the deed, then the reading refreshes. */
+  const answer = (id: ConfirmLevel): void => {
+    answered.current = true
+    pop()
+    void (id === 'clear-cookies' ? actions.clearCookies() : actions.clearData())
+  }
+  // The chips the phone pill keeps out of the pill (OMN-02, v2 §9.29): the blocking shield with
+  // its count and the translate offer are this sheet's rows, always, at its top, with the same
+  // names, states and actions the chips had, and a live state chip waits here as a row while a
+  // newer state has the pill's slot (`components/phone/pillChips.tsx`).
+  const mediaSheetOpen = uiStore.use((s) => s.mediaSheet !== null)
+  // The private lock's word (INC-05): the media row masks a locked private tab's title, and the
+  // lock can arm while this sheet stands (the app left and came back), so the rows are built
+  // again on it.
+  const lockMasking = privateLockStore.use((s) => s.locked || s.lifting)
+  const pillChips = extension
+    ? []
+    : pillChipRows(state, tab, {
+        siteInfoOpen: true,
+        mediaSheetOpen,
+        activeTabId: activeTab(state)?.id ?? null
+      })
+  // The sheet's two switch rows, each earned by the tab's state or a stored answer and each held
+  // for the sheet's life on its origin once earned (`useHeldRow`; §10.4): the Sound row (Chrome
+  // Android's page info shows Sound for an audible tab; `showsSoundRow`) – its on is the forget
+  // on a quiet tab under the default's Allow, so it takes the same hold as its neighbour – and
+  // the Background video row (MED-08 / EDGE-32; `showsBackgroundVideoRow`), whose off is the
+  // forget on a page without video. Only a reading OF the site under the sheet can earn either:
+  // the last origin's reading stays up while the new one is read.
+  const media = mediaOf(state, tab.id)
+  const read = info !== null && info.origin === site.origin
+  const sound = useHeldRow(read && showsSoundRow(info.permissions, tab), site.origin)
+  const backgroundVideo = useHeldRow(
+    read && showsBackgroundVideoRow(info.permissions, media, state.platform),
+    site.origin
+  )
+  // The chassis measures its detents again when this changes: a level, the reading arriving,
+  // the pill's rows changing under it, or a switch row arriving.
+  const contentKey = `${tab.id}:${level}:${info ? 'ready' : 'reading'}:${allCookies ? 'all' : 'fold'}:${pillChips.length}:${lockMasking ? 'masked' : ''}:${sound ? 'sound' : ''}:${backgroundVideo ? 'video' : ''}`
+
+  return (
+    <>
+      <BottomSheet
+        ref={sheet}
+        onDismissed={() => siteInfoDismissed()}
+        contentKey={contentKey}
+        handleLabel="Dismiss"
+        // The dialog's name as TalkBack opens it (A11Y-01): what the sheet is and whose, then the
+        // level's title once the sheet has drilled into one (the root pane stays in the track, so
+        // the name is composed rather than pointed at a title element), the question on a
+        // confirmation level.
+        label={
+          level === 'main'
+            ? `Site information for ${sheetTitleOf(site, extension)}`
+            : isConfirmLevel(level)
+              ? confirmWords(CONFIRM_KINDS[level], siteName, cookies.length).title
+              : LEVEL_TITLES[level]
+        }
+        // The §9.16 header of a detail level; a confirmation level is a title block over its
+        // footer, with no bar and no control (§9.23, §10.4) – Escape and the back gesture pop it.
+        header={
+          titled ? (
+            <>
+              <button
+                type="button"
+                className="zen-sheet-header-control"
+                data-side="leading"
+                onClick={pop}
+                aria-label="Back to site information"
+              >
+                <ChevronLeft className="h-5 w-5" strokeWidth={1.75} aria-hidden />
+              </button>
+              <h2 className="zen-sheet-title">{LEVEL_TITLES[titled]}</h2>
+            </>
+          ) : undefined
+        }
+      >
+        {/*
+          The panes are rendered `hidden` but for the two in play, so the chassis measures the
+          sheet on the level it shows – on mount, before any frame is painted, as much as at a
+          push – and the first frame of a slide has the pane arriving in the document with its
+          content. Only a confirmation's pane holds the focus itself (§10.4).
+        */}
+        <div ref={trackRef} className="zen-sheet-track">
+          <section
+            ref={register('main')}
+            className="zen-sheet-pane"
+            data-level="main"
+            hidden={!inPlay('main')}
+          >
+            <SheetTitle
+              tab={tab}
+              state={state}
+              site={site}
+              security={security}
+              extension={extension}
+            />
+            {extension ? (
+              <div className="flex flex-col pb-2">
+                <SheetRow
+                  glyph={<Puzzle />}
+                  label={extension.extension ? 'Manage extension' : 'Manage extensions'}
+                  onClick={() => {
+                    dismissSiteInfo()
+                    manageExtension(extension.id, tab.id)
+                  }}
+                />
+              </div>
+            ) : (
+              <PillChipRows chips={pillChips} push={push} />
+            )}
+            {!extension && (
+              <SheetMainRows
+                site={site}
+                security={security}
+                info={info}
+                loading={loading}
+                busy={actions.busy}
+                push={push}
+                onSettings={() => actions.openSettings()}
+                onClear={() => push('clear-data')}
+                defaults={state.permissionDefaults}
+                sound={sound}
+                backgroundVideo={backgroundVideo}
+                onSwitch={(permission, on) => void actions.setSwitch(permission, on)}
+              />
+            )}
+          </section>
+          <section
+            ref={register('connection')}
+            className="zen-sheet-pane"
+            data-level="connection"
+            hidden={!inPlay('connection')}
+          >
+            <ConnectionRows security={security} kit={SHEET_ROWS} />
+          </section>
+          <section
+            ref={register('cookies')}
+            className="zen-sheet-pane"
+            data-level="cookies"
+            hidden={!inPlay('cookies')}
+          >
+            {info && (
+              <SiteDataRow
+                site={info.siteData}
+                busy={actions.busy === 'siteData'}
+                onOpen={() => setPicker(true)}
+              />
+            )}
+            <CookieRows
+              info={info}
+              site={site}
+              all={allCookies}
+              onToggleAll={() => setAllCookies((v) => !v)}
+              kit={SHEET_ROWS}
+            />
+            {cookies.length > 0 && (
+              <>
+                <div aria-hidden className="zen-sheet-sep" />
+                <button
+                  type="button"
+                  className="zen-sheet-item"
+                  data-danger
+                  aria-busy={actions.busy === 'cookies' || undefined}
+                  onClick={() => push('clear-cookies')}
+                >
+                  <span className="zen-sheet-item-glyph" data-tone="danger">
+                    <Trash2 />
+                  </span>
+                  <span className="min-w-0 flex-1 truncate">Delete cookies</span>
+                </button>
+              </>
+            )}
+          </section>
+          <section
+            ref={register('permissions')}
+            className="zen-sheet-pane"
+            data-level="permissions"
+            hidden={!inPlay('permissions')}
+          >
+            <PermissionRows
+              info={info}
+              busy={actions.busy}
+              onReset={actions.resetPermission}
+              kit={SHEET_ROWS}
+            />
+          </section>
+          <section
+            ref={register('trackers')}
+            className="zen-sheet-pane"
+            data-level="trackers"
+            hidden={!inPlay('trackers')}
+          >
+            <TrackerReportRows
+              tab={tab}
+              open={level === 'trackers'}
+              onSettings={() => {
+                const origin = siteOriginOf(tab.url)
+                if (!overlayAvailable('settings')) dismissSiteInfo()
+                openSettingsPage('privacy', origin ? { site: origin } : undefined)
+              }}
+            />
+          </section>
+          <ConfirmPane
+            ref={register('clear-cookies')}
+            id="clear-cookies"
+            words={confirmWords('cookies', siteName, cookies.length)}
+            hidden={!inPlay('clear-cookies')}
+            onCancel={pop}
+            onConfirm={() => answer('clear-cookies')}
+          />
+          <ConfirmPane
+            ref={register('clear-data')}
+            id="clear-data"
+            words={confirmWords('data', siteName, cookies.length)}
+            hidden={!inPlay('clear-data')}
+            onCancel={pop}
+            onConfirm={() => answer('clear-data')}
+          />
+        </div>
+      </BottomSheet>
+      {picker && info && (
+        // The picker as the Settings value rows open theirs (§9.13): the menulist's sheet over
+        // this one, radio rows with the option's line under each; a pick applies once the sheet
+        // has gone, and the row above reads the new state from the next reading.
+        <V2MenulistSheet<SiteDataChoice>
+          label={SITE_DATA_TEXT.site.picker}
+          value={siteDataChoice(info.siteData)}
+          options={siteDataChoiceOptions(info.siteData, state.siteData.clearsAtNextLaunch)}
+          onPick={(choice) => {
+            if (choice !== siteDataChoice(info.siteData))
+              void actions.setSiteData(info.siteData, choice)
+          }}
+          onClose={() => setPicker(false)}
+        />
+      )}
+    </>
+  )
+}
+
+/**
+ * The per-site cookie policy at the top of the cookies level (Chrome's "Cookies and site data"
+ * page reached from page info): a §9.2 two-line row naming the choice for this site and what
+ * decides it – the list entry, or the default it falls to – that opens the picker. Working
+ * (§9.30): the row keeps its look and says so. A page with no site to add is a fact, not a
+ * target.
+ */
+function SiteDataRow({
+  site,
+  busy,
+  onOpen
+}: {
+  site: SiteInfo['siteData']
+  busy: boolean
+  onOpen: () => void
+}): JSX.Element {
+  return (
+    <div className="flex flex-col">
+      <SheetRow
+        glyph={<Cookie />}
+        label={SITE_DATA_TEXT.site.label}
+        description={siteDataRowLine(site)}
+        busy={busy}
+        haspopup="dialog"
+        onClick={site.addable || site.pattern ? onOpen : undefined}
+      />
+      <div aria-hidden className="zen-sheet-sep" />
+    </div>
+  )
+}
+
+/**
+ * The sheet opens on a title block (§9.23): the favicon on the host's start, the connection
+ * under it. An extension's page names no host: the block says whose page it is.
+ */
+/** The sheet's title: the site's host, an extension page's kind, or the browser's own name. */
+function sheetTitleOf(site: SiteDescription, extension: ExtensionPageChrome | null): string {
+  return extension ? 'Extension page' : site.web ? site.host.replace(/^www\./, '') : 'Ione'
+}
+
+function SheetTitle({
+  tab,
+  state,
+  site,
+  security,
+  extension
+}: {
+  tab: Tab
+  state: UIState
+  site: SiteDescription
+  security: Security
+  extension: ExtensionPageChrome | null
+}): JSX.Element {
+  const title = sheetTitleOf(site, extension)
+  const container =
+    tab.containerId !== DEFAULT_CONTAINER_ID && tab.containerId !== PRIVATE_CONTAINER_ID
+      ? state.containers.find((c) => c.id === tab.containerId)?.name
+      : undefined
+  // Under the verdict, who vouches for a valid certificate – or, when the certificate failed
+  // verification, what is wrong with it: an invalid certificate's issuer is no credential to
+  // offer here (the Connection level's certificate detail still lists it).
+  const line = [
+    extension ? extensionPageLine(extension) : security.short,
+    security.fault ?? (security.certificate?.issuer || null),
+    container
+  ].filter((p): p is string => Boolean(p))
+  return (
+    <div className="zen-sheet-title-block">
+      <h2>
+        <Favicon tab={tab} size={20} />
+        <span className="min-w-0 truncate">{title}</span>
+        {isPrivateTab(tab, state) && <span className="zen-v2-badge">Private</span>}
+      </h2>
+      {line.length > 0 && (
+        <p className="flex items-center gap-1.5">
+          {securityGlyph(security, {
+            className: cn('h-4 w-4 shrink-0', toneClass(security.tone)),
+            strokeWidth: 1.75
+          })}
+          <span className="min-w-0 truncate">{line.join(' · ')}</span>
+        </p>
+      )}
+    </div>
+  )
+}
+
+/**
+ * What the phone pill carries only here (OMN-02; v2 §9.29 as amended on Bennett's ruling: the
+ * pill shows the favicon, the host and the lock, nothing else): a rows group at the top of the
+ * root level, over a hairline, one chassis row per chip with the chip's name, its state as the
+ * value and its action – the shield row carries the blocked count and leads on to the blocking
+ * lists in Settings, the translate row still offers (the sheet leaves for the bar), a media row
+ * waiting behind a newer state opens the player – so nothing is lost, only moved. No heading:
+ * the rows name themselves. Nothing on a page with neither.
+ */
+function PillChipRows({
+  chips,
+  push
+}: {
+  chips: ReadonlyArray<PillChipModel & { row: PillChipRow }>
+  /** Opens the level a §10.4 detail row among them leads to (the shield's tracker report). */
+  push: (id: 'trackers') => void
+}): JSX.Element | null {
+  if (chips.length === 0) return null
+  return (
+    <div className="flex flex-col" data-testid="siteinfo-pill-chips">
+      {chips.map((chip) => {
+        const level = chip.row.level
+        return (
+          <SheetRow
+            key={chip.id}
+            glyph={chip.row.glyph}
+            label={chip.row.label}
+            value={chip.row.value}
+            onClick={level ? () => push(level) : chip.row.activate}
+          />
+        )
+      })}
+      <div aria-hidden className="zen-sheet-sep" />
+    </div>
+  )
+}
+
+/**
+ * The tracker report (PS-33), one level under the shield's row: the sites the engine blocked
+ * requests to on the page, one §10.1 chassis row each – the registrable domain as the label,
+ * the request count as the tabular-nums value, and the kind of rule that blocked it as the
+ * 13/69% line only when the kind says something: the user's own filter, an extension, Safe
+ * Browsing; a list match, the default kind, carries no line and is a one-line 44 row (§9.29:
+ * the same word on every row says nothing; §9.2 lets the heights mix) – sorted by count as the
+ * level opens and never re-sorted while it is up; a site blocked
+ * later joins at the foot (§9.29), the counts move live. Empty, §9.17's one sentence. No
+ * controls, no per-site allow; the one footer is a hairline and a 44 navigation row to
+ * Settings › Privacy and security at the site. The rows are the chassis row's static form
+ * (§9.34: `data-static`, no press fill); that footer row is the level's one control, and the
+ * keyboard lands on it as the level opens (`enter`: the pane's first focusable, as the desktop's
+ * `focus="first"` lands on its footer row). A private tab's list is the same; nothing here
+ * persists (the record is the tab's, gone with the document).
+ * The order starts over each time the level opens (`open`), so a report that changed under a
+ * closed level shows sorted the next time.
+ */
+function TrackerReportRows({
+  tab,
+  open,
+  onSettings
+}: {
+  tab: Tab
+  open: boolean
+  onSettings: () => void
+}): JSX.Element {
+  const [order, setOrder] = useState<readonly string[]>([])
+  const nextOrder = open ? trackerReportOrder(order, tab.blockedSites) : []
+  if (nextOrder !== order && (open || order.length > 0)) setOrder(nextOrder)
+  const rows = trackerReportRows(nextOrder, tab.blockedSites)
+  return (
+    <div className="flex flex-col pb-2" data-testid="tracker-report">
+      {rows.length === 0 ? (
+        <p className="zen-sheet-empty">{TRACKER_REPORT_EMPTY}</p>
+      ) : (
+        rows.map((site) => (
+          <div key={site.domain} data-tracker-row={site.domain} className="contents">
+            <SheetRow
+              label={site.domain}
+              description={blockedSiteCategoryLabel(site.category)}
+              value={String(site.count)}
+            />
+          </div>
+        ))
+      )}
+      <div aria-hidden className="zen-sheet-sep" />
+      <button type="button" className="zen-sheet-item" onClick={onSettings}>
+        <span className="min-w-0 flex-1 truncate">{TRACKER_REPORT_SETTINGS}</span>
+      </button>
+    </div>
+  )
+}
+
+/**
+ * The four rows of the root level – with the Sound switch row after Permissions where the sheet
+ * earns it (`sound`, the caller's hold on `showsSoundRow`: a tab that plays or has played sound,
+ * or whose site has its own `sound` answer – the one setting "Mute Site" and Settings write too
+ * – as Chrome Android's page info shows Sound for an audible tab); then, its media neighbour
+ * (§9.29 / §10.4, seated as Site settings seats it after Sound), the Background video switch row
+ * where the sheet earns it (`backgroundVideo`, the caller's hold on `showsBackgroundVideoRow`)
+ * – and the two actions under a hairline. Each switch reads the state in force for this site
+ * (`switchOn`: its own answer, else the default the core carries in `defaults`), and a press
+ * hands the state it asks for to `onSwitch`, which writes the site's rule for it. The
+ * Permissions row's value names what is STORED for the site, as the engine lists it – not the
+ * state in force: a default's answer is nobody's exception.
+ */
+function SheetMainRows({
+  site,
+  security,
+  info,
+  loading,
+  busy,
+  push,
+  onSettings,
+  onClear,
+  defaults,
+  sound,
+  backgroundVideo,
+  onSwitch
+}: {
+  site: SiteDescription
+  security: Security
+  info: SiteInfo | null
+  loading: boolean
+  busy: Busy
+  push: (id: LevelId) => void
+  onSettings: () => void
+  onClear: () => void
+  defaults: PermissionDefaults
+  sound: boolean
+  backgroundVideo: boolean
+  onSwitch: (permission: SwitchPermission, on: boolean) => void
+}): JSX.Element {
+  const reading = loading && !info
+  const cookies = info?.cookies.items ?? []
+  const permissions = info?.permissions ?? []
+  const hasData = info ? cookies.length > 0 || storesAnything(info) : false
+  const soundAllowed = switchOn(permissions, 'sound', defaults)
+  const backgroundVideoAllowed = switchOn(permissions, 'background-video', defaults)
+  return (
+    <div className="flex flex-col pb-2">
+      <SheetRow
+        glyph={securityGlyph(security)}
+        tone={security.tone}
+        label="Connection"
+        value={security.short || undefined}
+        valueTone={security.tone === 'warn' || security.tone === 'danger' ? 'warn' : undefined}
+        onClick={security.detail ? () => push('connection') : undefined}
+      />
+      {site.web && (
+        <>
+          {/*
+            The level holds the per-site policy row as well as what the site stored, so it opens
+            as soon as the reading is in; a list's word for the site is the row's second line.
+          */}
+          <SheetRow
+            glyph={<Cookie />}
+            label="Cookies and site data"
+            description={info ? siteDataOverviewLine(info.siteData) : undefined}
+            value={info ? summariseData(info) : reading ? 'Reading…' : undefined}
+            onClick={info ? () => push('cookies') : undefined}
+          />
+          <SheetRow
+            glyph={<ShieldCheck />}
+            label="Permissions"
+            value={
+              info
+                ? permissions.length
+                  ? permissions.map((p) => permissionLabel(p.permission)).join(', ')
+                  : 'None asked for'
+                : reading
+                  ? 'Reading…'
+                  : undefined
+            }
+            onClick={permissions.length ? () => push('permissions') : undefined}
+          />
+          {sound && (
+            <SoundSwitchRow
+              allowed={soundAllowed}
+              busy={busy === 'permission:sound'}
+              onChange={(on) => onSwitch('sound', on)}
+            />
+          )}
+          {backgroundVideo && (
+            <BackgroundVideoSwitchRow
+              allowed={backgroundVideoAllowed}
+              busy={busy === 'permission:background-video'}
+              onChange={(on) => onSwitch('background-video', on)}
+            />
+          )}
+          <div aria-hidden className="zen-sheet-sep" />
+          <SheetRow glyph={<Settings />} label="Site settings" onClick={onSettings} />
+          <button
+            type="button"
+            className="zen-sheet-item"
+            data-danger
+            disabled={!hasData && permissions.length === 0}
+            onClick={onClear}
+          >
+            <span className="zen-sheet-item-glyph" data-tone="danger">
+              <Trash2 />
+            </span>
+            <span className="min-w-0 flex-1 truncate">Delete site data</span>
+          </button>
+        </>
+      )}
+      {!site.web && permissions.length > 0 && (
+        <SheetRow
+          glyph={<ShieldCheck />}
+          label="Permissions"
+          value={permissions.map((p) => permissionLabel(p.permission)).join(', ')}
+          onClick={() => push('permissions')}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * The Sound row as a switch (§10.4: the phone's form of a two-way setting): the chassis row at
+ * its base 44 (§9.21: the 20 px switch asks for no more) with the speaker glyph – crossed while
+ * the site is muted – "Sound" and the shared `.zen-v2-switch` trailing, the whole row the
+ * target; its position is the state in force for this site (its own answer, else the default,
+ * Allow from the catalogue), and off blocks the site's sound as "Mute Site" does. Busy while the
+ * core writes (§9.30): `aria-busy`, a second press does nothing, the switch shows the value the
+ * core still holds.
+ */
+function SoundSwitchRow({
+  allowed,
+  busy,
+  onChange
+}: {
+  allowed: boolean
+  busy: boolean
+  onChange: (allowed: boolean) => void
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={allowed}
+      aria-busy={busy || undefined}
+      className="zen-sheet-item"
+      data-permission="sound"
+      onClick={busy ? undefined : () => onChange(!allowed)}
+    >
+      <span className="zen-sheet-item-glyph">{allowed ? <Volume2 /> : <VolumeX />}</span>
+      <span className="min-w-0 flex-1 truncate">Sound</span>
+      <span className="zen-v2-switch" aria-hidden />
+    </button>
+  )
+}
+
+/**
+ * The Background video row as a switch (MED-08 / EDGE-32; the lead's ruling on services' #523:
+ * a per-site quick toggle belongs among the sheet's permission rows, in the Sound row's form,
+ * nothing on the media notification): the §9.2 two-line chassis row – the catalogue's label,
+ * and under it one line, the same in both states, naming what the switch does for this site
+ * (`BACKGROUND_VIDEO_LINE`: "Keeps playing video in the background"; the state is the switch's
+ * alone, so the line never tells it twice – the lead's ruling on #531) – with the shared
+ * `.zen-v2-switch` trailing, the whole row the target. Its position is the state in force for
+ * this site (its own answer, else the default, Block from the catalogue and Allow where Settings
+ * turned it); on keeps the site's video playing, which the core carries to the host on the media
+ * session before the next background transition. Busy while the core writes (§9.30):
+ * `aria-busy`, a second press does nothing, the switch shows the value the core still holds.
+ */
+function BackgroundVideoSwitchRow({
+  allowed,
+  busy,
+  onChange
+}: {
+  allowed: boolean
+  busy: boolean
+  onChange: (allowed: boolean) => void
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={allowed}
+      aria-busy={busy || undefined}
+      // The row's name is its label and its line, as `SheetRow` composes a two-line row's: the
+      // line says what the switch does here, which the name would otherwise drop; the state is
+      // the switch's (`aria-checked`), read as on or off after the name.
+      aria-label={`Background video, ${BACKGROUND_VIDEO_LINE}`}
+      className="zen-sheet-item zen-sheet-item-two-line"
+      data-permission="background-video"
+      onClick={busy ? undefined : () => onChange(!allowed)}
+    >
+      <span className="zen-sheet-item-glyph">
+        <MonitorPlay />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate">Background video</span>
+        <span className="zen-sheet-item-secondary block text-[13px] leading-[var(--v2-line-small)] [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2] overflow-hidden">
+          {BACKGROUND_VIDEO_LINE}
+        </span>
+      </span>
+      <span className="zen-v2-switch" aria-hidden />
+    </button>
+  )
+}
+
+/**
+ * A chassis row (§9.2, §9.18): 44 tall, glyph 20, label 15, a 13/69% value, a chevron when it
+ * leads on. Without `onClick` it is the static form (§9.34): `data-static`, which keeps the
+ * chassis's press fill off a row that is not a target.
+ */
+function SheetRow({
+  glyph,
+  tone,
+  label,
+  description,
+  value,
+  valueTone,
+  control,
+  danger,
+  disabled,
+  busy,
+  haspopup,
+  onClick
+}: {
+  glyph?: ReactNode
+  tone?: Tone
+  label: string
+  description?: string
+  value?: string
+  valueTone?: 'warn'
+  control?: ReactNode
+  danger?: boolean
+  disabled?: boolean
+  /** The row's action is running (§9.30): full opacity, `aria-busy`, a press does nothing. */
+  busy?: boolean
+  /** The row opens a sheet over this one. */
+  haspopup?: 'dialog'
+  onClick?: () => void
+}): JSX.Element {
+  const body = (
+    <>
+      {glyph && (
+        <span className="zen-sheet-item-glyph" data-tone={tone}>
+          {glyph}
+        </span>
+      )}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate">{label}</span>
+        {description && (
+          <span className="zen-sheet-item-secondary block text-[13px] leading-[var(--v2-line-small)] [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2] overflow-hidden">
+            {description}
+          </span>
+        )}
+      </span>
+      {value && (
+        <span className="zen-sheet-item-value" data-tone={valueTone}>
+          {value}
+        </span>
+      )}
+      {control}
+      {onClick && !control && (
+        // A trailing indicator: 16 on both platforms (§9.3).
+        <ChevronRight className="zen-sheet-item-secondary h-4 w-4 shrink-0" strokeWidth={1.75} />
+      )}
+    </>
+  )
+  const className = cn(
+    'zen-sheet-item',
+    description && 'zen-sheet-item-two-line',
+    control && 'zen-sheet-item-control'
+  )
+  if (onClick)
+    return (
+      <button
+        type="button"
+        className={className}
+        data-danger={danger || undefined}
+        disabled={disabled}
+        // The row's name is its label, its value and its second line, read as parts
+        // ("Connection, Secure"; "Cookies for this site, Never allow · Listed as [*.]example.com"):
+        // a description carries the row's state, which the name would otherwise drop.
+        aria-label={[label, value, description].filter(Boolean).join(', ')}
+        aria-busy={busy || undefined}
+        aria-haspopup={haspopup}
+        onClick={busy ? undefined : onClick}
+      >
+        {body}
+      </button>
+    )
+  return (
+    <div className={className} data-danger={danger || undefined} data-static="">
+      {body}
+    </div>
+  )
+}
+
+function SheetHeading({ title, aside }: { title: string; aside?: string }): JSX.Element {
+  return (
+    <h3 className="zen-sheet-heading">
+      <span className="min-w-0 flex-1 truncate">{title}</span>
+      {aside && <span className="zen-sheet-item-value">{aside}</span>}
+    </h3>
+  )
+}
+
+/** The words of a confirmation: the question, what it does, the verb and the verb's spoken name. */
+interface ConfirmWords {
+  title: string
+  detail: string
+  action: string
+  confirmLabel: string
+}
+
+/**
+ * "Delete cookies?" and "Delete site data?" as levels of the sheet (§10.4, the design lead's
+ * ruling on W5-17): one level in from the row that asks, a title block with the question and
+ * what it does over the two actions splitting the footer (§9.11), no header (§9.23). The pane
+ * wears the §9.23 confirmation's keyboard contract exactly, on the primitive's own hook
+ * (`dialogs/confirmKeyboard.ts` `useConfirmKeyboard`, the one implementation `ConfirmDialog`
+ * and the desktop popover's confirm levels hold their containers with): it is a dialog of its
+ * own – `role="alertdialog"`, named by its question, `tabIndex -1` and ringless – that holds
+ * the focus as the level is entered (`PhoneSheet`'s `enter`); Tab enters at Cancel and then the
+ * danger verb, Shift+Tab at the verb, the sheet's grabber after them (the chassis's `wrapTab`
+ * at the window on a held container inside the sheet, so the hook's own wrap is off); Enter
+ * from the held container is inert – destructive, so no default (§9.22 as amended) – and a
+ * focused button answers its own; Escape, the back control's absence notwithstanding, and the
+ * back gesture are one hop back to the row that asked, which takes the keyboard again
+ * (`leave`). The verb pops the level and then does the deed. The pane is in the document for
+ * the life of the sheet (`hidden` while away), so the hook binds to it once, at the mount.
+ */
+function ConfirmPane({
+  ref,
+  id,
+  words,
+  hidden,
+  onCancel,
+  onConfirm
+}: {
+  ref: Ref<HTMLElement>
+  id: ConfirmLevel
+  words: ConfirmWords
+  hidden: boolean
+  onCancel: () => void
+  onConfirm: () => void
+}): JSX.Element {
+  const uid = useId()
+  const titleId = `${uid}title`
+  const descriptionId = `${uid}description`
+  const pane = useRef<HTMLElement | null>(null)
+  useConfirmKeyboard(pane, { destructive: true, confirm: onConfirm, tab: false })
+  // One callback for the life of the pane (the registry's is stable): the hook's ref and the
+  // sheet's pane registry both see the element.
+  const attach = useCallback(
+    (el: HTMLElement | null): void => {
+      pane.current = el
+      if (typeof ref === 'function') ref(el)
+      else if (ref) ref.current = el
+    },
+    [ref]
+  )
+  return (
+    <section
+      ref={attach}
+      className="zen-sheet-pane"
+      data-level={id}
+      data-confirm={id}
+      data-destructive=""
+      role="alertdialog"
+      aria-labelledby={titleId}
+      aria-describedby={descriptionId}
+      tabIndex={-1}
+      hidden={hidden}
+    >
+      <div className="zen-sheet-title-block">
+        <h2 id={titleId}>
+          <Trash2 className="h-5 w-5 shrink-0" strokeWidth={1.75} aria-hidden />
+          <span className="min-w-0 truncate">{words.title}</span>
+        </h2>
+        <p id={descriptionId}>{words.detail}</p>
+      </div>
+      <div className="zen-sheet-footer">
+        <button type="button" className="zen-v2-button" data-action="cancel" onClick={onCancel}>
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="zen-v2-button"
+          data-action="confirm"
+          data-danger
+          aria-label={words.confirmLabel}
+          onClick={onConfirm}
+        >
+          {words.action}
+        </button>
+      </div>
+    </section>
+  )
+}
+
+function confirmWords(kind: 'cookies' | 'data', site: string, count: number): ConfirmWords {
+  const where = site || 'this site'
+  return kind === 'cookies'
+    ? {
+        // The cookies level joins the Delete family (W8-11, the design lead's ruling: cookies are
+        // site data, one level above "Delete site data" – two verbs there would be a seam).
+        title: 'Delete cookies?',
+        detail: `Deletes ${count} cookie${count === 1 ? '' : 's'} and signs you out of ${where}.`,
+        action: 'Delete cookies',
+        confirmLabel: 'Confirm delete cookies'
+      }
+    : {
+        // The Delete family's verb (W8-11): Chrome's `IDS_SETTINGS_SITE_SETTINGS_SITE_DELETE_STORAGE_DIALOG_TITLE`
+        // "Delete site data?" over the house line, its verb along.
+        title: 'Delete site data?',
+        detail: `Deletes the cookies, stored data and permissions of ${where}, then reloads the page.`,
+        action: 'Delete site data',
+        confirmLabel: 'Confirm delete site data'
+      }
+}
+
+// ---------------------------------------------------------------------------
+// The levels' rows, shared by both surfaces
+// ---------------------------------------------------------------------------
+
+/** The two row vocabularies, one per surface: the chassis row on a phone, the popover row on a mouse. */
+interface RowKit {
+  Row: typeof SheetRow
+  Heading: typeof SheetHeading
+  phone?: boolean
+}
+const SHEET_ROWS: RowKit = { Row: SheetRow, Heading: SheetHeading, phone: true }
+
+/** The connection and its certificate: the state as a two-line row, then the certificate's fields. */
+function ConnectionRows({ security, kit }: { security: Security; kit: RowKit }): JSX.Element {
+  const { Row, Heading, phone } = kit
+  const cert = security.certificate
+  return (
+    <div className={cn('flex flex-col', phone && 'pb-2')}>
+      <Row
+        glyph={securityGlyph(security)}
+        tone={security.tone}
+        label={security.headline}
+        description={security.detail}
+      />
+      {cert && (
+        <>
+          <Heading
+            title={security.certificateError ? 'Certificate that was refused' : 'Certificate'}
+          />
+          <Row label="Issued to" value={cert.subject || '—'} />
+          <Row label="Issued by" value={cert.issuer || '—'} />
+          {cert.validFrom !== null && <Row label="Valid from" value={formatDate(cert.validFrom)} />}
+          {cert.validTo !== null && <Row label="Valid until" value={formatDate(cert.validTo)} />}
+          {cert.protocol && <Row label="Protocol" value={cert.protocol} />}
+        </>
+      )}
+    </div>
+  )
+}
+
+/** Every cookie of the site, the sites embedded in it, and what else it stored. */
+function CookieRows({
+  info,
+  site,
+  all,
+  onToggleAll,
+  kit
+}: {
+  info: SiteInfo | null
+  site: SiteDescription
+  all: boolean
+  onToggleAll: () => void
+  kit: RowKit
+}): JSX.Element {
+  const { Row, Heading, phone } = kit
+  const cookies = info?.cookies.items ?? []
+  const shown = all ? cookies : cookies.slice(0, COOKIE_FOLD)
+  const thirdParty = info?.cookies.thirdParty ?? []
+  // The fold's chevron sits in the row's trailing slot: 16 on both platforms (§9.3).
+  const foldClass = phone ? 'zen-sheet-item-secondary h-4 w-4 shrink-0' : 'zen-siteinfo-chevron'
+  return (
+    <div className={cn('flex flex-col', phone && 'pb-2')}>
+      <Heading
+        title="Cookies"
+        aside={
+          info && cookies.length > 0
+            ? `${cookies.length} · ${formatBytes(cookieBytes(cookies))}`
+            : undefined
+        }
+      />
+      {info && cookies.length === 0 && (
+        <p className={phone ? 'zen-sheet-empty' : 'zen-siteinfo-empty'}>
+          This site has not stored any cookies
+        </p>
+      )}
+      {shown.map((c, i) => (
+        <CookieRow key={`${c.name}|${c.domain}|${i}`} cookie={c} site={site.site} Row={Row} />
+      ))}
+      {cookies.length > COOKIE_FOLD && (
+        <Row
+          label={all ? 'Show fewer' : `Show all ${cookies.length}`}
+          control={
+            all ? (
+              <ChevronUp className={foldClass} strokeWidth={phone ? 1.75 : 1.5} />
+            ) : (
+              <ChevronDown className={foldClass} strokeWidth={phone ? 1.75 : 1.5} />
+            )
+          }
+          onClick={onToggleAll}
+        />
+      )}
+      {thirdParty.length > 0 && (
+        <>
+          <Heading title="Also set by embedded sites" />
+          {thirdParty.map((t) => (
+            <Row key={t.site} label={t.site} value={String(t.count)} />
+          ))}
+        </>
+      )}
+      {info && <StorageRows info={info} Row={Row} Heading={Heading} />}
+    </div>
+  )
+}
+
+/** A cookie: its name, the flags that set it apart as a description, and its size. */
+function CookieRow({
+  cookie,
+  site,
+  Row
+}: {
+  cookie: SiteCookie
+  site: string
+  Row: typeof SheetRow
+}): JSX.Element {
+  const attrs: string[] = []
+  const domain = cookie.domain.replace(/^\./, '')
+  if (domain && domain !== site) attrs.push(domain)
+  if (cookie.secure) attrs.push('Secure')
+  if (cookie.httpOnly) attrs.push('HttpOnly')
+  if (cookie.session) attrs.push('Session')
+  return (
+    <Row
+      label={cookie.name || '(unnamed)'}
+      description={attrs.length ? attrs.join(' · ') : undefined}
+      value={cookie.size > 0 ? formatBytes(cookie.size) : undefined}
+    />
+  )
+}
+
+function StorageRows({
+  info,
+  Row,
+  Heading
+}: {
+  info: SiteInfo
+  Row: typeof SheetRow
+  Heading: typeof SheetHeading
+}): JSX.Element | null {
+  const s = info.storage
+  const rows: Array<[string, string]> = []
+  if (s.usageBytes !== null && s.usageBytes > 0)
+    rows.push(['Storage used', formatBytes(s.usageBytes)])
+  if (s.localStorageItems !== null && s.localStorageItems > 0)
+    rows.push(['Local storage', items(s.localStorageItems)])
+  if (s.sessionStorageItems !== null && s.sessionStorageItems > 0)
+    rows.push(['Session storage', items(s.sessionStorageItems)])
+  if (s.serviceWorkers !== null && s.serviceWorkers > 0)
+    rows.push(['Service workers', String(s.serviceWorkers)])
+  if (s.origins.length > 1) rows.push(['Origins with data', String(s.origins.length)])
+  if (rows.length === 0) return null
+  return (
+    <>
+      <Heading title="Site data" />
+      {rows.map(([label, value]) => (
+        <Row key={label} label={label} value={value} />
+      ))}
+    </>
+  )
+}
+
+/** What the site may do, each with a control to take it back (§9.11: an action inside a row). */
+function PermissionRows({
+  info,
+  busy,
+  onReset,
+  kit
+}: {
+  info: SiteInfo | null
+  busy: Busy
+  onReset: (permission: string) => Promise<void>
+  kit: RowKit
+}): JSX.Element {
+  const { Row, phone } = kit
+  const permissions = info?.permissions ?? []
+  return (
+    <div className={cn('flex flex-col', phone && 'pb-2')}>
+      {info && permissions.length === 0 && (
+        <p className={phone ? 'zen-sheet-empty' : 'zen-siteinfo-empty'}>
+          This site has not asked for any permissions
+        </p>
+      )}
+      {permissions.map((p) => {
+        const label = permissionLabel(p.permission)
+        return (
+          <Row
+            key={p.permission}
+            glyph={permissionGlyph(p.permission)}
+            label={label}
+            value={p.decision === 'allow' ? 'Allowed' : 'Blocked'}
+            control={
+              <button
+                type="button"
+                className={phone ? 'zen-v2-button' : 'zen-button'}
+                aria-label={`Reset ${label} permission`}
+                // Working (§9.30): full opacity, the label gives way to a spinner at the same width.
+                aria-busy={busy === `permission:${p.permission}` || undefined}
+                onClick={() => void onReset(p.permission)}
+              >
+                {busy === `permission:${p.permission}` ? (
+                  <Loader2 className="zen-spin h-4 w-4" aria-hidden />
+                ) : (
+                  'Reset'
+                )}
+              </button>
+            }
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Actions, and words for numbers
+// ---------------------------------------------------------------------------
+
+/** Which action is running, for the control that started it to show as busy (§9.30). */
+type Busy = 'cookies' | 'data' | 'siteData' | `permission:${string}` | null
+
+/** The sheet's switch rows, by the catalogue row each writes. */
+type SwitchPermission = 'sound' | 'background-video'
+
+function useActions(
+  tab: Tab,
+  site: SiteDescription,
+  defaults: PermissionDefaults
+): {
+  busy: Busy
+  clearCookies: () => Promise<void>
+  clearData: () => Promise<void>
+  resetPermission: (permission?: string) => Promise<void>
+  setSwitch: (permission: SwitchPermission, on: boolean) => Promise<void>
+  setSiteData: (current: SiteInfo['siteData'], choice: SiteDataChoice) => Promise<void>
+  openSettings: () => void
+} {
+  const [busy, setBusy] = useState<Busy>(null)
+  // Busy is not disabled (§9.30): the working control keeps its look and says so; a second press
+  // while one action runs is simply ignored here.
+  const act = async (key: NonNullable<Busy>, work: () => Promise<void>): Promise<void> => {
+    if (busy) return
+    setBusy(key)
+    try {
+      await work()
+    } catch {
+      pushToast('That did not work. Try again.', 'error')
+    } finally {
+      setBusy(null)
+    }
+  }
+  return {
+    busy,
+    clearCookies: () =>
+      act('cookies', async () => {
+        const { removed } = await cmd('site.clearCookies', { tabId: tab.id })
+        // The toast names the data, said as done (W8-11: the cookies level is the family's).
+        pushToast(
+          removed === 0
+            ? 'No cookies to delete'
+            : removed === 1
+              ? '1 cookie deleted'
+              : `${removed} cookies deleted`
+        )
+        refreshSiteInfo()
+      }),
+    clearData: () =>
+      act('data', async () => {
+        await cmd('site.clearData', { tabId: tab.id })
+        // Names the data, not the site (W8-11): Chrome's compound from
+        // `IDS_SETTINGS_SITE_SETTINGS_COOKIE_REMOVE_SITE`, said as done.
+        pushToast('Site data and permissions deleted')
+        refreshSiteInfo()
+      }),
+    resetPermission: (permission?: string) =>
+      act(`permission:${permission ?? '*'}`, async () => {
+        await cmd('site.resetPermissions', { tabId: tab.id, permission })
+        refreshSiteInfo()
+      }),
+    // A switch row's press (§10.4, the lead's ruling on #531): the site's rule that gives the
+    // state the press asks – `permissions.set` of an allow under a blocking default (what
+    // Settings' exception list writes), of a deny under an allowing one (what "Mute Site" writes
+    // for Sound) – and `permissions.forget` only where the default in force already gives it, as
+    // Chrome clears an exception equal to the default (`switchWrite`). The default is read at the
+    // press, from the state the core carries. The core's write carries a `sound` change onto
+    // the site's tabs and a `background-video` one onto the media session, re-pushed to the host.
+    setSwitch: (permission: SwitchPermission, on: boolean) =>
+      act(`permission:${permission}`, async () => {
+        const write = switchWrite(on, defaultInForce(permission, defaults))
+        if ('forget' in write) await cmd('permissions.forget', { origin: site.origin, permission })
+        else
+          await cmd('permissions.set', {
+            origin: site.origin,
+            permission,
+            decision: write.decision
+          })
+        refreshSiteInfo()
+      }),
+    // The site onto the list picked (Chrome's "Add" of the cookies page, from the page itself),
+    // or off its list: the engine says why when it refused (a list at its thousand); either
+    // way the reading is taken again, the row and the cookies under it with it.
+    setSiteData: (current, choice) =>
+      act('siteData', async () => {
+        const problem = await applySiteDataChoice(current, tab.url, choice)
+        if (problem) pushToast(problem, 'error')
+        refreshSiteInfo()
+      }),
+    // Settings (§10): the site's settings live there; opening it replaces the sheet. Through the
+    // one route for internal pages (lib/pages.ts): on a host with page tabs the Settings tab
+    // comes up in place of this sheet, which leaves first; the desktop's overlay dismisses the
+    // popover itself as it opens (lib/siteInfo.ts).
+    openSettings: () => {
+      if (!overlayAvailable('settings')) dismissSiteInfo()
+      openSettingsPage()
+    }
+  }
+}
+
+function summariseData(info: SiteInfo): string {
+  const cookies = info.cookies.items
+  const parts: string[] = []
+  if (cookies.length) parts.push(`${cookies.length} cookie${cookies.length === 1 ? '' : 's'}`)
+  const usage = info.storage.usageBytes
+  if (usage !== null && usage > 0) parts.push(formatBytes(usage))
+  else if (cookies.length) parts.push(formatBytes(cookieBytes(cookies)))
+  if (parts.length === 0) return storesAnything(info) ? 'Some site data' : 'None'
+  return parts.join(' · ')
+}
+
+function items(n: number): string {
+  return `${n} item${n === 1 ? '' : 's'}`
+}
+
+/** Anything beyond cookies: quota-managed storage, Web Storage items or service workers. */
+function storesAnything(info: SiteInfo): boolean {
+  const s = info.storage
+  return (
+    (s.usageBytes ?? 0) > 0 ||
+    (s.localStorageItems ?? 0) > 0 ||
+    (s.sessionStorageItems ?? 0) > 0 ||
+    (s.serviceWorkers ?? 0) > 0 ||
+    s.origins.length > 0
+  )
+}
+
+function formatDate(ms: number): string {
+  try {
+    return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(ms))
+  } catch {
+    return new Date(ms).toDateString()
+  }
+}

@@ -1,0 +1,241 @@
+import type { EngineDataCounts, EngineDataKind, SessionHost } from '../../core/platform'
+import { app, session, type Session } from 'electron'
+import { DEFAULT_CONTAINER_ID, PRIVATE_CONTAINER_ID, type Tab } from '../../shared/types'
+import { acceptLanguages, chromeUserAgent } from '../../shared/browserIdentity'
+import {
+  DEFAULT_APP_PROXY_SETTINGS,
+  isKnownProxyTarget,
+  type AppProxySettings
+} from '../../shared/appProxy'
+import { targetToProxyConfig } from '../../core/appProxy'
+import { sessionProxyConfig } from '../../core/extensions/api/proxy'
+
+/** Every storage kind of `clearStorageData` but cookies. */
+const SITE_STORAGES: Array<
+  'filesystem' | 'indexdb' | 'localstorage' | 'shadercache' | 'serviceworkers' | 'cachestorage'
+> = ['filesystem', 'indexdb', 'localstorage', 'shadercache', 'serviceworkers', 'cachestorage']
+
+/** `.example.com` and `example.com` are one site for the cookie count. */
+export function cookieSite(domain: string | undefined): string {
+  return (domain ?? '').replace(/^\./, '').toLowerCase()
+}
+
+/**
+ * Each Zen container maps to a persistent Chromium session partition, which gives it its own
+ * cookies, storage and cache – exactly what Firefox's Multi-Account Containers provide.
+ *
+ * Private windows share one in-memory partition (no `persist:` prefix) that is wiped when the
+ * last private window closes, like Firefox's private browsing session.
+ */
+export class SessionManager implements SessionHost {
+  private readonly sessions = new Map<string, Session>()
+  private readonly onCreate: Array<(ses: Session, containerId: string) => void> = []
+  /** Overlay sessions for a tab that overrides the container's proxy (`containerId::proxyId`). */
+  private readonly proxySessions = new Map<string, Session>()
+  private userProxy: AppProxySettings = structuredClone(DEFAULT_APP_PROXY_SETTINGS)
+  private proxyRefresh: (() => void) | null = null
+
+  constructor(
+    private readonly userAgent: string,
+    private languages: string = buildAcceptLanguages()
+  ) {
+    // `session.setUserAgent` covers frames and their requests; extension service workers read the
+    // app-level fallback for `navigator.userAgent` (LastPass sees "Electron/" there and takes its
+    // desktop-app path, touching `document` in a worker), so both present the same plain UA.
+    app.userAgentFallback = userAgent
+  }
+
+  /** The `Accept-Language` list every session sends (comma-separated, unweighted). */
+  get acceptLanguages(): string {
+    return this.languages
+  }
+
+  /**
+   * The preferred languages (Settings › Languages, CT-41) as the sessions' `Accept-Language`:
+   * every session present – the private one included – takes the list now, and every session
+   * to come takes it as it is made. Chromium reads the list on each request, so open pages send
+   * it from their next request on; the header carries Chrome's weights (`en-US,en;q=0.9`).
+   */
+  setAcceptLanguages(list: string): void {
+    if (!list || list === this.languages) return
+    this.languages = list
+    for (const ses of this.sessions.values()) ses.setUserAgent(this.userAgent, list)
+  }
+
+  /** Register a hook that runs for every session (existing and future). */
+  configure(hook: (ses: Session, containerId: string) => void): void {
+    this.onCreate.push(hook)
+    for (const [id, ses] of this.sessions) hook(ses, id)
+  }
+
+  partitionFor(containerId: string): string {
+    if (containerId === PRIVATE_CONTAINER_ID) return 'zen-private'
+    return containerId === DEFAULT_CONTAINER_ID
+      ? 'persist:zen-default'
+      : `persist:zen-container-${containerId}`
+  }
+
+  isPersistent(containerId: string): boolean {
+    return containerId !== PRIVATE_CONTAINER_ID
+  }
+
+  /** The container whose session `ses` is (one made here), else undefined (a handful of sessions). */
+  containerOf(ses: Session): string | undefined {
+    for (const [id, each] of this.sessions) if (each === ses) return id
+    return undefined
+  }
+
+  /**
+   * A per-tab proxy overlay. `chrome.proxy` must not own these: the tab's chosen target
+   * is applied here, and a refresh of the default PAC would otherwise wipe it.
+   */
+  isProxyOverlay(ses: Session): boolean {
+    for (const each of this.proxySessions.values()) if (each === ses) return true
+    return false
+  }
+
+  get(containerId: string): Session {
+    const existing = this.sessions.get(containerId)
+    if (existing) return existing
+    const ses = session.fromPartition(this.partitionFor(containerId))
+    // The language list makes the session's `Accept-Language` Chrome's (`en-US,en;q=0.9`);
+    // Electron's own header names the locale alone.
+    ses.setUserAgent(this.userAgent, this.languages)
+    this.sessions.set(containerId, ses)
+    for (const hook of this.onCreate) hook(ses, containerId)
+    return ses
+  }
+
+  /** The extension host's `chrome.proxy` resolver: user settings changing re-resolves it. */
+  bindProxyRefresh(hook: () => void): void {
+    this.proxyRefresh = hook
+  }
+
+  applyUserProxy(settings: AppProxySettings): void {
+    this.userProxy = settings
+    this.proxyRefresh?.()
+    for (const [key, ses] of this.proxySessions) {
+      const proxyId = key.split('::')[1]
+      if (!proxyId) continue
+      void ses.setProxy(sessionProxyConfig(targetToProxyConfig(settings, proxyId)))
+    }
+  }
+
+  /**
+   * The session a tab's page uses: the container's, or a dedicated overlay when the tab
+   * overrides the proxy. Overlay sessions share no cookies with the container (Electron's
+   * `setProxy` is per session).
+   */
+  forTab(tab: Pick<Tab, 'containerId' | 'proxyId'>): Session {
+    const override =
+      typeof tab.proxyId === 'string' && isKnownProxyTarget(this.userProxy, tab.proxyId)
+        ? tab.proxyId
+        : undefined
+    if (!override) return this.get(tab.containerId)
+    const key = `${tab.containerId}::${override}`
+    const existing = this.proxySessions.get(key)
+    if (existing) return existing
+    const persist = this.isPersistent(tab.containerId)
+    const partition = persist
+      ? `persist:zen-proxy-${tab.containerId}-${override}`
+      : `zen-proxy-${tab.containerId}-${override}`
+    const ses = session.fromPartition(partition)
+    ses.setUserAgent(this.userAgent, this.languages)
+    this.proxySessions.set(key, ses)
+    for (const hook of this.onCreate) hook(ses, tab.containerId)
+    void ses.setProxy(sessionProxyConfig(targetToProxyConfig(this.userProxy, override)))
+    return ses
+  }
+
+  all(): Session[] {
+    return [...this.sessions.values()]
+  }
+
+  /** Sessions that can hold extensions (Electron refuses to load them into in-memory sessions). */
+  persistent(): Array<[string, Session]> {
+    return [...this.sessions.entries()].filter(([id]) => this.isPersistent(id))
+  }
+
+  async clearContainerData(containerId: string): Promise<void> {
+    const ses = this.sessions.get(containerId)
+    if (!ses) return
+    await ses.clearStorageData()
+    await ses.clearCache()
+  }
+
+  /** Forget everything the private session accumulated (last private window closed). */
+  async clearPrivate(): Promise<void> {
+    await this.clearContainerData(PRIVATE_CONTAINER_ID)
+    // Certificate errors are decided per TLS handshake: a connection kept alive over a certificate
+    // the session proceeded past must not carry into the next private session.
+    await this.sessions.get(PRIVATE_CONTAINER_ID)?.closeAllConnections()
+  }
+
+  /**
+   * Clear browsing data: containers that were never opened this run are opened for it, so what
+   * they hold on disk goes too. Chromium's session API has no time range: everything of a kind.
+   */
+  async clearBrowsingData(containerIds: string[], kinds: EngineDataKind[]): Promise<void> {
+    const wanted = new Set(kinds)
+    for (const id of containerIds) {
+      const ses = this.get(id)
+      if (wanted.has('cookies') && wanted.has('storage')) await ses.clearStorageData()
+      else if (wanted.has('cookies')) await ses.clearStorageData({ storages: ['cookies'] })
+      else if (wanted.has('storage')) await ses.clearStorageData({ storages: SITE_STORAGES })
+      if (wanted.has('cache')) {
+        await ses.clearCache()
+        await ses.clearCodeCaches({})
+      }
+    }
+  }
+
+  /** Distinct cookie domains and the cache's size across the containers, for the preview. */
+  async browsingDataCounts(containerIds: string[]): Promise<EngineDataCounts> {
+    const domains = new Set<string>()
+    let cacheBytes = 0
+    for (const id of containerIds) {
+      const ses = this.get(id)
+      for (const cookie of await ses.cookies.get({})) domains.add(cookieSite(cookie.domain))
+      cacheBytes += await ses.getCacheSize()
+    }
+    return { cookieSites: domains.size, cacheBytes }
+  }
+
+  /** Chromium keeps accepted HTTP credentials per session; without this a site never asks again. */
+  async clearAuthCache(): Promise<void> {
+    await Promise.all(this.all().map((ses) => ses.clearAuthCache()))
+  }
+}
+
+/**
+ * Present a plain Chrome user agent: Electron's default string without its "Electron/x" and
+ * "Ione/x" tokens and with the Chrome version reduced to `<major>.0.0.0`, as every Chrome
+ * sends it. Sites treat the extra tokens and an unreduced version as an embedded browser and
+ * serve degraded experiences; Zen likewise ships a standard Firefox UA.
+ */
+export function buildUserAgent(): string {
+  return chromeUserAgent(app.userAgentFallback, app.getName())
+}
+
+/**
+ * The OS's languages as BCP 47 tags, the UI locale first and the system's preferred list after
+ * it: what a fresh profile's preferred languages start from (`PlatformInfo.locales`).
+ */
+export function systemLocales(): string[] {
+  let preferred: string[] = []
+  try {
+    preferred = app.getPreferredSystemLanguages()
+  } catch {
+    // Not every platform reports a list; the locale alone is still expanded.
+  }
+  return [app.getLocale(), ...preferred]
+}
+
+/**
+ * Chrome's `Accept-Language` list for this system (see `acceptLanguages`): what the sessions
+ * send until the core hands the profile's preferred languages over (`setAcceptLanguages`).
+ */
+export function buildAcceptLanguages(): string {
+  const [locale, ...preferred] = systemLocales()
+  return acceptLanguages(locale, preferred)
+}

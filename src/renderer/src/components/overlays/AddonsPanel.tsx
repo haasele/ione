@@ -1,0 +1,220 @@
+import type { JSX } from 'react'
+import { useState } from 'react'
+import { FolderOpen, Link2, Plus, Trash2 } from 'lucide-react'
+import { S } from '@shared/strings'
+import type { Mod, UIState } from '@shared/types'
+import { useFadeEdges } from '@renderer/hooks/useFadeEdges'
+import { run } from '@renderer/lib/api'
+import { useViewport } from '@renderer/lib/formFactor'
+import { cn } from '@renderer/lib/utils'
+import { ExtensionsPage } from '../extensions/ExtensionsPage'
+import { V2Menulist } from '../extensions/V2Menulist'
+import { Button } from '../ui/button'
+import { Input } from '../ui/input'
+import { Switch } from '../ui/switch'
+import { EmptyNote, OverlayShell } from './OverlayShell'
+
+type Tab = 'extensions' | 'mods'
+
+/**
+ * §9.10's "Extensions and Mods" (Ctrl+Shift+A; Zen's Add-ons and Themes): extensions and chrome
+ * CSS mods. The title is the string table's `addons.open` – the app menu's row, the key table's
+ * and the palette's words (P-6). The Extensions tab is an in-content page that owns its
+ * scrolling (components/extensions/ExtensionsPage); on a phone the category column becomes a
+ * menulist above the page (v2 draft §6) whose options open in a bottom sheet (§9.13).
+ */
+export function AddonsPanel({ state }: { state: UIState }): JSX.Element {
+  const [tab, setTab] = useState<Tab>('extensions')
+  const phone = useViewport().formFactor === 'phone'
+  const fade = useFadeEdges<HTMLDivElement>({ axis: 'y' })
+  const tabs: Array<{ id: Tab; label: string }> = [
+    { id: 'extensions', label: 'Extensions' },
+    { id: 'mods', label: 'Mods' }
+  ]
+  return (
+    <OverlayShell title={S.title('addons.open')} variant="full">
+      <div className={cn('flex h-full', phone && 'flex-col')}>
+        {phone ? (
+          <div className="zen-v2 zen-v2-page shrink-0 px-4 pt-3 pb-1">
+            <V2Menulist
+              label="Category"
+              value={tab}
+              options={tabs.map((item) => ({ value: item.id, label: item.label }))}
+              onChange={setTab}
+            />
+          </div>
+        ) : (
+          <nav className="w-52 shrink-0 border-r border-[var(--zen-border)] px-2 pb-2">
+            {tabs.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={cn(
+                  'zen-squircle flex h-9 w-full items-center rounded-lg px-3 text-left text-[13px] hover:bg-[var(--zen-element-bg)]',
+                  tab === item.id && 'bg-[var(--zen-element-bg-active)] font-medium'
+                )}
+                onClick={() => setTab(item.id)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </nav>
+        )}
+        {tab === 'extensions' ? (
+          <ExtensionsPage state={state} />
+        ) : (
+          <div ref={fade} className="min-w-0 flex-1 overflow-y-auto p-6">
+            <div className="mx-auto flex max-w-2xl flex-col gap-5">
+              <ModsSection state={state} />
+            </div>
+          </div>
+        )}
+      </div>
+    </OverlayShell>
+  )
+}
+
+/** The Extensions section of Settings: the management page inside the Settings column. */
+export function ExtensionsSection({ state }: { state: UIState }): JSX.Element {
+  return <ExtensionsPage state={state} embedded />
+}
+
+export function ModsSection({ state }: { state: UIState }): JSX.Element {
+  const [editing, setEditing] = useState<string | null>(null)
+  const [url, setUrl] = useState('')
+  return (
+    <>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="text-[15px] font-semibold">Mods</h3>
+          <p className="mt-1 text-[12.5px] text-[var(--zen-muted)]">
+            Custom CSS for the browser chrome, like Zen&apos;s mods and <code>userChrome.css</code>.
+            Style hooks: <code>.zen-tab</code>, <code>.zen-essential</code>, <code>.zen-panel</code>
+            , <code>.zen-content-frame</code>, <code>.zen-toolbar-button</code>,{' '}
+            <code>[data-active]</code>.
+          </p>
+        </div>
+        <div className="flex shrink-0 gap-2">
+          <Button size="sm" variant="secondary" onClick={() => run('mod.importFile', undefined)}>
+            <FolderOpen className="mr-1.5 h-3.5 w-3.5" /> Import…
+          </Button>
+          <Button
+            size="sm"
+            onClick={() => {
+              void run('mod.add', { name: 'New mod', css: '/* your CSS */\n' })
+            }}
+          >
+            <Plus className="mr-1.5 h-3.5 w-3.5" /> New mod
+          </Button>
+        </div>
+      </div>
+      <div className="flex items-center gap-2">
+        <Link2 className="h-4 w-4 shrink-0 opacity-60" />
+        <Input
+          placeholder="https://example.com/mod.css"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && url.trim()) {
+              run('mod.importUrl', { url: url.trim() })
+              setUrl('')
+            }
+          }}
+        />
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={!url.trim()}
+          onClick={() => {
+            run('mod.importUrl', { url: url.trim() })
+            setUrl('')
+          }}
+        >
+          Import from URL
+        </Button>
+      </div>
+      {state.mods.length === 0 ? (
+        <EmptyNote>No mods installed.</EmptyNote>
+      ) : (
+        <ul className="zen-squircle overflow-hidden rounded-xl border border-[var(--zen-border)]">
+          {state.mods.map((mod) => (
+            <ModRow
+              key={mod.id}
+              mod={mod}
+              editing={editing === mod.id}
+              onToggleEdit={() => setEditing(editing === mod.id ? null : mod.id)}
+            />
+          ))}
+        </ul>
+      )}
+    </>
+  )
+}
+
+function ModRow({
+  mod,
+  editing,
+  onToggleEdit
+}: {
+  mod: Mod
+  editing: boolean
+  onToggleEdit: () => void
+}): JSX.Element {
+  const [css, setCss] = useState(mod.css)
+  const [name, setName] = useState(mod.name)
+  return (
+    <li className="border-b border-[var(--zen-border)] last:border-b-0">
+      <div className="flex items-center gap-3 px-4 py-3">
+        <div className="min-w-0 flex-1">
+          {editing ? (
+            <Input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onBlur={() =>
+                name.trim() !== mod.name && run('mod.update', { id: mod.id, patch: { name } })
+              }
+              className="h-7 max-w-xs"
+            />
+          ) : (
+            <button
+              type="button"
+              className="truncate text-left text-[13.5px] font-medium"
+              onClick={onToggleEdit}
+            >
+              {mod.name}
+            </button>
+          )}
+          <div className="truncate text-[11.5px] text-[var(--zen-muted)]">
+            {mod.source ?? `${mod.css.length.toLocaleString()} characters`}
+          </div>
+        </div>
+        <Button variant="ghost" size="sm" onClick={onToggleEdit}>
+          {editing ? 'Done' : 'Edit'}
+        </Button>
+        <Switch
+          checked={mod.enabled}
+          onCheckedChange={(v) => run('mod.update', { id: mod.id, patch: { enabled: v } })}
+        />
+        <button
+          type="button"
+          className="zen-toolbar-button h-7 w-7"
+          title="Remove mod"
+          onClick={() => run('mod.remove', { id: mod.id })}
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
+      </div>
+      {editing && (
+        <div className="px-4 pb-3">
+          <textarea
+            value={css}
+            spellCheck={false}
+            className="zen-squircle h-48 w-full resize-y rounded-xl bg-[var(--zen-element-bg)] p-2.5 font-mono text-[12px]"
+            onChange={(e) => setCss(e.target.value)}
+            onBlur={() => css !== mod.css && run('mod.update', { id: mod.id, patch: { css } })}
+          />
+        </div>
+      )}
+    </li>
+  )
+}

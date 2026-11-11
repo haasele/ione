@@ -1,0 +1,566 @@
+import type { SpaceTheme, ThemeAlgorithm, ThemeColor } from './types'
+
+export type RGB = [number, number, number]
+export type HSL = [number, number, number] // h 0..360, s 0..1, l 0..1
+
+export const clamp = (v: number, min: number, max: number): number =>
+  Math.min(max, Math.max(min, v))
+
+export function rgbToHsl([r, g, b]: RGB): HSL {
+  const rn = r / 255
+  const gn = g / 255
+  const bn = b / 255
+  const max = Math.max(rn, gn, bn)
+  const min = Math.min(rn, gn, bn)
+  const l = (max + min) / 2
+  if (max === min) return [0, 0, l]
+  const d = max - min
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
+  let h: number
+  if (max === rn) h = ((gn - bn) / d + (gn < bn ? 6 : 0)) * 60
+  else if (max === gn) h = ((bn - rn) / d + 2) * 60
+  else h = ((rn - gn) / d + 4) * 60
+  return [h, s, l]
+}
+
+export function hslToRgb([h, s, l]: HSL): RGB {
+  const hue = ((h % 360) + 360) % 360
+  if (s === 0) {
+    const v = Math.round(l * 255)
+    return [v, v, v]
+  }
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s
+  const p = 2 * l - q
+  const f = (t: number): number => {
+    let tt = t
+    if (tt < 0) tt += 1
+    if (tt > 1) tt -= 1
+    if (tt < 1 / 6) return p + (q - p) * 6 * tt
+    if (tt < 1 / 2) return q
+    if (tt < 2 / 3) return p + (q - p) * (2 / 3 - tt) * 6
+    return p
+  }
+  return [
+    Math.round(f(hue / 360 + 1 / 3) * 255),
+    Math.round(f(hue / 360) * 255),
+    Math.round(f(hue / 360 - 1 / 3) * 255)
+  ]
+}
+
+export function rgbToHex([r, g, b]: RGB): string {
+  return `#${[r, g, b].map((v) => clamp(Math.round(v), 0, 255).toString(16).padStart(2, '0')).join('')}`
+}
+
+export function hexToRgb(hex: string): RGB | null {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim())
+  if (!m) return null
+  const n = parseInt(m[1], 16)
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+}
+
+/**
+ * A computed CSS colour as `#rrggbbaa`, the form the Android host's `parseColor` takes – how a
+ * chrome token such as `--zen-scrim` is handed to native views: `rgb(r, g, b)`,
+ * `rgba(r, g, b, a)`, the modern `rgb(r g b / a)`, and `color(srgb r g b [/ a])`, the form the
+ * WebView serialises a `color-mix()` computed value in (`--v2-accent` is a `color-mix` of
+ * `--zen-accent`: `color(srgb 0.750588 0.772549 0.968627)` in the dark run's logcat), so the
+ * accent reads as a colour and not as '' and the host draws the space's live accent rather than
+ * its static `v2_accent_*` (W6-S14, after W6-D22's finding). The `color()` channels are 0–1
+ * numbers or percentages (`none` is a missing channel, 0); the alpha, a number or a percentage,
+ * is 1 when absent. Null for anything else (`transparent`, another colour space).
+ */
+export function cssColorToHex(value: string): string | null {
+  const v = value.trim()
+  const rgb =
+    /^rgba?\(\s*(\d+(?:\.\d+)?)\s*[, ]\s*(\d+(?:\.\d+)?)\s*[, ]\s*(\d+(?:\.\d+)?)\s*(?:[,/]\s*(\d*\.?\d+%?)\s*)?\)$/i.exec(
+      v
+    )
+  if (rgb) return hexOfChannels([+rgb[1], +rgb[2], +rgb[3]], rgb[4])
+  const srgb =
+    /^color\(\s*srgb\s+(none|-?\d*\.?\d+%?)\s+(none|-?\d*\.?\d+%?)\s+(none|-?\d*\.?\d+%?)\s*(?:\/\s*(none|-?\d*\.?\d+%?)\s*)?\)$/i.exec(
+      v
+    )
+  if (srgb) {
+    const channel = (c: string): number =>
+      c === 'none' ? 0 : c.endsWith('%') ? (parseFloat(c) / 100) * 255 : parseFloat(c) * 255
+    const alpha = srgb[4] === 'none' ? '0' : srgb[4]
+    return hexOfChannels([channel(srgb[1]), channel(srgb[2]), channel(srgb[3])], alpha)
+  }
+  return null
+}
+
+/** `#rrggbbaa` of 0–255 channels and a CSS alpha (a number 0–1 or a percentage; 1 when absent). */
+function hexOfChannels(rgb: number[], alpha: string | undefined): string {
+  const a =
+    alpha === undefined ? 1 : alpha.endsWith('%') ? parseFloat(alpha) / 100 : parseFloat(alpha)
+  const channels: number[] = [...rgb, a * 255]
+  return `#${channels.map((c) => clamp(Math.round(c), 0, 255).toString(16).padStart(2, '0')).join('')}`
+}
+
+export function mix(a: RGB, b: RGB, t: number): RGB {
+  const k = clamp(t, 0, 1)
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * k),
+    Math.round(a[1] + (b[1] - a[1]) * k),
+    Math.round(a[2] + (b[2] - a[2]) * k)
+  ]
+}
+
+/** Relative luminance (WCAG). */
+export function luminance([r, g, b]: RGB): number {
+  const lin = (c: number): number => {
+    const v = c / 255
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)
+  }
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+/** WCAG contrast ratio of two colours, 1 to 21. */
+export function contrastRatio(a: RGB, b: RGB): number {
+  const la = luminance(a)
+  const lb = luminance(b)
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
+}
+
+/** The chrome's two inks: near-white on a dark window, near-black on a light one. */
+export const LIGHT_INK: RGB = [240, 240, 245]
+export const DARK_INK: RGB = [30, 30, 36]
+
+/**
+ * Whether a colour reads as dark: a luminance under 0.45. The web-app tiles and the Android
+ * launcher split their letter ink on this reading (`tileInk`, `ShortcutTile.onColor`), so it
+ * stays; the chrome's own ink polarity is `wantsLightInk`, which goes by contrast.
+ */
+export function isDarkColor(rgb: RGB): boolean {
+  return luminance(rgb) < 0.45
+}
+
+/**
+ * The ink polarity for a window painted with these colours: the ink whose worst stop still has
+ * the most contrast, since one ink has to read over the whole gradient (a11y-30). The crossover
+ * for a single colour is a luminance near 0.19, not the 0.45 `isDarkColor` reads: on the
+ * mid-tones in between, light ink sits under 3:1 while dark ink clears 4.5:1, so a gradient from
+ * a mid-tone to a dark colour takes dark ink where a reading of its average alone picked white.
+ */
+export function wantsLightInk(colors: RGB[]): boolean {
+  if (colors.length === 0) return false
+  const worst = (ink: RGB): number => Math.min(...colors.map((c) => contrastRatio(ink, c)))
+  return worst(LIGHT_INK) > worst(DARK_INK)
+}
+
+// ---------------------------------------------------------------------------
+// Colour wheel <-> colour
+// ---------------------------------------------------------------------------
+
+/** Convert a normalised wheel position (0..1, centre = 0.5) to a colour: angle → hue, radius → saturation. */
+export function wheelToColor(x: number, y: number): RGB {
+  const dx = x - 0.5
+  const dy = y - 0.5
+  const radius = clamp(Math.sqrt(dx * dx + dy * dy) / 0.5, 0, 1)
+  const angle = (Math.atan2(dy, dx) * 180) / Math.PI
+  const hue = (angle + 360 + 90) % 360
+  return hslToRgb([hue, radius, 0.5 + (1 - radius) * 0.25])
+}
+
+export function colorToWheel(rgb: RGB): { x: number; y: number } {
+  const [h, s] = rgbToHsl(rgb)
+  const angle = ((h - 90) * Math.PI) / 180
+  const r = clamp(s, 0, 1) * 0.5
+  return { x: 0.5 + Math.cos(angle) * r, y: 0.5 + Math.sin(angle) * r }
+}
+
+function rotateOnWheel(primary: ThemeColor, degrees: number): ThemeColor {
+  const dx = primary.x - 0.5
+  const dy = primary.y - 0.5
+  const rad = (degrees * Math.PI) / 180
+  const x = 0.5 + dx * Math.cos(rad) - dy * Math.sin(rad)
+  const y = 0.5 + dx * Math.sin(rad) + dy * Math.cos(rad)
+  return { c: wheelToColor(x, y), x, y }
+}
+
+/**
+ * Given the primary colour, produce the derived secondary colours for a harmony algorithm.
+ * `floating` keeps whatever positions the user dragged the dots to.
+ */
+export function deriveColors(colors: ThemeColor[], algorithm: ThemeAlgorithm): ThemeColor[] {
+  const primary = colors.find((c) => c.isPrimary) ?? colors[0]
+  if (!primary || algorithm === 'floating') return colors
+  const count = colors.length
+  if (count <= 1) return colors
+  const angles: Record<Exclude<ThemeAlgorithm, 'floating'>, number[]> = {
+    complementary: [180, 180],
+    analogous: [30, -30],
+    splitComplementary: [150, -150],
+    triadic: [120, -120]
+  }
+  const offsets = angles[algorithm]
+  const secondary = colors.filter((c) => c !== primary)
+  return [
+    { ...primary, isPrimary: true },
+    ...secondary.map((_, i) => rotateOnWheel(primary, offsets[i % offsets.length]))
+  ]
+}
+
+export function toMonochrome(colors: ThemeColor[]): ThemeColor[] {
+  const primary = colors.find((c) => c.isPrimary) ?? colors[0]
+  if (!primary) return colors
+  const [h, s, l] = rgbToHsl(primary.c)
+  return colors.map((c, i) => {
+    if (c === primary) return { ...c, isPrimary: true }
+    const shift = i % 2 === 0 ? -0.18 : 0.18
+    return { ...c, c: hslToRgb([h, s * 0.8, clamp(l + shift * (1 + (i >> 1)), 0.08, 0.92)]) }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Theme → CSS
+// ---------------------------------------------------------------------------
+
+export const BASE_LIGHT: RGB = [242, 241, 245]
+export const BASE_DARK: RGB = [28, 28, 32]
+
+/**
+ * The default look's accent in the light scheme – the space colour a space with no theme takes
+ * (`resolveTheme`): `--zen-accent`'s value in `main.css`, the Indigo app icon's colour, the
+ * host's `zen_accent` (`colors.xml`). One literal, here.
+ */
+export const DEFAULT_ACCENT: RGB = [98, 100, 220]
+
+/**
+ * The control accent under the default look in the light scheme – the primary button, the on
+ * switch, the focus ring, the selection: the accent mixed 40 % into black, as `--v2-accent`
+ * mixes it (`main.css`: `color-mix(in srgb, var(--zen-accent) 40%, #000)`) and as the host's
+ * `v2_accent_light` stands in for it (`colors.xml`). For a surface that has no tokens of the
+ * chrome's – the PDF viewer's form widgets, drawn on white paper in either theme – and must not
+ * follow a space's own accent.
+ */
+export const DEFAULT_CONTROL_ACCENT_LIGHT: RGB = mix([0, 0, 0], DEFAULT_ACCENT, 0.4)
+
+export interface ResolvedTheme {
+  /** CSS `background` value for the browser window. */
+  background: string
+  /**
+   * The colours `background` is made of, evenly spaced along the gradient (one for a solid
+   * colour): what a blend between two themes interpolates (`blendResolvedThemes`).
+   */
+  stops: RGB[]
+  /** The gradient's angle in degrees (`rotation` of the space theme; 0 for a solid colour). */
+  rotation: number
+  /** Solid colour approximating the gradient (used for the content edge / fallbacks). */
+  averageColor: RGB
+  isDark: boolean
+  /** Accent colour used for the active tab, focus rings etc. */
+  accent: RGB
+  texture: number
+}
+
+/** The CSS `background` of evenly spaced `stops` at `rotation` degrees (a solid colour for one stop). */
+function gradientCss(stops: RGB[], rotation: number): string {
+  if (stops.length === 1) return rgbToHex(stops[0])
+  return `linear-gradient(${Math.round(rotation)}deg, ${stops
+    .map((c, i) => `${rgbToHex(c)} ${Math.round((i / (stops.length - 1)) * 100)}%`)
+    .join(', ')})`
+}
+
+/** `stops` re-sampled to `count` evenly spaced colours along the same gradient. */
+function resampleStops(stops: RGB[], count: number): RGB[] {
+  if (stops.length === count) return stops
+  if (stops.length === 1) return Array.from({ length: count }, () => stops[0])
+  return Array.from({ length: count }, (_, i) => {
+    const at = (i / (count - 1)) * (stops.length - 1)
+    const lo = Math.floor(at)
+    const hi = Math.min(stops.length - 1, lo + 1)
+    return mix(stops[lo], stops[hi], at - lo)
+  })
+}
+
+/**
+ * The theme `t` of the way from `a` to `b` (0 = `a`, 1 = `b`): every colour lerps, the gradient
+ * through its stops (re-sampled to the longer of the two so a solid colour blends into a
+ * gradient and back), the angle and the texture linearly. Which side counts as dark switches at
+ * the midpoint: the flag drives the ink and the page family's tokens, which do not interpolate.
+ * This is the phone chrome's theme blend (design language v2 §11.5; MOT-14 for the private
+ * theme): `useTheme` runs `t` linearly over 240 ms, so the window surfaces lerp while the page
+ * family switches at once, at 120 ms.
+ */
+export function blendResolvedThemes(a: ResolvedTheme, b: ResolvedTheme, t: number): ResolvedTheme {
+  const k = clamp(t, 0, 1)
+  if (k <= 0) return a
+  if (k >= 1) return b
+  const count = Math.max(a.stops.length, b.stops.length)
+  const from = resampleStops(a.stops, count)
+  const to = resampleStops(b.stops, count)
+  const stops = from.map((c, i) => mix(c, to[i], k))
+  const rotation = a.rotation + (b.rotation - a.rotation) * k
+  return {
+    background: gradientCss(stops, rotation),
+    stops,
+    rotation,
+    averageColor: mix(a.averageColor, b.averageColor, k),
+    isDark: k < 0.5 ? a.isDark : b.isDark,
+    accent: mix(a.accent, b.accent, k),
+    texture: a.texture + (b.texture - a.texture) * k
+  }
+}
+
+export function resolveTheme(theme: SpaceTheme | null, requestedScheme: boolean): ResolvedTheme {
+  // A theme pinned to one scheme (the private window's) is muted for that scheme under either OS setting.
+  const darkScheme = theme?.scheme ? theme.scheme === 'dark' : requestedScheme
+  const base = darkScheme ? BASE_DARK : BASE_LIGHT
+  if (!theme || theme.colors.length === 0) {
+    return {
+      background: rgbToHex(base),
+      stops: [base],
+      rotation: 0,
+      averageColor: base,
+      isDark: darkScheme,
+      accent: darkScheme ? [130, 132, 240] : DEFAULT_ACCENT,
+      texture: 0
+    }
+  }
+  let colors = deriveColors(theme.colors, theme.algorithm)
+  if (theme.monochrome) colors = toMonochrome(colors)
+  const tinted = colors.map((c) => {
+    // Zen mutes the raw colour so that the gradient stays readable behind the UI.
+    const muted = darkScheme ? mix(c.c, [0, 0, 0], 0.55) : mix(c.c, [255, 255, 255], 0.3)
+    return mix(base, muted, clamp(theme.opacity, 0, 1))
+  })
+  const avg: RGB = tinted.reduce<RGB>(
+    (acc, c) => [
+      acc[0] + c[0] / tinted.length,
+      acc[1] + c[1] / tinted.length,
+      acc[2] + c[2] / tinted.length
+    ],
+    [0, 0, 0]
+  )
+  const average: RGB = [Math.round(avg[0]), Math.round(avg[1]), Math.round(avg[2])]
+  const primary = colors.find((c) => c.isPrimary) ?? colors[0]
+  const rotation = tinted.length === 1 ? 0 : theme.rotation
+  return {
+    background: gradientCss(tinted, rotation),
+    stops: tinted,
+    rotation,
+    averageColor: average,
+    // The ink has to read on every stop of the gradient, not only on its average (a11y-30).
+    isDark: wantsLightInk(tinted),
+    accent: primary.c,
+    texture: clamp(theme.texture, 0, 1)
+  }
+}
+
+/**
+ * The wallpaper a space stands for: its gradient at full strength (the window mutes the colours
+ * under the chrome; a wallpaper shows them as they are), or the base colour of spaces that have
+ * no gradient.
+ */
+export function resolveWallpaper(theme: SpaceTheme | null, darkScheme: boolean): string {
+  if (!theme || theme.colors.length === 0) return resolveTheme(null, darkScheme).background
+  return resolveTheme({ ...theme, opacity: 1 }, darkScheme).background
+}
+
+export function makeTheme(primaryHex: string, extra: string[] = []): SpaceTheme {
+  const rgb = hexToRgb(primaryHex) ?? [120, 120, 220]
+  const pos = colorToWheel(rgb)
+  const colors: ThemeColor[] = [{ c: rgb, x: pos.x, y: pos.y, isPrimary: true }]
+  for (const hex of extra) {
+    const c = hexToRgb(hex)
+    if (!c) continue
+    const p = colorToWheel(c)
+    colors.push({ c, x: p.x, y: p.y })
+  }
+  return {
+    type: 'gradient',
+    colors,
+    opacity: 0.6,
+    texture: 0,
+    algorithm: 'floating',
+    monochrome: false,
+    rotation: 135
+  }
+}
+
+/**
+ * A theme as the theme editor writes it (`space.update`; NTP-14): the wheel's colours are the
+ * user's own choice, so a theme whose colours changed no longer follows the background picture
+ * (`SpaceTheme.fromImage`), and the editor never starts the following – only Settings' switch
+ * does. Edits that leave the colours – opacity, texture, angle, algorithm, monochrome – keep a
+ * following that was on, even from an editor whose copy of the theme predates the switch.
+ */
+export function editedTheme(
+  current: SpaceTheme | null,
+  next: SpaceTheme | null
+): SpaceTheme | null {
+  if (!next) return null
+  if (current?.fromImage === true && sameColors(current.colors, next.colors)) {
+    return next.fromImage === true ? next : { ...next, fromImage: true }
+  }
+  return next.fromImage === undefined ? next : unfollowedTheme(next)
+}
+
+/** `theme` following the picture no longer: the colours it has stay, as the space's own. */
+export function unfollowedTheme(theme: SpaceTheme): SpaceTheme {
+  const own = { ...theme }
+  delete own.fromImage
+  return own
+}
+
+function sameColors(a: ThemeColor[], b: ThemeColor[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((p, i) => {
+      const q = b[i]
+      return (
+        p.c[0] === q.c[0] &&
+        p.c[1] === q.c[1] &&
+        p.c[2] === q.c[2] &&
+        p.x === q.x &&
+        p.y === q.y &&
+        Boolean(p.isPrimary) === Boolean(q.isPrimary)
+      )
+    })
+  )
+}
+
+/**
+ * Zen's private-window look: a deep purple gradient regardless of the space theme, and dark
+ * under either scheme (an Incognito window is): muted towards paper for a light scheme it came
+ * out lavender, where neither ink reached 4.5:1 (a11y-30).
+ */
+export const PRIVATE_THEME: SpaceTheme = {
+  ...makeTheme('#5b3fa0', ['#2b1d4f', '#3f2c7a']),
+  opacity: 0.85,
+  scheme: 'dark'
+}
+
+/** Preset gradients offered in the theme picker / onboarding. */
+export const THEME_PRESETS: Array<{ name: string; theme: SpaceTheme }> = [
+  { name: 'Ione Purple', theme: makeTheme('#9d7cff', ['#ff8bd1']) },
+  { name: 'Ocean', theme: makeTheme('#4fa3ff', ['#5af0d6']) },
+  { name: 'Forest', theme: makeTheme('#4caf50', ['#c8e06e']) },
+  { name: 'Sunset', theme: makeTheme('#ff7a59', ['#ffc857', '#ff4f9a']) },
+  { name: 'Rose', theme: makeTheme('#ff6b9d', ['#ffb3c6']) },
+  { name: 'Slate', theme: makeTheme('#7d8ba1', ['#a9b8cf']) }
+]
+
+/**
+ * The name Settings › Appearance's theme row reads for a space's theme (settings-30; Chrome's
+ * `themeSublabel_` names the installed theme, "Chrome colours" for a picked colour and nothing
+ * for the classic theme): "Default" for the base look, a preset's name while the theme is that
+ * preset as the picker wrote it, "From image" while the colours follow the background picture,
+ * else "Custom" – a preset the editor changed, or colours of the user's own.
+ */
+export function themeName(theme: SpaceTheme | null): string {
+  if (!theme || isDefaultLook(theme)) return 'Default'
+  if (theme.fromImage === true) return 'From image'
+  const preset = THEME_PRESETS.find((p) => sameTheme(p.theme, theme))
+  return preset ? preset.name : 'Custom'
+}
+
+/** Whether a space has the base look – no theme, or one with no colours (what `resolveTheme` paints as the base). */
+export function isDefaultLook(theme: SpaceTheme | null): boolean {
+  return !theme || theme.colors.length === 0
+}
+
+/**
+ * How far the OS accent is lifted toward white in the dark scheme (settings-116; #572's L9):
+ * the default look's own dark step – its accent pair goes 98/100 → 130/132 on red and green,
+ * a fifth of the way to white (`resolveTheme`) – so an accent read from the OS reads on the
+ * dark chrome as the default look's does: Windows' `#0078d4` on `BASE_DARK` is 3.75:1 raw and
+ * 5.14:1 lifted, beside the default dark accent's 5.26:1. The controls' accent follows, mixed
+ * from it (`--v2-accent`). A themed space's accent is its own colour in both schemes
+ * (`resolveTheme`), and is not this function's.
+ */
+export const DARK_ACCENT_LIFT = 0.2
+
+/**
+ * The resolved theme with the OS accent in the theme's own (settings-116; Chrome's
+ * `follows_system_colors`, whose `kColorAccent` is the OS accent): `--zen-accent` takes it, and
+ * with it the controls' accent the tokens mix from it (`--v2-accent`: the primary button, the
+ * on switch, the focus ring, the selection). The default look alone – a themed space keeps the
+ * accent its colours give it, as Chrome's follow yields to an installed theme – and only where
+ * the host read an accent (`UIState.systemAccent`; Windows and macOS) and the switch is on. In
+ * the dark scheme the accent takes the resolver's dark step (`DARK_ACCENT_LIFT`), as the
+ * default look's own accent does; in the light scheme it is the OS's colour as read.
+ */
+export function withSystemAccent(
+  resolved: ResolvedTheme,
+  theme: SpaceTheme | null,
+  accent: string | null
+): ResolvedTheme {
+  if (!accent || !isDefaultLook(theme)) return resolved
+  const rgb = hexToRgb(accent)
+  if (!rgb) return resolved
+  return {
+    ...resolved,
+    accent: resolved.isDark ? mix(rgb, [255, 255, 255], DARK_ACCENT_LIFT) : rgb
+  }
+}
+
+function sameTheme(a: SpaceTheme, b: SpaceTheme): boolean {
+  return (
+    a.opacity === b.opacity &&
+    a.texture === b.texture &&
+    a.algorithm === b.algorithm &&
+    a.monochrome === b.monochrome &&
+    a.rotation === b.rotation &&
+    (a.scheme ?? null) === (b.scheme ?? null) &&
+    sameColors(a.colors, b.colors)
+  )
+}
+
+/**
+ * Base colour of panels, sheets and popovers: paper (or near-black) carrying the space's own
+ * colour, the way Zen's popups are a few percent of the primary colour over white or `#101010`.
+ */
+export function panelBase(resolved: ResolvedTheme): RGB {
+  return resolved.isDark
+    ? mix(resolved.averageColor, [16, 16, 16], 0.45)
+    : mix(resolved.averageColor, [255, 255, 255], 0.7)
+}
+
+/** The chrome's ink (`--zen-fg`) on a resolved theme. */
+export function themeInk(resolved: ResolvedTheme): RGB {
+  return resolved.isDark ? LIGHT_INK : DARK_INK
+}
+
+/**
+ * Height (px) of the chrome's header row: the sidebar's title row (6px inset + 32px row) that
+ * holds the window buttons on Linux, and the native caption buttons on Windows.
+ */
+export const CAPTION_HEIGHT = 38
+
+/** Colours of the native caption buttons Windows draws over the chrome (Window Controls Overlay). */
+export interface CaptionColors {
+  /** Background behind the buttons as `#rrggbbaa`. */
+  color: string
+  /** Glyph colour as `#rrggbb`. */
+  symbolColor: string
+}
+
+/**
+ * The caption buttons sit on the space gradient itself: their rest background is the theme's
+ * solid colour at alpha 0 (Windows derives the hover fill's polarity from the opaque channels,
+ * so a dark space still gets a light hover), and the glyphs use the chrome's ink.
+ */
+export function captionColors(resolved: ResolvedTheme): CaptionColors {
+  return {
+    color: `${rgbToHex(resolved.averageColor)}00`,
+    symbolColor: rgbToHex(themeInk(resolved))
+  }
+}
+
+export function themeCssVariables(resolved: ResolvedTheme): Record<string, string> {
+  const fg = themeInk(resolved)
+  // Space separated so `rgb(var(--zen-fg-rgb) / 0.1)` is valid modern colour syntax.
+  const fgRgb = fg.join(' ')
+  return {
+    '--zen-bg': resolved.background,
+    '--zen-bg-solid': rgbToHex(resolved.averageColor),
+    '--zen-fg': rgbToHex(fg),
+    '--zen-fg-rgb': fgRgb,
+    '--zen-accent': rgbToHex(resolved.accent),
+    '--zen-accent-rgb': resolved.accent.join(' '),
+    '--zen-panel-rgb': panelBase(resolved).join(' '),
+    '--zen-texture': String(resolved.texture)
+  }
+}

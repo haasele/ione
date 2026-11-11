@@ -1,0 +1,1221 @@
+import {
+  app,
+  clipboard,
+  dialog,
+  ipcMain,
+  nativeTheme,
+  net,
+  session,
+  shell,
+  systemPreferences,
+  webContents,
+  type IpcMainEvent,
+  type Session,
+  type WebContents
+} from 'electron'
+import { readFileSync, statSync, writeFileSync } from 'node:fs'
+import { release } from 'node:os'
+import { basename, join } from 'node:path'
+import type {
+  HostCapabilities,
+  NewTabPageAction,
+  NewTabPageState,
+  Platform as PlatformOs
+} from '../../shared/types'
+import { isNewTabUrl } from '../../shared/url'
+import { contentSettingId } from '../../shared/contentSettings'
+import { SCREEN_CAPTURE_INTENT_CHANNEL } from '../../shared/screenCapture'
+import { PRIVATE_WORLD_CHANNELS } from '../../shared/privateWorld'
+import {
+  NOTIFICATION_PERMISSION_CHANNEL,
+  NOTIFICATION_REQUEST_CHANNEL,
+  type NotificationPermissionStatus
+} from '../../shared/notifications'
+import { Browser } from '../../core/browser'
+import { macTitleBarDoubleClickAction } from '../../core/captionDoubleClick'
+import { MEDIA_HUB_INACTIVE_MS } from '../../core/mediaSession'
+import { isStorageAccessPermission, permissionSite } from '../../core/permissions'
+import type {
+  AppHost,
+  ClipboardHost,
+  ConfirmOptions,
+  DialogHost,
+  LanguagesHost,
+  MediaHubHost,
+  NetHost,
+  PageFontsHost,
+  PageMessage,
+  PasswordsHost,
+  PerformanceHost,
+  PickedTextFile,
+  Platform,
+  PlatformInfo,
+  ShellHost,
+  ThemeHost
+} from '../../core/platform'
+import type { ZenWindow } from '../../core/window'
+import type { WindowSwitches } from '../cli'
+import { MediaAccessGate, mediaRefusedMessage } from './mediaAccess'
+import {
+  readSystemAccent,
+  systemAccentReadable,
+  watchSystemAccent,
+  type SystemAccentSource
+} from './accent'
+import { DEFAULT_CONTAINER_ID, PRIVATE_CONTAINER_ID } from '../../shared/types'
+import { resolveDownloadSettings } from '../../shared/downloads'
+import {
+  DISMISSED_ANSWER,
+  PAGE_DIALOG_CHANNEL,
+  sanitizeDialogCall,
+  type PageDialogAnswer
+} from '../../shared/pageDialogIpc'
+import {
+  PAGE_PROMPT_CHANNEL,
+  sanitizePromptCall,
+  type PagePromptAnswer
+} from '../../shared/pagePromptIpc'
+import { FileStoreIO } from './storeIo'
+import { SessionManager, buildUserAgent, systemLocales } from './sessions'
+import { acceptLanguageList } from '../../shared/languages'
+import { installFaviconProtocol, installZenProtocol } from './protocol'
+import { desktopVersionFacts, readDesktopVersionInput } from './versionFacts'
+import { chromiumLicencesResponder } from './licences'
+import { ElectronDownloads, downloadDir } from './downloads'
+import { ElectronDownloadsShell } from './downloadsShell'
+import { DockBadge } from './dockBadge'
+import { ElectronAppBadges } from './appBadges'
+import { ElectronMenus } from './menus'
+import { ElectronTabViewHost, copyImageFromUrl } from './views'
+import { ElectronWindowFactory, type ElectronWindow } from './window'
+import { ElectronNewTabBackground } from './newTabBackground'
+import { ExtensionService } from './extensions'
+import { WebstoreBridge } from './webstoreBridge'
+import { ExtensionApiHost } from './extensionApi'
+import { electronDownloadBridge } from './extensionApi/downloadsBridge'
+import { createDnrSink } from './extensionApi/dnrSink'
+import { ExtensionFavicons, faviconRequestHandler } from './extensionApi/favicons'
+import { ExtensionResourceOrigin } from './extensionApi/resourceOrigin'
+import { edgeStoreUserAgent, navigationClientHints, webstoreClientHints } from './requestHeaders'
+import { ResourceGovernor } from './resources/governor'
+import { ElectronSyncHost } from '../sync/host'
+import { ElectronAgentTransport } from '../agent/server'
+import { SkillInstaller } from '../agent/skills'
+import { CookiePolicyEnforcer, ElectronSiteData } from './siteData'
+import { ElectronTranslateHost, focusedChromeWebContents } from './translate'
+import { ElectronPrintingHost } from './printing'
+import { ElectronUpdateHost } from './updates'
+import { applyAppIcon, iconPngPath, privateIconPath } from './appIcon'
+import { ElectronDefaultBrowser } from './defaultBrowser'
+import { ElectronShortcuts } from './shortcuts'
+import { ensureWindowsAppIdRegistered, notificationPermissionStatus } from './notifications'
+import { PRIVATE_APP_USER_MODEL_ID, privateRelaunchDisplayName } from './privateTaskbar'
+import {
+  NotificationRequestRelay,
+  decideNotificationRequest,
+  relayedFrom
+} from './notificationRequests'
+import { createPasswordsHost } from './passwords'
+import { SafeStorageSecrets } from './secrets'
+import { attachWebAuthnHandlers, configurePlatformAuthenticators } from './webauthn'
+import { attachBluetoothChoosers, attachDeviceHandlers } from './devices'
+import {
+  attachSecurityHandlers,
+  permissionCheckDetails,
+  permissionName,
+  permissionRequestDetails
+} from './security'
+import { electronPerformanceHost } from './backgroundWork'
+import { quitChordOf } from './devtoolsKeys'
+import { QUIT_HOLD_COVER_CHANNEL, primeChromeForRelease } from './quitHoldKeys'
+import createBackgroundWorker from './backgroundWorker?nodeWorker'
+import { ElectronBlocking, ElectronBundledLists, bundledListsDirectory } from './blocking'
+import { supportsWindowMaterial } from './appShell'
+import { ElectronPrivacy } from './privacy'
+import { ContentRulesHandler, attachContentGuards } from './contentRules'
+import { attachDocumentStart, registerDocumentStartProvider } from './documentStart'
+import { ElectronSpellcheck } from './spellcheck'
+import { openProxySettings } from './systemSettings'
+import { ElectronScreenCapture } from './screenCapture'
+import { StartupHold, extensionLayerNeedsHold } from './startupHold'
+import { ElectronShareSheet } from './shareSheet'
+import { ElectronGeolocation } from './geolocation'
+import { ElectronImportHost } from './importHost'
+import { ElectronTaskHost } from './tasks'
+import { ElectronMpris } from './mpris'
+import { ElectronSpeechHost } from './speech'
+import { sharedSpeechEngine } from './extensionApi/ttsBridge'
+
+export const ELECTRON_CAPABILITIES: HostCapabilities = {
+  windowControls: true,
+  windowControlsOverlay: process.platform === 'win32',
+  windowMaterial: supportsWindowMaterial(process.platform, release()),
+  nativeWindowControls: true,
+  // Frameless windows can be `transparent`, letting the compositor show what is behind them
+  // (Settings › Appearance › Window transparency; Hyprland, niri, KWin).
+  windowTransparency: true,
+  nativeMenus: true,
+  windowDrag: true,
+  devtools: true,
+  compactReveal: true,
+  pictureInPicture: true,
+  viewSource: true,
+  windows: true,
+  extensions: true,
+  resourceGovernor: true,
+  sync: true,
+  print: true,
+  // Pages render to PDF (`printToPDF`) and printers are listed (`getPrintersAsync`): Ctrl+P opens
+  // Ione's preview; Chromium's own preview is not part of Electron.
+  printPreview: true,
+  // `webContents.savePage` writes HTMLComplete, HTMLOnly and MHTML: Save Page As is the submenu.
+  savePageFormats: true,
+  // Chromium's PDF viewer draws PDFs in the page itself.
+  pdfViewer: false,
+  // Chromium's viewer prints its own document; no PDF hand-off to a system print flow.
+  pdfPrint: false,
+  agents: true,
+  // Claude Code, Cursor, Codex, OpenCode, Gemini CLI and GitHub Copilot run beside the browser:
+  // the skill installs into each tool's folder, plus the shared `~/.agents/skills` folder.
+  agentSkills: true,
+  updates: true,
+  share: false,
+  sharePanel: false,
+  clipboardChip: false,
+  appLinkSettings: false,
+  pullToRefresh: false,
+  passwords: true,
+  // Status from the OS (shell association, LaunchServices, xdg-settings); the request opens
+  // Windows Settings, the macOS prompt or runs xdg-settings (platform/defaultBrowser.ts).
+  defaultBrowser: true,
+  requestBlocking: true,
+  reducedExtensionIsolation: false,
+  pageControls: false,
+  darkenSites: true,
+  // Private browsing is a window of its own on desktop (`windows`).
+  privateTabs: false,
+  inactiveTabs: false,
+  secureDns: true,
+  quitsThroughCore: true,
+  lookalikeHolds: true,
+  // `zen://newtab` is served by the zen protocol and bridged by the page preload.
+  newTabPage: true,
+  // Settings is a page tab in the content area (`pages/settings`, design language v2 §10.5).
+  pageTabs: true,
+  // Installed web apps get a launcher (Start menu / applications menu / ~/Applications) that
+  // opens them in a window of their own (platform/shortcuts.ts, MW-22 / MW-23).
+  pinShortcuts: true,
+  translate: true,
+  // No speech recogniser on the desktop hosts; the mic buttons stay away.
+  voiceSearch: false,
+  screenCapture: true,
+  shareSheet: true,
+  // Selected text gets the page context menu on the desktop; the floating toolbar is Android's.
+  selectionToolbar: false,
+  // The mini menu over a settled selection (CT-39): the page preload reports the selection
+  // (`shared/selectionScript`) and the chrome draws the pill; the phone's floating toolbar is
+  // its selection menu, so the phone leaves this unset.
+  selectionMenu: true,
+  // The autofill picker floats in a `WebContentsView` above the pages (`ElectronWindow.setPopupSurface`).
+  popupSurface: true,
+  // No camera to scan with on the desktop hosts; the camera buttons stay away.
+  qrScan: false,
+  // Chromium's `speechSynthesis` behind a hidden page (`platform/speech.ts`).
+  readAloud: true,
+  // Every session's `Accept-Language` follows the preferred languages (`session.setUserAgent`).
+  pageLanguages: true,
+  // Blink on the desktop maps `serif` / `sans-serif` / `monospace` through the web preferences.
+  genericFontFamilies: true,
+  // Electron 44's `webContents.setCaretBrowsingEnabled` (`platform/views.ts`), F7's toggle.
+  caretBrowsing: true,
+  // DESKTOP FYI (Q1, the observable landing): the page's `WebContentsView` composites above the
+  // chrome and the main process places it synchronously, so the chrome's stand-ins leave as
+  // they always have; nothing here answers a placement with the view's drawn frame. Were the
+  // desktop ever to want the §11 rule too (`hideFollowsCover` records the frame it lost on the
+  // hide side, #299 F1), the answer would be `ElectronTabView`'s, from the view's
+  // `paint`/`did-frame-finish-load`-class signal, and this flag turns the chrome's waits on.
+  placementAnswered: false,
+  agentDialogs: true,
+  agentDialogPolicy: true,
+  // An agent's tab keeps its native prompts from the user (`AgentService.routePrompt`): file
+  // choosers over the DevTools protocol and the preload's `print` / File System Access shims
+  // (`ElectronTabView.interceptAgentPrompts`), the rest through the core's own prompts.
+  agentPrompts: [
+    'file-chooser',
+    'download',
+    'http-auth',
+    'client-certificate',
+    'permission',
+    'screen-capture',
+    'device-chooser',
+    'device-pairing',
+    'external-protocol',
+    'print'
+  ]
+}
+
+/**
+ * Zen's browser core running inside Electron's main process. Everything here adapts Electron's
+ * APIs to the `Platform` contract; the behaviour itself lives in `src/core`.
+ */
+export class ElectronPlatform implements Platform {
+  readonly info: PlatformInfo
+  readonly capabilities = ELECTRON_CAPABILITIES
+  readonly io: FileStoreIO
+  readonly windows: ElectronWindowFactory
+  readonly views: ElectronTabViewHost
+  readonly menus: ElectronMenus
+  readonly sessions: SessionManager
+  readonly downloads: ElectronDownloads
+  readonly dialogs: DialogHost
+  readonly clipboard: ClipboardHost
+  readonly shell: ShellHost
+  readonly net: NetHost
+  readonly app: AppHost
+  readonly theme: ThemeHost
+  /** The preferred languages as every session's `Accept-Language` (CT-41). */
+  readonly languages: LanguagesHost
+  /** The page fonts in every page view's web preferences, live where the debugger is free (CT-25). */
+  readonly pageFonts: PageFontsHost
+  readonly siteData: ElectronSiteData
+  readonly passwords: PasswordsHost
+  readonly blocking: ElectronBundledLists
+  readonly privacy: ElectronPrivacy
+  /** The `worker_threads` worker the core's heavy parsing runs in, and the demo drivers' hold on the startup sweeps. */
+  readonly performance: PerformanceHost
+  /** The webRequest multiplexer and text matcher; created with the browser in `start`. */
+  requestBlocking!: ElectronBlocking
+  readonly translate: ElectronTranslateHost
+  /** Chromium's per-session spellchecker, one setting for every session. */
+  readonly spellcheck: ElectronSpellcheck
+  /** The print preview's printers and Save as PDF dialog. */
+  readonly printing = new ElectronPrintingHost(browserWindowOf)
+  /** Default-browser status and registration on Windows, macOS and Linux. */
+  readonly defaultBrowser = new ElectronDefaultBrowser()
+  /** Installed web apps' launchers and icons (MW-22). */
+  readonly shortcuts: ElectronShortcuts
+  /** `getDisplayMedia`: the sources behind the core's picker and the grant to the engine (MW-19). */
+  readonly screenCapture: ElectronScreenCapture
+  /** Shared files to the downloads folder; macOS's own share sheet (MW-21). */
+  readonly shareSheet: ElectronShareSheet
+  /** The Wi-Fi scan behind the network location provider; Linux and Windows have a scanner (MW-04). */
+  readonly geolocation = new ElectronGeolocation()
+  /** Cross-device sync: the system folder dialog, the hostname, a node:fs folder transport (ID-08). */
+  readonly sync = new ElectronSyncHost()
+  /** The sync server's app password and the like, `safeStorage`-encrypted under the profile (ID-32). */
+  readonly secrets: SafeStorageSecrets
+  /** Other browsers' profiles on this machine for Settings > Import (ID-23). */
+  readonly importHost = new ElectronImportHost()
+  /** The task manager page's process list (`zen://tasks`); its network count attaches in `start`. */
+  readonly tasks: ElectronTaskHost
+  /** The `ione-browser` Agent Skill into the coding harnesses' skills folders (Settings › AI Agents). */
+  readonly agentSkills: SkillInstaller
+  /** Linux: Ione as an MPRIS player on the session bus (MW-18). */
+  readonly mediaSession?: ElectronMpris
+  /** The media hub's linger for a paused session: Chrome's 60 minutes, or a drive's `ZEN_MEDIA_LINGER_MS`. */
+  readonly mediaHub: MediaHubHost = { inactiveAfterMs: mediaHubLingerMs() }
+  /** Read aloud's voices and utterances over the hidden `speechSynthesis` page (CT-12 / CT-13). */
+  readonly speech: ElectronSpeechHost = new ElectronSpeechHost(sharedSpeechEngine())
+  readonly newTabBackground: ElectronNewTabBackground
+  /**
+   * The dock badge's (macOS) and launcher count's (Linux) one owner: the downloads' unseen count
+   * and the installed apps' badges (MW-51) share the icon through it.
+   */
+  readonly dockBadge = new DockBadge()
+  /** Taskbar progress, dock badge and completion notifications for downloads. */
+  downloadsShell: ElectronDownloadsShell | null = null
+  /** Installed apps' badges (MW-51): the taskbar overlay per app window on Windows, the dock elsewhere. */
+  appBadges: ElectronAppBadges | null = null
+  browser!: Browser
+  private readonly profileDir: string
+  /**
+   * macOS's own camera / microphone consent (os-59, `mediaAccess.ts`), asked before the first
+   * site prompt for a device; a refusal is told to the user once per device per run.
+   */
+  private readonly mediaAccess = new MediaAccessGate({
+    platform: process.platform,
+    system: systemPreferences,
+    onRefused: (kind, status) => {
+      console.warn(`[zen] media: the system withholds the ${kind} (${status})`)
+      this.browser?.toast(mediaRefusedMessage(kind), 'error')
+    }
+  })
+  /** The gesture behind each page's `Notification.requestPermission()`, relayed by its preload. */
+  private readonly notificationRequests = new NotificationRequestRelay()
+
+  constructor(
+    private readonly userDataDir: string,
+    options: {
+      holdBackgroundWork?: boolean
+      /** `--test-quit-hold` was on the command line: the quit chord holds on every OS (the drives). */
+      quitHoldEverywhere?: boolean
+      /** The launch's `--kiosk` / `--start-maximized` (`cli.ts`), for every browser window. */
+      windowSwitches?: WindowSwitches
+      /**
+       * `--zen-region` / `ZEN_REGION` (`cli.ts` `regionOverride`): the region reported in the
+       * OS's place, for the EEA's search-engine choice screen (W6-2); a normal launch has none.
+       */
+      regionOverride?: string | null
+      /**
+       * `--test-system-accent=<hex>` (`accent.ts`): the drives' OS accent where the X server has
+       * none (settings-116); a normal launch carries none and the OS's accent stands.
+       */
+      systemAccentOverride?: string | null
+    } = {}
+  ) {
+    this.info = {
+      os: process.platform as PlatformOs,
+      version: app.getVersion(),
+      locales: systemLocales(),
+      // The OS's region as Electron reads it (`''` when it cannot tell), the override first.
+      region: options.regionOverride ?? app.getLocaleCountryCode()
+    }
+    this.performance = electronPerformanceHost({
+      holdBackgroundWork: options.holdBackgroundWork === true,
+      spawnWorker: () => createBackgroundWorker({})
+    })
+    this.profileDir = join(userDataDir, 'zen')
+    this.io = new FileStoreIO(this.profileDir)
+    this.secrets = new SafeStorageSecrets(this.io)
+    this.agentSkills = new SkillInstaller({ version: this.info.version, io: this.io })
+    this.blocking = new ElectronBundledLists(bundledListsDirectory(), this.profileDir)
+    this.newTabBackground = new ElectronNewTabBackground(join(this.profileDir, 'newtab'))
+    // The launcher confirms to the core once its files are written (the browser exists by then:
+    // pins are asked for from a page).
+    this.shortcuts = new ElectronShortcuts(join(this.profileDir, 'webapps'), (id, details) =>
+      this.browser.webApps.onPinned(id, details)
+    )
+    this.windows = new ElectronWindowFactory(options.windowSwitches)
+    this.translate = new ElectronTranslateHost(userDataDir, () =>
+      focusedChromeWebContents((id) => this.windows.windowForWebContents(id) !== undefined)
+    )
+    this.sessions = new SessionManager(buildUserAgent())
+    this.spellcheck = new ElectronSpellcheck(this.sessions)
+    this.downloads = new ElectronDownloads(
+      () => {
+        const downloads = resolveDownloadSettings(this.browser.state.settings)
+        return { askWhereToSave: downloads.askWhereToSave, directory: downloads.directory }
+      },
+      () => this.browser.state.settings.appIcon
+    )
+    // The views hand "Save … As…" downloads to the downloads host, which then asks where to save.
+    this.views = new ElectronTabViewHost(this.sessions, this.downloads)
+    this.tasks = new ElectronTaskHost({
+      tabIdForWebContents: (id) => {
+        const wc = webContents.fromId(id)
+        return wc ? this.views.tabIdForWebContents(wc) : undefined
+      },
+      chromeWindowId: (id) => this.windows.windowForWebContents(id)?.id ?? null,
+      markEndedByUser: (id) => this.views.noteEndedByUser(id)
+    })
+    this.screenCapture = new ElectronScreenCapture(this.views, () => this.browser.screenCapture)
+    // The hub's Save writes where every other save goes (`downloadDir`: the configured folder,
+    // else the platform's Downloads – made, not $HOME, where Electron lands without an XDG dir).
+    this.shareSheet = new ElectronShareSheet(downloadDir, (win) => browserWindowOf(win))
+    if (process.platform === 'linux') this.mediaSession = new ElectronMpris(() => this.browser)
+    // The core's Safe Browsing service exists once the browser does (`start`); no request runs before.
+    this.privacy = new ElectronPrivacy(
+      this.views,
+      { lookup: (url) => (this.browser ? this.browser.protection.safeBrowsing.lookup(url) : null) },
+      undefined,
+      undefined,
+      // The jar's half of the per-site cookie policy: never-sites' cookies go as they land.
+      new CookiePolicyEnforcer(this.sessions),
+      // The lookalike hold (PS-18): the core's verdict on a tab's main-frame request.
+      { check: (url) => (this.browser ? this.browser.protection.checkLookalike(url) : null) }
+    )
+    this.siteData = new ElectronSiteData(this.sessions)
+    this.menus = new ElectronMenus()
+    this.dialogs = {
+      confirm: async (options: ConfirmOptions, win?: ZenWindow) => {
+        const bw = browserWindowOf(win)
+        const message = {
+          type: 'question' as const,
+          buttons: [options.okLabel, options.cancelLabel],
+          defaultId: options.danger ? 1 : 0,
+          cancelId: 1,
+          message: options.message,
+          detail: options.detail,
+          noLink: true
+        }
+        const result = bw
+          ? await dialog.showMessageBox(bw, message)
+          : await dialog.showMessageBox(message)
+        return result.response === 0
+      },
+      pickTextFiles: async (options, win?: ZenWindow) => {
+        const bw = browserWindowOf(win)
+        const dialogOptions = {
+          title: options.title,
+          properties: ['openFile' as const],
+          filters: [
+            { name: options.extensions.join(', ').toUpperCase(), extensions: options.extensions }
+          ]
+        }
+        const result = bw
+          ? await dialog.showOpenDialog(bw, dialogOptions)
+          : await dialog.showOpenDialog(dialogOptions)
+        if (result.canceled) return []
+        const files: PickedTextFile[] = []
+        for (const path of result.filePaths) {
+          if (options.maxBytes !== undefined && statSync(path).size > options.maxBytes) continue
+          files.push({ name: basename(path), text: readFileSync(path, 'utf8') })
+        }
+        return files
+      },
+      pickFiles: async (options, win?: ZenWindow) => {
+        const bw = browserWindowOf(win)
+        const dialogOptions = {
+          title: options.title,
+          properties: ['openFile' as const, 'multiSelections' as const]
+        }
+        const result = bw
+          ? await dialog.showOpenDialog(bw, dialogOptions)
+          : await dialog.showOpenDialog(dialogOptions)
+        return result.canceled ? [] : result.filePaths
+      },
+      saveTextFile: async (options, win?: ZenWindow) => {
+        const bw = browserWindowOf(win)
+        const dialogOptions = {
+          title: options.title,
+          defaultPath: join(app.getPath('downloads'), options.defaultName),
+          filters: [
+            { name: options.extensions.join(', ').toUpperCase(), extensions: options.extensions }
+          ]
+        }
+        const result = bw
+          ? await dialog.showSaveDialog(bw, dialogOptions)
+          : await dialog.showSaveDialog(dialogOptions)
+        if (result.canceled || !result.filePath) return false
+        try {
+          writeFileSync(result.filePath, options.text, 'utf8')
+          return true
+        } catch (error) {
+          console.warn('[zen] save file:', (error as Error).message)
+          return false
+        }
+      }
+    }
+    this.passwords = createPasswordsHost()
+    this.clipboard = {
+      // Asynchronous since Electron 44; the host contract stays fire-and-forget. Electron has no
+      // sensitive flag for the system clipboard; the core's timed clearing covers desktop.
+      writeText: (text) =>
+        void clipboard
+          .writeText(text)
+          .catch((error: Error) => console.warn('[zen] clipboard:', error.message)),
+      writeImageFromUrl: (url) => copyImageFromUrl(url),
+      readText: () => clipboard.readText().catch(() => ''),
+      clearText: async (expected) => {
+        try {
+          if ((await clipboard.readText()) === expected) clipboard.clear()
+        } catch (error) {
+          console.warn('[zen] clipboard:', (error as Error).message)
+        }
+      }
+    }
+    this.shell = {
+      openExternal: (url) => void shell.openExternal(url),
+      openPath: async (path) => {
+        await shell.openPath(path)
+      },
+      showItemInFolder: (path) => shell.showItemInFolder(path),
+      // Settings › System's door to the computer's proxy settings, per OS as Chrome opens it.
+      openProxySettings: () => openProxySettings()
+    }
+    this.net = {
+      fetchText: async (url, options) => {
+        const signals = [
+          options.signal,
+          options.timeoutMs && AbortSignal.timeout(options.timeoutMs)
+        ]
+        const live = signals.filter((s): s is AbortSignal => Boolean(s))
+        const target = redirectedOrigin(url)
+        const res = await net.fetch(target.url, {
+          method: options.method ?? 'GET',
+          body: options.method === 'POST' ? (options.body ?? '') : undefined,
+          signal: live.length > 0 ? AbortSignal.any(live) : undefined,
+          headers: target.origin
+            ? { ...options.headers, 'x-zen-origin': target.origin }
+            : options.headers,
+          cache: 'no-store'
+        })
+        const headers: Record<string, string> = {}
+        for (const name of ['etag', 'last-modified', 'content-type']) {
+          const value = res.headers.get(name)
+          if (value) headers[name] = value
+        }
+        if (!res.ok) return { ok: false, status: res.status, text: '', headers }
+        if (options.maxBytes !== undefined) {
+          // The cap bounds the download: the body is read in chunks and dropped, the connection
+          // with it, as soon as it runs past the cap (the same failure shape as Android's).
+          const text = await readCapped(res, options.maxBytes)
+          if (text === null) return { ok: false, status: 0, text: '', headers: {} }
+          return { ok: true, status: res.status, text, headers }
+        }
+        return { ok: true, status: res.status, text: await res.text(), headers }
+      },
+      resolveHost: async (host, options) => {
+        if (options.signal?.aborted) return false
+        try {
+          const timeout = new Promise<false>((resolve) => {
+            const timer = setTimeout(() => resolve(false), 1500)
+            options.signal?.addEventListener('abort', () => {
+              clearTimeout(timer)
+              resolve(false)
+            })
+          })
+          const resolved = await Promise.race([
+            session.defaultSession.resolveHost(host).then((r) => r.endpoints.length > 0),
+            timeout
+          ])
+          return resolved
+        } catch {
+          return false
+        }
+      }
+    }
+    this.app = {
+      quit: () => app.quit(),
+      relaunch: () => {
+        app.relaunch()
+        app.quit()
+      },
+      lastWindowClosed: () => {
+        if (process.platform !== 'darwin') app.quit()
+      },
+      setAppIcon: (id) =>
+        applyAppIcon(
+          id,
+          this.browser
+            .allWindows()
+            // Private windows keep the private icon, whatever the variant (os-56).
+            .filter((win) => !win.isPrivate)
+            .map((win) => browserWindowOf(win))
+            .filter((bw): bw is Electron.BrowserWindow => bw !== undefined)
+        ),
+      isDefaultBrowser: () => this.defaultBrowser.isDefault(),
+      requestDefaultBrowser: () => this.defaultBrowser.request(),
+      // Windows and macOS have a system emoji picker; Linux has none (Chrome shows no item there).
+      ...(app.isEmojiPanelSupported() ? { showEmojiPanel: () => app.showEmojiPanel() } : {}),
+      // macOS lets the user choose what a title bar's double-click does; read live, so a change
+      // in System Settings takes effect on the next double-click.
+      ...(process.platform === 'darwin'
+        ? {
+            titleBarDoubleClickAction: () =>
+              macTitleBarDoubleClickAction(
+                systemPreferences.getUserDefault('AppleActionOnDoubleClick', 'string')
+              )
+          }
+        : {}),
+      // The desktop drives' stand-in for the macOS hold-to-quit (`--test-quit-hold`): present
+      // only when the launch asked, so a normal launch's host holds on macOS alone.
+      ...(options.quitHoldEverywhere === true ? { quitHoldEverywhere: () => true } : {})
+    }
+    // The OS accent (settings-116): Windows' and macOS's through `systemPreferences`, the
+    // drives' override anywhere; Linux has no reading, so the host offers none and the
+    // Settings row is held.
+    const accentOverride = options.systemAccentOverride ?? null
+    const accentSource = systemPreferences as SystemAccentSource
+    const accent = systemAccentReadable(accentSource, process.platform, accentOverride)
+      ? {
+          systemAccent: () => readSystemAccent(accentSource, process.platform, accentOverride),
+          onAccentChanged: (listener: () => void) =>
+            watchSystemAccent(accentSource, process.platform, listener)
+        }
+      : {}
+    this.theme = {
+      systemDark: () => nativeTheme.shouldUseDarkColors,
+      onChanged: (listener) => void nativeTheme.on('updated', listener),
+      setSource: (scheme) => {
+        nativeTheme.themeSource = scheme
+        // The setting itself, for the `zen://` documents and the page views on a platform whose
+        // engine does not carry the source to pages (Linux: `emulatedColorScheme`).
+        this.views.applyColorScheme(scheme)
+      },
+      ...accent
+    }
+    this.languages = {
+      apply: (languages) => this.sessions.setAcceptLanguages(acceptLanguageList(languages))
+    }
+    this.pageFonts = {
+      apply: (fonts) => this.views.applyFonts(fonts)
+    }
+  }
+
+  /**
+   * Mozilla's Readability is an externalised runtime dependency, read from `node_modules` (or the
+   * asar) on first use.
+   */
+  readabilitySource(file: 'Readability.js' | 'Readability-readerable.js'): string | null {
+    try {
+      return readFileSync(require.resolve(`@mozilla/readability/${file}`), 'utf8')
+    } catch {
+      return null
+    }
+  }
+
+  createGovernor(browser: Browser): ResourceGovernor {
+    return new ResourceGovernor(browser)
+  }
+
+  createExtensions(browser: Browser): ExtensionService {
+    return new ExtensionService(browser, this.sessions, this.userDataDir)
+  }
+
+  createAgentTransport(): ElectronAgentTransport {
+    return new ElectronAgentTransport()
+  }
+
+  createUpdateHost(): ElectronUpdateHost {
+    return new ElectronUpdateHost()
+  }
+
+  /**
+   * Build the browser, wire IPC and sessions, and restore the windows (`windows: false` holds
+   * the browser windows back for a run that begins on an app window alone,
+   * `restoreLastSession` is the `--restore-last-session` switch; both `Browser.start`'s).
+   */
+  start(options: { windows?: boolean; restoreLastSession?: boolean } = {}): Browser {
+    const browser = new Browser(this)
+    this.browser = browser
+    // A toolbox's quit-chord relay reads the chord the key table binds to `app.quit` (`devtoolsKeys.ts`).
+    this.views.quitChord = () => quitChordOf(browser.state.shortcuts)
+    this.windows.bind(browser)
+    this.downloads.bind(browser.downloads, {
+      tabIdFor: (source) => this.views.tabIdForWebContents(source) ?? null,
+      parentWindow: (sourceTabId) =>
+        browserWindowOf(
+          sourceTabId ? browser.tabs.windowFor(sourceTabId) : browser.focusedWindow()
+        ),
+      stopNavigation: (tabId) => {
+        const view = this.views.viewForTab(tabId)
+        if (view && !view.isDestroyed()) view.stop()
+      },
+      agentDestination: (sourceTabId, download) =>
+        browser.agents.downloadDestination(sourceTabId, download)
+    })
+    const webstore = new WebstoreBridge(browser.extensions as ExtensionService, (wc) => {
+      const tabId = this.views.tabIdForWebContents(wc)
+      return tabId ? browser.tabs.ownerOf(tabId) : undefined
+    })
+    webstore.install()
+    // Extensions' `use_dynamic_url` resources and Chrome's `_favicon/` resource are served from
+    // a per-run origin of Ione's (the lookup runs once the API host below exists); the icons
+    // come from the history and bookmarks models.
+    const extensionResources = new ExtensionResourceOrigin((id) => extensionApi.loaded(id), {
+      favicons: new ExtensionFavicons({ history: browser.history, bookmarks: browser.bookmarks })
+    })
+    const extensionApi = new ExtensionApiHost(
+      browser,
+      this.sessions,
+      this.views,
+      this.io,
+      this.userDataDir,
+      // Extensions' declarativeNetRequest rule sets go straight into the request-blocking
+      // engine, each scoped to the sessions its extension is loaded into (never the private
+      // window's unless the user allowed the extension there).
+      createDnrSink(browser.blocking.engine, extensionResources, {
+        partitionsOf: (id) => extensionApi.partitionsOf(id)
+      }),
+      electronDownloadBridge(this.downloads)
+    )
+    extensionApi.install()
+    const extensionService = browser.extensions as ExtensionService
+    extensionService.attachApi(extensionApi)
+    extensionService.onChange((event) => extensionApi.registryChanged(event))
+    this.requestBlocking = new ElectronBlocking(browser, this.views, this.profileDir)
+    this.requestBlocking.start()
+    // How a download's request ends (a refusing status, a `net::` error) names the reason an
+    // interrupted row shows; Electron's download item alone only says "interrupted".
+    this.downloads.observeRequests(this.requestBlocking)
+    // The task manager's network column counts on the same hook, only while the page samples.
+    this.tasks.attachNetwork(this.requestBlocking.multiplexer)
+    // An MV3 worker alone in its process is placed by the pid its preload reported: the engine
+    // names the worker's process by a render-process-host id only, never the OS pid.
+    this.tasks.attachExtensionWorkers(() => extensionApi.workerProcesses())
+    // Extensions' chrome.webRequest listeners run over the same hook, after the rule engine;
+    // so do the request-side effects of chrome.privacy (pings, Referer, DNT).
+    extensionApi.webRequest.attach(this.requestBlocking)
+    extensionApi.privacy.attach(this.requestBlocking)
+    // `navigator.doNotTrack` follows the same effective source as the `DNT: 1` header: the
+    // user's setting or an extension's `chrome.privacy.websites.doNotTrackEnabled` (the value
+    // for private windows counts only for a private tab's documents). While the extension
+    // layer's first publish is pending the flags' `dnt` already says sent – the eighth guarded
+    // key's strict pole (`ProtectionService.doNotTrack`), which the header and the signal both
+    // read – so nothing here waits on the publish.
+    this.privacy.attachExtensionSignals(
+      {
+        doNotTrack: (privateWindow) =>
+          extensionApi.privacy.effectiveValue('websites', 'doNotTrackEnabled', privateWindow) ===
+          true
+      },
+      (sender) => {
+        const tabId = this.views.tabIdForWebContents(sender)
+        return (
+          tabId !== undefined &&
+          browser.state.model.tabs[tabId]?.containerId === PRIVATE_CONTAINER_ID
+        )
+      }
+    )
+    // chrome.fontSettings' per-script families, cursive/fantasy/math and fixed-width size have
+    // no slot in the page fonts setting: they reach the pages through the views' font layer.
+    extensionApi.fontSettings.attachPages({
+      locale: app.getLocale(),
+      applyExtensionFonts: (layer) => this.views.applyExtensionFonts(layer)
+    })
+    // `chrome-extension://<id>/_favicon/` requests go to the served origin's route (Electron's
+    // loader would leave them hanging), for extensions granted the `favicon` permission.
+    this.requestBlocking.multiplexer.register(
+      faviconRequestHandler(extensionResources, (id) =>
+        extensionApi.grants(id).permissions.includes('favicon')
+      )
+    )
+    // Decisions the engine took by an extension's rule feed getMatchedRules, the action badge
+    // count and onRuleMatchedDebug.
+    this.requestBlocking.onDecision((request, decision) =>
+      extensionApi.declarativeNetRequest.decided(request, decision)
+    )
+    // Chrome's low-entropy client hints on the navigations Electron sends without any (every
+    // session, the private window's included), then the stores' header rewrites (Chrome's brand
+    // for the Chrome Web Store, Edge's user agent and brand for Edge Add-ons); all builtin
+    // handlers of the multiplexer, which owns each session's one onBeforeSendHeaders slot. The
+    // store rewrites run after the hints, so the brand they add lands in a list that exists;
+    // persistent sessions only, like the store preload.
+    this.requestBlocking.registerHeaderRewrite(navigationClientHints)
+    this.requestBlocking.registerHeaderRewrite(webstoreClientHints, { persistentOnly: true })
+    this.requestBlocking.registerHeaderRewrite(edgeStoreUserAgent, { persistentOnly: true })
+    // Safe Browsing ahead of the rules, the cookie and signal edits after them; the upgrade
+    // observer and the `signals` field of the page preload's document-start answer.
+    this.privacy.attach(this.requestBlocking)
+    // The per-site content settings that act in the request engine (images, PDF download) and
+    // the `guards` field of the page preload's document-start answer (sensors, FedCM, payment
+    // handlers); the core answers both from the permission store.
+    this.requestBlocking.multiplexer.register(new ContentRulesHandler(browser.contentRules))
+    attachContentGuards(browser.contentRules, (ses) =>
+      this.requestBlocking.multiplexer.containerOf(ses)
+    )
+    // The JavaScript switch is each view's own (`Emulation.setScriptExecutionDisabled`).
+    this.views.contentRules = browser.contentRules
+    this.downloadsShell = new ElectronDownloadsShell(browser, this.dockBadge)
+    this.appBadges = new ElectronAppBadges(browser, this.dockBadge)
+    const chromiumLicences = chromiumLicencesResponder()
+    // The run's first documents – the restored pages' and the chrome windows' – wait for the
+    // extension layer's first publish (`startupHold.ts`), the one hold for both funnels. It
+    // closes below, at the default session's extension load, when an enabled extension holds
+    // persisted `chrome.privacy` values; the windows come after (`browser.start`).
+    const startupHold = new StartupHold()
+    this.views.startupHold = startupHold
+    this.windows.startupHold = startupHold
+    // The extension records other devices synced wait for the same hold (ID-44): no install,
+    // switch or removal lands in the registry while the layer's first publish is pending.
+    extensionService.startupHold = startupHold
+    this.sessions.configure((ses: Session, containerId: string) => {
+      installZenProtocol(
+        ses,
+        (id) => browser.reader.pageHtml(id),
+        () => this.newTabBackground.response(),
+        chromiumLicences,
+        () => this.views.colorScheme,
+        (hash) => browser.favicons.document(hash),
+        // zen://version (SET-66): the process's facts, read as the page is requested.
+        () => desktopVersionFacts(readDesktopVersionInput(ses, this.profileDir))
+      )
+      extensionResources.install(ses)
+      // The one webRequest listener set of the session; every request hook goes through it.
+      this.requestBlocking.attach(ses, containerId)
+      this.attachPermissions(ses, containerId, (target, origin) =>
+        extensionApi.tabCapture.allowsMediaRequest(target, origin)
+      )
+      // `getDisplayMedia` goes to the core's picker instead of Electron's flat refusal.
+      this.screenCapture.attach(ses)
+      attachWebAuthnHandlers(browser, this.views, ses)
+      // WebUSB / Web Serial / WebHID choosers and per-device grants (Web Bluetooth's is per view);
+      // the private session's picks are granted for that session only.
+      attachDeviceHandlers(browser, this.views, ses, process.platform, containerId)
+      this.downloads.attach(ses, containerId, (sourceTabId) =>
+        browser.onDownloadStarted(sourceTabId)
+      )
+      if (this.sessions.isPersistent(containerId)) {
+        webstore.attach(ses)
+        // The API host listens for `extension-loaded` before the service loads: the load's
+        // event publishes the layer (`extensionApi/privacy.ts` `load`), the promise settles after.
+        extensionApi.attachSession(ses, containerId)
+        const loaded = extensionService.attachSession(ses)
+        if (
+          containerId === DEFAULT_CONTAINER_ID &&
+          extensionLayerNeedsHold(extensionService.records(), (id) =>
+            extensionApi.store.privacyValues(id)
+          )
+        ) {
+          // The layer is pending until its first publish lands (`State.setExtensionControls`
+          // ends it) or the load settles – resolved or rejected – whichever comes first: the
+          // core's readers answer the strict pole meanwhile, so a hold the bound lets go of
+          // before the publish fails safe (the root's condition). Registered before the hold's
+          // own `then`, so on the ordinary path the interval ends before the documents go.
+          browser.state.setExtensionLayerPending(true)
+          const settled = (): void => browser.state.setExtensionLayerPending(false)
+          loaded.then(settled, settled)
+          startupHold.until(loaded)
+        }
+      }
+    })
+    this.sessions.get(DEFAULT_CONTAINER_ID)
+    this.attachChromePermissions()
+    // The chrome's documents draw the cached favicons (HB-47) from their own session.
+    installFaviconProtocol(session.defaultSession, (hash) => browser.favicons.document(hash))
+    this.registerIpc(browser)
+    attachSecurityHandlers(browser, this.views, extensionApi.webRequest)
+    attachBluetoothChoosers(browser, this.views)
+    configurePlatformAuthenticators(__IONE_APPLE_TEAM_ID__)
+    browser.start(options)
+    // The engine has its persisted rule sets now: the ones of extensions removed or disabled
+    // while Ione was closed go before the enabled ones load (`extensions.start`, above).
+    extensionApi.declarativeNetRequest.reconcile()
+    // Toasts need the app id registered with Windows; a copy without installer shortcuts
+    // (development, portable) registers it itself. The private windows' second id (os-56) the
+    // same way, with the group's name and the private icon, so Windows draws that group from
+    // its class key where no shortcut carries the id.
+    if (process.platform === 'win32') {
+      void ensureWindowsAppIdRegistered(app.getName(), iconPngPath(browser.state.settings.appIcon))
+      void ensureWindowsAppIdRegistered(
+        privateRelaunchDisplayName(app.getName()),
+        privateIconPath('png'),
+        undefined,
+        PRIVATE_APP_USER_MODEL_ID
+      )
+    }
+    return browser
+  }
+
+  /**
+   * The chrome's own session (the default one: the browser windows' documents, nothing of a
+   * page's). Electron grants a session without handlers every request; that stands for the
+   * chrome's documents, and the one grant made explicit is Local Font Access – the Customize
+   * fonts pickers list the installed fonts through the chrome document's `queryLocalFonts()`
+   * (CT-25). Pages live in the container sessions, whose handlers refuse `local-fonts` outright
+   * (the Fonts content setting is deny-only), so no page ever sees the list.
+   */
+  private attachChromePermissions(): void {
+    const chromeDocument = (wc: WebContents | null): boolean =>
+      wc !== null && !wc.isDestroyed() && this.windows.windowForWebContents(wc.id) !== undefined
+    const ses = session.defaultSession
+    ses.setPermissionRequestHandler((wc, permission, callback) => {
+      callback(permission === 'local-fonts' ? chromeDocument(wc) : true)
+    })
+    ses.setPermissionCheckHandler((wc, permission) =>
+      permission === 'local-fonts' ? chromeDocument(wc) : true
+    )
+  }
+
+  /**
+   * `captureAllows`: whether an extension's capture stands behind a media request the engine
+   * makes on `target` for a consuming document of `securityOrigin` – a `chrome.tabCapture`
+   * request on the captured tab, or a `chrome.desktopCapture` pick the consuming document is
+   * redeeming (`getUserMedia` with `chromeMediaSource: "desktop"`, which Electron parses natively
+   * once this handler allows it).
+   */
+  private attachPermissions(
+    ses: Session,
+    containerId: string,
+    captureAllows: (target: WebContents, securityOrigin: string | undefined) => boolean
+  ): void {
+    const { permissions, external } = this.browser
+    ses.setPermissionRequestHandler((webContents, rawPermission, callback, details) => {
+      const url = details.requestingUrl || webContents?.getURL() || ''
+      const tabId = webContents ? this.views.tabIdForWebContents(webContents) : undefined
+      const request = permissionRequestDetails(webContents, details, tabId, containerId)
+      // A `getDisplayMedia` call arrives as `media` without devices: the screen-sharing row,
+      // whose Allow puts the picker up right here – the picker is the consent, and only a
+      // refusal at this stage reads as Chrome's `NotAllowedError` to the page. Its answer waits
+      // for the engine's display-media request (`screenCapture.attach`).
+      const permission = permissionName(rawPermission, details)
+      // An extension's tab capture arrives the same way, on the captured tab, from the
+      // consuming document's origin: the user's gesture on the extension was the consent
+      // (Chrome's `tabCaptureForTab`), and the engine's stream registry already tied the id to
+      // that one document and moment. So does a `chooseDesktopMedia` pick's `getUserMedia`, on
+      // the consuming document itself: the picker was the consent.
+      if (
+        permission === 'display-capture' &&
+        webContents &&
+        captureAllows(webContents, 'securityOrigin' in details ? details.securityOrigin : undefined)
+      ) {
+        callback(true)
+        return
+      }
+      if (permission === 'display-capture' && tabId && webContents) {
+        void permissions
+          .decide(permission, url, request)
+          .then((allowed) =>
+            allowed ? this.screenCapture.permission(webContents, tabId, url) : false
+          )
+          .then(callback)
+        return
+      }
+      // Chromium does not tell us whether a page's launch of another application had a
+      // gesture, so the core's own activation tracking decides: without one the launch is
+      // listed with the tab's blocked pop-ups instead of prompting.
+      if (permission === 'openExternal' && tabId && request.externalUrl) {
+        void external.request(tabId, request.externalUrl).then(callback)
+        return
+      }
+      // A tab page's notification request takes the core's own rule (`webNotifications.decide`,
+      // the one Android's page script reaches): a site dismissed before, or a request without a
+      // gesture behind it, asks quietly – the bell in the pill's slot – and a first gestured ask
+      // is the loud prompt; the answer of either resolves the engine's request here. The gesture
+      // is the page bridge's word, relayed ahead of the engine's request and matched to it
+      // (`notificationRequests.ts`).
+      if (permission === 'notifications' && tabId && webContents) {
+        void decideNotificationRequest(
+          this.browser.webNotifications,
+          this.notificationRequests,
+          webContents.id,
+          tabId,
+          url,
+          details.isMainFrame,
+          request
+        ).then(callback)
+        return
+      }
+      // A page locking the keyboard keeps Esc: the fullscreen hint says to hold it instead.
+      if (permission === 'keyboardLock' && tabId)
+        this.browser.fullscreen.keyboardLockRequested(tabId)
+      // The camera and the microphone are the system's to give first on macOS (os-59): its
+      // dialog comes before the site's prompt, and its refusal answers the request in the
+      // engine's stead – no site prompt whose Allow the system would not honour, and nothing
+      // remembered against the site. Off macOS the gate lets every request through.
+      if (permission === 'media' && request.mediaTypes && request.mediaTypes.length > 0) {
+        // An agent's tab never puts the system's dialog in front of the user.
+        const agentTab = Boolean(tabId && this.browser.agents.takesPrompt(tabId, 'permission'))
+        void this.mediaAccess
+          .allows(request.mediaTypes, { ask: !agentTab })
+          .then((systemAllows) =>
+            systemAllows ? permissions.decide(permission, url, request) : false
+          )
+          .then(callback)
+        return
+      }
+      // Chromium does not tell us whether a Storage Access API request had a gesture behind it
+      // either, and the web platform refuses one without: the core's activation clock stands in
+      // (`popups.activation`), as it does for launches of other applications above.
+      if (isStorageAccessPermission(permission) && tabId)
+        request.userGesture = this.browser.popups.activation(tabId).isActive(Date.now())
+      void permissions.decide(permission, url, request).then(callback)
+    })
+    ses.setPermissionCheckHandler((_wc, permission, requestingOrigin, details) =>
+      permissions.check(
+        permission,
+        requestingOrigin,
+        permissionCheckDetails(permission, requestingOrigin, details, this.browser)
+      )
+    )
+  }
+
+  private registerIpc(browser: Browser): void {
+    ipcMain.handle('zen:cmd', async (event, name: string, args: unknown) => {
+      const win = this.windows.windowForWebContents(event.sender.id)
+      if (!win) throw new Error('Unauthorised sender')
+      return browser.handleCommand(win, name, args)
+    })
+    // A window's chrome says its hold-to-quit cover engaged over a hung page: the keyboard is
+    // about to come to the chrome, and one key down of the chord goes into the chrome's widget
+    // first, so the release the hold waits for is heard there (`quitHoldKeys.ts`). The chrome
+    // alone is heard; the key is sent while a hold runs and never otherwise.
+    ipcMain.on(QUIT_HOLD_COVER_CHANNEL, (event) => {
+      if (!this.windows.windowForWebContents(event.sender.id)) return
+      primeChromeForRelease(event.sender, browser.quitHold, browser.state.shortcuts)
+    })
+    ipcMain.on('zen:page', (event, message: PageMessage) => {
+      this.views
+        .viewForWebContents(event.sender)
+        ?.dispatchPageMessage(message, event.senderFrame ?? undefined)
+    })
+    // A page frame's answer to a script the host ran in the browser's private world of that
+    // frame (`shared/privateWorld.ts`: the image-search thumbnail in a sub-frame). Only a tab
+    // page's frame is heard, and the relay takes the answer from the frame it asked alone.
+    ipcMain.on(PRIVATE_WORLD_CHANNELS.answer, (event, raw: unknown) => {
+      if (!this.views.viewForWebContents(event.sender)) return
+      this.views.privateWorld.answer(event.senderFrame, raw)
+    })
+    // A page's `alert` / `confirm` / `prompt`: the renderer blocks on `sendSync` until
+    // `returnValue` is set, which happens once the chrome's dialog is answered. Every path must
+    // set it, or the page would hang.
+    ipcMain.on(PAGE_DIALOG_CHANNEL, (event, raw: unknown) => {
+      const answer = (value: PageDialogAnswer): void => {
+        try {
+          event.returnValue = value
+        } catch {
+          // The page went away while its dialog was up.
+        }
+      }
+      const view = this.views.viewForWebContents(event.sender)
+      const call = sanitizeDialogCall(raw)
+      if (!view || !call) {
+        answer(DISMISSED_ANSWER)
+        return
+      }
+      view
+        .askDialog(call, event.senderFrame?.url ?? '')
+        .then(answer, () => answer(DISMISSED_ANSWER))
+    })
+    // A page's `window.print()` or File System Access picker (`preload/pagePrompts.ts`): whose it
+    // is – an agent's tab keeps it from the user. Answered at once; every path sets the value.
+    ipcMain.on(PAGE_PROMPT_CHANNEL, (event, raw: unknown) => {
+      const view = this.views.viewForWebContents(event.sender)
+      const call = sanitizePromptCall(raw)
+      let answer: PagePromptAnswer = 'user'
+      try {
+        if (view && call) answer = view.askPagePrompt(call)
+      } catch {
+        answer = 'user'
+      }
+      try {
+        event.returnValue = answer
+      } catch {
+        // The page went away meanwhile.
+      }
+    })
+    // The new tab page: its preload fetches the first state synchronously (before the first
+    // paint) and sends actions. Only the main frame of a tab view showing `zen://newtab` is heard.
+    ipcMain.on('zen:newtab-state', (event) => {
+      const tabId = this.newTabSender(event)
+      const state: NewTabPageState | null = tabId ? browser.newTab.stateFor(tabId) : null
+      event.returnValue = state
+    })
+    ipcMain.on('zen:newtab', (event, action: NewTabPageAction) => {
+      const tabId = this.newTabSender(event)
+      if (!tabId || !action || typeof action.type !== 'string') return
+      if (!isNewTabUrl(event.senderFrame?.url ?? event.sender.getURL())) return
+      browser.newTab.handleAction(tabId, action)
+    })
+    // A page's `display-mode` (MW-23), carried by the one document-start ask every frame of a
+    // tab's page makes; anything else that asks (the chrome, an extension page) is a browser page.
+    registerDocumentStartProvider('displayMode', (event) => {
+      const tabId = this.views.tabIdForWebContents(event.sender)
+      return tabId ? browser.displayModeFor(tabId) : 'browser'
+    })
+    // The page preload's ONE synchronous ask before its first script (`documentStart.ts`): the
+    // privacy signals (`privacy.attach`), the display mode (above), the page-world guards
+    // (`attachContentGuards`) and the extensions' user-script plan (`ExtensionApiHost.install`),
+    // each field from its provider, each provider once per ask, a throw its field's default.
+    attachDocumentStart()
+    // A page's `getDisplayMedia` call, announced synchronously by its main-world shim right
+    // before the engine sees it (MW-19): whether it asked for audio, which the permission
+    // request that follows does not say. Only a tab's page is heard; the answer is immediate,
+    // as the page's call waits on it.
+    ipcMain.on(SCREEN_CAPTURE_INTENT_CHANNEL, (event, audio: unknown) => {
+      if (this.views.viewForWebContents(event.sender))
+        this.screenCapture.intent(event.sender, audio === true)
+      event.returnValue = true
+    })
+    this.attachNotificationStatus(browser)
+  }
+
+  /** The tab (or preloaded placeholder) whose main frame sent a new tab page message. */
+  private newTabSender(event: IpcMainEvent): string | undefined {
+    if (!this.views.viewForWebContents(event.sender)) return undefined
+    if (event.senderFrame && event.senderFrame !== event.sender.mainFrame) return undefined
+    return this.views.tabIdForWebContents(event.sender)
+  }
+
+  /**
+   * `Notification.permission` for pages: the page preload asks synchronously on the page's
+   * first read (the frame's URL is Chromium's word, not the page's), and every change to the
+   * notification permission – an answer to a prompt, Settings, Clear browsing data – is pushed
+   * to the open pages of the site (all pages when a default changed).
+   */
+  private attachNotificationStatus(browser: Browser): void {
+    const { permissions } = browser
+    const statusOf = (url: string, wc: WebContents): NotificationPermissionStatus =>
+      notificationPermissionStatus(permissions, url, this.views.tabIdForWebContents(wc))
+    ipcMain.on(NOTIFICATION_PERMISSION_CHANNEL, (event) => {
+      const url = event.senderFrame?.url ?? event.sender.getURL()
+      event.returnValue = statusOf(url, event.sender)
+    })
+    // The page bridge's word on a `requestPermission()` call – the gesture behind it – ahead of
+    // the engine's own request, for the permission request handler to match (`attachPermissions`).
+    ipcMain.on(NOTIFICATION_REQUEST_CHANNEL, (event, gesture: unknown) => {
+      if (!this.views.viewForWebContents(event.sender)) return
+      this.notificationRequests.note(event.sender.id, {
+        gesture: typeof gesture === 'boolean' ? gesture : undefined,
+        ...relayedFrom(event.senderFrame, event.sender.getURL())
+      })
+    })
+    this.views.onViewCreated((view) =>
+      view.webContents.once('destroyed', () => this.notificationRequests.forget(view.webContentsId))
+    )
+    permissions.subscribe((change) => {
+      if (contentSettingId(change.permission) !== 'notifications') return
+      for (const view of this.views.all()) {
+        if (view.isDestroyed()) continue
+        const url = view.getURL()
+        if (change.origin !== null && permissionSite(url) !== change.origin) continue
+        view.webContents.send(NOTIFICATION_PERMISSION_CHANNEL, statusOf(url, view.webContents))
+      }
+    })
+  }
+}
+
+/**
+ * Test hook: `ZEN_MEDIA_LINGER_MS=3000` shortens the media hub's linger for a paused session
+ * (`MEDIA_HUB_INACTIVE_MS`, Chrome's 60 minutes) so a drive can watch it run out within its
+ * budget. Unset in normal runs; anything but a positive whole number of milliseconds is ignored.
+ */
+function mediaHubLingerMs(): number {
+  const override = process.env['ZEN_MEDIA_LINGER_MS']
+  if (!override) return MEDIA_HUB_INACTIVE_MS
+  const ms = Number(override)
+  return Number.isInteger(ms) && ms > 0 ? ms : MEDIA_HUB_INACTIVE_MS
+}
+
+/**
+ * Test hook: `ZEN_NET_ORIGIN=http://127.0.0.1:8788` sends every core fetch (search suggestions,
+ * omnibox answers, Live Folders) to that origin instead, with the intended origin in an
+ * `x-zen-origin` header, so a harness can answer deterministically. Unset in normal runs.
+ */
+function redirectedOrigin(url: string): { url: string; origin: string | null } {
+  const override = process.env['ZEN_NET_ORIGIN']
+  if (!override) return { url, origin: null }
+  try {
+    const original = new URL(url)
+    const target = new URL(override)
+    target.pathname = original.pathname
+    target.search = original.search
+    return { url: target.toString(), origin: original.origin }
+  } catch {
+    return { url, origin: null }
+  }
+}
+
+/**
+ * A response body read no further than `maxBytes` (`NetHost.fetchText`'s cap): the stream is
+ * cancelled and null returned as soon as the bytes read run past it, so an oversized body is
+ * not downloaded whole and then thrown away. Decoded as UTF-8, as `Response.text()` would.
+ */
+async function readCapped(res: Response, maxBytes: number): Promise<string | null> {
+  const declared = Number(res.headers.get('content-length'))
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await res.body?.cancel().catch(() => undefined)
+    return null
+  }
+  if (!res.body) return await res.text()
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let read = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    read += value.byteLength
+    if (read > maxBytes) {
+      await reader.cancel().catch(() => undefined)
+      return null
+    }
+    chunks.push(value)
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks))
+}
+
+function browserWindowOf(win: ZenWindow | undefined): Electron.BrowserWindow | undefined {
+  const host = win?.host as ElectronWindow | undefined
+  return host?.alive ? host.win : undefined
+}

@@ -1,0 +1,240 @@
+// @vitest-environment happy-dom
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, type ReactElement } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import type { ExtensionInfo, UIState } from '@shared/types'
+import {
+  ROLL_MARK,
+  ROLL_MARK_CSS_VARIABLE,
+  ROLL_MARK_GRID,
+  rollMarkDot,
+  rollMarkPathData
+} from '@shared/game/mark'
+
+/*
+ * The favicon slot of a tab on an extension's page (v2 §10.1 applied to extension pages): the
+ * extension's icon when the page supplies no favicon of its own – the puzzle glyph while the
+ * extension has none or is unknown – and never a letter of its id, for both forms the address
+ * takes (`chrome-extension://` and the Android runtime's emulated origin). A page that names a
+ * favicon keeps it, as any site does.
+ */
+
+const invoke = vi.fn(async () => null)
+Object.assign(window, { zen: { invoke, on: () => () => undefined } })
+;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+
+const { Favicon } = await import('../sidebar/Favicon')
+const { browserStore } = await import('@renderer/lib/ui')
+
+const ID = 'dbepggeogbaibhgnhhndojpepiihcmeb'
+const ICON = 'data:image/png;base64,icon'
+const OWN_FAVICON = 'data:image/png;base64,favicon'
+const SCHEME_URL = `chrome-extension://${ID}/pages/options.html`
+const EMULATED_URL = `https://${ID}.ext.ione.invalid/pages/options.html`
+
+const source = (
+  url: string,
+  favicon: string | null = null
+): Parameters<typeof Favicon>[0]['tab'] => ({
+  url,
+  title: 'Vimium Options',
+  favicon,
+  customIcon: null,
+  customTitle: null,
+  loading: false,
+  discarded: false,
+  containerId: 'default'
+})
+
+function withExtensions(extensions: ExtensionInfo[]): void {
+  browserStore.set({ state: { extensions } as unknown as UIState })
+}
+
+const vimium = { id: ID, name: 'Vimium', icon: ICON, enabled: true } as ExtensionInfo
+
+let root: Root | null = null
+let host: HTMLElement | null = null
+
+function render(el: ReactElement): HTMLElement {
+  host = document.createElement('div')
+  document.body.appendChild(host)
+  root = createRoot(host)
+  act(() => root!.render(el))
+  return host
+}
+
+beforeEach(() => withExtensions([vimium]))
+
+afterEach(() => {
+  act(() => root?.unmount())
+  host?.remove()
+  root = null
+  host = null
+  browserStore.set({ state: null })
+})
+
+describe('Favicon on an extension page', () => {
+  it('shows the extension’s icon at the slot’s size when the page has no favicon of its own', () => {
+    for (const url of [SCHEME_URL, EMULATED_URL]) {
+      const el = render(<Favicon tab={source(url)} size={16} />)
+      const img = el.querySelector('img')
+      expect(img?.getAttribute('src')).toBe(ICON)
+      expect(img?.style.width).toBe('16px')
+      expect(el.textContent).toBe('')
+      act(() => root?.unmount())
+      host?.remove()
+    }
+  })
+
+  it('shows the puzzle glyph, never a letter tile, while the extension has no icon or is unknown', () => {
+    withExtensions([{ ...vimium, icon: null }])
+    let el = render(<Favicon tab={source(SCHEME_URL)} size={16} />)
+    expect(el.querySelector('img')).toBeNull()
+    expect(el.querySelector('svg.zen-ext-icon-glyph')).not.toBeNull()
+    expect(el.textContent).toBe('')
+    act(() => root?.unmount())
+    host?.remove()
+    // Removed, or the list has not arrived: the id is no site to take a letter from.
+    withExtensions([])
+    el = render(<Favicon tab={source(EMULATED_URL)} size={16} />)
+    expect(el.querySelector('svg.zen-ext-icon-glyph')).not.toBeNull()
+    expect(el.textContent).toBe('')
+  })
+
+  it('keeps a favicon the page names, as any site does', () => {
+    const el = render(<Favicon tab={source(SCHEME_URL, OWN_FAVICON)} size={16} />)
+    expect(el.querySelector('img')?.getAttribute('src')).toBe(OWN_FAVICON)
+  })
+
+  it('still draws a site without a favicon as its letter tile', () => {
+    const el = render(<Favicon tab={source('https://www.example.com/')} size={16} />)
+    expect(el.querySelector('img')).toBeNull()
+    expect(el.textContent).toBe('E')
+  })
+})
+
+/*
+ * The throbber (tabs-41): one 16 × 16, 2 px ring in Chrome's two phases – `waiting` until the
+ * document commits, `loading` after – and the icon that takes its place fades back in; an icon
+ * that never spun draws at once.
+ */
+describe('the row’s throbber', () => {
+  const SITE = 'https://www.example.com/'
+  const loading = (waiting: boolean): Parameters<typeof Favicon>[0]['tab'] => ({
+    ...source(SITE, OWN_FAVICON),
+    loading: true,
+    waiting
+  })
+
+  it('spins muted and backwards while waiting, in the accent forwards while loading', () => {
+    const el = render(<Favicon tab={loading(true)} size={16} />)
+    const ring = el.querySelector('.zen-tab-throbber')
+    expect(ring).not.toBeNull()
+    expect(ring?.getAttribute('data-phase')).toBe('waiting')
+    expect(ring?.getAttribute('aria-label')).toBe('Loading')
+    expect(ring?.classList.contains('border-2')).toBe(true)
+    expect((ring as HTMLElement).style.width).toBe('16px')
+    expect(el.querySelector('img')).toBeNull()
+
+    act(() => root?.render(<Favicon tab={loading(false)} size={16} />))
+    expect(el.querySelector('.zen-tab-throbber')?.getAttribute('data-phase')).toBe('loading')
+  })
+
+  it('fades the favicon back in after the ring, and draws one that never spun at once', () => {
+    const el = render(<Favicon tab={loading(true)} size={16} />)
+    act(() => root?.render(<Favicon tab={source(SITE, OWN_FAVICON)} size={16} />))
+    expect(el.querySelector('.zen-tab-throbber')).toBeNull()
+    const img = el.querySelector('img')
+    expect(img?.getAttribute('src')).toBe(OWN_FAVICON)
+    expect(img?.classList.contains('zen-tab-favicon-in')).toBe(true)
+    act(() => root?.unmount())
+    host?.remove()
+
+    const fresh = render(<Favicon tab={source(SITE, OWN_FAVICON)} size={16} />)
+    expect(fresh.querySelector('img')?.classList.contains('zen-tab-favicon-in')).toBe(false)
+  })
+
+  it('shows no ring for a sleeping tab, whatever its load flags say', () => {
+    const el = render(<Favicon tab={{ ...loading(true), discarded: true }} size={16} />)
+    expect(el.querySelector('.zen-tab-throbber')).toBeNull()
+    expect(el.querySelector('img')?.classList.contains('zen-tab-favicon-in')).toBe(false)
+  })
+})
+
+/*
+ * A Reader View tab keeps its page's identity (v2 §9.29; the design gate for #491, PUI-14): the
+ * page's icon still – the core keeps `favicon` over the reader's navigation – and, for a page
+ * that had none, the letter tile of the page's host read through the reader URL, where the
+ * slot used to fall to the globe of a siteless page. The phone's pill, the tab overview's card
+ * and the sidebar's row all draw this one slot.
+ */
+describe('Favicon in Reader View', () => {
+  const ARTICLE = 'https://news.example/story'
+  const READER = `zen://reader?id=article_1&url=${encodeURIComponent(ARTICLE)}`
+
+  it('keeps the page’s icon', () => {
+    const el = render(<Favicon tab={source(READER, OWN_FAVICON)} size={20} />)
+    expect(el.querySelector('img')?.getAttribute('src')).toBe(OWN_FAVICON)
+    expect(el.querySelector('svg.lucide-globe')).toBeNull()
+  })
+
+  it('draws the page’s letter tile, not the globe, where the page had no icon', () => {
+    const el = render(<Favicon tab={source(READER)} size={20} />)
+    expect(el.querySelector('img')).toBeNull()
+    expect(el.querySelector('svg.lucide-globe')).toBeNull()
+    expect(el.textContent).toBe('N')
+    // The same tile the article's tab drew.
+    act(() => root?.unmount())
+    host?.remove()
+    const article = render(<Favicon tab={source(ARTICLE)} size={20} />)
+    expect(article.textContent).toBe('N')
+  })
+
+  it('a reader URL without its page, and any other internal page, keep the globe', () => {
+    const el = render(<Favicon tab={source('zen://reader?id=article_1')} size={20} />)
+    expect(el.querySelector('svg.lucide-globe')).not.toBeNull()
+    expect(el.textContent).toBe('')
+  })
+})
+
+describe('Favicon on the game tab (§9.17; the lead’s (β-2) on #607)', () => {
+  it('wears Roll’s picture from the one source, never the globe: the ring mid-roll in the mark colour, its dot on the inner orbit, on a short ground line in the slot’s ink', () => {
+    for (const url of ['zen://game', 'ione://game']) {
+      const el = render(<Favicon tab={source(url)} size={16} />)
+      expect(el.querySelector('svg.lucide-globe')).toBeNull()
+      const svg = el.querySelector<SVGSVGElement>('svg.lucide-roll')!
+      expect(svg).not.toBeNull()
+      expect(svg.getAttribute('viewBox')).toBe(`0 0 ${ROLL_MARK_GRID} ${ROLL_MARK_GRID}`)
+      expect(svg.getAttribute('aria-hidden')).toBe('true')
+      expect(svg.style.width).toBe('16px')
+      const [line] = svg.querySelectorAll('line')
+      const [ring, dot] = svg.querySelectorAll('circle')
+      const paths = rollMarkPathData()
+      // The ground: the slot's ink (the root's `currentColor`), the vector's own stroke.
+      expect(line?.getAttribute('x1')).toBe(String(ROLL_MARK.ground.x1))
+      expect(line?.getAttribute('x2')).toBe(String(ROLL_MARK.ground.x2))
+      expect(line?.getAttribute('y1')).toBe(String(ROLL_MARK.ground.y))
+      expect(line?.getAttribute('stroke-width')).toBe(String(ROLL_MARK.ground.stroke))
+      expect(line?.getAttribute('stroke')).toBeNull()
+      // The ring and the dot in the brand indigo through the theme's `--zen-roll-mark`.
+      const mark = `var(${ROLL_MARK_CSS_VARIABLE}, currentColor)`
+      expect(ring?.getAttribute('cx')).toBe(String(ROLL_MARK.ring.cx))
+      expect(ring?.getAttribute('cy')).toBe(String(ROLL_MARK.ring.cy))
+      expect(ring?.getAttribute('r')).toBe(String(ROLL_MARK.ring.r))
+      expect(ring?.getAttribute('stroke')).toBe(mark)
+      expect(ring?.getAttribute('stroke-width')).toBe(String(ROLL_MARK.ring.stroke))
+      expect(ring?.getAttribute('fill')).toBeNull()
+      const centre = rollMarkDot()
+      expect(dot?.getAttribute('cx')).toBe(String(centre.cx))
+      expect(dot?.getAttribute('cy')).toBe(String(centre.cy))
+      expect(dot?.getAttribute('r')).toBe(String(centre.r))
+      expect(dot?.getAttribute('fill')).toBe(mark)
+      expect(dot?.getAttribute('stroke')).toBe('none')
+      // The same numbers the widget's vector writes (`mark.test.ts` holds the XML to them).
+      expect(paths.dot).toBe('M14.49,6.04 a2,2 0 1,0 0.01,0 Z')
+      expect(el.textContent).toBe('')
+      act(() => root?.unmount())
+      host?.remove()
+    }
+  })
+})

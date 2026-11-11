@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path name="clipboard" path="clipboard/" />
+    <!-- Images and favicons handed to the share sheet (Share.kt). -->
+    <cache-path name="share" path="share/" />
+    <cache-path name="updates" path="updates/" />
+    <!-- Photos and videos the camera app writes for a page's file input (BrowserActivity.showFileChooser). -->
+    <cache-path name="capture" path="capture/" />
+    <!-- Files an AI agent hands a page's file input, written here first (TabWebView.answerFileChooser). -->
+    <cache-path name="agent-uploads" path="agent-uploads/" />
+    <external-files-path name="downloads" path="Download/" />
+    <!-- Downloads on Android 8–9 land in the public directory (Android 10+ uses MediaStore). -->
+    <external-path name="public-downloads" path="Download/" />
+    <files-path name="pages" path="pages/" />
+    <!-- A saved page's archive when there is no external storage at all (Host.savePage's last resort). -->
+    <files-path name="download-fallback" path="Download/" />
+</paths>

@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.Zen" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/zen_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="o_mr1">shortEdges</item>
+        <item name="colorPrimary">#6264DC</item>
+        <item name="colorSecondary">#6264DC</item>
+    </style>
+
+    <!-- The cold start's splash (OS-26, MainActivity): the launcher's mark on the brand colour –
+         the default icon's background (ic_launcher_colors.xml, generated with the icons) – held
+         over the window until the chrome's first real frame (StartupSplash), the boot theme below
+         it (Theme.Zen.Boot: the browser theme in the splash's colour until the chrome's first
+         theme). The bars are transparent with light icons over the black; the tone the chrome
+         asks for meanwhile is applied as the splash's exit ends. API 33+ draws the icon for a
+         plain start too (an `am start` without the show-icon flag: the harness's and the pair
+         tool's), where the default would be the solid colour alone. -->
+    <style name="Theme.Zen.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/ic_launcher_bg_black</item>
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_foreground</item>
+        <item name="postSplashScreenTheme">@style/Theme.Zen.Boot</item>
+        <item name="android:windowSplashScreenBehavior" tools:targetApi="tiramisu">icon_preferred</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="o_mr1">shortEdges</item>
+    </style>
+
+    <!-- The theme the splash leaves MainActivity's window in: the browser theme with the window's
+         background in the splash's colour and the bars' icons in its tone. The platform draws the
+         app window's first frame before the SplashScreenView it hands over is attached to it (the
+         hand-over frame), and on the recipe's emulator that frame stood for 250–400 ms: in
+         Theme.Zen's zen_background it is the plain window the row removes, seen between two runs
+         of the splash; in the brand colour it is the splash without its mark. The chrome's first
+         theme replaces both (Host.applyTheme paints the root and the decor in the chrome's colour
+         and asks for its bar tone, at the chrome's boot, before READY), so nothing after the boot
+         wears this; the chrome WebView is transparent until the chrome paints, which is why the
+         window's colour shows through it. Theme.Zen's child by name: the night Theme.Zen is its
+         parent at night, and there is no night copy of this style. -->
+    <style name="Theme.Zen.Boot">
+        <item name="android:windowBackground">@color/ic_launcher_bg_black</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o">false</item>
+    </style>
+
+    <!-- A custom tab: the browser theme, arriving from the bottom and leaving the same way
+         (Chrome's default; a caller's own start and exit animations take precedence). -->
+    <style name="Theme.Zen.CustomTab">
+        <item name="android:windowAnimationStyle">@style/Animation.Zen.CustomTab</item>
+    </style>
+    <style name="Animation.Zen.CustomTab" parent="@android:style/Animation.Activity">
+        <item name="android:activityOpenEnterAnimation">@anim/cct_slide_in_up</item>
+        <item name="android:activityOpenExitAnimation">@anim/cct_stay</item>
+        <item name="android:activityCloseEnterAnimation">@anim/cct_stay</item>
+        <item name="android:activityCloseExitAnimation">@anim/cct_slide_out_down</item>
+    </style>
+
+    <!-- An installed web app's window (WebAppActivity, PWA-07): the browser theme under the
+         system's own app-launch animation, as an app of its own; the theme the splash below
+         leaves the window in. -->
+    <style name="Theme.Zen.WebApp" />
+
+    <!-- The web app's cold launch splash (PWA-06, WebAppActivity's manifest theme). The platform
+         draws the starting window from these attributes before any code of the app runs, so the
+         app's own colour and tile cannot be here (WebAppSplash puts them on the view at the
+         hand-over): a fixed ground – the web app window's page colour, light or night – and a
+         transparent icon, so no Ione mark stands in for the app's. The bars' icons are dark
+         over the light ground (the night ground and its light icons: values-night/themes.xml,
+         the style whole, as a night qualifier replaces a style); the tone the app wants is
+         applied as the splash lifts. -->
+    <style name="Theme.Zen.WebApp.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/v2_page_light</item>
+        <item name="windowSplashScreenAnimatedIcon">@android:color/transparent</item>
+        <item name="postSplashScreenTheme">@style/Theme.Zen.WebApp</item>
+        <item name="android:windowSplashScreenBehavior" tools:targetApi="tiramisu">icon_preferred</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="o_mr1">shortEdges</item>
+    </style>
+
+    <!-- A phone sheet drawn natively per the v2 draft (§6): neutral panel, top radius 12, edge to
+         edge under the navigation bar, scrim black .4 light / .55 dark. The 1 dp hairline is drawn
+         by the sheet's content view (SheetEdge, under NativePromptSheet, ext/ExtensionSheet and
+         CustomTabMenuSheet):
+         its sides run through the navigation bar to the screen's bottom, so the sheet style pads
+         nothing for the bar – the content view takes the bar as its own bottom padding, through the
+         edge – where Material's would pad the container and stop the content view, and the
+         hairline's sides with it, a bar's height above the panel fill's edge. -->
+    <style name="ThemeOverlay.Zen.Sheet" parent="ThemeOverlay.Material3.BottomSheetDialog">
+        <item name="bottomSheetStyle">@style/Widget.Zen.Sheet</item>
+        <item name="android:backgroundDimAmount">0.4</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+    <style name="ThemeOverlay.Zen.Sheet.Dark">
+        <item name="bottomSheetStyle">@style/Widget.Zen.Sheet.Dark</item>
+        <item name="android:backgroundDimAmount">0.55</item>
+    </style>
+    <style name="Widget.Zen.Sheet" parent="Widget.Material3.BottomSheet.Modal">
+        <item name="backgroundTint">@color/v2_panel_light</item>
+        <item name="shapeAppearance">@style/ShapeAppearance.Zen.Sheet</item>
+        <item name="shapeAppearanceOverlay">@null</item>
+        <item name="paddingBottomSystemWindowInsets">false</item>
+    </style>
+    <style name="Widget.Zen.Sheet.Dark">
+        <item name="backgroundTint">@color/v2_panel_dark</item>
+    </style>
+    <style name="ShapeAppearance.Zen.Sheet" parent="">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSizeTopLeft">12dp</item>
+        <item name="cornerSizeTopRight">12dp</item>
+        <item name="cornerSizeBottomLeft">0dp</item>
+        <item name="cornerSizeBottomRight">0dp</item>
+    </style>
+
+    <!-- The custom tab's menu: the same sheet under its own name. Its content view (CustomTabMenuSheet)
+         draws the edge and takes the navigation bar as its own bottom padding through it, like the
+         prompt sheet's and the extension sheet's, so the sheet style pads nothing for the bar here
+         either: the hairline's sides run through the bar to the screen's bottom. -->
+    <style name="ThemeOverlay.Zen.CustomTabSheet" parent="ThemeOverlay.Zen.Sheet" />
+    <style name="ThemeOverlay.Zen.CustomTabSheet.Dark" parent="ThemeOverlay.Zen.Sheet.Dark" />
+
+    <!-- A native prompt sheet (NativePromptSheet, v2 §9.23): the same sheet, coming and going on
+         §11.3's 120 ms opacity fade in place instead of the platform's slide; the dim with it. -->
+    <style name="ThemeOverlay.Zen.PromptSheet" parent="ThemeOverlay.Zen.Sheet">
+        <item name="android:windowAnimationStyle">@style/Animation.Zen.PromptSheet</item>
+    </style>
+    <style name="ThemeOverlay.Zen.PromptSheet.Dark" parent="ThemeOverlay.Zen.Sheet.Dark">
+        <item name="android:windowAnimationStyle">@style/Animation.Zen.PromptSheet</item>
+    </style>
+    <style name="Animation.Zen.PromptSheet" parent="@android:style/Animation.Dialog">
+        <item name="android:windowEnterAnimation">@anim/prompt_sheet_in</item>
+        <item name="android:windowExitAnimation">@anim/prompt_sheet_out</item>
+    </style>
+
+    <!-- The prompt sheet's §9.12 field: the platform draws a field's cursor and selection handles
+         in the theme's activated colour (Theme.Zen's primary), so the field is built under this
+         overlay, which makes that colour the v2 accent of the theme in force – v2_accent_*, the
+         token's value, pinned to main.css – and no ink on the sheet comes from outside the table. -->
+    <style name="ThemeOverlay.Zen.PromptField" parent="">
+        <item name="android:colorControlActivated">@color/v2_accent_light</item>
+        <item name="colorControlActivated">@color/v2_accent_light</item>
+    </style>
+    <style name="ThemeOverlay.Zen.PromptField.Dark">
+        <item name="android:colorControlActivated">@color/v2_accent_dark</item>
+        <item name="colorControlActivated">@color/v2_accent_dark</item>
+    </style>
+</resources>

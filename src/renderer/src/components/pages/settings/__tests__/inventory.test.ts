@@ -1,0 +1,1326 @@
+// @vitest-environment happy-dom
+import { isValidElement } from 'react'
+import { describe, expect, it, vi } from 'vitest'
+import type { HostCapabilities, Settings, Tab, UIState } from '@shared/types'
+import type { RowGroup } from '../model'
+import { INTERNAL_PAGES, availableSections } from '@shared/internalPages'
+import { DEFAULT_BLOCKING_SETTINGS, emptyBlockingStatus } from '@shared/blocking'
+import {
+  DEFAULT_CONTAINERS,
+  DEFAULT_SETTINGS,
+  emptyAgentSkillStatus,
+  emptyAutofillUIState,
+  emptyPasswordsStatus,
+  emptyResourceSnapshot
+} from '@shared/defaults'
+import { DEFAULT_PAGE_ENVIRONMENT } from '@shared/pageControls'
+import { DEFAULT_SEARCH_ENGINES } from '@shared/search'
+import type { TranslateUIState } from '@shared/translate'
+import { emptyPrivacyStatus } from '@shared/privacy'
+import { emptySiteDataStatus } from '@shared/siteData'
+import { emptyUpdateStatus } from '@shared/updates'
+
+/*
+ * The desktop's Settings rows, as the overlay panes had them before the tab (PR #193) became the
+ * one rendering: every category the Electron host shows is built through the shared builder
+ * with the desktop layout and walked, and each row the panes offered – Zen's, #62's Security,
+ * #106's Languages, #115's tracking prevention, #135's site controls, #145's Autofill, #156's
+ * protection, #228's zoom, dark theme and spell check, #254's sync scope – is asserted by its
+ * label, item sheets included. The list is the inventory taken on `main` before the merge
+ * (`internal/desktop-parity/settings-row-inventory-pr193.md`); a row that moves category or
+ * loses its label fails here rather than silently.
+ */
+
+const invoke = vi.fn<(name: string, args?: unknown) => Promise<null>>(async () => null)
+Object.assign(window, { zen: { invoke, on: () => () => undefined } })
+
+const { buildSection } = await import('../sections')
+const { allRows, findRow, groupShows } = await import('../model')
+const { idleAutofillSettings } = await import('@renderer/lib/autofillSettings')
+const { idleDictionaryWords } = await import('@renderer/lib/spellcheckWords')
+
+/** Electron's capabilities (`src/main/platform/index.ts`), the Windows material on. */
+const ELECTRON: HostCapabilities = {
+  windowControls: true,
+  windowControlsOverlay: false,
+  windowMaterial: true,
+      nativeWindowControls: true,
+  windowTransparency: true,
+  nativeMenus: true,
+  windowDrag: true,
+  devtools: true,
+  compactReveal: true,
+  pictureInPicture: true,
+  viewSource: true,
+  windows: true,
+  extensions: true,
+  resourceGovernor: true,
+  sync: true,
+  print: true,
+  printPreview: true,
+  savePageFormats: true,
+  pdfViewer: false,
+  pdfPrint: false,
+  agents: true,
+  agentSkills: true,
+  updates: true,
+  share: false,
+  sharePanel: false,
+  clipboardChip: false,
+  appLinkSettings: false,
+  pullToRefresh: false,
+  passwords: true,
+  defaultBrowser: true,
+  requestBlocking: true,
+  reducedExtensionIsolation: false,
+  pageControls: false,
+  darkenSites: true,
+  privateTabs: false,
+  inactiveTabs: false,
+  secureDns: true,
+  quitsThroughCore: true,
+  lookalikeHolds: true,
+  newTabPage: true,
+  pageTabs: true,
+  // The desktop writes launchers for installed web apps (Settings › Apps lists them).
+  pinShortcuts: true,
+  translate: true,
+  voiceSearch: false,
+  screenCapture: true,
+  shareSheet: true,
+  selectionToolbar: false,
+  popupSurface: true,
+  qrScan: false,
+  readAloud: true,
+  pageLanguages: true,
+  genericFontFamilies: true,
+  caretBrowsing: true,
+  placementAnswered: false,
+  agentDialogs: true,
+  agentDialogPolicy: true
+}
+
+const SETTINGS_TAB = {
+  id: 'settings',
+  spaceId: 'space',
+  containerId: 'default',
+  url: 'zen://settings',
+  title: 'Settings',
+  favicon: null,
+  pinned: false,
+  essential: false,
+  pinnedUrl: null,
+  customTitle: null,
+  customIcon: null,
+  windowId: null,
+  folderId: null,
+  loading: false,
+  canGoBack: false,
+  canGoForward: false,
+  audible: false,
+  muted: false,
+  discarded: false,
+  frozen: false,
+  cpuThrottle: 1,
+  zoom: 1,
+  splitGroupId: null,
+  createdAt: 0,
+  lastActiveAt: 0,
+  errorCode: null,
+  bookmarked: false,
+  readerable: false,
+  blockedCount: 0,
+  openerTabId: null
+} as Tab
+
+const TRANSLATE: TranslateUIState = {
+  available: true,
+  preferences: {
+    preferred: ['en', 'de'],
+    alwaysTranslate: ['fr'],
+    neverTranslate: ['es'],
+    neverTranslateSites: ['example.org'],
+    autoOffer: true
+  },
+  languages: ['de', 'en', 'fr', 'es'],
+  installed: [
+    { from: 'de', to: 'en', version: '1.0', bytes: 35_000_000, installed: true, downloading: false }
+  ],
+  downloading: [],
+  registryDate: '2026-09-01',
+  modelLicense: 'MPL-2.0',
+  tabs: {}
+}
+
+const NOW = 1_800_000_000_000
+
+/** A desktop profile with something in every list, so the per-item rows build too. */
+function desktopState(): UIState {
+  const settings: Settings = {
+    ...DEFAULT_SETTINGS,
+    spaceRouting: { 'example.com': 'space' },
+    unloadExcludedDomains: ['mail.example.com'],
+    pageControls: {
+      ...DEFAULT_SETTINGS.pageControls,
+      siteZooms: { 'wikipedia.org': 1.25 },
+      darkenSiteExceptions: { 'example.net': false }
+    },
+    agents: { ...DEFAULT_SETTINGS.agents, enabled: true },
+    downloads: { ...DEFAULT_SETTINGS.downloads, autoOpenTypes: ['pdf'] },
+    // CT-41: the preferred languages the pane's "Languages you read" rows became (translate's
+    // `preferred` is derived from this list); CT-25: a size off the default, so Reset builds.
+    languages: ['en', 'de'],
+    fonts: { ...DEFAULT_SETTINGS.fonts, size: 18 },
+    blocking: {
+      ...DEFAULT_BLOCKING_SETTINGS,
+      customLists: [
+        {
+          id: 'custom:annoyances',
+          url: 'https://example.com/annoyances.txt',
+          name: 'Annoyances',
+          enabled: true
+        }
+      ]
+    }
+  } as Settings
+  return {
+    platform: 'linux',
+    capabilities: ELECTRON,
+    version: '0.3.77-test',
+    systemDark: false,
+    tabs: { settings: SETTINGS_TAB },
+    essentialTabIds: [],
+    spaces: [{ id: 'space', name: 'Personal', activeTabId: 'settings', tabIds: ['settings'] }],
+    activeSpaceId: 'space',
+    containers: DEFAULT_CONTAINERS,
+    folders: {},
+    splitGroups: {},
+    settings,
+    shortcuts: [
+      {
+        id: 'key_newNavigatorTab',
+        action: 'tab.new',
+        group: 'windowAndTabManagement',
+        label: 'New tab',
+        binding: { key: 't', ctrl: true, alt: false, shift: false, meta: false },
+        extraBindings: [],
+        unsupported: false,
+        hidden: false
+      }
+    ],
+    searchEngines: DEFAULT_SEARCH_ENGINES,
+    searchEngineControl: null,
+    extensionControls: {},
+    glance: null,
+    compactSidebarRevealed: false,
+    window: {
+      id: 'w',
+      kind: 'main',
+      maximized: false,
+      fullscreen: false,
+      focused: true,
+      htmlFullscreenTabId: null
+    },
+    downloads: [],
+    downloadsProgress: { active: 0, progress: 0 },
+    bookmarks: [],
+    readingList: [],
+    newTabShortcuts: [{ id: 'nt1', title: 'Ione', url: 'https://ione.example/' }],
+    newTabHiddenHosts: [],
+    newTabBackground: { image: false, canPick: true, accent: null },
+    recentlyClosedCount: 0,
+    recentlyClosed: [],
+    media: [],
+    findResult: null,
+    devtoolsOpenFor: [],
+    resources: { ...emptyResourceSnapshot(), restartRequired: true },
+    foreignTabIds: [],
+    windowCount: 1,
+    boosts: [
+      {
+        domain: 'github.com',
+        enabled: true,
+        tint: null,
+        tintIntensity: 0,
+        font: null,
+        fontSize: 100,
+        darkMode: false,
+        zapped: [],
+        css: '',
+        updatedAt: 1
+      }
+    ],
+    zappingTabId: null,
+    liveFolders: {},
+    extensions: [],
+    extensionUpdates: { checking: false, lastCheckedAt: null },
+    sidePanel: null,
+    mods: [{ id: 'm1', name: 'Round tabs', source: null, css: '', enabled: true, updatedAt: 1 }],
+    webApps: [
+      {
+        id: 'notes',
+        name: 'Notes',
+        startUrl: 'https://notes.example/',
+        scope: 'https://notes.example/',
+        pinnedAt: 1,
+        icon: null,
+        bounds: null
+      }
+    ],
+    sync: {
+      enabled: true,
+      folder: '/home/me/Sync',
+      folderName: '/home/me/Sync',
+      folderLost: false,
+      deviceId: 'dev',
+      deviceName: 'Laptop',
+      scope: {
+        spaces: true,
+        folders: true,
+        pinnedTabs: true,
+        essentials: true,
+        openTabs: false,
+        containers: true,
+        bookmarks: true,
+        passwords: true,
+        settings: true,
+        shortcuts: true,
+        boosts: true
+      },
+      lastSyncAt: NOW - 60_000,
+      lastError: null,
+      syncing: false,
+      devices: [{ id: 'other', name: 'Phone', lastSeen: NOW - 120_000 }],
+      pendingMerge: false,
+      remoteTabsVersion: 0,
+      transport: 'folder',
+      webdav: null,
+      webdavAvailable: false,
+      authRefused: false,
+      accountAvailable: false,
+      account: null,
+      accountLink: null,
+      accountLinkFailure: null,
+      accountSignedOut: false
+    },
+    agents: [],
+    awayAgents: [],
+    agentServer: {
+      running: true,
+      url: 'http://127.0.0.1:8765/mcp',
+      lanUrls: [],
+      token: 'secret-token',
+      error: null
+    },
+    // The Agent skill group: two harnesses found on this computer, the skill in one of them, so
+    // the status row, a switch per harness and the install-everywhere action all build.
+    agentSkills: {
+      ...emptyAgentSkillStatus('0.3.77-test'),
+      targets: [
+        {
+          id: 'claude',
+          label: 'Claude Code',
+          dir: '~/.claude/skills/ione-browser',
+          detected: true,
+          installed: true,
+          installedVersion: '0.3.77-test',
+          note: null
+        },
+        {
+          id: 'cursor',
+          label: 'Cursor',
+          dir: '~/.cursor/skills/ione-browser',
+          detected: true,
+          installed: false,
+          installedVersion: null,
+          note: null
+        },
+        {
+          id: 'codex',
+          label: 'Codex',
+          dir: '~/.codex/skills/ione-browser',
+          detected: false,
+          installed: false,
+          installedVersion: null,
+          note: null
+        }
+      ]
+    },
+    updates: emptyUpdateStatus('0.3.77-test', { os: 'linux', arch: 'x64', kind: 'appimage' }),
+    passwords: emptyPasswordsStatus(),
+    defaultBrowser: { isDefault: false, prompt: null },
+    blockedPopups: {},
+    permissionRules: [{ origin: 'https://meet.example', permission: 'camera', decision: 'allow' }],
+    permissionDefaults: {},
+    deviceGrants: [],
+    lastSafetyCheck: null,
+    permissionPrompts: [],
+    securityPrompts: [],
+    pageDialogs: [],
+    closingTabIds: [],
+    screenCaptureRequests: [],
+    shareRequests: [],
+    crashRestore: null,
+    autofill: emptyAutofillUIState(),
+    blocking: {
+      ...emptyBlockingStatus(),
+      ready: true,
+      lists: [
+        {
+          id: 'easylist',
+          name: 'EasyList',
+          description: 'Ads',
+          url: 'https://lists.example/easylist.txt',
+          homepage: 'https://lists.example/easylist',
+          licence: 'GPL-3.0',
+          tier: 'basic',
+          enabled: true,
+          version: '1',
+          updatedAt: NOW,
+          filterCount: 1000,
+          bundled: false,
+          updating: false,
+          lastError: null
+        },
+        {
+          id: 'custom:annoyances',
+          name: 'Annoyances',
+          description: 'Annoyances filters',
+          url: 'https://example.com/annoyances.txt',
+          homepage: 'https://example.com/',
+          licence: 'GPL-3.0',
+          tier: null,
+          enabled: true,
+          version: '1',
+          updatedAt: NOW,
+          filterCount: 10,
+          bundled: false,
+          updating: false,
+          lastError: null
+        }
+      ],
+      siteExceptions: ['https://news.example']
+    },
+    privacy: { ...emptyPrivacyStatus(), httpsOnlyExceptions: ['intranet.example'] },
+    siteData: emptySiteDataStatus(),
+    translate: TRANSLATE,
+    pageEnvironment: DEFAULT_PAGE_ENVIRONMENT,
+    spellcheck: {
+      available: true,
+      systemLanguages: false,
+      languages: [
+        { code: 'en-US', name: 'English (United States)', enabled: true, status: 'ready' },
+        { code: 'de', name: 'German', enabled: false, status: 'unknown' }
+      ]
+    },
+    readAloud: null,
+    import: null
+  } as unknown as UIState
+}
+
+/**
+ * The inventory: the desktop overlay's categories on `main` before the merge, each with the
+ * labels of its rows as the builder words them. A category the overlay had of its own that the
+ * builder folds into another (Site Settings, Clear Browsing Data and Safety Check sit under
+ * Privacy and Security, as the phone had them) is listed under the category it lives in now.
+ */
+const INVENTORY: Record<string, readonly string[]> = {
+  look: [
+    'Colour scheme',
+    // The overlay's 'Toolbar layout' menulist is the Layout card grid (§9.37, §10.4).
+    'Layout',
+    'Tabs on the right',
+    'Expanded sidebar',
+    // The Collapsed sidebar layout's dependent row (tabs-03, W4-8).
+    'Expand on hover',
+    'Remove browser padding',
+    'Use Windows transparency effects',
+    'Window transparency',
+    'Page zoom',
+    'wikipedia.org',
+    'Remove zoom',
+    'Treatment',
+    'Show bookmarks bar',
+    'Import bookmarks',
+    'Export bookmarks',
+    'Floating behaviour',
+    'Apply dark theme to sites',
+    'example.net',
+    'Remove exception',
+    'Split view drag and drop',
+    'Enable Glance',
+    'Trigger'
+  ],
+  compact: ['Enable compact mode', 'Hide sidebar', 'Hide top toolbar'],
+  newtab: [
+    'Open the new tab page',
+    'Layout',
+    'Shortcuts',
+    'Background',
+    'Change background image',
+    'Remove background image',
+    'Show a greeting',
+    'Ione',
+    'Add shortcut'
+  ],
+  tabs: [
+    'Open new tabs',
+    'Show separator between pinned and regular tabs',
+    'Ctrl+Tab stays within Essentials or regular tabs',
+    // W6-3: the "Restore previous session on startup" switch became Settings › On startup's
+    // choice on the windowed hosts (the phone keeps the switch).
+    'When Ione starts',
+    'Restore pages after a crash',
+    'Confirm before closing multiple tabs',
+    'Tabs across windows',
+    'Open a blank window',
+    'When closing a pinned tab',
+    'Restore pinned tabs to their pinned URL on startup',
+    'Third-party links on pinned and essential tabs',
+    'Container-specific Essentials',
+    'Maximum number of Essentials'
+    // W8-2: the pane's "Unload inactive tabs", "Unload after" and "Never unload these domains"
+    // are Performance's Memory Saver rows now, under Chrome's names (below).
+  ],
+  // W8-2: Chrome's Performance page. Memory Saver is the tabs pane's Tab unloading under Chrome's
+  // name (the switch, the tiers as a radio in place of the minutes field, the excluded domains as
+  // item rows with Add / Add current site); Energy Saver is new, and took the Resources pane's
+  // "On battery, shrink budgets to" as its effect (one setting, one place).
+  performance: [
+    'Memory Saver',
+    'Memory Saver options',
+    'Add a site',
+    'Add current site',
+    'Energy Saver',
+    'Energy Saver options',
+    'While Energy Saver is on, shrink the budgets to'
+  ],
+  downloads: [
+    'Location',
+    'Open the downloads folder',
+    'Ask where to save each file',
+    'Show the downloads when a download finishes',
+    'Show the downloads when a download starts',
+    'Always show the downloads button',
+    'Notify when a download finishes',
+    'Open certain file types automatically'
+  ],
+  resources: [
+    'Memory, CPU and GPU memory',
+    'Free up memory now',
+    'Refresh the sample',
+    'Keep the browser within budgets',
+    'Enforcement',
+    'Memory budget',
+    'Share of installed RAM',
+    'CPU budget',
+    'GPU memory budget',
+    // W8-2: "On battery, shrink budgets to" is Performance › Energy Saver's effect row; the
+    // pane's "Unload hidden pages" twin switch, its "after" field and the "Excluded domains" fact
+    // went with Memory Saver – this row is the link to them (§9.1 one owner).
+    'Memory Saver and Energy Saver',
+    'Freeze hidden pages after',
+    'Freeze everything when idle for',
+    'Maximum live pages',
+    'Background loads at once',
+    'Pages playing audio',
+    'Pinned tabs',
+    'Essentials',
+    'Relaunch to apply',
+    'GPU',
+    'Renderer process limit',
+    'JavaScript heap cap per page',
+    'Low-end device mode',
+    'No spare renderer process',
+    'Drop the back/forward cache',
+    // "Block prerendering" folded into Privacy and security's Preload pages (PS-43, services pass 10).
+    'Raster threads per page',
+    'V8: favour memory over speed'
+  ],
+  search: [
+    'Default search engine',
+    'Show search suggestions',
+    'Show history suggestions',
+    'Show bookmark suggestions',
+    'Always show full URLs',
+    'Engine keywords'
+  ],
+  autofill: [
+    'Offer to save passwords',
+    'Sign in automatically',
+    'Clear copied passwords',
+    'Unlock'
+  ],
+  languages: [
+    'Offer to translate pages in other languages',
+    // The pane's "Languages you read" rows are the Preferred languages rows (CT-41, driven by
+    // `Settings.languages`); the pane's "Translate pages into this language" (Make first) and
+    // Remove actions are the rows' ⋯ menu – Move Up / Move Down / Remove – not rows of their
+    // own, and "Add a language you read" is Add language, Chrome's wording.
+    'English',
+    'German',
+    'Add language',
+    'French',
+    'Spanish',
+    'example.org',
+    'German to English',
+    'Remove model',
+    'Download a model',
+    'Check the spelling of text fields',
+    'English (United States)',
+    'Ione',
+    'Add a new word'
+  ],
+  privacy: [
+    // Safety Check (#135)
+    'Safety check',
+    'Check now',
+    // Security (#156)
+    'Protection level',
+    'Google Safe Browsing API key',
+    'Update feeds now',
+    // Tracking prevention (#115)
+    'Block ads and trackers',
+    'Level',
+    'Update lists automatically',
+    'Update lists now',
+    'EasyList',
+    'Annoyances',
+    'Add a list by its URL',
+    'Edit your filters',
+    'news.example',
+    'Add a site',
+    // Delete browsing data (#135; Chrome's words since M124, W8-7)
+    'Delete browsing data',
+    // Cookies, HTTPS-only, secure DNS, signals (#156). The Third-party cookies row folded into
+    // Cookies and site data's default radio on #322 (the lead's ruling on Q3): the mode is the
+    // "Default behaviour" choice there and the private-only switch under it.
+    'Only in private windows',
+    // Preload pages (PS-43): Chrome's row, on both hosts, where the Resources pane's "Block
+    // prerendering" switch went.
+    'Preload pages',
+    'HTTPS-only mode',
+    'intranet.example',
+    'Use secure DNS',
+    'Resolver',
+    'Send a Global Privacy Control signal',
+    'Send a Do Not Track request',
+    // Site Settings (#135): the 39 content types and the sites with their own settings
+    'Location',
+    'Camera',
+    'Microphone',
+    'Notifications',
+    'Background sync',
+    'Motion sensors',
+    'Automatic downloads',
+    'MIDI devices',
+    'USB devices',
+    'Serial ports',
+    'HID devices',
+    'Bluetooth devices',
+    'File editing',
+    'Clipboard',
+    'Payment handlers',
+    // Insecure content is the Android host's row alone (services pass 10): Electron fixes
+    // `allowRunningInsecureContent` per WebContents at creation and has no per-site path, so the
+    // desktop is not offered a row nothing acts on (`support.desktop: 'n-a'`).
+    'Virtual reality',
+    'Window management',
+    'Fonts',
+    'Local network access',
+    'Images',
+    'JavaScript',
+    'Pop-ups and redirects',
+    'Ads and trackers',
+    'Sound',
+    'PDF documents',
+    'Protected content',
+    'Third-party sign-in',
+    'On-device site data',
+    'Open other apps',
+    'Cookies while embedded',
+    'Cookies for embedded sites',
+    'Your device use',
+    'Fullscreen',
+    'Automatic picture-in-picture',
+    'Pointer lock',
+    'Keyboard lock',
+    'Speaker selection',
+    'Clipboard writes',
+    'Screen sharing',
+    'Default behaviour',
+    'meet.example',
+    'Reset all sites'
+  ],
+  spaces: ['example.com', 'Remove route', 'Add route'],
+  containers: [
+    'No Container',
+    'Personal',
+    'Colour',
+    'Icon',
+    'Move up',
+    'Move down',
+    'Delete container',
+    'New container'
+  ],
+  boosts: ['github.com', 'Boost a site'],
+  mods: ['Round tabs', 'New Mod', 'Import from URL', 'Import from file'],
+  extensions: ['From the Chrome Web Store', 'From a file', 'Load unpacked', 'Check for updates'],
+  // shortcuts-menus-138: the installed apps by name (the fixture's one), Open and Uninstall
+  // behind each row's ⋯.
+  apps: ['Notes'],
+  agents: [
+    'Enable the MCP server',
+    'Port',
+    'Allow devices on the local network',
+    'Connection token',
+    'Regenerate token',
+    'Default mode for new agents',
+    'Show the agent’s cursor',
+    'Ask before a new agent connects',
+    'Allow agents to run JavaScript in pages',
+    // The Agent skill group (desktop hosts): the status row, a switch per notable coding agent
+    // (the fixture lists three; Codex is not on this computer but still has a pre-install row)
+    // and the install-everywhere action.
+    'ione-browser skill',
+    'Claude Code',
+    'Cursor',
+    'Codex',
+    'Install for every agent found'
+  ],
+  passwords: ['Manage passwords', 'Offer to save passwords', 'Ask again before showing or copying'],
+  // #259's Import (ID-23): the pane's two dialog rows; the last import's one row comes and goes.
+  import: ['Bookmarks, history, passwords and addresses', 'Bookmarks HTML or passwords CSV'],
+  security: ['meet.example', 'Forget sign-ins and certificates'],
+  sync: [
+    'Sync now',
+    // The pane's label for the device's field (`overlays/SyncSection.tsx` at e59cb52e: "This
+    // device"), which #261's builder keeps on both hosts; #193's own port had renamed it "Name"
+    // under a "This device" heading.
+    'This device',
+    'Phone',
+    'Spaces',
+    'Folders',
+    'Pinned tabs',
+    'Essentials',
+    'Open tabs',
+    'Containers',
+    'Bookmarks',
+    'Passwords',
+    'Settings',
+    'Keyboard shortcuts',
+    'Boosts',
+    // The pane's second button, "Turn off and remove this device's data", is not a row of the
+    // tab: the design lead's ruling on #261's desktop page (the stills of its two rows) – removing
+    // the data only means something together with turning off, so it is a checkbox row inside
+    // the prompt (§9.23: a choice that means something only with the footer's action), not a
+    // second action. The tab carries it as the "Also remove this device's data from the folder"
+    // checkbox in Turn off sync's dialog (`SyncDisconnectForm`), the phone sheet's composition,
+    // so nothing the pane offered is lost.
+    'Turn off sync'
+  ],
+  shortcuts: ['Shortcut set', 'Your changes', 'New tab'],
+  'default-browser': ['Ione is not your default browser'],
+  updates: [
+    'Check for updates',
+    'Check for updates automatically',
+    'Download updates in the background',
+    'Release channel',
+    'Verification'
+  ],
+  // Settings › System: in-app proxies, then the OS panel as a secondary door.
+  system: [
+    'Default connection',
+    'Add proxy',
+    'Add routing rule',
+    'Default for agents',
+    'Add agent rule',
+    "Open your computer's proxy settings"
+  ],
+  about: ['Ione', 'Check for updates', 'Engine', 'Upstream project']
+}
+
+/** Group headings the overlay's panes named that the builder keeps as headings. */
+const HEADINGS: Record<string, readonly string[]> = {
+  look: [
+    'Appearance',
+    'Sites with their own zoom',
+    'App icon',
+    'Bookmarks',
+    'Sites',
+    'Site exceptions',
+    'Split view',
+    'Glance'
+  ],
+  // W8-2: the pane's "Tab unloading" heading is Performance's "Memory Saver".
+  tabs: ['Tabs', 'Window sync', 'Pinned tabs and Essentials'],
+  performance: ['Memory Saver', 'Always keep these sites active', 'Energy Saver'],
+  languages: [
+    // CT-41: the pane's "Languages you read" became Preferred languages, the category's first
+    // group (Chrome's order on chrome://settings/languages).
+    'Preferred languages',
+    'Translation',
+    'Always translate',
+    'Never translate',
+    'Sites never translated',
+    'Translation models',
+    'Spell check',
+    'Custom dictionary'
+  ],
+  privacy: [
+    'Safety check',
+    'Safe Browsing',
+    'Tracking prevention',
+    'Filter lists',
+    'Your lists',
+    'Your filters',
+    'Sites without blocking',
+    'Delete browsing data',
+    // #156's Third-party cookies heading folded into #310's Cookies and site data (#322, Q3).
+    'Cookies and site data',
+    'Site settings',
+    'Content',
+    'Additional permissions',
+    'Sites with their own settings',
+    'Preload pages',
+    'HTTPS-only mode',
+    'Sites allowed over http',
+    'Secure DNS',
+    'Privacy signals'
+  ],
+  // #261 put Sync on the shared builder and the pane's rows kept their labels under the builder's
+  // headings: Sync now under Status (#193's port said "Sync across devices"), the device's field
+  // beside the folder row under Folder and device (the port's "This device" group), the device
+  // list under Other devices (the pane's "Devices"), the switches under What you sync (the
+  // pane's "What to sync").
+  sync: ['Status', 'Folder and device', 'Other devices', 'What you sync'],
+  import: ['Import from another browser', 'Import from a file'],
+  security: ['Site permissions', 'This session'],
+  passwords: ['Password manager', 'Saving', 'Security'],
+  system: ['Connection', 'Proxies', 'Routing rules', 'Agent access', 'Computer']
+}
+
+const PAGE = INTERNAL_PAGES.settings
+
+describe('the desktop Settings tab carries every row of the overlay panes it replaces', () => {
+  const state = desktopState()
+  const sections = availableSections(PAGE, ELECTRON, 'desktop', 'linux')
+  const ctx = {
+    state,
+    tab: SETTINGS_TAB,
+    pointer: true,
+    formFactor: 'desktop' as const,
+    set: () => undefined,
+    navigate: () => undefined,
+    openBarEditor: () => undefined,
+    boost: () => undefined,
+    autofill: idleAutofillSettings(),
+    screenLock: false,
+    readAloudVoices: null,
+    dictionary: { ...idleDictionaryWords(), words: ['Ione'] }
+  }
+  const models = new Map(sections.map((s) => [s.id, buildSection(s, ctx)]))
+
+  it('shows the overlay’s categories in Zen’s order, three of them folded into Privacy and Security', () => {
+    expect(sections.map((s) => s.label)).toEqual([
+      'Look and Feel',
+      'Compact Mode',
+      'New Tab',
+      'Tab Management',
+      // W8-2: Chrome's Performance page (Memory Saver, Energy Saver), the desktop and tablet
+      // shells', right after the tabs it sleeps.
+      'Performance',
+      'Downloads',
+      'Resources',
+      'Search',
+      'Autofill',
+      'Languages',
+      'Privacy and Security',
+      'Space Routing',
+      'Containers',
+      'Boosts',
+      'Mods',
+      'Extensions',
+      // shortcuts-menus-138: the installed web apps, on a host that writes their launchers.
+      'Apps',
+      'AI Agents',
+      'Passwords',
+      'Security',
+      // The Ione account on its own page, before the Sync it is the first transport of.
+      'Account',
+      'Sync',
+      'Import',
+      'Accessibility',
+      'Keyboard Shortcuts',
+      'Default Browser',
+      'Updates',
+      // Chrome's System (the computer's proxy settings), before its Reset settings.
+      'System',
+      // settings-70: Chrome's "Reset settings" at the foot of its list (W7-6).
+      'Reset Settings',
+      'About'
+    ])
+    // Accessibility was the overlay's `pageControls` category (false on Electron); the speech
+    // engine (#257, `readAloud`) brings it to the desktop with Read aloud's groups alone – the
+    // zoom groups stay the phone's.
+    // Caret browsing's group (CT-34) is the desktop's too: its engine has the switch.
+    expect(models.get('accessibility')!.groups.map((g) => g.id)).toEqual([
+      'read-aloud',
+      'read-aloud-voices',
+      'caret-browsing'
+    ])
+  })
+
+  for (const [id, labels] of Object.entries(INVENTORY)) {
+    it(`carries the ${id} rows`, () => {
+      const model = models.get(id)
+      expect(model, `${id} is not a desktop category`).toBeDefined()
+      const rows = allRows(model!.groups)
+      const found = new Set(rows.map((r) => r.label))
+      const missing = labels.filter((label) => !found.has(label))
+      expect(missing, `rows of ${id} the tab does not carry`).toEqual([])
+      // Nothing of the phone shell's reaches the desktop: every group and row shown is the
+      // desktop's, and no group is left with no rows and no empty state.
+      for (const group of model!.groups) {
+        expect(group.layouts ?? ['desktop']).toContain('desktop')
+        expect(groupShows(group), `${id} › ${group.id} shows`).toBe(true)
+      }
+      for (const row of rows) expect(row.layouts ?? ['desktop']).toContain('desktop')
+    })
+  }
+
+  for (const [id, headings] of Object.entries(HEADINGS)) {
+    it(`keeps the ${id} group headings`, () => {
+      const model = models.get(id)!
+      const found = model.groups.map((g) => g.heading).filter((h) => h !== null)
+      expect(headings.filter((h) => !found.includes(h))).toEqual([])
+    })
+  }
+
+  it('gives every row of a category an id of its own', () => {
+    for (const [id, model] of models) {
+      const ids = allRows(model.groups).map((r) => r.id)
+      const dupes = ids.filter((rowId, i) => ids.indexOf(rowId) !== i)
+      expect(dupes, `${id} repeats row ids`).toEqual([])
+    }
+  })
+
+  // The desktop vocabulary (§10.5): a command row trails a button, so the phone's whole-row tap
+  // targets the other programs added never reach the desktop as bare text. A row that leaves the
+  // page (chevron, external) or leads with a status glyph (the safety check's results) is the
+  // pressable row on both.
+  it('gives every plain action row a desktop button label', () => {
+    const bare: string[] = []
+    for (const [id, model] of models) {
+      for (const row of allRows(model.groups)) {
+        if (row.kind !== 'action' || row.leaves || row.leading || row.button) continue
+        bare.push(`${id} › ${row.label}`)
+      }
+    }
+    expect(bare).toEqual([])
+  })
+})
+
+/*
+ * The AI Agents › Agent skill group (S2 of the MCP program): the `ione-browser` Agent Skill's
+ * install state per coding agent, as `agentSkills` reports it – a status line, a switch per
+ * notable agent (detected or not, so a user can pre-install) and one action for all of them
+ * (the #460 gate: no "Kept current" row, its sentence rides the install row; Remove everywhere
+ * asks nothing and wears no danger ink; the status row's error state trails its glyph). Desktop
+ * hosts only: a phone has no agent to install into.
+ */
+describe('the AI Agents › Agent skill group', () => {
+  const section = availableSections(PAGE, ELECTRON, 'desktop', 'linux').find(
+    (s) => s.id === 'agents'
+  )!
+  const build = (
+    agentSkills: UIState['agentSkills'],
+    capabilities: HostCapabilities = ELECTRON
+  ): ReturnType<typeof buildSection> => {
+    const state = desktopState()
+    return buildSection(section, {
+      state: { ...state, capabilities, agentSkills },
+      tab: SETTINGS_TAB,
+      pointer: true,
+      formFactor: 'desktop',
+      set: () => undefined,
+      navigate: () => undefined,
+      openBarEditor: () => undefined,
+      boost: () => undefined,
+      autofill: idleAutofillSettings(),
+      screenLock: false,
+      readAloudVoices: null,
+      dictionary: idleDictionaryWords()
+    })
+  }
+  const target = (
+    id: string,
+    label: string,
+    detected: boolean,
+    installed: boolean
+  ): UIState['agentSkills']['targets'][number] => ({
+    id,
+    label,
+    dir: `~/.${id}/skills/ione-browser`,
+    detected,
+    installed,
+    installedVersion: installed ? '0.3.77-test' : null,
+    note: null
+  })
+  const skill = (model: ReturnType<typeof buildSection>): RowGroup | undefined =>
+    model.groups.find((g) => g.id === 'skill')
+
+  it('sits right after Connect an agent, on hosts with coding agents to install into', () => {
+    const status = { ...emptyAgentSkillStatus('0.3.77-test'), targets: [] }
+    const model = build(status)
+    const ids = model.groups.map((g) => g.id)
+    expect(ids.indexOf('skill')).toBe(ids.indexOf('connect') + 1)
+    // Two lines at 664 (§10.5): the etiquette in a sentence, the folder in another – no product
+    // list in the group copy; the rows name the notable agents, detected or not.
+    expect(skill(model)?.description).toBe(
+      'A skill file that teaches coding agents to drive this browser beside you: their own tab group, nothing touched that is not theirs. Ione keeps a copy in each agent’s skills folder.'
+    )
+    expect(
+      build(status, { ...ELECTRON, agentSkills: false }).groups.map((g) => g.id)
+    ).not.toContain('skill')
+  })
+
+  it('offers a switch per notable agent, including ones not found yet, and one install for all of them while any is missing', () => {
+    invoke.mockClear()
+    const group = skill(
+      build({
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        targets: [
+          target('claude', 'Claude Code', true, false),
+          target('cursor', 'Cursor', true, false),
+          target('codex', 'Codex', false, false)
+        ]
+      })
+    )!
+    expect(group.heading).toBe('Agent skill')
+    // No "Kept current" row: its sentence rides the install row's description.
+    expect(group.rows.map((r) => r.id)).toEqual([
+      'skill-status',
+      'skill:claude',
+      'skill:cursor',
+      'skill:codex',
+      'skill-all'
+    ])
+    const status = group.rows[0]
+    expect(status.kind === 'info' && status.description).toBe('Not installed')
+    expect(status.tone).toBeUndefined()
+    expect(status.kind === 'info' && status.trailing).toBeUndefined()
+    const cursor = findRow([group], 'skill:cursor')!
+    expect(cursor.kind).toBe('switch')
+    if (cursor.kind === 'switch') {
+      expect(cursor.checked).toBe(false)
+      expect(cursor.description).toBe('~/.cursor/skills/ione-browser')
+      // The directory is a path: one line shortened from its start (§9.2's exception, #677).
+      expect(cursor.address).toBe(true)
+      cursor.onChange(true)
+      expect(invoke).toHaveBeenLastCalledWith('agent.installSkill', { targets: ['cursor'] })
+      cursor.onChange(false)
+      expect(invoke).toHaveBeenLastCalledWith('agent.uninstallSkill', { targets: ['cursor'] })
+    }
+    const codex = findRow([group], 'skill:codex')!
+    expect(codex.kind === 'switch' && codex.checked).toBe(false)
+    const all = findRow([group], 'skill-all')!
+    expect(all.kind === 'action' && all.label).toBe('Install for every agent found')
+    if (all.kind === 'action') {
+      expect(all.description).toBe(
+        'Writes the skill into each folder above and keeps it current when Ione updates.'
+      )
+      expect(all.button).toBe('Install')
+      expect(all.confirm).toBeUndefined()
+      all.onPress?.()
+      expect(invoke).toHaveBeenLastCalledWith('agent.installSkill', {
+        targets: ['claude', 'cursor', 'codex']
+      })
+    }
+  })
+
+  it('counts the installs and turns the action into Remove everywhere, unasked and unmarked, once all are in', () => {
+    invoke.mockClear()
+    const partial = skill(
+      build({
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        targets: [
+          target('claude', 'Claude Code', true, true),
+          target('cursor', 'Cursor', true, false),
+          target('codex', 'Codex', true, false)
+        ]
+      })
+    )!
+    const partialStatus = partial.rows[0]
+    expect(partialStatus.kind === 'info' && partialStatus.description).toBe(
+      'Installed for 1 of 3 agents found · version 0.3.77-test'
+    )
+    expect(findRow([partial], 'skill-all')?.label).toBe('Install for every agent found')
+
+    const full = skill(
+      build({
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        targets: [
+          target('claude', 'Claude Code', true, true),
+          target('cursor', 'Cursor', true, true)
+        ]
+      })
+    )!
+    const fullStatus = full.rows[0]
+    expect(fullStatus.kind === 'info' && fullStatus.description).toBe(
+      'Installed for 2 of 2 agents found · version 0.3.77-test'
+    )
+    // §10.5 as amended on #450: the files are Ione's copies, an edited one is spared, Install
+    // brings them back – no confirm, no danger ink, no ellipsis; it runs at once.
+    const remove = findRow([full], 'skill-all')!
+    expect(remove.kind === 'action' && remove.label).toBe('Remove everywhere')
+    if (remove.kind === 'action') {
+      expect(remove.description).toBe(
+        'Takes Ione’s copy out of each folder above; a copy you edited stays.'
+      )
+      expect(remove.button).toBe('Remove')
+      expect(remove.destructive).toBeUndefined()
+      expect(remove.confirm).toBeUndefined()
+      remove.onPress?.()
+      expect(invoke).toHaveBeenLastCalledWith('agent.uninstallSkill', {
+        targets: ['claude', 'cursor']
+      })
+    }
+  })
+
+  it('lists every notable agent even when none of them are on this computer', () => {
+    const group = skill(
+      build({
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        targets: [
+          target('claude', 'Claude Code', false, false),
+          target('cursor', 'Cursor', false, false),
+          target('codex', 'Codex', false, false),
+          {
+            ...target('opencode', 'OpenCode', false, false),
+            dir: '~/.config/opencode/skills/ione-browser'
+          },
+          target('gemini', 'Gemini CLI', false, false),
+          {
+            ...target('copilot', 'GitHub Copilot', false, false),
+            dir: '~/.copilot/skills/ione-browser'
+          },
+          {
+            ...target('agents', 'Shared skills folder', false, false),
+            dir: '~/.agents/skills/ione-browser'
+          }
+        ]
+      })
+    )!
+    expect(group.rows.map((r) => r.id)).toEqual([
+      'skill-status',
+      'skill:claude',
+      'skill:cursor',
+      'skill:codex',
+      'skill:opencode',
+      'skill:gemini',
+      'skill:copilot',
+      'skill:agents',
+      'skill-all'
+    ])
+    expect(group.rows[0].kind === 'info' && group.rows[0].description).toBe(
+      'No coding agent found on this computer'
+    )
+    expect(findRow([group], 'skill:opencode')?.label).toBe('OpenCode')
+    expect(findRow([group], 'skill:gemini')?.label).toBe('Gemini CLI')
+    expect(findRow([group], 'skill:copilot')?.label).toBe('GitHub Copilot')
+    expect(findRow([group], 'skill:agents')?.label).toBe('Shared skills folder')
+    expect(findRow([group], 'skill:opencode')?.description).toBe(
+      '~/.config/opencode/skills/ione-browser'
+    )
+  })
+
+  it('lists a notable agent that is not on this computer so it can be pre-installed', () => {
+    invoke.mockClear()
+    const group = skill(
+      build({
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        targets: [target('codex', 'Codex', false, false)]
+      })
+    )!
+    expect(group.rows.map((r) => r.id)).toEqual(['skill-status', 'skill:codex', 'skill-all'])
+    const status = group.rows[0]
+    expect(status.kind === 'info' && status.description).toBe(
+      'No coding agent found on this computer'
+    )
+    const all = findRow([group], 'skill-all')!
+    if (all.kind === 'action') {
+      expect(all.button).toBe('Install')
+      all.onPress?.()
+      expect(invoke).toHaveBeenLastCalledWith('agent.installSkill', { targets: ['codex'] })
+    }
+  })
+
+  it('says when no coding agent is on this computer and offers to look again', () => {
+    invoke.mockClear()
+    const group = skill(
+      build({
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        targets: []
+      })
+    )!
+    expect(group.rows.map((r) => r.id)).toEqual(['skill-status', 'skill-all'])
+    const status = group.rows[0]
+    expect(status.kind === 'info' && status.description).toBe(
+      'No coding agent found on this computer'
+    )
+    const again = findRow([group], 'skill-all')!
+    if (again.kind === 'action') {
+      expect(again.button).toBe('Check again')
+      again.onPress?.()
+      expect(invoke).toHaveBeenLastCalledWith('agent.refreshSkill', undefined)
+    }
+  })
+
+  it('shows the installer’s error with its trailing glyph, and an agent’s note in place of the path', () => {
+    const group = skill(
+      build({
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        error: 'Could not install: EACCES',
+        targets: [
+          {
+            ...target('claude', 'Claude Code', true, false),
+            note: 'A copy Ione did not install is there; installing replaces it'
+          },
+          {
+            ...target('cursor', 'Cursor', true, true),
+            note: 'Left in place: SKILL.md – it was edited since Ione installed it'
+          }
+        ]
+      })
+    )!
+    const status = group.rows[0]
+    if (status.kind !== 'info') throw new Error('not an info row')
+    expect(status.description).toBe('Could not install: EACCES')
+    // §10.4 / §9.33: a status row trails its 16 glyph with the line that reports the status,
+    // both in the danger ink through the row's one tone – the glyph carries no ink class.
+    expect(status.tone).toBe('danger')
+    expect(status.leading).toBeUndefined()
+    if (!isValidElement<{ className?: string }>(status.trailing)) throw new Error('no glyph')
+    expect(status.trailing.props.className).toBe('zen-settings-trailing-glyph')
+    // The installer's cautions warn and do not fail: the warn ink, on both of its sentences.
+    const claude = findRow([group], 'skill:claude')!
+    expect(claude.kind === 'switch' && claude.description).toBe(
+      'A copy Ione did not install is there; installing replaces it'
+    )
+    expect(claude.tone).toBe('warn')
+    const cursor = findRow([group], 'skill:cursor')!
+    expect(cursor.description).toBe(
+      'Left in place: SKILL.md – it was edited since Ione installed it'
+    )
+    expect(cursor.tone).toBe('warn')
+  })
+
+  it('keeps the count on the status line, in the danger tone, when one agent’s install failed and the others are in: only that row says why, in the danger ink', () => {
+    const sentence =
+      'Could not install: something else is in the way at ~/.codex/skills/ione-browser'
+    const group = skill(
+      build({
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        error: sentence,
+        targets: [
+          target('claude', 'Claude Code', true, true),
+          target('cursor', 'Cursor', true, true),
+          { ...target('codex', 'Codex', true, false), note: sentence }
+        ]
+      })
+    )!
+    const status = group.rows[0]
+    if (status.kind !== 'info') throw new Error('not an info row')
+    // The sentence once, on the row it is about (the lead's tidy from the #460 r3 read): the
+    // status line keeps its count and reports the failure through the danger tone and the
+    // §10.4 glyph alone.
+    expect(status.description).toBe('Installed for 2 of 3 agents found · version 0.3.77-test')
+    expect(status.tone).toBe('danger')
+    if (!isValidElement<{ className?: string }>(status.trailing)) throw new Error('no glyph')
+    expect(status.trailing.props.className).toBe('zen-settings-trailing-glyph')
+    // One failure, one ink (the lead's #468 delta read): the row's sentence is a failure, so it
+    // wears the danger ink the status row wears for it (a switch row has no glyph slot; the
+    // glyph is the status row's).
+    const codex = findRow([group], 'skill:codex')!
+    expect(codex.kind === 'switch' && codex.checked).toBe(false)
+    expect(codex.description).toBe(sentence)
+    expect(codex.tone).toBe('danger')
+    for (const id of ['skill:claude', 'skill:cursor']) {
+      const row = findRow([group], id)!
+      expect(row.kind === 'switch' && row.checked).toBe(true)
+      expect(row.description).toBe(`~/.${id.slice('skill:'.length)}/skills/ione-browser`)
+      expect(row.tone).toBeUndefined()
+    }
+    // Not every agent has it, so the bulk action still installs.
+    expect(findRow([group], 'skill-all')?.label).toBe('Install for every agent found')
+    for (const text of [status.description, codex.description])
+      for (const leak of ['.tmp', '/home/', '/tmp/', 'EACCES:']) expect(text).not.toContain(leak)
+
+    // With no agent in, the count would say "Not installed" and hide the failure: the status
+    // line carries the row's sentence then, glyph and tone as before.
+    const none = skill(
+      build({
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        error: sentence,
+        targets: [
+          target('claude', 'Claude Code', true, false),
+          { ...target('codex', 'Codex', true, false), note: sentence }
+        ]
+      })
+    )!
+    const noneStatus = none.rows[0]
+    if (noneStatus.kind !== 'info') throw new Error('not an info row')
+    expect(noneStatus.description).toBe(sentence)
+    expect(noneStatus.tone).toBe('danger')
+    expect(isValidElement(noneStatus.trailing)).toBe(true)
+    expect(findRow([none], 'skill:codex')?.description).toBe(sentence)
+    expect(findRow([none], 'skill:codex')?.tone).toBe('danger')
+
+    // A failure of the operation as a whole (the record could not be saved) is no row's: the
+    // status line says it, whatever is installed.
+    const whole =
+      'Could not install: Ione could not save its record in its profile folder (no permission to write); the copies were removed again.'
+    const recorded = skill(
+      build({
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        error: whole,
+        targets: [
+          target('claude', 'Claude Code', true, true),
+          target('codex', 'Codex', true, false)
+        ]
+      })
+    )!
+    const recordedStatus = recorded.rows[0]
+    if (recordedStatus.kind !== 'info') throw new Error('not an info row')
+    expect(recordedStatus.description).toBe(whole)
+    expect(recordedStatus.tone).toBe('danger')
+    expect(isValidElement(recordedStatus.trailing)).toBe(true)
+  })
+
+  it('names no harness in what it shows', () => {
+    const states: UIState['agentSkills'][] = [
+      { ...emptyAgentSkillStatus('0.3.77-test'), targets: [] },
+      {
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        targets: [
+          target('claude', 'Claude Code', true, false),
+          target('cursor', 'Cursor', true, true)
+        ]
+      },
+      {
+        ...emptyAgentSkillStatus('0.3.77-test'),
+        targets: [target('claude', 'Claude Code', true, true)]
+      }
+    ]
+    for (const state of states) {
+      const group = skill(build(state))!
+      const shown = [
+        group.heading,
+        group.description,
+        ...group.rows.flatMap((r) => [r.label, r.description])
+      ]
+      for (const text of shown) expect(text ?? '').not.toMatch(/harness/i)
+    }
+  })
+})

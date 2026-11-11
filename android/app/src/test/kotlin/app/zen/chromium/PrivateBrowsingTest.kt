@@ -1,0 +1,203 @@
+package app.zen.chromium
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.io.File
+
+/**
+ * The host's side of private browsing beyond the profile: the window's screenshot guard goes up
+ * exactly while the chrome says the surface is private (a recording is let in only when asked,
+ * which [PrivateBrowsing.guard] allows in debug builds alone), and the launcher's static shortcut
+ * reaches `MainActivity` – through `LauncherIconActivity`, the trampoline outside the browser's
+ * task – with the action the activity turns into a private tab. The resource wiring is checked
+ * from the files: a shortcut whose meta-data, id, action or target drifted would install and
+ * never open anything.
+ */
+class PrivateBrowsingTest {
+    private fun read(vararg candidates: String): String {
+        val file = candidates.map(::File).firstOrNull { it.exists() }
+        assertTrue("${candidates.first()} not found from ${File(".").absolutePath}", file != null)
+        return file!!.readText()
+    }
+
+    @Test
+    fun theGuardGoesUpOnThePrivateSurfaceAloneAndARecordingTakesItDown() {
+        assertTrue(PrivateBrowsing.guardWanted(privateSurface = true, recording = false))
+        assertFalse(PrivateBrowsing.guardWanted(privateSurface = false, recording = false))
+        assertFalse(PrivateBrowsing.guardWanted(privateSurface = true, recording = true))
+        assertFalse(PrivateBrowsing.guardWanted(privateSurface = false, recording = true))
+        // The override is off until a recording driver turns it on.
+        assertFalse(PrivateBrowsing.captureForRecording)
+    }
+
+    /**
+     * INC-05: the lock cover is drawn on the private surface, so the chrome's word keeps the
+     * guard up under it; the host's own hidden private views (the frames between the app's
+     * return and the chrome's next report) keep it up on their own too. Neither reads whether
+     * private tabs merely exist: a regular page with the private tabs locked behind it captures
+     * as before, and a recording is let in as before.
+     */
+    @Test
+    fun theGuardStaysUpUnderTheLockCover() {
+        assertTrue(PrivateBrowsing.guardWanted(privateSurface = true, recording = false, lockedContent = true))
+        assertTrue(PrivateBrowsing.guardWanted(privateSurface = false, recording = false, lockedContent = true))
+        assertFalse(PrivateBrowsing.guardWanted(privateSurface = false, recording = false, lockedContent = false))
+        assertFalse(PrivateBrowsing.guardWanted(privateSurface = true, recording = true, lockedContent = true))
+    }
+
+    /**
+     * The guard has one owner: the chrome's `window.setSecure`, through [PrivateBrowsing.guard].
+     * A second writer reading the page views' visibility (the private session's first cut) missed
+     * the private new tab page, which has no page view, kept the overview's Tabs pane guarded
+     * while private tabs existed, and wrote past the recording override; the flag is written in
+     * the one file.
+     */
+    @Test
+    fun theGuardHasOneOwner() {
+        val sources = listOf("src/main/kotlin", "app/src/main/kotlin").map(::File).firstOrNull { it.isDirectory }
+        assertTrue("src/main/kotlin not found from ${File(".").absolutePath}", sources != null)
+        val writers = sources!!.walkTopDown()
+            .filter { it.extension == "kt" && "LayoutParams.FLAG_SECURE" in it.readText() }
+            .map { it.name }
+            .toList()
+        assertEquals(listOf("PrivateBrowsing.kt"), writers)
+    }
+
+    private fun shortcuts() = read(SHORTCUTS_TEMPLATE, "app/$SHORTCUTS_TEMPLATE")
+
+    /** Each `<shortcut>` block of the template, in rank order. */
+    private fun shortcutBlocks() = shortcuts().split(Regex("<shortcut\\s")).drop(1).map { it.substringBefore("</shortcut>") }
+
+    private fun privateShortcut() =
+        shortcutBlocks().single { """android:shortcutId="${PrivateBrowsing.SHORTCUT_ID}"""" in it }
+
+    @Test
+    fun theShortcutOpensAPrivateTabInTheBrowserActivityThroughTheTrampoline() {
+        val shortcut = privateShortcut()
+        assertTrue("""android:enabled="true"""" in shortcut)
+        assertTrue("""android:action="${PrivateBrowsing.ACTION_NEW_TAB}"""" in shortcut)
+        // The system stamps a manifest shortcut's intent with FLAG_ACTIVITY_CLEAR_TASK: aimed at
+        // MainActivity it would clear the browser's task; the trampoline in its own task relays
+        // the action into the running window instead – every shortcut's, not only this one's.
+        for (block in shortcutBlocks()) {
+            assertTrue("""android:targetClass="app.zen.chromium.LauncherIconActivity"""" in block)
+            assertFalse("""android:targetClass="app.zen.chromium.MainActivity"""" in block)
+        }
+        val manifest = read("src/main/AndroidManifest.xml", "app/src/main/AndroidManifest.xml")
+        val trampoline = manifest.substringAfter("android:name=\".LauncherIconActivity\"").substringBefore("/>")
+        assertTrue("""android:taskAffinity=""""" in trampoline)
+        assertTrue("""android:noHistory="true"""" in trampoline)
+        // Four shortcuts, the launcher's row (Chrome's count): New tab, New private tab, Search, Scan
+        // QR code – the app's own before any pinned web app; the private one second, next to New tab.
+        assertEquals(
+            listOf("new-tab", PrivateBrowsing.SHORTCUT_ID, "search", "scan-qr"),
+            shortcutBlocks().map { it.substringAfter("android:shortcutId=\"").substringBefore("\"") }
+        )
+    }
+
+    @Test
+    fun theOtherShortcutsCarryTheirLandingAsTheExtraTheTrampolineForwards() {
+        val landings = shortcutBlocks()
+            .filter { """android:shortcutId="${PrivateBrowsing.SHORTCUT_ID}"""" !in it }
+            .map { block ->
+                assertTrue("""android:action="android.intent.action.MAIN"""" in block)
+                assertTrue("""android:name="${Landing.EXTRA}"""" in block)
+                block.substringAfter("android:value=\"").substringBefore("\"")
+            }
+        assertEquals(listOf(Landing.NEW_TAB, Landing.SEARCH, Landing.SCAN), landings)
+        // The private shortcut says it by its action alone, which the trampoline reads as the landing.
+        assertFalse(Landing.EXTRA in privateShortcut())
+        for (landing in landings) assertEquals(landing, Landing.forwarded("android.intent.action.MAIN", landing))
+    }
+
+    @Test
+    fun theTrampolineForwardsTheShortcutsActionAsThePrivateLandingAndNothingElse() {
+        assertEquals(Landing.PRIVATE, Landing.forwarded(PrivateBrowsing.ACTION_NEW_TAB, null))
+        // A launcher tap on an icon alias, or any other start, is the launcher's plain start.
+        assertEquals(null, Landing.forwarded("android.intent.action.MAIN", null))
+        assertEquals(null, Landing.forwarded("android.intent.action.VIEW", null))
+        assertEquals(null, Landing.forwarded(null, null))
+    }
+
+    /**
+     * The system server reads the intent's targetPackage as a plain string with its own resources:
+     * an @string reference of the app's installs a shortcut to "@<id>/MainActivity" that nothing
+     * can start. So the file is a template the build writes per variant with the applicationId
+     * spelt out (debug carries a suffix), and no copy of it sits in res/ to shadow the written one.
+     */
+    @Test
+    fun theShortcutTargetsTheVariantsApplicationIdSpeltOut() {
+        for (shortcut in shortcutBlocks()) {
+            assertTrue("""android:targetPackage="${'$'}{applicationId}"""" in shortcut)
+            assertFalse("@string" in shortcut.substringAfter("<intent"))
+        }
+        val build = read("build.gradle.kts", "app/build.gradle.kts")
+        assertTrue("class WriteShortcuts" in build)
+        assertTrue("""file("$SHORTCUTS_TEMPLATE")""" in build)
+        assertTrue("""replace("\${'$'}{applicationId}", applicationId.get())""" in build)
+        assertTrue("addGeneratedSourceDirectory(write, WriteShortcuts::outputDirectory)" in build)
+        assertTrue("""resolve("xml/shortcuts.xml")""" in build)
+        assertFalse(File("src/main/res/xml/shortcuts.xml").exists() || File("app/src/main/res/xml/shortcuts.xml").exists())
+    }
+
+    @Test
+    fun theShortcutsLabelsAndIconExist() {
+        val shortcuts = shortcuts()
+        val strings = read("src/main/res/values/strings.xml", "app/src/main/res/values/strings.xml")
+        for (name in listOf("shortcut_private_short", "shortcut_private_long")) {
+            assertTrue("$name unused", """@string/$name"""" in shortcuts)
+            assertTrue("$name undefined", """<string name="$name">""" in strings)
+        }
+        // Sentence case, following the platform (Chrome's "New incognito tab"), not the Title Case
+        // of the menus inside the app (design language v2 9.1); one strings file, so every variant's
+        // generated shortcuts.xml resolves the same labels.
+        assertTrue("""<string name="shortcut_private_short">New private tab</string>""" in strings)
+        assertTrue("""<string name="shortcut_private_long">New private tab in Ione</string>""" in strings)
+        assertTrue("""android:icon="@drawable/ic_shortcut_private"""" in shortcuts)
+        val icon = read(
+            "src/main/res/drawable/ic_shortcut_private.xml",
+            "app/src/main/res/drawable/ic_shortcut_private.xml"
+        )
+        assertTrue("<adaptive-icon" in icon)
+        assertTrue("@drawable/ic_shortcut_private_foreground" in icon)
+        assertTrue("@color/shortcut_private_background" in icon)
+        // The other three: labels in sentence case, each an adaptive icon on the app icon's indigo.
+        for ((stem, short, long) in listOf(
+            Triple("new_tab", "New tab", "New tab in Ione"),
+            Triple("search", "Search", "Search with Ione"),
+            Triple("scan", "Scan QR code", "Scan a QR code with Ione")
+        )) {
+            assertTrue("""@string/shortcut_${stem}_short"""" in shortcuts)
+            assertTrue("""@string/shortcut_${stem}_long"""" in shortcuts)
+            assertTrue("""<string name="shortcut_${stem}_short">$short</string>""" in strings)
+            assertTrue("""<string name="shortcut_${stem}_long">$long</string>""" in strings)
+            assertTrue("""android:icon="@drawable/ic_shortcut_$stem"""" in shortcuts)
+            val other = read("src/main/res/drawable/ic_shortcut_$stem.xml", "app/src/main/res/drawable/ic_shortcut_$stem.xml")
+            assertTrue("<adaptive-icon" in other)
+            assertTrue("@drawable/ic_shortcut_${stem}_foreground" in other)
+            assertTrue("@color/shortcut_background" in other)
+        }
+    }
+
+    @Test
+    fun everyLauncherAliasDeclaresTheShortcuts() {
+        val manifest = read("src/main/AndroidManifest.xml", "app/src/main/AndroidManifest.xml")
+        val meta = """<meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />"""
+        val aliases = manifest.split("<activity-alias").drop(1)
+        assertEquals(LauncherIconVariants.ALIASES.size, aliases.size)
+        for (alias in aliases) {
+            val body = alias.substringBefore("</activity-alias>")
+            assertTrue("an alias without the shortcuts: ${body.lines().first()}", meta in body)
+            assertTrue("android.intent.category.LAUNCHER" in body)
+        }
+        // The browser activity itself holds no launcher entry, so the meta-data would be dead there.
+        val activity = manifest.substringAfter("android:name=\".MainActivity\"").substringBefore("</activity>")
+        assertFalse("android.app.shortcuts" in activity)
+    }
+
+    private companion object {
+        const val SHORTCUTS_TEMPLATE = "src/main/shortcuts/shortcuts.xml"
+    }
+}

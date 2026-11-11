@@ -1,0 +1,1043 @@
+package app.zen.chromium
+
+import android.annotation.SuppressLint
+import android.app.PendingIntent
+import android.app.PictureInPictureParams
+import android.content.ClipData
+import android.content.ContentValues
+import android.content.ClipboardManager
+import android.content.ComponentCallbacks2
+import android.content.Context
+import android.content.Intent
+import android.content.MutableContextWrapper
+import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.Rect
+import android.graphics.drawable.BitmapDrawable
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.SystemClock
+import android.provider.MediaStore
+import android.util.Log
+import android.util.Rational
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatDelegate
+import androidx.browser.customtabs.CustomTabsCallback
+import androidx.browser.customtabs.CustomTabsIntent
+import androidx.core.content.ContextCompat
+import androidx.core.content.pm.ShortcutInfoCompat
+import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.core.graphics.drawable.IconCompat
+import androidx.core.os.BundleCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import org.json.JSONObject
+import java.io.File
+import kotlin.math.abs
+
+/**
+ * Another app's custom tab, rendered by Ione: a [TabWebView] (the same page class, clients and
+ * plumbing as a tab of the browser window) under a native toolbar in the caller's colours, with
+ * the caller's close control, action button and menu items, the caller's bottom toolbar
+ * ([CustomTabBottomBar], CCT-07) above the navigation bar, closing back into the caller's task
+ * with the caller's exit animation. "Open in Ione" hands the live page to the browser window;
+ * Minimize shrinks the tab into a floating picture-in-picture card (CCT-11) and the platform's
+ * expand control brings it back.
+ *
+ * Reached through [LinkDispatchActivity] (or `MainActivity.handleIntent` when aimed at the
+ * browser directly), always in the task of whoever started it and never in the browser's own:
+ * the manifest gives it its own (empty) affinity, so a `singleTask` browser cannot swallow it.
+ */
+class CustomTabActivity : BrowserActivity(), CustomTabHost.Listener, CustomTabToolbar.Listener, CustomTabFindBar.Listener, CustomTabBottomBar.Listener, CustomTabSessions.Visuals {
+    lateinit var config: CustomTabConfig
+        private set
+    lateinit var host: CustomTabHost
+        private set
+    lateinit var toolbar: CustomTabToolbar
+        private set
+    lateinit var bottomBar: CustomTabBottomBar
+        private set
+
+    private lateinit var shell: FrameLayout
+    private lateinit var pageContainer: FrameLayout
+    private lateinit var fullscreenLayer: FrameLayout
+    /** The status bar strip in the toolbar's colour; the toolbar slides up behind it when hiding. */
+    private lateinit var statusStrip: View
+    private var divider: View? = null
+    private var findBar: CustomTabFindBar? = null
+    private var topInset = 0
+    private var bottomInset = 0
+    /** The soft keyboard is up: the bottom toolbar steps aside for it, as Chrome's does. */
+    private var keyboardUp = false
+    private var toolbarShown = true
+    private var toolbarAnimating = false
+    private var scrolledSinceTurn = 0
+    private var lastScrollY = 0
+    private var currentUrl = ""
+    /** The page is between `startLoading` and its end: the icon row's Reload reads Stop (§9.13). */
+    private var pageLoading = false
+    /** The profile's documents, read for the star and written for the inbox and nothing else ([CustomTabBookmarks]). */
+    private val storage by lazy { Storage(this) }
+    /** The core's bookmarks as last read (`state.json`), and the taps this tab filed for the browser. */
+    private var bookmarkedUrls: Set<String> = emptySet()
+    private var pendingBookmarks: List<CustomTabBookmarks.Entry> = emptyList()
+    /** The caller's `PendingIntent` for a swipe up on the bottom toolbar; the caller can set it later. */
+    private var swipeUpIntent: PendingIntent? = null
+    /** The intent that hears the bottom toolbar's RemoteViews clicks; replaced by the caller's later views. */
+    private var remoteClickIntent: PendingIntent? = null
+    /** The bottom bar's height the page was last laid out for, so a change can slide instead of jump. */
+    private var laidOutBarHeight = 0
+    /** Minimize's card, in the shell only while the tab is in picture-in-picture. */
+    private var minimizedCard: CustomTabMinimizedCard? = null
+    private var minimized = false
+    /** While set, [getPackageName] answers with the caller's package (see [closeToCaller]). */
+    private var packageForAnimation: String? = null
+    /** The engagement signals (CCT-14), decided from the page's scrolls and touches, sent to the session's callback. */
+    private val engagement = CustomTabEngagement(object : CustomTabEngagement.Listener {
+        override fun onVerticalScroll(isDirectionUp: Boolean) = CustomTabSessions.verticalScroll(config.session, isDirectionUp)
+        override fun onGreatestScrollPercentageIncreased(percentage: Int) = CustomTabSessions.greatestScrollPercentage(config.session, percentage)
+    })
+
+    /** The page (a fresh view after a renderer crash, see `TabHost.replaceCrashed`). */
+    val page: TabWebView? get() = host.tabs.get(TAB_ID)
+
+    /**
+     * The Auth Tab's return (CCT-13), only when the caller asked for one: claims the redirect's
+     * navigation and answers through [returnToCaller]. Null on an ordinary custom tab.
+     */
+    private var authTab: AuthTabVerifier? = null
+
+    /**
+     * The Trusted Web Activity's verifier (CCT-20), only when the caller launched one with its
+     * claimed origins ([CustomTabConfig.trustedOrigins]). Null on an ordinary custom tab.
+     */
+    private var twa: TwaVerifier? = null
+    /** The page's TWA state ([TwaScope.stateFor]), null before the first committed navigation. */
+    private var twaState: TwaScope.Verification? = null
+    /**
+     * App mode (a TWA alone): the page is on a claimed or verified origin and the toolbar is gone,
+     * the page under the status bar strip; out of it the custom tab's toolbar with its X is up.
+     */
+    private var appMode = false
+    /**
+     * The toolbar is up and pinned (Chrome's `BrowserControlsState.SHOWN`, [TwaScope.controls]):
+     * a page in the TWA badged "Not secure" keeps its controls whatever a scroll does. Never set
+     * on a plain custom tab.
+     */
+    private var toolbarPinned = false
+    /** The TWA's first document is still loading: its failures are the start page's ([twaQuality]). */
+    private var twaStartPage = true
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // The caller's colour scheme decides the scheme of every native piece (dialogs, the
+        // menu), not the system's: applied before the theme is resolved.
+        when (intent.getIntExtra(CustomTabsIntent.EXTRA_COLOR_SCHEME, CustomTabsIntent.COLOR_SCHEME_SYSTEM)) {
+            CustomTabsIntent.COLOR_SCHEME_LIGHT -> delegate.localNightMode = AppCompatDelegate.MODE_NIGHT_NO
+            CustomTabsIntent.COLOR_SCHEME_DARK -> delegate.localNightMode = AppCompatDelegate.MODE_NIGHT_YES
+        }
+        super.onCreate(savedInstanceState)
+        config = CustomTabConfig.from(this, intent)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        config.authTab?.let { redirect ->
+            // Until the redirect arrives the caller's answer is the platform's own for a closed
+            // tab, RESULT_CANCELED (back, the close control, the task swiped away). The caller
+            // is the app that started the trampoline for a result – the result's addressee, the
+            // system's word (forwarded through LinkDispatchActivity) – else what it saw.
+            setResult(RESULT_CANCELED)
+            authTab = AuthTabVerifier(this, redirect, callerPackage = callingPackage ?: config.callerPackage, onResult = ::returnToCaller)
+        }
+
+        shell = FrameLayout(this)
+        pageContainer = FrameLayout(this)
+        fullscreenLayer = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            visibility = View.GONE
+        }
+        host = CustomTabHost(this, this, pageContainer, fullscreenLayer, config.scheme.dark, authTab = authTab)
+        toolbar = CustomTabToolbar(this, config, this)
+        statusStrip = View(this).apply { setBackgroundColor(config.scheme.toolbar) }
+        bottomBar = CustomTabBottomBar(this, config.scheme, this)
+        swipeUpIntent = config.swipeUpIntent
+        remoteClickIntent = config.remoteViews?.clickIntent
+        bottomBar.setRemoteViews(config.remoteViews)
+        bottomBar.setButtons(config.bottomButtons)
+        bottomBar.swipeUpEnabled = swipeUpIntent != null
+        bottomBar.visibility = if (bottomBar.hasContent) View.VISIBLE else View.GONE
+        shell.addView(pageContainer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        shell.addView(toolbar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        shell.addView(statusStrip, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, Gravity.TOP))
+        shell.addView(bottomBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+        shell.addView(fullscreenLayer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        setContentView(shell)
+        applyScheme()
+
+        ViewCompat.setOnApplyWindowInsetsListener(shell) { _, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            topInset = bars.top
+            bottomInset = maxOf(bars.bottom, ime.bottom)
+            keyboardUp = ime.bottom > bars.bottom
+            shell.setPadding(bars.left, 0, bars.right, 0)
+            toolbar.setTopInset(bars.top)
+            statusStrip.layoutParams = (statusStrip.layoutParams as FrameLayout.LayoutParams).apply { height = bars.top }
+            bottomBar.setBottomInset(bars.bottom)
+            bottomBar.visibility = if (bottomBar.hasContent && !keyboardUp && !minimized) View.VISIBLE else View.GONE
+            layoutPage()
+            WindowInsetsCompat.CONSUMED
+        }
+        CustomTabSessions.attach(config.session, this)
+
+        // Back: the page's history first (predictively, like a tab of the browser), then out to
+        // the caller. The callback never lets go, so the system never finishes us without the
+        // exit animation the caller asked for.
+        host.back = PredictiveBack(this, host, chrome = { null }, onLeave = ::closeToCaller, alwaysHandle = true, dismissOverlay = ::closeFind)
+        config.trustedOrigins?.let { origins ->
+            // The client is the session's binder (Chrome's `ClientPackageNameProvider`), else what
+            // the launch said. The start page is judged before it loads, as Chrome's
+            // `CurrentPageVerifier` judges `getUrlToLoad()` at native init: a claimed origin is
+            // pending, and pending is app mode – no toolbar at first paint, the verdict beside the
+            // load and never ahead of it.
+            val verifier = TwaVerifier(this, CustomTabSessions.packageOf(config.session) ?: config.callerPackage, origins, ::onTwaVerdict)
+            twa = verifier
+            setTwaState(TwaScope.stateFor(config.url, origins, verifier.verdicts, null), config.url)
+            verifier.start()
+        }
+        createPage().loadUrl(config.url)
+        host.back.update(chrome = false, tabId = TAB_ID)
+    }
+
+    // --- the page --------------------------------------------------------------------------------
+
+    /**
+     * The page, created around a [MutableContextWrapper] so "Open in Ione" can re-point it at
+     * the browser window (`TabHost.adopt`), full size in its container.
+     */
+    private fun createPage(): TabWebView {
+        val view = host.tabs.create(TAB_ID, Profiles.DEFAULT_CONTAINER, MutableContextWrapper(this))
+        attachPage(view)
+        return view
+    }
+
+    /**
+     * The page's scrolls feed the engagement signals (its offset over what it can scroll, and
+     * the touches that say which scrolls are the user's) and, when the caller asked, the
+     * toolbar's hiding. The touch listener only listens: the page handles every event itself.
+     */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun attachPage(view: TabWebView) {
+        view.layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        view.visibility = View.VISIBLE
+        view.setOnScrollChangeListener { v, _, y, _, _ ->
+            engagement.scrolled(y, y + (v as TabWebView).scrollRemaining(), SystemClock.uptimeMillis())
+            if (config.hideToolbarOnScroll) onPageScrolled(y)
+        }
+        view.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> engagement.touchDown()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> engagement.touchUp(event.eventTime)
+            }
+            false
+        }
+    }
+
+    /** What the page reports through [CustomTabHost.viewEvent]. */
+    override fun onPageEvent(name: String, payload: JSONObject?) {
+        when (name) {
+            "navigated" -> {
+                val url = payload?.strOrNull("url") ?: return
+                currentUrl = url
+                toolbar.setUrl(url)
+                // A new document (not a pushState or hash change of the one shown): the greatest
+                // scroll percentage starts over for it, as Chrome's does at a committed navigation.
+                if (!payload.optBoolean("inPage", false)) {
+                    engagement.navigated()
+                    // The committed document decides the TWA's scope, as Chrome's
+                    // `CurrentPageVerifier` decides at `onDidFinishNavigationInPrimaryMainFrame`
+                    // (a redirect's hops land here too); a same-document change is no navigation.
+                    twa?.let { verifier -> setTwaState(TwaScope.stateFor(url, config.trustedOrigins.orEmpty(), verifier.verdicts, twaState), url) }
+                }
+            }
+            "title" -> toolbar.setTitle(payload?.strOrNull("title"))
+            "startLoading" -> {
+                pageLoading = true
+                showToolbar()
+                navigationEvent(CustomTabsCallback.NAVIGATION_STARTED)
+            }
+            "stopLoading" -> {
+                pageLoading = false
+                toolbar.setProgress(100)
+                navigationEvent(CustomTabsCallback.NAVIGATION_FINISHED)
+                twaStartPage = false
+            }
+            "failLoad" -> {
+                pageLoading = false
+                toolbar.setProgress(100)
+                navigationEvent(CustomTabsCallback.NAVIGATION_FAILED)
+                twaQuality(payload?.strOrNull("url"), "failed to load – ${payload?.strOrNull("description") ?: "a net error"}; the error page shows")
+                twaStartPage = false
+            }
+            "httpError" -> twaQuality(payload?.strOrNull("url"), "answered HTTP ${payload?.optInt("status") ?: 0}")
+            "found" -> findBar?.setCount(payload?.optInt("activeMatchOrdinal") ?: 0, payload?.optInt("matches") ?: 0)
+            // A long-press on a link: Chrome's Auth Tab has no context menu (the sign-in's page
+            // is not the user's to copy or share out of), so nothing opens on one.
+            "contextMenu" -> if (authTab == null) payload?.strOrNull("linkURL")?.takeIf { it.isNotEmpty() }?.let(::linkMenu)
+            // The renderer died and TabHost swapped in a fresh view: place it and load again.
+            "crashed" -> page?.let { fresh ->
+                attachPage(fresh)
+                fresh.loadUrl(currentUrl.ifEmpty { config.url })
+            }
+        }
+    }
+
+    override fun onProgress(percent: Int) = toolbar.setProgress(percent)
+
+    // --- colours and bars (CCT-09) ---------------------------------------------------------------
+
+    private fun applyScheme() {
+        val scheme = config.scheme
+        // Edge to edge: the toolbar paints the status bar strip in its own colour (its top inset)
+        // and the shell's background is what shows under the navigation bar.
+        shell.setBackgroundColor(scheme.navigationBar)
+        pageContainer.setBackgroundColor(ContextCompat.getColor(this, if (scheme.dark) R.color.v2_page_dark else R.color.v2_page_light))
+        window.decorView.setBackgroundColor(scheme.navigationBar)
+        val controller = WindowInsetsControllerCompat(window, shell)
+        controller.isAppearanceLightStatusBars = !scheme.lightToolbarForeground
+        controller.isAppearanceLightNavigationBars = !scheme.lightNavigationForeground
+        scheme.navigationBarDivider?.let { color ->
+            divider = View(this).apply { setBackgroundColor(color) }
+            shell.addView(divider, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1, Gravity.BOTTOM))
+        }
+    }
+
+    /**
+     * Place the page under the toolbar (or under the status bar alone when it is hidden) and
+     * above the caller's bottom toolbar (or the navigation bar alone while the bottom toolbar is
+     * hidden with it, or gone for the keyboard): the page's viewport never runs under the bar.
+     */
+    private fun layoutPage() {
+        val lp = pageContainer.layoutParams as FrameLayout.LayoutParams
+        lp.topMargin = topInset + if (toolbarShown && !appMode) toolbar.barHeight else 0
+        val barHeight = currentBarHeight()
+        laidOutBarHeight = barHeight
+        lp.bottomMargin = CustomTabBottomBarRules.pageBottomMargin(bottomInset, barHeight, toolbarShown && barHeight > 0)
+        pageContainer.layoutParams = lp
+        (divider?.layoutParams as? FrameLayout.LayoutParams)?.let {
+            it.bottomMargin = bottomInset
+            divider?.layoutParams = it
+            divider?.visibility = if (bottomInset > 0) View.VISIBLE else View.GONE
+        }
+    }
+
+    /** The bottom toolbar's height as the page should allow for it now; 0 when there is none to show. */
+    private fun currentBarHeight(): Int {
+        if (bottomBar.visibility != View.VISIBLE) return 0
+        val laidOut = bottomBar.barHeight
+        if (laidOut > 0) return laidOut
+        val width = (if (shell.width > 0) shell.width else resources.displayMetrics.widthPixels) - shell.paddingLeft - shell.paddingRight
+        return bottomBar.measureBarHeight(width.coerceAtLeast(1))
+    }
+
+    // --- toolbar hiding on scroll (EXTRA_ENABLE_URLBAR_HIDING) ----------------------------------
+
+    private fun onPageScrolled(y: Int) {
+        val dy = y - lastScrollY
+        lastScrollY = y
+        if (findBar != null || host.fullscreenTab != null || toolbarAnimating || appMode || toolbarPinned) return
+        if (y <= 0) {
+            scrolledSinceTurn = 0
+            showToolbar()
+            return
+        }
+        // Direction changes restart the count, so a page scrolled slowly still gets there.
+        if ((dy > 0) != (scrolledSinceTurn > 0)) scrolledSinceTurn = 0
+        scrolledSinceTurn += dy
+        val threshold = (SCROLL_THRESHOLD_DP * resources.displayMetrics.density).toInt()
+        if (scrolledSinceTurn > threshold && toolbarShown) hideToolbar()
+        else if (scrolledSinceTurn < -threshold && !toolbarShown) showToolbar()
+        if (abs(scrolledSinceTurn) > threshold) scrolledSinceTurn = 0
+    }
+
+    /**
+     * The toolbar slides up behind the status bar strip ([statusStrip], drawn over it in the same
+     * colour) and the page follows it: the page is first grown by the bar's height behind it (one
+     * relayout, drawn where it was), then both translate together so nothing jumps and no gap
+     * opens at the bottom. The caller's bottom toolbar goes with it, down past the navigation
+     * bar (§11.5's bottom dock: the page grows under it at the first frame, the bar slides off
+     * what is now the page's own strip), as Chrome's bottom bar rides the browser controls.
+     */
+    private fun hideToolbar() {
+        if (!toolbarShown || toolbarAnimating) return
+        toolbarShown = false
+        toolbarAnimating = true
+        val h = toolbar.barHeight.toFloat()
+        val bar = currentBarHeight()
+        layoutPage()
+        pageContainer.translationY = h
+        toolbar.animate().translationY(-h).setDuration(TOOLBAR_MS).start()
+        if (bar > 0) {
+            bottomBar.stopSettling()
+            bottomBar.animate().translationY(CustomTabBottomBarRules.hiddenTranslation(bar, bottomInset).toFloat()).setDuration(TOOLBAR_MS).start()
+        }
+        pageContainer.animate().translationY(0f).setDuration(TOOLBAR_MS).withEndAction { toolbarAnimating = false }.start()
+    }
+
+    /** The reverse: the bars return first, the page gives the bottom toolbar its strip back at the rest. */
+    private fun showToolbar() {
+        if (toolbarShown) return
+        toolbarShown = true
+        toolbarAnimating = true
+        val h = toolbar.barHeight.toFloat()
+        toolbar.animate().translationY(0f).setDuration(TOOLBAR_MS).start()
+        if (bottomBar.translationY != 0f) bottomBar.animate().translationY(0f).setDuration(TOOLBAR_MS).start()
+        pageContainer.animate().translationY(h).setDuration(TOOLBAR_MS).withEndAction {
+            pageContainer.translationY = 0f
+            layoutPage()
+            toolbarAnimating = false
+        }.start()
+    }
+
+    // --- the Trusted Web Activity's scope (CCT-20) -------------------------------------------------
+
+    /** A verdict landed ([TwaVerifier]): the page it applies to is judged again, whatever it is now. */
+    private fun onTwaVerdict(origin: String, verification: TwaScope.Verification) {
+        val verifier = twa ?: return
+        val url = currentUrl.ifEmpty { config.url }
+        // The start page's origin failing is a start-page fact whatever its load state (the
+        // verdict may land after the page finished loading), so it bypasses twaQuality's gate.
+        if (verification == TwaScope.Verification.FAILED && TwaScope.origin(config.url) == origin) {
+            Log.i(TWA_TAG, "Trusted Web Activity: the start page ${config.url} is not the client's: the Digital Asset Links check of $origin failed")
+        }
+        setTwaState(TwaScope.stateFor(url, config.trustedOrigins.orEmpty(), verifier.verdicts, twaState), url)
+    }
+
+    /**
+     * The state and, from it, the toolbar's constraint ([TwaScope.controls]): gone for app mode,
+     * pinned up on a "Not secure" page – brought back if a scroll had hidden it – or the custom
+     * tab's own scroll-hide.
+     */
+    private fun setTwaState(state: TwaScope.Verification?, url: String) {
+        twaState = state
+        val controls = TwaScope.controls(state, url)
+        toolbarPinned = controls == TwaScope.Controls.SHOWN
+        setAppMode(controls == TwaScope.Controls.HIDDEN)
+        if (toolbarPinned && !toolbarShown) showToolbar()
+    }
+
+    /**
+     * The TWA's edge: in app mode the toolbar is gone and the page starts under the status bar
+     * strip; out of it the custom tab's toolbar with its X is up, at rest whatever a scroll had
+     * done to the bars before (Chrome's `showToolbarTemporarily` as the controls come back,
+     * `TrustedWebActivityBrowserControlsVisibilityManager.java:96-99`). Nothing new is drawn:
+     * the toolbar is the one every custom tab has.
+     */
+    private fun setAppMode(on: Boolean) {
+        if (appMode == on) return
+        appMode = on
+        toolbar.animate().cancel()
+        pageContainer.animate().cancel()
+        bottomBar.animate().cancel()
+        bottomBar.stopSettling()
+        toolbar.translationY = 0f
+        pageContainer.translationY = 0f
+        bottomBar.translationY = 0f
+        toolbarShown = true
+        toolbarAnimating = false
+        scrolledSinceTurn = 0
+        applyToolbarVisibility()
+        layoutPage()
+    }
+
+    /** The toolbar view's visibility from the one rule the mode and the minimized card share ([CustomTabMinimize.toolbarVisibility]). */
+    private fun applyToolbarVisibility() {
+        toolbar.visibility = when (CustomTabMinimize.toolbarVisibility(minimized, appMode)) {
+            CustomTabMinimize.Visibility.VISIBLE -> View.VISIBLE
+            CustomTabMinimize.Visibility.INVISIBLE -> View.INVISIBLE
+            CustomTabMinimize.Visibility.GONE -> View.GONE
+        }
+    }
+
+    /**
+     * A quality violation of the TWA's start page while it loads – it failed to load (offline) or
+     * answered a 404 or a 5xx – named in the log, which is all Chrome 152 does: its
+     * `QualityEnforcer` and the `quality_enforcement` callback went in M115. The user sees what
+     * the page shows: WebView's error page, or the server's own body. The start page's origin
+     * failing its Digital Asset Links check is named by [onTwaVerdict] directly, whatever the
+     * load state when the verdict lands.
+     */
+    private fun twaQuality(url: String?, what: String) {
+        if (twa == null || !twaStartPage) return
+        Log.i(TWA_TAG, "Trusted Web Activity: the start page ${url ?: config.url} $what")
+    }
+
+    // --- the caller's bottom toolbar (CCT-07) -------------------------------------------------------
+
+    override fun onRemoteViewClick(id: Int) {
+        val intent = remoteClickIntent ?: return
+        val (extra, clicked) = CustomTabButtons.remoteViewClick(id)
+        sendToCaller(intent, Intent().putExtra(extra, clicked))
+    }
+
+    override fun onBottomButton(button: CustomTabConfig.ActionButton) = sendToCaller(button.intent)
+
+    override fun onSwipeUp() {
+        swipeUpIntent?.let { sendToCaller(it) }
+    }
+
+    /**
+     * The bar's own height changed (the caller's later `setSecondaryToolbarViews`, typically the
+     * secondary toolbar it reveals after a swipe up). Shown, the bar's edge slides from where it
+     * was to where it is on §11's spring (the bar's own reveal, so it rides along under a finger
+     * still holding the bar) and the page takes a taller bar at the rest, a shorter one at once;
+     * hidden, it simply parks the bar further off. The first layout is not a change.
+     */
+    override fun onBarHeightChanged() {
+        if (minimized) return
+        val now = currentBarHeight()
+        val was = laidOutBarHeight
+        if (!toolbarShown) {
+            bottomBar.translationY = CustomTabBottomBarRules.hiddenTranslation(now, bottomInset).toFloat()
+            laidOutBarHeight = now
+            return
+        }
+        if (was == 0 || now == was || toolbarAnimating) {
+            layoutPage()
+            return
+        }
+        if (now < was) layoutPage()
+        bottomBar.revealGrowth(now - was)
+    }
+
+    override fun onBarSettled() {
+        if (!minimized && toolbarShown && !toolbarAnimating) layoutPage()
+    }
+
+    /**
+     * The caller's later visuals (`CustomTabsService.updateVisuals` for this tab's session): new
+     * bottom toolbar views (or none), a new swipe-up intent (or none), a new icon for one of its
+     * buttons. True when anything named in the bundle was applied.
+     */
+    override fun applyVisuals(bundle: Bundle): Boolean {
+        var applied = false
+        if (bundle.containsKey(CustomTabsIntent.EXTRA_REMOTEVIEWS)) {
+            val remote = CustomTabConfig.remoteViews(bundle)
+            remoteClickIntent = remote?.clickIntent
+            bottomBar.setRemoteViews(remote)
+            bottomBar.visibility = if (bottomBar.hasContent && !keyboardUp && !minimized) View.VISIBLE else View.GONE
+            if (!bottomBar.hasContent) layoutPage()
+            applied = true
+        }
+        if (bundle.containsKey(CustomTabsIntent.EXTRA_SECONDARY_TOOLBAR_SWIPE_UP_GESTURE)) {
+            swipeUpIntent = BundleCompat.getParcelable(bundle, CustomTabsIntent.EXTRA_SECONDARY_TOOLBAR_SWIPE_UP_GESTURE, PendingIntent::class.java)
+            bottomBar.swipeUpEnabled = swipeUpIntent != null
+            applied = true
+        }
+        bundle.getBundle(CustomTabsIntent.EXTRA_ACTION_BUTTON_BUNDLE)?.let { button ->
+            val icon = BundleCompat.getParcelable(button, CustomTabsIntent.KEY_ICON, Bitmap::class.java) ?: return@let
+            val description = button.getString(CustomTabsIntent.KEY_DESCRIPTION) ?: ""
+            val id = button.getInt(CustomTabsIntent.KEY_ID, CustomTabButtons.TOP_BAR_ID)
+            applied = (if (id == CustomTabButtons.TOP_BAR_ID) toolbar.updateAction(icon, description) else bottomBar.updateButton(id, icon, description)) || applied
+        }
+        return applied
+    }
+
+    // --- Minimize (CCT-11) ----------------------------------------------------------------------------
+
+    /**
+     * The tab into a floating picture-in-picture window, Chrome's 16:9 card, grown out of the
+     * toolbar. Only this activity ever enters picture-in-picture; the browser window's is the
+     * video's. The system may refuse (a policy, a task that cannot); then nothing changes.
+     */
+    override fun onMinimize() {
+        if (minimized || isFinishing || host.fullscreenTab != null || authTab != null) return
+        closeFind()
+        val builder = PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(CustomTabMinimize.ASPECT_WIDTH, CustomTabMinimize.ASPECT_HEIGHT))
+        val source = Rect()
+        if (toolbar.getGlobalVisibleRect(source)) builder.setSourceRectHint(source)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setSeamlessResizeEnabled(false)
+            builder.setAutoEnterEnabled(false)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val card = CustomTabMinimize.card(page?.title, currentUrl.ifEmpty { config.url })
+            builder.setTitle(card.title)
+            if (card.host != card.title) builder.setSubtitle(card.host)
+        }
+        runCatching { enterPictureInPictureMode(builder.build()) }
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        val event = CustomTabMinimize.event(minimized, isInPictureInPictureMode) ?: return
+        minimized = isInPictureInPictureMode
+        if (minimized) showMinimizedCard() else hideMinimizedCard()
+        CustomTabSessions.minimized(config.session, event)
+    }
+
+    /** The card over everything; the page waits paused and out of sight, its title and favicon on the card. */
+    private fun showMinimizedCard() {
+        val card = minimizedCard ?: CustomTabMinimizedCard(this, config.scheme.dark).also { minimizedCard = it }
+        card.show(CustomTabMinimize.card(page?.title, currentUrl.ifEmpty { config.url }), page?.favicon)
+        if (card.parent == null) shell.addView(card, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        pageContainer.visibility = View.INVISIBLE
+        applyToolbarVisibility()
+        statusStrip.visibility = View.INVISIBLE
+        bottomBar.visibility = View.GONE
+        divider?.visibility = View.GONE
+        page?.onPause()
+    }
+
+    /** The card lifts; the toolbar returns only out of app mode – a TWA that committed into its scope meanwhile keeps it gone. */
+    private fun hideMinimizedCard() {
+        minimizedCard?.let(shell::removeView)
+        pageContainer.visibility = View.VISIBLE
+        applyToolbarVisibility()
+        statusStrip.visibility = View.VISIBLE
+        bottomBar.visibility = if (bottomBar.hasContent && !keyboardUp) View.VISIBLE else View.GONE
+        page?.onResume()
+        layoutPage()
+    }
+
+    /** The tab is in its floating card. */
+    val isMinimized: Boolean get() = minimized
+
+    // --- toolbar controls --------------------------------------------------------------------------
+
+    /**
+     * The X. A Trusted Web Activity's, up only out of scope: back to the newest page of the
+     * history on a verified origin (Chrome's `CloseButtonNavigator.navigateSingleTab`,
+     * `CloseButtonNavigator.java:125-139`), and out to the caller only when the history holds
+     * none. Every other custom tab's closes.
+     */
+    override fun onClose() {
+        val verifier = twa
+        val view = page
+        if (verifier != null && view != null) {
+            val list = view.copyBackForwardList()
+            val history = (0 until list.size).map { list.getItemAtIndex(it).url }
+            TwaScope.landingIndex(history, list.currentIndex, verifier.verdicts)?.let { i ->
+                view.goBackOrForward(i - list.currentIndex)
+                return
+            }
+        }
+        closeToCaller()
+    }
+
+    override fun onMenu() {
+        val titles = config.menuItems.map { it.title }
+        // The page's state is read once, as the menu opens (§9.13): the row does not flip under a finger.
+        val state = CustomTabMenu.PageState(
+            canGoForward = page?.canGoForward() == true,
+            bookmark = CustomTabBookmarks.starOf(currentUrl.ifEmpty { config.url }, bookmarkedUrls, pendingBookmarks),
+            loading = pageLoading,
+            desktopSite = host.desktopSite
+        )
+        // Add to Home Screen is on the sheet only where the launcher pins shortcuts, as Chrome's is.
+        val pins = ShortcutManagerCompat.isRequestPinShortcutSupported(this)
+        CustomTabMenuSheet(
+            this, config.scheme.dark,
+            CustomTabMenu.groups(
+                titles, config.share, host.desktopSite,
+                // Chrome's Auth Tab menu has neither: the sign-in stays in the tab that returns it.
+                addToHomeScreen = pins && authTab == null, openInBrowser = authTab == null
+            ), ::onMenuPick,
+            CustomTabMenu.iconRow(state, config.bookmarksButton, config.downloadButton), ::onIconPick
+        ).show()
+    }
+
+    /** The icon row's five (§9.13). */
+    private fun onIconPick(icon: CustomTabMenu.Icon) {
+        when (icon) {
+            CustomTabMenu.Icon.Forward -> page?.goForward()
+            CustomTabMenu.Icon.Bookmark -> toggleBookmark()
+            CustomTabMenu.Icon.Download -> downloadPage()
+            CustomTabMenu.Icon.Info -> showPageInfo()
+            CustomTabMenu.Icon.Reload -> if (pageLoading) page?.stopLoading() else page?.reload()
+        }
+    }
+
+    // --- the star and Download (CCT-03) -------------------------------------------------------------
+
+    /** The core's bookmarks and this tab's inbox, read off the main thread; the star reads them at the next open. */
+    private fun readBookmarks() {
+        storage.execute {
+            val bookmarked = CustomTabBookmarks.bookmarkedUrls(storage.read(CustomTabBookmarks.STATE))
+            val pending = CustomTabBookmarks.entries(storage.read(CustomTabBookmarks.INBOX))
+            runOnUiThread {
+                bookmarkedUrls = bookmarked
+                pendingBookmarks = pending
+            }
+        }
+    }
+
+    /**
+     * The star: a page the browser holds as a bookmark reads `Edit Bookmark` and opens in Ione,
+     * whose bar has the editor a custom tab has not; any other page is filed in the inbox for the
+     * browser to take into its bookmarks, and while the filing is pending the star reads `Remove
+     * Bookmark` – the second tap withdraws it, which is what the name says. Nothing here writes
+     * the core's model ([CustomTabBookmarks]).
+     */
+    private fun toggleBookmark() {
+        val url = currentUrl.ifEmpty { config.url }
+        if (url in bookmarkedUrls) {
+            openInIone()
+            return
+        }
+        val filed = pendingBookmarks.any { it.url == url }
+        pendingBookmarks = if (filed) {
+            CustomTabBookmarks.withoutEntry(pendingBookmarks, url)
+        } else {
+            val title = page?.title?.trim()?.ifEmpty { null } ?: Uri.parse(url).host ?: url
+            CustomTabBookmarks.withEntry(pendingBookmarks, CustomTabBookmarks.Entry(url, title, System.currentTimeMillis()))
+        }
+        storage.write(CustomTabBookmarks.INBOX, CustomTabBookmarks.serialize(pendingBookmarks)) { }
+        Toast.makeText(this, if (filed) R.string.cct_bookmark_removed else R.string.cct_bookmarked, Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * Download Page: the page as an MHTML archive in Downloads – the browser's Save Page path
+     * without its core (`Host.savePage`): written to a scratch file, then a MediaStore Downloads
+     * row on Q+; below Q, the app's own Downloads folder (the public one wants a runtime
+     * permission a custom tab does not ask for).
+     */
+    private fun downloadPage() {
+        val current = page ?: return
+        val url = currentUrl.ifEmpty { config.url }
+        val name = SavePageLogic.archiveName(current.title?.trim()?.ifEmpty { null } ?: Uri.parse(url).host ?: "page")
+        val scratch = File(File(cacheDir, "savepage").apply { mkdirs() }, "${System.nanoTime()}.${SavePageLogic.EXTENSION}")
+        current.saveWebArchive(scratch.absolutePath, false) { written ->
+            if (written == null) {
+                scratch.delete()
+                Toast.makeText(this, R.string.cct_download_failed, Toast.LENGTH_SHORT).show()
+                return@saveWebArchive
+            }
+            storage.execute {
+                val saved = runCatching { publishArchive(scratch, name) }.getOrNull()
+                scratch.delete()
+                runOnUiThread {
+                    val text = if (saved != null) getString(R.string.cct_page_saved, saved) else getString(R.string.cct_download_failed)
+                    Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    /** The archive into Downloads; the name the file got, or null when nothing was written. */
+    private fun publishArchive(scratch: File, name: String): String? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, SavePageLogic.MIME_TYPE)
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
+            contentResolver.openOutputStream(uri)?.use { out -> scratch.inputStream().use { it.copyTo(out) } } ?: return null
+            values.clear()
+            values.put(MediaStore.Downloads.IS_PENDING, 0)
+            contentResolver.update(uri, values, null, null)
+            return contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            } ?: name
+        }
+        val dir = (getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: File(filesDir, "Download")).apply { mkdirs() }
+        val file = File(dir, SavePageLogic.uniqueArchiveName(name) { File(dir, it).exists() })
+        scratch.copyTo(file, overwrite = false)
+        return file.name
+    }
+
+    /**
+     * Page Info, the icon row's (i): the page's host and its connection on the v2 prompt sheet
+     * (§9.23) – the host on one line with the page's favicon (the globe without one), the
+     * browser's site-info sheet's Connection row (secure, local, not secure: [CustomTabPageInfo])
+     * with its sentence under the title, Done. A custom tab has no chrome to draw the browser's
+     * sheet; the connection is what the tab knows from the URL.
+     */
+    private fun showPageInfo() {
+        val url = currentUrl.ifEmpty { config.url }
+        val host = Uri.parse(url).host ?: url
+        val ink = V2Ink(this, config.scheme.dark)
+        val favicon = page?.favicon
+        val (headline, detail, glyph) = when (CustomTabPageInfo.connectionOf(url)) {
+            CustomTabPageInfo.Connection.SECURE -> Triple(R.string.cct_secure, R.string.cct_secure_detail, R.drawable.ic_cct_lock)
+            CustomTabPageInfo.Connection.LOCAL -> Triple(R.string.cct_local_site, R.string.cct_local_site_detail, R.drawable.ic_globe)
+            CustomTabPageInfo.Connection.INSECURE -> Triple(R.string.cct_not_secure, R.string.cct_not_secure_detail, R.drawable.ic_cct_lock_open)
+        }
+        val content = NativePromptSheet.Content(
+            title = host,
+            titleOneLine = true,
+            glyph = if (favicon != null) BitmapDrawable(resources, favicon) else ink.glyph(R.drawable.ic_globe),
+            description = getString(detail),
+            rows = listOf(NativePromptSheet.Row(getString(headline), ink.glyph(glyph, ink.textDeemphasized))),
+            primary = NativePromptSheet.Peer(getString(R.string.cct_done))
+        )
+        NativePromptSheet(this, ink, content) { }.show()
+    }
+
+    /**
+     * Add to Home Screen (CCT-03): the page as a pinned shortcut that opens a tab of the browser.
+     * The v2 prompt sheet asks its name first (§9.22's form sheet: the field prefilled with the
+     * page's title, selected; Cancel, Add), then the browser's own pin path's tile (the name's
+     * first letter on the toolbar's colour, `Shortcuts`' letter tile) and launch intent are
+     * requested of the launcher, which confirms the pin its own way. The row is on the sheet only
+     * where the launcher pins ([onMenu]); the check here is the guard behind the hidden row.
+     */
+    private fun addToHomeScreen() {
+        if (!ShortcutManagerCompat.isRequestPinShortcutSupported(this)) return
+        val url = currentUrl.ifEmpty { config.url }
+        val title = page?.title?.trim()?.ifEmpty { null } ?: Uri.parse(url).host ?: url
+        val ink = V2Ink(this, config.scheme.dark)
+        val content = NativePromptSheet.Content(
+            title = getString(R.string.cct_add_to_home_screen),
+            field = NativePromptSheet.Field(text = title, label = getString(R.string.cct_shortcut_name)),
+            secondary = getString(R.string.cct_cancel),
+            primary = NativePromptSheet.Peer(getString(R.string.cct_add))
+        )
+        NativePromptSheet(this, ink, content) { answer ->
+            if (!answer.accepted) return@NativePromptSheet
+            pinShortcut(url, answer.text?.trim()?.ifEmpty { null } ?: title)
+        }.show()
+    }
+
+    private fun pinShortcut(url: String, name: String) {
+        val tile = Shortcuts.letterTile(this, name, config.scheme.toolbar)
+        val info = ShortcutInfoCompat.Builder(this, Shortcuts.shortcutId(url))
+            .setShortLabel(name.take(Shortcuts.SHORT_LABEL_MAX))
+            .setLongLabel(name)
+            .setIcon(IconCompat.createWithAdaptiveBitmap(tile))
+            .setIntent(Shortcuts.launchIntent(this, url, null))
+            .build()
+        ShortcutManagerCompat.requestPinShortcut(this, info, null)
+    }
+
+    /**
+     * Desktop site (CCT-03), Chrome's check row: the tab's user agent and layout from the next
+     * load on, and the page asked for again at once, as the browser's row does through the core.
+     */
+    private fun setDesktopSite(on: Boolean) {
+        host.desktopSite = on
+        val current = page ?: return
+        current.setDesktopMode(on)
+        current.reload()
+    }
+
+    override fun onAction() {
+        config.actionButton?.let { sendToCaller(it.intent) }
+    }
+
+    /** The toolbar's Share (CCT-17): the same sheet, the same title and URL, as the menu's row. */
+    override fun onShare() = share()
+
+    private fun onMenuPick(item: CustomTabMenu.Item) {
+        when (item) {
+            is CustomTabMenu.Item.Caller -> config.menuItems.getOrNull(item.index)?.let { sendToCaller(it.intent) }
+            CustomTabMenu.Item.Share -> share()
+            CustomTabMenu.Item.CopyLink -> copyLink(currentUrl.ifEmpty { config.url })
+            CustomTabMenu.Item.Reload -> page?.reload()
+            CustomTabMenu.Item.FindInPage -> openFind()
+            CustomTabMenu.Item.AddToHomeScreen -> addToHomeScreen()
+            is CustomTabMenu.Item.DesktopSite -> setDesktopSite(!item.checked)
+            CustomTabMenu.Item.OpenInIone -> openInIone()
+        }
+    }
+
+    /**
+     * The caller's `PendingIntent` for a button, menu item, bottom toolbar click or swipe, told
+     * which page it was pressed on (`fill` carries anything more, such as the clicked id).
+     */
+    private fun sendToCaller(pendingIntent: PendingIntent, fill: Intent = Intent()) {
+        fill.setData(Uri.parse(currentUrl.ifEmpty { config.url }))
+        try {
+            pendingIntent.send(this, 0, fill)
+        } catch (e: PendingIntent.CanceledException) {
+            // The caller cancelled it; nothing to do.
+        }
+    }
+
+    private fun share() {
+        val url = currentUrl.ifEmpty { config.url }
+        val title = page?.title?.ifEmpty { null }
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, url)
+            if (title != null) putExtra(Intent.EXTRA_SUBJECT, title)
+        }
+        startActivity(Intent.createChooser(send, title ?: url))
+    }
+
+    private fun copyLink(url: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("Ione", url))
+        // Android 13+ shows its own confirmation.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) Toast.makeText(this, R.string.cct_link_copied, Toast.LENGTH_SHORT).show()
+    }
+
+    /** A long-press on a link: the few things a custom tab can do with it. */
+    private fun linkMenu(url: String) {
+        val items = arrayOf(getString(R.string.cct_copy_link), getString(R.string.cct_share))
+        MaterialAlertDialogBuilder(this)
+            .setTitle(url)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> copyLink(url)
+                    1 -> startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, url)
+                    }, url))
+                }
+            }
+            .show()
+    }
+
+    // --- find in page ------------------------------------------------------------------------------
+
+    private fun openFind() {
+        if (findBar != null) return
+        showToolbar()
+        val bar = CustomTabFindBar(this, toolbar.ink, toolbar.barHeight, this)
+        bar.setBackgroundColor(config.scheme.toolbar)
+        toolbar.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, toolbar.barHeight, Gravity.BOTTOM))
+        findBar = bar
+        host.back.update(chrome = true, tabId = TAB_ID)
+        bar.focusField()
+    }
+
+    /** True when the find bar was up (and is now gone). */
+    private fun closeFind(): Boolean {
+        val bar = findBar ?: return false
+        findBar = null
+        bar.hideKeyboard()
+        toolbar.removeView(bar)
+        page?.stopFind()
+        host.back.update(chrome = false, tabId = TAB_ID)
+        return true
+    }
+
+    override fun onFind(text: String, forward: Boolean, newSession: Boolean) {
+        val view = page ?: return
+        if (text.isEmpty()) view.stopFind() else view.find(text, forward, newSession)
+    }
+
+    override fun onFindClosed() {
+        closeFind()
+    }
+
+    // --- leaving -------------------------------------------------------------------------------------
+
+    /**
+     * Open in Ione (CCT-04): the live page – history, scroll position, form state – leaves this
+     * host for the browser window through [TabHandoff]; the intent carries its URL too, for a
+     * window that never collects it.
+     */
+    private fun openInIone() {
+        val view = page ?: return
+        val url = view.url ?: currentUrl.ifEmpty { config.url }
+        closeFind()
+        host.tabs.release(TAB_ID) ?: return
+        view.setOnScrollChangeListener(null)
+        view.setOnTouchListener(null)
+        val token = TabHandoff.park(view)
+        startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                .setClass(this, MainActivity::class.java)
+                .putExtra(TabHandoff.EXTRA_TOKEN, token)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+        finish()
+    }
+
+    /**
+     * The Auth Tab's answer (CCT-13): the redirect the page reached, as the activity's result –
+     * `RESULT_OK` with the URL as the data, or the https verification's failure or timeout with
+     * none (`AuthTabIntent`'s codes) – and the tab closes into the caller, which hears it as the
+     * result of the activity it started (the trampoline forwarded the result to it).
+     */
+    private fun returnToCaller(code: Int, url: String?) {
+        if (isFinishing) return
+        setResult(code, url?.let { Intent().setData(Uri.parse(it)) })
+        closeToCaller()
+    }
+
+    /** A navigation event to whichever session the caller made: a custom tab's, or an Auth Tab's callback. */
+    private fun navigationEvent(event: Int) {
+        CustomTabSessions.navigationEvent(config.session, event)
+        CustomTabSessions.authNavigationEvent(config.authSession, event)
+    }
+
+    /**
+     * Close (CCT-05): finish into the caller's task. A caller that sent `EXTRA_EXIT_ANIMATION_BUNDLE`
+     * gets its own animations, which live in its package: `overridePendingTransition` resolves
+     * them through [getPackageName], answered with that package for the duration of the call
+     * (Chrome does the same). Otherwise the theme's slide-down runs.
+     */
+    fun closeToCaller() {
+        if (isFinishing) return
+        host.fullscreenTab?.let(host::exitFullscreen)
+        finish()
+        val animation = config.exitAnimation() ?: return
+        packageForAnimation = animation.packageName
+        try {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(animation.enterRes, animation.exitRes)
+        } finally {
+            packageForAnimation = null
+        }
+    }
+
+    override fun getPackageName(): String = packageForAnimation ?: super.getPackageName()
+
+    // --- lifecycle -----------------------------------------------------------------------------------
+
+    override fun onStart() {
+        super.onStart()
+        navigationEvent(CustomTabsCallback.TAB_SHOWN)
+        readBookmarks()
+    }
+
+    override fun onStop() {
+        navigationEvent(CustomTabsCallback.TAB_HIDDEN)
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        // The tab is going for good (Close, back out, Open in Ione, the task swiped away), not
+        // being recreated for a configuration change: the session's engagement ends (CCT-14).
+        if (isFinishing) CustomTabSessions.sessionEnded(config.session, engagement.didUserInteract)
+        CustomTabSessions.detach(config.session, this)
+        authTab?.destroy()
+        twa?.destroy()
+        bottomBar.stopSettling()
+        host.destroy()
+        storage.close()
+        super.onDestroy()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        shell.requestLayout()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) host.snapshots.clear()
+    }
+
+    companion object {
+        /** The one page's id within its TabHost. */
+        const val TAB_ID = "custom-tab"
+        private const val TOOLBAR_MS = 200L
+        private const val TWA_TAG = "ZenTwa"
+        /** Scroll distance in one direction before the toolbar moves. */
+        private const val SCROLL_THRESHOLD_DP = 40
+    }
+}

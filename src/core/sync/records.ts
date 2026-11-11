@@ -1,0 +1,2025 @@
+import type {
+  AddressEntry,
+  BookmarkNode,
+  BookmarkNodeType,
+  Boost,
+  Container,
+  Credential,
+  ExtensionInfo,
+  Folder,
+  FolderAgentMark,
+  FolderColor,
+  KeyBinding,
+  Mod,
+  PasskeyEntry,
+  PaymentCard,
+  ReadingListEntry,
+  Settings,
+  Space,
+  SpaceAgentMark,
+  SpaceTheme,
+  SyncScope,
+  Tab
+} from '../../shared/types'
+import { DEFAULT_CONTAINER_ID } from '../../shared/types'
+import { OTHER_BOOKMARKS_ID, isBookmarkRoot } from '../../shared/bookmarks'
+import { sanitizeMod } from '../../shared/mods'
+import { isReadingListUrl, sanitizeReadingEntry } from '../../shared/readingList'
+import { isExtensionId, type StoreId } from '../extensions/store'
+import type { Model } from '../model'
+import type { SiteDataPolicy } from '../../shared/siteData'
+import { sha1Hex } from './sha1'
+
+/**
+ * Sync records: the unit of cross-device replication. Every syncable entity is flattened into
+ * a small JSON payload with a stable id; conflicts are resolved last-writer-wins per record,
+ * exactly like Firefox Sync's engines – and, for the one settings record, per top-level key, as
+ * Chrome Sync treats each preference as its own item (`SyncRecord.keys`, `diffSettings`).
+ */
+
+export type RecordType =
+  | 'space'
+  | 'folder'
+  | 'tab'
+  | 'container'
+  | 'bookmark'
+  | 'settings'
+  | 'shortcuts'
+  | 'boost'
+  /** Ordering of spaces / containers / essentials / a space's tabs, separate from their content. */
+  | 'order'
+  /** One entry of the credential store: a saved login, or a passkey's public record (ID-09). */
+  | 'credential'
+  /**
+   * The per-site cookie and site-data policy (`SiteDataPolicy`, one record of the settings
+   * scope, PS-23): a peer on a build without it ignores the record, as `inScope` says nothing
+   * for a type it does not know, and neither tombstones nor applies it.
+   */
+  | 'site-data'
+  /**
+   * One entry of the reading list (W6-1's `ReadingListEntry`; Chrome's "Reading list" type),
+   * under the entry's own id, carrying every field but `favicon` (`ReadingListEntryData`); the
+   * `readingList` scope's. Additive on the wire like `site-data`: a peer on a build without the
+   * type leaves the record alone (`__tests__/compat.test.ts` pins how this build treats a type it
+   * does not know, which is how the builds before it treat this one).
+   */
+  | 'reading-list-entry'
+  /**
+   * One Mod (`Mod`, Settings › Mods: a sheet of CSS for the browser chrome; services pass 15,
+   * ID-43), under the Mod's own id, carrying every field but `id` (`ModData`); the `mods`
+   * scope's. Additive on the wire like the two above: a peer on a build without the type leaves
+   * the record alone (`__tests__/compat.test.ts`).
+   */
+  | 'mod'
+  /**
+   * One address of the credential vault (`AddressEntry`; ID-45, Chrome's "Addresses and more"
+   * type), under the vault entry's own id, carrying the vault's fields (`AddressData`); the
+   * `addresses` scope's. A vault type like `credential`: published while the vault is open, held
+   * with the logins while it is locked (`isVaultRecordType`). Its own type, not a third kind of
+   * `credential`, for the peers on the builds before it: a `credential` record whose kind a
+   * build does not read is a WINNER there (`inScope` says yes to the type) that lands nothing,
+   * and the round then tombstones what it never held – a tombstone every newer peer applies –
+   * whereas a type a build does not know falls out at `inScope`, before the metadata, and is
+   * skipped every round (`__tests__/compat.test.ts`). One type per scope key, so `inScope`
+   * filters it by its key alone, as every other type. This build gives a vault record it cannot
+   * read the same skip (`vaultRecordReadable`).
+   */
+  | 'address'
+  /**
+   * One payment card of the credential vault (`PaymentCard`; ID-45, Chrome's "Payment methods"
+   * type), under the vault entry's own id, carrying the vault's fields (`PaymentMethodData`) –
+   * the number as the vault keeps it, inside the same envelope as a login's password; the
+   * `paymentMethods` scope's. A vault type, its own for the reason `address` is.
+   */
+  | 'payment-method'
+  /**
+   * One extension installed from a store (Chrome's "Extensions" type; services pass 16, ID-44),
+   * under the extension's own id, carrying the store it came from and whether it is enabled and
+   * pinned to the toolbar (`ExtensionRecordData`); the `extensions` scope's. Additive on the
+   * wire like `site-data`, the reading list and the Mods: a peer on a build without the type
+   * leaves the record alone (`__tests__/compat.test.ts`).
+   */
+  | 'extension'
+
+export interface SyncRecord {
+  id: string
+  type: RecordType
+  /** Wall-clock ms of the last change on the device that made it. */
+  modified: number
+  deleted: boolean
+  data: unknown
+  /**
+   * The settings record only (`SETTINGS_RECORD_ID`): the `modified` of each top-level key of
+   * `data` whose time differs from the record's – the record's is the newest of them – so a
+   * reader on this build merges the record key by key, as Chrome Sync treats each preference as
+   * its own item, while a build before it reads the record whole at the time of its newest edit,
+   * exactly as it always did (`winningRemote`). Never on another record, and absent while every
+   * key shares the record's time, so a record set no one edited under this build serialises and
+   * hashes as before (`__tests__/compat.test.ts`); `hashData(data)` never sees it – it stands
+   * beside `data`, not in it. A key the map does not name is at the record's time.
+   */
+  keys?: Record<string, number>
+}
+
+/** One top-level key of the settings record in the metadata: its value's hash and its own time. */
+export interface KeyMeta {
+  hash: string
+  modified: number
+}
+
+export interface RecordMeta {
+  type: RecordType
+  hash: string
+  modified: number
+  deleted: boolean
+  /**
+   * The settings record only: each top-level key's own hash and `modified` (`SyncRecord.keys`
+   * on the wire; `diffSettings` for the rules). Absent, the entry says what it always said –
+   * every key at `modified`, no hash finer than the record's: a metadata from before per-key
+   * merge, or a record first seen at the last diff – and the next diff that finds the record
+   * unchanged fills it in at that time, as the boot seed does (`seedSettingsMeta`).
+   */
+  keys?: Record<string, KeyMeta>
+}
+
+export type MetaMap = Record<string, RecordMeta>
+
+export interface SpaceData {
+  name: string
+  icon: string
+  containerId: string
+  theme: SpaceTheme | null
+  pinnedCollapsed: boolean
+  /**
+   * The agents' mark (`Space.agent`), present only on a marked space so every other record
+   * hashes as it always did; a peer without the field ignores it, and one whose record lacks it
+   * leaves the local mark alone (`readSpaceAgentMark`).
+   */
+  agent?: SpaceAgentMark
+}
+
+/** `order:spaces`, `order:containers`, `order:essentials` → `{ ids }`; `order:tabs:<spaceId>` → sections. */
+export interface OrderData {
+  ids?: string[]
+  pinned?: string[]
+  regular?: string[]
+}
+
+export const ORDER_SPACES = 'order:spaces'
+export const ORDER_CONTAINERS = 'order:containers'
+export const ORDER_ESSENTIALS = 'order:essentials'
+export const orderTabsId = (spaceId: string): string => `order:tabs:${spaceId}`
+
+export interface FolderData {
+  spaceId: string
+  name: string
+  icon: string
+  collapsed: boolean
+  /** Absent for folders without a group colour, so their records hash as they always did. */
+  color?: FolderColor
+  /** The agent's mark (`Folder.agent`); absent on the user's folders, as `color` is when none. */
+  agent?: FolderAgentMark
+}
+
+/**
+ * The agent's mark a folder record carries, when it carries a well-formed one: `undefined` when
+ * the record has no such field (a peer older than the mark, or the user's folder – the local
+ * mark, if any, stays), so a malformed field is the same as none.
+ */
+export function readFolderAgentMark(data: unknown): FolderAgentMark | undefined {
+  const raw = (data as { agent?: unknown } | null)?.agent
+  if (!raw || typeof raw !== 'object') return undefined
+  const { name, createdAt } = raw as { name?: unknown; createdAt?: unknown }
+  if (typeof name !== 'string' || typeof createdAt !== 'number' || !Number.isFinite(createdAt))
+    return undefined
+  return { name, createdAt }
+}
+
+/** The agents' mark a space record carries, when well-formed; `undefined` otherwise (as above). */
+export function readSpaceAgentMark(data: unknown): SpaceAgentMark | undefined {
+  const raw = (data as { agent?: unknown } | null)?.agent
+  if (!raw || typeof raw !== 'object') return undefined
+  const mark = raw as { kind?: unknown; name?: unknown; createdAt?: unknown }
+  if (mark.kind === 'shared') return { kind: 'shared' }
+  if (
+    mark.kind === 'own' &&
+    typeof mark.name === 'string' &&
+    typeof mark.createdAt === 'number' &&
+    Number.isFinite(mark.createdAt)
+  )
+    return { kind: 'own', name: mark.name, createdAt: mark.createdAt }
+  return undefined
+}
+
+export interface TabData {
+  url: string
+  pinnedUrl: string | null
+  title: string
+  customTitle: string | null
+  customIcon: string | null
+  /** The icon's `http(s)` address, or null: what `wireFavicon` lets across (a `data:` icon reads as null). */
+  favicon: string | null
+  pinned: boolean
+  essential: boolean
+  spaceId: string | null
+  folderId: string | null
+  containerId: string
+  muted: boolean
+}
+
+export interface ContainerData {
+  name: string
+  color: Container['color']
+  icon: Container['icon']
+}
+
+/**
+ * What a favicon may carry across the sync boundary – the engine's rule for every record that
+ * names an icon (a bookmark's, a tab record's, the `open-tabs` view's, a history visit's),
+ * argued from the receiver's need: an `http(s)` address MAY travel, the receiving device can
+ * fetch it (and its favicon cache keeps one copy, `core/favicons.ts`); a `data:` URL NEVER
+ * travels – it is the icon's bytes (a 32 px PNG is 2–6 KB of base64 per record, over thousands
+ * of bookmarks and visits in the device file and the history pages), and the receiver caches
+ * its own once it opens the page; a host-local address – the cache's `zen://favicon/<hash>`, a
+ * `file:`, `chrome:`, `about:` – never travels either, a peer cannot use it. Applied where a
+ * record is MADE (`collectLocal`, `collectOpenTabs`, `wireVisit`) and where one is READ
+ * (`readBookmarkData`, `readOpenTabs`, `readHistoryPage`, the tab apply): a peer's build may
+ * still send what this one does not. The reading list set the precedent (`readingListEntryData`:
+ * `favicon` never travels at all – the list resolves its icons by `url` from the cache). On the
+ * apply side, a landed record WITHOUT a favicon keeps this device's own for the same id and
+ * url (`BookmarkService.applySynced`, the tab apply): a missing favicon is not a deletion of
+ * the local one, it is the peer's icon staying home.
+ *
+ * Returns the address when it may travel, else `undefined`.
+ */
+export function wireFavicon(favicon: string | null | undefined): string | undefined {
+  if (typeof favicon !== 'string' || !favicon) return undefined
+  return /^https?:\/\//i.test(favicon) ? favicon : undefined
+}
+
+/**
+ * One bookmark tree node (roots are fixed on every device and never replicate). Position is part
+ * of the record: a move is a change of `parentId` / `index`, resolved last-writer-wins per node;
+ * the receiving tree repairs index collisions and orphans (`normalizeBookmarkNodes`).
+ */
+export interface BookmarkData {
+  parentId: string
+  index: number
+  type: BookmarkNodeType
+  title: string
+  url?: string
+  /**
+   * The icon's `http(s)` address when the bookmark has one (`wireFavicon`): never the bytes of a
+   * `data:` URL nor a host-local address. A record without it says nothing about the receiver's
+   * own icon for the node (`BookmarkService.applySynced` keeps it).
+   */
+  favicon?: string
+  dateAdded: number
+}
+
+/** Pre-tree devices (state.json v1–v2) sent flat bookmarks. */
+interface LegacyBookmarkData {
+  url: string
+  title: string
+  favicon: string | null
+  createdAt: number
+}
+
+/**
+ * Read a bookmark record from any device generation: tree records as they are, flat legacy
+ * records as bookmarks appended to "Other bookmarks". Null for garbage.
+ */
+export function readBookmarkData(data: unknown): BookmarkData | null {
+  if (!data || typeof data !== 'object') return null
+  const r = data as Partial<BookmarkData & LegacyBookmarkData>
+  if (typeof r.parentId === 'string' && (r.type === 'url' || r.type === 'folder')) {
+    if (r.type === 'url' && typeof r.url !== 'string') return null
+    const out: BookmarkData = {
+      parentId: r.parentId,
+      index:
+        typeof r.index === 'number' && Number.isFinite(r.index) ? r.index : Number.MAX_SAFE_INTEGER,
+      type: r.type,
+      title: typeof r.title === 'string' ? r.title : (r.url ?? ''),
+      dateAdded: typeof r.dateAdded === 'number' ? r.dateAdded : Date.now()
+    }
+    if (r.type === 'url') {
+      out.url = r.url
+      const favicon = wireFavicon(r.favicon)
+      if (favicon) out.favicon = favicon
+    }
+    return out
+  }
+  if (typeof r.url === 'string' && r.url) {
+    const out: BookmarkData = {
+      parentId: OTHER_BOOKMARKS_ID,
+      index: Number.MAX_SAFE_INTEGER,
+      type: 'url',
+      title: typeof r.title === 'string' && r.title ? r.title : r.url,
+      url: r.url,
+      dateAdded: typeof r.createdAt === 'number' ? r.createdAt : Date.now()
+    }
+    const favicon = wireFavicon(r.favicon)
+    if (favicon) out.favicon = favicon
+    return out
+  }
+  return null
+}
+
+/**
+ * A reading-list entry as its record carries it (services pass 11; the interface doc §1–§3 in
+ * `internal/desktop-parity/reading-list-interface.md` as services' read amended it): the
+ * entry's six fields – `id`, `url`, `title`, `addedAt`, `updatedAt`, `readAt` while read – and
+ * never `favicon`, which is the device's own (a data URL is bytes across the boundary, an
+ * address may be host-local; the receiving device resolves the icon from its cache by `url`).
+ * `readAt` absent while unread serialises as absence and the hash sees it. `updatedAt` rides as
+ * information, set in the commit the engine stamps: the conflict clock is the record's
+ * `modified` – the engine's stamp at the commit that changed the entry (`SyncEngine.onLocalChange`)
+ * – and `winningRemote` reads no payload field. Last writer per entry; ties keep the local copy;
+ * no field-level merge (an entry is already one record per item). A removal is the engine's
+ * tombstone, from absence (`diffLocal`, at `now`, kept `TOMBSTONE_TTL_MS`); a later add of the
+ * same page makes a new id that wins by its own clock while the tombstone runs out.
+ */
+export type ReadingListEntryData = Omit<ReadingListEntry, 'favicon'>
+
+/** The record's payload for an entry: the six fields in the normal form's order, `favicon` left home. */
+export function readingListEntryData(entry: ReadingListEntry): ReadingListEntryData {
+  const data: ReadingListEntryData = {
+    id: entry.id,
+    url: entry.url,
+    title: entry.title,
+    addedAt: entry.addedAt,
+    updatedAt: entry.updatedAt
+  }
+  if (entry.readAt !== undefined) data.readAt = entry.readAt
+  return data
+}
+
+/**
+ * Read a reading-list record from another device – the apply side's sanitiser, before the entry
+ * joins the list (`ReadingListService.applySynced`): the model's own `sanitizeReadingEntry`
+ * under the record's id (a string URL, a finite `addedAt`, a title or the URL for one,
+ * `updatedAt` or the latest time the entry has, `readAt` while finite, unknown fields dropped;
+ * the field order the model's writes leave), a web address only (`isReadingListUrl`: the list
+ * never holds `zen://`, `about:blank` or a file, whatever a peer sends), and never a `favicon` –
+ * a peer's build that sends one sends its own device's. The model caps no title, so none is
+ * applied here: a cap the model lacks would rewrite a peer's bytes at apply. Null for garbage.
+ * Idempotent – what it returns, it returns again unchanged (`__tests__/records.test.ts`) – so
+ * a record this device re-publishes after applying it hashes as the entry it holds, and two
+ * builds never bounce an entry back and forth.
+ */
+export function readReadingListData(id: string, data: unknown): ReadingListEntry | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const entry = sanitizeReadingEntry({ ...(data as Record<string, unknown>), id })
+  if (!entry || !isReadingListUrl(entry.url)) return null
+  delete entry.favicon
+  return entry
+}
+
+/**
+ * One Mod as its record carries it (services pass 15, ID-43): every field but `id`, which is
+ * the record's – `name`, `source`, `css`, `enabled`, `updatedAt`, in the interface's order. The
+ * CSS travels whole, as a Boost's does: the sheet IS the Mod, and a `url()` inside it is the
+ * user's text – a `data:` picture written into the sheet travels as part of it (within
+ * `MAX_MOD_CSS`), while a `file:` or other host-local address names a file only the authoring
+ * device holds and travels as the address alone: the sync layer has no attachment path, and a
+ * picture is each device's own, as the new tab page's is (`NewTabService`). `source` is
+ * information – where the CSS was imported from, a file's name (`pickTextFiles` hands over the
+ * basename) or a URL – shown under the Mod's name on every device. `updatedAt` rides as
+ * information too: the conflict clock is the record's `modified`, the engine's stamp at the
+ * commit that changed the Mod (`SyncEngine.onLocalChange`), and `winningRemote` reads no payload
+ * field. Last writer per Mod; ties keep the local copy; no field-level merge. A removal is the
+ * engine's tombstone, from absence (`diffLocal`, at `now`, kept `TOMBSTONE_TTL_MS`).
+ */
+export type ModData = Omit<Mod, 'id'>
+
+/** The record's payload for a Mod: the five fields in the interface's order, `id` left to the record. */
+export function modData(mod: Mod): ModData {
+  return {
+    name: mod.name,
+    source: mod.source,
+    css: mod.css,
+    enabled: mod.enabled,
+    updatedAt: mod.updatedAt
+  }
+}
+
+/**
+ * Read a Mod record from another device – the apply side's sanitiser, before the Mod joins the
+ * list (`ModService.put`): `sanitizeMod` under the record's id (a CSS string, cut to
+ * `MAX_MOD_CSS`; a trimmed, never empty name; `source` a string or null; unknown fields dropped).
+ * Null for garbage. Idempotent – what it returns, it returns again unchanged
+ * (`__tests__/records.test.ts`) – so a Mod this device re-publishes after applying it hashes as
+ * the record it took, and two builds never bounce a Mod back and forth. A sheet a peer's build
+ * let grow past the cap lands cut, and the round that follows the apply (`SyncEngine.run`,
+ * `stamp: null`) republishes it at the peer's time, where the peer ties and keeps its own.
+ */
+export function readModData(id: string, data: unknown): Mod | null {
+  return sanitizeMod(id, data)
+}
+
+/**
+ * One store extension as its record carries it (services pass 16, ID-44; Chrome's
+ * `sync_pb::ExtensionSpecifics` carries the id, the update URL, `enabled`, `incognito_enabled`
+ * and the version – ours carries the three fields another device can act on): the store it was
+ * installed from (`ExtensionRecord.source` when that is a store id – the record's `id` names
+ * the extension there, which is where a receiving device installs it from), whether it is
+ * enabled, and whether it is pinned to the toolbar (`ExtensionRecord.toolbarPinned`, Chrome's
+ * "Pin to toolbar" – never `pinned`, the update-check skip, which is each device's own). The
+ * version travels nowhere: each device takes the store's current one. The per-device grants –
+ * `allowFileAccess`, `allowPrivate`, `allowUserScripts` – travel nowhere either: each is a
+ * permission the user gives THIS device's copy, and Chrome's `incognito_enabled` is the one
+ * such grant it syncs; we sync none. `updatedAt` travels nowhere either: when the files were
+ * written on a device is that device's fact, and the same state must hash the same on every
+ * device (`winningRemote` skips an equal hash; the round adopts a peer's entry on one).
+ *
+ * `installedAt` DOES travel (round 5), as the DECLINE's re-offer criterion and nothing else:
+ * when the extension was installed by hand, on whichever device did – the latest such install
+ * the publishing device knows of. A device that declined a synced landing
+ * (`Persisted.declinedExtensions`) is offered the extension again only by a record whose
+ * `installedAt` is later than its decline (`extensionDeclineStands`) – a fresh install by hand
+ * somewhere – never by a flip's newer stamp, nor by a landing elsewhere. For that the time must
+ * be the INSTALL's, not each copy's: an install made here publishes its own (`newRecord`, the
+ * registry's `installedAt`); a synced landing publishes the time the record it landed from
+ * carried (`ExtensionRecord.syncedInstalledAt` – a landing is nobody's install), none when that
+ * record carried none; and a later time on a record merges in like a later switch clock
+ * (`ExtensionSyncApplier.mergeSwitches` adopts it; a copy holding the later one is
+ * re-published), so every device's copy of one extension carries one time and the same state
+ * hashes the same everywhere, as above. Absent on a record from a build before the field and on
+ * a landing from one, which the criterion reads as "no install after the decline".
+ *
+ * The transport's conflict clock is the record's `modified` – the engine's stamp at the commit
+ * that changed the extension (`SyncEngine.onLocalChange`) – last writer per extension picks the
+ * record that travels (`winningRemote`; ties keep the local copy). What the winner LANDS is
+ * merged switch by switch: each switch carries its own clock, `enabledAt` / `toolbarPinnedAt`
+ * (ms, the device's time at the flip – `ExtensionRecord.enabledAt` / `toolbarPinnedAt`, set at
+ * install and on every flip), and the receiving host takes a switch from the winner only when
+ * the winner's clock for it is not older than its own (`ExtensionSyncApplier.applyOne`; ties
+ * take the winner's, which then hashes the same on both). One device pinning while another
+ * disables converges to pinned AND disabled on both: the second round re-publishes the merged
+ * record, whose clocks win the same way on the peer. A switch without a clock on the wire – a
+ * record from a build before the clocks, or a switch its host never flipped (the phone clocks
+ * the flips made on it alone, `AndroidExtensions.setEnabled` / `setToolbarPinned`; its install
+ * writes none) – reads as written at 0 (`syncedExtensionData`): older than any clocked switch,
+ * so it never beats one, and even with another unclocked switch, where the values' difference
+ * decides (ties take the winner's). A host that cannot apply a record (no
+ * `applySyncedExtensions`, the phone) never re-publishes the copy it could not change under
+ * the winner's stamp: the id is frozen for it until its own registry changes
+ * (`SyncEngine.sources`, `Persisted.unappliedExtensions`). A removal is the engine's tombstone,
+ * from the extension's absence (`diffLocal`, at `now`) – but only when the absence is an
+ * uninstall (`frozenRecords`: an install that has not landed, or failed, is no removal).
+ */
+export interface ExtensionRecordData {
+  store: StoreId
+  enabled: boolean
+  toolbarPinned: boolean
+  /** The switches' clocks (ms); absent when the publishing host keeps none for that switch. */
+  enabledAt?: number
+  toolbarPinnedAt?: number
+  /**
+   * When the extension was installed by hand (ms), on whichever device did – the decline's
+   * re-offer criterion (the doc above); absent when the publishing host holds no such time (a
+   * build before the field, a landing from a record without one).
+   */
+  installedAt?: number
+}
+
+/**
+ * A winner's payload as the host merges it: both clocks present, an absent one read as 0 – a
+ * switch no host ever wrote under a clock is older than every switch one did, so it never
+ * beats a clocked switch on the receiving host (`ExtensionSyncApplier.mergeSwitches` takes a
+ * switch only under a clock not older than its own). Never the record's `modified`: that stamp
+ * is the whole record's, and on a copy re-published by a host that changed nothing it would
+ * be a peer's time lent to a stale switch. `installedAt` the same way: 0 for none, which no
+ * time this device holds is older than, so a record without one neither moves the time here
+ * nor re-offers a decline.
+ */
+export type SyncedExtensionData = ExtensionRecordData & {
+  enabledAt: number
+  toolbarPinnedAt: number
+  installedAt: number
+}
+
+export function syncedExtensionData(data: ExtensionRecordData): SyncedExtensionData {
+  return {
+    store: data.store,
+    enabled: data.enabled,
+    toolbarPinned: data.toolbarPinned,
+    enabledAt: data.enabledAt ?? 0,
+    toolbarPinnedAt: data.toolbarPinnedAt ?? 0,
+    installedAt: data.installedAt ?? 0
+  }
+}
+
+/** The stores a record may name; any other `store` is garbage and the record is ignored. */
+const STORE_IDS: ReadonlySet<string> = new Set<StoreId>(['chrome-web-store', 'edge-add-ons'])
+
+/** The store an extension's `source` names, or null for a file or folder install: only a store install syncs. */
+export function extensionStoreOf(source: ExtensionInfo['source']): StoreId | null {
+  return STORE_IDS.has(source) ? (source as StoreId) : null
+}
+
+/**
+ * What `collectLocal` reads of an installed extension (`ExtensionHost.syncSources()`, the
+ * registry alone – no manifest is read for it; `list()` where a host has no projection): its
+ * id, where it came from, the two synced switches with their clocks, the install's time the
+ * record carries (`installedAt` – the desktop's `syncSources()` projects the time a synced
+ * landing took from its record over the landing's own, `ExtensionRecord.syncedInstalledAt`; the
+ * phone's `list()` its registry's, every install there being one made by hand), and whether it
+ * is a synced landing still waiting for the user's approval here
+ * (`ExtensionInfo.pendingApproval`) – such a landing is not this device's state to publish
+ * (`collectLocal` leaves it out; `frozenRecords` holds its entry).
+ */
+export type ExtensionSyncSource = Pick<
+  ExtensionInfo,
+  | 'id'
+  | 'source'
+  | 'enabled'
+  | 'toolbarPinned'
+  | 'pendingApproval'
+  | 'enabledAt'
+  | 'toolbarPinnedAt'
+  | 'installedAt'
+>
+
+/**
+ * The record's payload for a store extension: the three fields in the interface's order, then
+ * each switch's clock when the host keeps one, then the install's time when the host holds one
+ * (a time of 0 or none is left out, so a record from a host without clocks and without the time
+ * carries the three fields alone – the bytes a build from before the clocks wrote, and the
+ * fixture's).
+ */
+export function extensionRecordData(ext: ExtensionSyncSource, store: StoreId): ExtensionRecordData {
+  const data: ExtensionRecordData = {
+    store,
+    enabled: ext.enabled,
+    toolbarPinned: ext.toolbarPinned
+  }
+  if (ext.enabledAt !== undefined && ext.enabledAt > 0) data.enabledAt = ext.enabledAt
+  if (ext.toolbarPinnedAt !== undefined && ext.toolbarPinnedAt > 0)
+    data.toolbarPinnedAt = ext.toolbarPinnedAt
+  if (Number.isFinite(ext.installedAt) && ext.installedAt > 0) data.installedAt = ext.installedAt
+  return data
+}
+
+/**
+ * Read an extension record from another device – the apply side's reader, before the host acts
+ * on it (`ExtensionHost.applySyncedExtensions`): the id must be an extension id (32 letters
+ * a–p, `isExtensionId`), the store one this build knows, the two switches booleans, each
+ * switch's clock and the install's time a positive finite number when present (anything else
+ * reads as none). Null for anything else, and the record is ignored – an unknown store id (a
+ * store a later build adds) lands nothing here, as a type this build does not know does; a
+ * field this build does not know (one a later build adds) is dropped, the record read without
+ * it. Idempotent: what it returns, `extensionRecordData` publishes again as the same bytes, so
+ * a device that applied a record re-collects it to the received hash once the extension stands
+ * as the record says.
+ */
+export function readExtensionData(id: string, data: unknown): ExtensionRecordData | null {
+  if (!isExtensionId(id)) return null
+  if (!data || typeof data !== 'object') return null
+  const d = data as Record<string, unknown>
+  if (typeof d.store !== 'string' || !STORE_IDS.has(d.store)) return null
+  if (typeof d.enabled !== 'boolean' || typeof d.toolbarPinned !== 'boolean') return null
+  const read: ExtensionRecordData = {
+    store: d.store as StoreId,
+    enabled: d.enabled,
+    toolbarPinned: d.toolbarPinned
+  }
+  if (typeof d.enabledAt === 'number' && Number.isFinite(d.enabledAt) && d.enabledAt > 0)
+    read.enabledAt = d.enabledAt
+  if (
+    typeof d.toolbarPinnedAt === 'number' &&
+    Number.isFinite(d.toolbarPinnedAt) &&
+    d.toolbarPinnedAt > 0
+  )
+    read.toolbarPinnedAt = d.toolbarPinnedAt
+  if (typeof d.installedAt === 'number' && Number.isFinite(d.installedAt) && d.installedAt > 0)
+    read.installedAt = d.installedAt
+  return read
+}
+
+/**
+ * Whether this build can read an `extension` record – the engine rule of #712 for the type: a
+ * record this build cannot read is never applied, never written to the metadata, never
+ * tombstoned (`SyncEngine.run` drops such a winner before the metadata merge, so a later build's
+ * record – a store this one does not know – is found and skipped again each round rather than
+ * adopted as a copy this device holds). A live record must read (`readExtensionData`); a
+ * tombstone must at least name an extension.
+ */
+export function extensionRecordReadable(record: SyncRecord): boolean {
+  if (record.type !== 'extension') return true
+  return record.deleted
+    ? isExtensionId(record.id)
+    : readExtensionData(record.id, record.data) !== null
+}
+
+/**
+ * The settings that are one device's own and travel in neither direction: this device's record
+ * carries none of them, and a peer's record carrying one (a build from before a key joined the
+ * list still sends it) leaves this device's value standing – the settings record is otherwise
+ * merged key by key, a peer's later key landing (`winningSettings`), so a stray key would land
+ * as a choice made here. Such a key is never a peer's to win, either: this device holds no entry
+ * for it, so its "later" time would beat nothing every round and the apply would land nothing.
+ * - `onboardingDone`: the one-time flag.
+ * - `sidebarExpandOnHover`: a pointer's hover preference for the rail (tabs-03), on by default
+ *   since profile v6; a peer on v5 still stores that build's default `false`, no choice.
+ * - `searchChoice`: the EEA's search-engine choice screen's record (W6-2) – each device's to
+ *   answer once, as Chrome's; the engine it set travels as `searchEngineId`, the record does not.
+ * - `useSystemAccent`: whether the chrome follows this device's OS accent colour (settings-116,
+ *   W8-3) – the accent is the device's, and Chrome's `browser.theme.follows_system_colors` is
+ *   not in its syncable database either. (The Home button's pin, `toolbarPins.home`, syncs with
+ *   the record, as Chrome's `browser.show_home_button` does.)
+ * - `energySaver`, `unloadEnabled`, `unloadTimeoutMinutes`: Settings › Performance's modes and
+ *   timer (W8-2) – one class, each device's own: Energy Saver is a laptop's choice that means
+ *   nothing on a tower or a phone, and Memory Saver's switch and tier are sized to the device
+ *   running them. Chrome keeps all three twins (`performance_tuning.battery_saver_mode.state`,
+ *   `high_efficiency_mode.state`, `high_efficiency_mode.aggressiveness`) in local state, off
+ *   the sync list. The phone's sleeping-tabs mode and timer are these same two keys, so they
+ *   are each phone's own too: the desktop's tier no longer moves the phone's ladder, nor the
+ *   phone's the desktop's. No migration – each device keeps the value it holds: the two keys'
+ *   departure from this device's record stamps nothing (`diffSettings`), an older peer's copy
+ *   is stripped at apply (`withoutDeviceLocalSettings`) and never wins (`winningRemote`), and
+ *   older peers keep trading the keys among themselves, as `sidebarExpandOnHover`'s did. The
+ *   keep-active hosts (`unloadExcludedDomains`) stay synced: Chrome syncs its exceptions list
+ *   (`performance_tuning.tab_discarding.exceptions`, `syncer::PREFERENCES`).
+ * - `touchpadSwipeToNavigate`: Android's Settings › Accessibility › "Swipe between pages using
+ *   a touchpad" (GN-23 / A11Y-14) – Chrome registers its twin
+ *   (`settings.a11y.touchpad_overscroll_history_navigation`, `prefs_tab_helper.cc`) Android-only
+ *   and without `SYNCABLE_PREF`: the device with the touchpad decides, and a phone's or a
+ *   desktop's record has no say. No migration, as above: the key never joins a record.
+ * - `hoverCardMemoryUsage`: whether the tab hover card says the page's memory (settings-29,
+ *   W8-10; off by default, Chrome 152's effective default) – Chrome registers
+ *   `browser.hovercard.memory_usage_enabled` in local state (`RegisterBrowserPrefs` in
+ *   `browser_ui_prefs.cc`), never synced; the card is the desktop's alone, so the phone holds
+ *   the key inert. Same mechanics as the three above: no migration, an older peer's copy
+ *   stripped at apply and never winning.
+ * - `windowTransparency`: Settings › Appearance's see-through frame (Hyprland, niri and KWin
+ *   blur or dim what is behind it). The compositor is this machine's, as is whether it has one
+ *   to blur with, so another device's record has no say. No migration, as above: the key never
+ *   joins a record.
+ * - `bookmarkRowSortOrder`, `bookmarkRowDisplay` (HB-13): the phone's bookmark rows' order and
+ *   display, Chrome's `BookmarkUiPrefs` – two SharedPreferences keys on the device, never synced.
+ * - `iph`: the phone's in-product help bubbles' records (TB-19, `shared/iph.ts`) – when each
+ *   became available on this device and whether it has been shown. Chrome's feature engagement
+ *   tracker keeps its events in the profile's own LevelDB
+ *   (`components/feature_engagement/internal/persistent_event_store.cc` l.25–26, a
+ *   `leveldb_proto::ProtoDatabase<Event>`; l.43 `WriteEvent`), no sync layer over it: a phone
+ *   that has seen a bubble says nothing about the phone beside it, and a desktop has no such
+ *   bubble to be told about. No migration, as above.
+ * - `clearBrowsingDataRange`: the range the Delete browsing data dialog opens on – the one the
+ *   user last deleted with (services pass 13, seed #20). Chrome registered its twin,
+ *   `browser.clear_data.time_period`, as a syncable pref until CL 5398105 ("[CBD] Make options
+ *   not syncable", 2024-03-27: "not sync across devices and only be local per profile") dropped
+ *   the flag from every Delete browsing data choice; `components/browsing_data/core/
+ *   pref_names.cc:23–25` registers it plain today, and `components/sync_preferences/
+ *   common_syncable_prefs_database.cc:74–75` lists it as "(no longer synced)". Each device's
+ *   own, then: the desktop's dialog remembers what was deleted on that desktop; the phone's
+ *   Quick Delete form opens on its own 15 minutes and never reads the key. No migration, as
+ *   above: the key never joins a record.
+ * - `proxy`: Settings › System's named servers, routing rules and agent grants. Proxies are
+ *   this machine's (a LAN host, a PAC on the office network), and the record would otherwise
+ *   carry their passwords. No migration: the key never joins a record.
+ */
+export const DEVICE_LOCAL_SETTINGS = [
+  'onboardingDone',
+  'sidebarExpandOnHover',
+  'searchChoice',
+  'useSystemAccent',
+  'energySaver',
+  'unloadEnabled',
+  'unloadTimeoutMinutes',
+  'touchpadSwipeToNavigate',
+  'hoverCardMemoryUsage',
+  // Window transparency is this machine's compositor's (`Settings.windowTransparency`).
+  'windowTransparency',
+  // The window frame is the desktop's own; a Wayland compositor may draw no controls at all.
+  'nativeWindowControls',
+  'bookmarkRowSortOrder',
+  'bookmarkRowDisplay',
+  'iph',
+  'clearBrowsingDataRange',
+  // Named servers and their passwords are this machine's (Settings › System).
+  'proxy'
+] as const
+export type DeviceLocalSetting = (typeof DEVICE_LOCAL_SETTINGS)[number]
+const DEVICE_LOCAL = new Set<string>(DEVICE_LOCAL_SETTINGS)
+
+/** Whether `key` is one of `DEVICE_LOCAL_SETTINGS`. */
+function isDeviceLocalSetting(key: string): boolean {
+  return DEVICE_LOCAL.has(key)
+}
+
+/** A copy of `settings` without the device-local keys, the other keys in their order. */
+export function withoutDeviceLocalSettings<T extends object>(
+  settings: T
+): Omit<T, DeviceLocalSetting> {
+  const out = { ...settings } as Record<string, unknown>
+  for (const key of DEVICE_LOCAL_SETTINGS) delete out[key]
+  return out as Omit<T, DeviceLocalSetting>
+}
+
+/**
+ * The whole `Settings` object but the device-local keys. The new tab page's device-local sets
+ * (`BrowserState.newTabDevice`: this device's shortcuts and removed hosts) are not settings and
+ * never travel; a peer on an older build may add the phone's frozen `newTabPhone` key, which the
+ * apply path folds into `newTab`.
+ */
+export type SettingsData = Omit<Settings, DeviceLocalSetting>
+export interface ShortcutsData {
+  overrides: Record<string, KeyBinding | null>
+}
+
+export const SETTINGS_RECORD_ID = 'settings'
+export const SHORTCUTS_RECORD_ID = 'shortcuts'
+export const SITE_DATA_RECORD_ID = 'site-data'
+
+/**
+ * A saved login as Chrome's password sync carries it: the whole entry, secret included, under
+ * the folder's end-to-end key. The record id is the entry's id, so the same login edited on two
+ * devices merges last-writer-wins per entry and a deletion travels as the record's tombstone.
+ */
+export interface LoginCredentialData {
+  kind: 'login'
+  origin: string
+  url: string
+  username: string
+  password: string
+  realm: string | null
+  /** The user's note (ID-34), '' when none; part of the record since the type existed. */
+  notes: string
+  createdAt: number
+  updatedAt: number
+  lastUsedAt: number | null
+  /**
+   * The breach state of the password value (ID-31: `Credential.breached` and its timestamps),
+   * each present only when set, so a login without one hashes exactly as it always did and a
+   * device on an older build, which knows none of them, reads the record as before.
+   */
+  breached?: number
+  checkedAt?: number
+  leakWarnedAt?: number
+  leakIgnoredAt?: number
+}
+
+/** The `LoginCredentialData` breach fields, each taken along only when the login has a value. */
+function leakFieldsOf(c: Credential): Partial<LoginCredentialData> {
+  const out: Partial<LoginCredentialData> = {}
+  if (c.breached !== null) out.breached = c.breached
+  if (c.checkedAt !== null) out.checkedAt = c.checkedAt
+  if (c.leakWarnedAt !== null) out.leakWarnedAt = c.leakWarnedAt
+  if (c.leakIgnoredAt !== null) out.leakIgnoredAt = c.leakIgnoredAt
+  return out
+}
+
+/**
+ * A passkey's public record: relying party, account names, credential id, origin. This is all
+ * the store holds and all that can travel – the private key lives in the platform authenticator
+ * (Windows Hello, Touch ID, Android's credential manager) and never leaves the device, so a
+ * synced passkey shows up in the other device's list but signing in there needs the passkey
+ * created (or synced by the OS's own provider) on that device.
+ */
+export interface PasskeyCredentialData {
+  kind: 'passkey'
+  rpId: string
+  rpName: string
+  userName: string
+  userDisplayName: string
+  credentialId: string
+  origin: string
+  createdAt: number
+  lastUsedAt: number | null
+}
+
+export type CredentialData = LoginCredentialData | PasskeyCredentialData
+
+/** Read a credential record from another device; null for garbage or an unknown kind. */
+export function readCredentialData(data: unknown): CredentialData | null {
+  if (!data || typeof data !== 'object') return null
+  const r = data as Record<string, unknown>
+  const str = (key: string): string => (typeof r[key] === 'string' ? (r[key] as string) : '')
+  const num = (key: string, fallback: number): number =>
+    typeof r[key] === 'number' && Number.isFinite(r[key]) ? (r[key] as number) : fallback
+  const nullableNum = (key: string): number | null =>
+    typeof r[key] === 'number' && Number.isFinite(r[key]) ? (r[key] as number) : null
+  if (r.kind === 'login') {
+    if (!str('origin') || !str('password')) return null
+    const login: LoginCredentialData = {
+      kind: 'login',
+      origin: str('origin'),
+      url: str('url'),
+      username: str('username'),
+      password: str('password'),
+      realm: typeof r.realm === 'string' ? r.realm : null,
+      notes: str('notes'),
+      createdAt: num('createdAt', 0),
+      updatedAt: num('updatedAt', 0),
+      lastUsedAt: nullableNum('lastUsedAt')
+    }
+    for (const key of ['breached', 'checkedAt', 'leakWarnedAt', 'leakIgnoredAt'] as const) {
+      const value = nullableNum(key)
+      if (value !== null) login[key] = value
+    }
+    return login
+  }
+  if (r.kind === 'passkey') {
+    if (!str('rpId')) return null
+    return {
+      kind: 'passkey',
+      rpId: str('rpId'),
+      rpName: str('rpName'),
+      userName: str('userName'),
+      userDisplayName: str('userDisplayName'),
+      credentialId: str('credentialId'),
+      origin: str('origin'),
+      createdAt: num('createdAt', 0),
+      lastUsedAt: nullableNum('lastUsedAt')
+    }
+  }
+  return null
+}
+
+/**
+ * A postal address of the vault (`AddressEntry`; the `address` record, ID-45): every field the
+ * vault keeps, under the entry's id as the record id, so the same address edited on two devices
+ * merges last-writer-wins per entry and a deletion travels as the record's tombstone – the
+ * logins' rules (`LoginCredentialData`).
+ */
+export interface AddressData {
+  country: string
+  name: string
+  organization: string
+  streetAddress: string
+  locality: string
+  region: string
+  postalCode: string
+  sortingCode: string
+  phone: string
+  email: string
+  createdAt: number
+  updatedAt: number
+  lastUsedAt: number | null
+}
+
+/**
+ * A payment card of the vault (`PaymentCard`; the `payment-method` record): the number as the
+ * vault keeps it – the full digits (`CredentialStore.addCard`), no security code (the vault
+ * stores none) – under the folder's end-to-end key like a login's password, and nothing the
+ * vault does not hold.
+ */
+export interface PaymentMethodData {
+  number: string
+  expMonth: number
+  expYear: number
+  name: string
+  nickname: string
+  createdAt: number
+  updatedAt: number
+  lastUsedAt: number | null
+}
+
+export function addressData(a: AddressEntry): AddressData {
+  return {
+    country: a.country,
+    name: a.name,
+    organization: a.organization,
+    streetAddress: a.streetAddress,
+    locality: a.locality,
+    region: a.region,
+    postalCode: a.postalCode,
+    sortingCode: a.sortingCode,
+    phone: a.phone,
+    email: a.email,
+    createdAt: a.createdAt,
+    updatedAt: a.updatedAt,
+    lastUsedAt: a.lastUsedAt
+  }
+}
+
+export function paymentMethodData(c: PaymentCard): PaymentMethodData {
+  return {
+    number: c.number,
+    expMonth: c.expMonth,
+    expYear: c.expYear,
+    name: c.name,
+    nickname: c.nickname,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    lastUsedAt: c.lastUsedAt
+  }
+}
+
+function vaultFieldReaders(r: Record<string, unknown>): {
+  str: (key: string) => string
+  num: (key: string, fallback: number) => number
+  nullableNum: (key: string) => number | null
+} {
+  return {
+    str: (key) => (typeof r[key] === 'string' ? (r[key] as string) : ''),
+    num: (key, fallback) =>
+      typeof r[key] === 'number' && Number.isFinite(r[key]) ? (r[key] as number) : fallback,
+    nullableNum: (key) =>
+      typeof r[key] === 'number' && Number.isFinite(r[key]) ? (r[key] as number) : null
+  }
+}
+
+/**
+ * Read an `address` record from another device, repairing a missing field; null for garbage,
+ * which the round then skips – neither applied nor tombstoned (`vaultRecordReadable`). An
+ * address has no one field every country's form requires, so an object is enough.
+ */
+export function readAddressData(data: unknown): AddressData | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const { str, num, nullableNum } = vaultFieldReaders(data as Record<string, unknown>)
+  return {
+    country: str('country'),
+    name: str('name'),
+    organization: str('organization'),
+    streetAddress: str('streetAddress'),
+    locality: str('locality'),
+    region: str('region'),
+    postalCode: str('postalCode'),
+    sortingCode: str('sortingCode'),
+    phone: str('phone'),
+    email: str('email'),
+    createdAt: num('createdAt', 0),
+    updatedAt: num('updatedAt', 0),
+    lastUsedAt: nullableNum('lastUsedAt')
+  }
+}
+
+/**
+ * Read a `payment-method` record from another device; null for garbage or a card without a
+ * digit in its number (a card needs its number as a login needs its password), which the round
+ * then skips – neither applied nor tombstoned (`vaultRecordReadable`).
+ */
+export function readPaymentMethodData(data: unknown): PaymentMethodData | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const { str, num, nullableNum } = vaultFieldReaders(data as Record<string, unknown>)
+  if (!/\d/.test(str('number'))) return null
+  return {
+    number: str('number'),
+    expMonth: num('expMonth', 0),
+    expYear: num('expYear', 0),
+    name: str('name'),
+    nickname: str('nickname'),
+    createdAt: num('createdAt', 0),
+    updatedAt: num('updatedAt', 0),
+    lastUsedAt: nullableNum('lastUsedAt')
+  }
+}
+
+/**
+ * The record types the credential vault holds (`CredentialSources`): published only while it is
+ * open, held – neither tombstoned nor applied – while it is locked (`frozenRecords`, the round's
+ * `vaultOpen`), and outside the first sync's merge question (`SyncEngine.confirmMerge`: Chrome's
+ * password sync always merges by entry). Each under its own scope key (`inScope`).
+ */
+export function isVaultRecordType(type: RecordType): boolean {
+  return type === 'credential' || type === 'address' || type === 'payment-method'
+}
+
+/**
+ * Whether a vault record another device published is one this build can land: a tombstone, or
+ * a payload its reader accepts. One it cannot read – a kind of `credential` from a later build,
+ * or garbage – is left out of the round's winners, so it is neither applied nor written to the
+ * metadata, and the next round finds it and skips it again: a record never landed must never be
+ * tombstoned (`RecordType`'s note on `address`). A TYPE this build does not know never reaches
+ * here: `inScope` says nothing for it (`__tests__/compat.test.ts`).
+ */
+export function vaultRecordReadable(record: SyncRecord): boolean {
+  if (record.deleted) return true
+  if (record.type === 'credential') return readCredentialData(record.data) !== null
+  if (record.type === 'address') return readAddressData(record.data) !== null
+  if (record.type === 'payment-method') return readPaymentMethodData(record.data) !== null
+  return true
+}
+
+export function defaultScope(): SyncScope {
+  return {
+    spaces: true,
+    folders: true,
+    pinnedTabs: true,
+    essentials: true,
+    openTabs: false,
+    containers: true,
+    bookmarks: true,
+    settings: true,
+    shortcuts: true,
+    boosts: true,
+    passwords: true,
+    addresses: true,
+    paymentMethods: true,
+    history: true,
+    readingList: true,
+    mods: true,
+    extensions: true
+  }
+}
+
+/** Every type on: what a device holds in total, whatever it currently chooses to sync. */
+export function fullScope(): SyncScope {
+  return {
+    spaces: true,
+    folders: true,
+    pinnedTabs: true,
+    essentials: true,
+    openTabs: true,
+    containers: true,
+    bookmarks: true,
+    settings: true,
+    shortcuts: true,
+    boosts: true,
+    passwords: true,
+    addresses: true,
+    paymentMethods: true,
+    history: true,
+    readingList: true,
+    mods: true,
+    extensions: true
+  }
+}
+
+/**
+ * Whether a record another device published is wanted under `scope` (Chrome's per-type
+ * toggles work both ways: a type turned off is neither sent nor received). Tab records are
+ * read by section; a tab tombstone carries no data and is taken while any tab section syncs.
+ */
+export function inScope(record: SyncRecord, scope: SyncScope): boolean {
+  switch (record.type) {
+    case 'space':
+      return scope.spaces
+    case 'folder':
+      return scope.folders
+    case 'container':
+      return scope.containers
+    case 'bookmark':
+      return scope.bookmarks
+    case 'reading-list-entry':
+      return scope.readingList
+    case 'settings':
+    case 'site-data':
+      return scope.settings
+    case 'shortcuts':
+      return scope.shortcuts
+    case 'boost':
+      return scope.boosts
+    case 'mod':
+      return scope.mods
+    case 'extension':
+      return scope.extensions
+    case 'credential':
+      return scope.passwords
+    case 'address':
+      return scope.addresses
+    case 'payment-method':
+      return scope.paymentMethods
+    case 'tab': {
+      if (record.deleted || !record.data || typeof record.data !== 'object')
+        return scope.pinnedTabs || scope.essentials || scope.openTabs
+      const data = record.data as Partial<TabData>
+      if (data.essential) return scope.essentials
+      if (data.pinned) return scope.pinnedTabs
+      return scope.openTabs
+    }
+    case 'order':
+      if (record.id === ORDER_SPACES) return scope.spaces
+      if (record.id === ORDER_CONTAINERS) return scope.containers
+      if (record.id === ORDER_ESSENTIALS) return scope.essentials
+      return scope.pinnedTabs || scope.openTabs
+  }
+}
+
+/** JSON with sorted keys so equal payloads hash equally on every device. */
+export function stableStringify(value: unknown): string {
+  return JSON.stringify(sortKeys(value))
+}
+
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeys)
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const key of Object.keys(value as Record<string, unknown>).sort())
+      out[key] = sortKeys((value as Record<string, unknown>)[key])
+    return out
+  }
+  return value
+}
+
+export function hashData(data: unknown): string {
+  return sha1Hex(stableStringify(data))
+}
+
+// ---------------------------------------------------------------------------
+// The settings record, key by key
+// ---------------------------------------------------------------------------
+
+/**
+ * Top-level settings keys that only make sense together and so merge as one: `searchEngineId`
+ * names an engine that `searchEngines` may be the only carrier of (an engine added by hand on
+ * the peer), a 0.3.x phone's frozen `newTabPhone` is folded into `newTab` at apply, and the
+ * 0.4.x `restoreSession` switch – retired by 0.4.83's `startup` (Settings › On startup) – is
+ * folded into `startup` there. An edit of either member stamps both; a peer's copy wins or
+ * loses for both at once; the two travel in one record from one device (`newestByRecord`). A
+ * renamed key's group is what lets an old peer's key and this device's successor compare as one
+ * item by time (`winningSettings`) and lets the successor inherit the retired key's time at the
+ * upgrade (`seedSettingsMeta`).
+ */
+const SETTINGS_KEY_GROUPS: Readonly<Record<string, string>> = {
+  searchEngineId: 'searchEngines',
+  newTabPhone: 'newTab',
+  restoreSession: 'startup'
+}
+
+/**
+ * The renamed keys this build never publishes (`collectLocal` holds their successors alone; an
+ * old peer's copy is folded at apply). One leaves this device's record by the build's hand, not
+ * the user's: at the upgrade that stopped publishing it (`restoreSession`, mirrored beside
+ * `startup` from 0.4.83 to 0.5.5 and retired 2026-09-26), or at the re-snapshot after an old
+ * peer's key won and was folded into its successor. `diffSettings` and `seedSettingsMeta` treat
+ * the departure alike: no stamp on the group, and the group's time – its newest member's, the
+ * retired key counted – stands, the successor taking the retired key's later time
+ * (`retiredKeyTimes`); else the old peer's switch that won once would win every round.
+ */
+const RETIRED_SETTINGS_KEYS: ReadonlySet<string> = new Set(['newTabPhone', 'restoreSession'])
+
+/** The composite group a settings key merges under: its own name unless it is a member. */
+export function settingsKeyGroup(key: string): string {
+  return SETTINGS_KEY_GROUPS[key] ?? key
+}
+
+/**
+ * Per group, the newest time of the retired keys (`RETIRED_SETTINGS_KEYS`) `previous` holds
+ * that `present` no longer carries: the floor the group's surviving members keep when the
+ * retired key leaves. Empty when none left.
+ */
+function retiredKeyTimes(
+  previous: Record<string, KeyMeta>,
+  present: ReadonlySet<string>
+): Map<string, number> {
+  const floors = new Map<string, number>()
+  for (const [key, entry] of Object.entries(previous)) {
+    if (!RETIRED_SETTINGS_KEYS.has(key) || present.has(key)) continue
+    const group = settingsKeyGroup(key)
+    floors.set(group, Math.max(floors.get(group) ?? 0, entry.modified))
+  }
+  return floors
+}
+
+export function isSettingsRecord(id: string, type: RecordType): boolean {
+  return type === 'settings' && id === SETTINGS_RECORD_ID
+}
+
+/**
+ * The top-level keys of a settings record's data with the values they carry – what the wire
+ * carries: a key set to `undefined` is not serialised and so does not exist to a peer. Nothing
+ * for data that is no object.
+ */
+function settingsEntries(data: unknown): Array<[string, unknown]> {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return []
+  return Object.entries(data as Record<string, unknown>).filter(([, value]) => value !== undefined)
+}
+
+/** The time a settings record gives one of its keys: its own, or the record's when it names none. */
+export function settingsKeyTime(record: SyncRecord, key: string): number {
+  const own = record.keys?.[key]
+  return typeof own === 'number' && Number.isFinite(own) ? own : record.modified
+}
+
+/** The wire form of per-key times: only the keys whose time differs from the record's. */
+function keysOnWire(
+  times: Record<string, number>,
+  modified: number
+): Record<string, number> | undefined {
+  let out: Record<string, number> | undefined
+  for (const [key, time] of Object.entries(times)) {
+    if (time === modified) continue
+    ;(out ??= {})[key] = time
+  }
+  return out
+}
+
+/** The keys grouped by the composite group each merges under (`settingsKeyGroup`). */
+function groupsOf(keys: Iterable<string>): Map<string, string[]> {
+  const groups = new Map<string, string[]>()
+  for (const key of keys) {
+    const group = settingsKeyGroup(key)
+    const members = groups.get(group)
+    if (members) members.push(key)
+    else groups.set(group, [key])
+  }
+  return groups
+}
+
+/** The newest of the per-key times, or `fallback` when there is no key. */
+function newestOf(times: Iterable<number>, fallback: number): number {
+  let out: number | undefined
+  for (const time of times) if (out === undefined || time > out) out = time
+  return out ?? fallback
+}
+
+/** The settings record `data` publishes under per-key times: `keys` on the wire when any differs. */
+function settingsRecord(
+  id: string,
+  data: unknown,
+  times: Record<string, number>,
+  fallback: number
+): SyncRecord {
+  const modified = newestOf(Object.values(times), fallback)
+  const record: SyncRecord = { id, type: 'settings', modified, deleted: false, data }
+  const keys = keysOnWire(times, modified)
+  if (keys) record.keys = keys
+  return record
+}
+
+/**
+ * The settings record's own diff, key by key: against the metadata's entry for each top-level
+ * key (each composite group, `SETTINGS_KEY_GROUPS`), a value whose hash stands keeps the key's
+ * time; a group with a changed, added or removed member takes `stamp` on every member present –
+ * or, when the diff only notices (`stamp` null), each member keeps its own time and a member the
+ * metadata did not know takes 0 (`DiffLocalOptions.stamp`: made, not noticed). A key the object
+ * no longer holds loses its entry and the record simply lacks it, which says nothing to a peer
+ * (the `menuOrder` precedent: a reset travels as an explicit value, `[]`); a retired key's
+ * departure (`RETIRED_SETTINGS_KEYS`) stamps no one and leaves its time to its group. The
+ * record's `modified` is the newest key's.
+ *
+ * An entry without `keys` speaks for the record whole. Unchanged, every key stands at the
+ * record's time with its value's hash from here on – the boot seed's migration for an entry the
+ * seed did not see (a record first seen at the last diff, a joiner's `confirmMerge` entry).
+ * Changed, the change cannot be placed on a key: every key takes the record's stamp –
+ * whole-record last-writer-wins, the rule the record had until per-key merge and the one "keep
+ * this device's data" (`confirmMerge`, hash '') wants.
+ *
+ * The record's own hash is computed first and, unchanged, settles it: the entry's per-key part
+ * was computed from this very data, so it stands as it is and no key is hashed – most state
+ * commits (a tab moved, a bookmark added) touch no setting, and the diff they run costs the
+ * settings record what it did before per-key merge. Only a changed record is placed key by key.
+ */
+function diffSettings(
+  prev: RecordMeta,
+  data: unknown,
+  stamp: number | null
+): { meta: RecordMeta; changed: boolean } {
+  const hash = hashData(data)
+  if (prev.keys && prev.hash === hash) {
+    const modified = newestOf(
+      Object.values(prev.keys).map((k) => k.modified),
+      prev.modified
+    )
+    return {
+      meta: { type: 'settings', hash, modified, deleted: false, keys: prev.keys },
+      changed: false
+    }
+  }
+  const entries = settingsEntries(data)
+  const keys: Record<string, KeyMeta> = {}
+  let changed = false
+  if (!prev.keys) {
+    const same = prev.hash === hash
+    const time = same ? prev.modified : (stamp ?? prev.modified)
+    for (const [key, value] of entries) keys[key] = { hash: hashData(value), modified: time }
+    changed = !same
+  } else {
+    const previous = prev.keys
+    const hashes = new Map(entries.map(([key, value]) => [key, hashData(value)] as const))
+    const gone = Object.keys(previous).filter((key) => !hashes.has(key))
+    if (gone.length) changed = true
+    // A retired key's departure (`RETIRED_SETTINGS_KEYS`) is the build's, not an edit of its
+    // group: the record is republished without it, no member is stamped, and the group's time
+    // stands – a survivor takes the retired key's time when that is the later.
+    const removed = new Set(
+      gone.filter((key) => !RETIRED_SETTINGS_KEYS.has(key)).map(settingsKeyGroup)
+    )
+    const floors = retiredKeyTimes(previous, new Set(hashes.keys()))
+    for (const [group, members] of groupsOf(hashes.keys())) {
+      const moved =
+        removed.has(group) || members.some((key) => previous[key]?.hash !== hashes.get(key))
+      if (moved) changed = true
+      const floor = floors.get(group) ?? 0
+      for (const key of members) {
+        const kept = Math.max(previous[key]?.modified ?? 0, floor)
+        keys[key] = { hash: hashes.get(key)!, modified: moved ? (stamp ?? kept) : kept }
+      }
+    }
+  }
+  const modified = newestOf(
+    Object.values(keys).map((k) => k.modified),
+    prev.modified
+  )
+  return { meta: { type: 'settings', hash, modified, deleted: false, keys }, changed }
+}
+
+/**
+ * The boot seed's form of the settings entry (`SyncEngine.seedMeta`): what differs at start is
+ * the build's, adopted without a stamp, key by key. An entry from before per-key merge gains
+ * every key at the record's time – nothing finer is known – with its value's hash; an entry
+ * with keys adopts a changed value's hash at the key's own time, puts a key it did not know (a
+ * default this build added) at the newest time of its group's other members the entry knew –
+ * a key that succeeds a retired one (`startup` after `restoreSession`) is the same edit under a
+ * new name, so the edit's time travels with the rename and an old peer's older switch cannot
+ * beat this device's later choice – else at 0, a key no one edited never beats a peer's; and
+ * drops a key the build no longer holds – a retired key (`RETIRED_SETTINGS_KEYS`) leaving its
+ * later time to its group's survivors, as `diffSettings` does. The record's `modified` stands.
+ * Returns `prev` itself when nothing differs.
+ */
+export function seedSettingsMeta(prev: RecordMeta, data: unknown): RecordMeta {
+  const entries = settingsEntries(data)
+  const hash = hashData(data)
+  const keys: Record<string, KeyMeta> = {}
+  if (!prev.keys) {
+    for (const [key, value] of entries)
+      keys[key] = { hash: hashData(value), modified: prev.modified }
+    return { ...prev, hash, keys }
+  }
+  let changed = prev.hash !== hash
+  const floors = retiredKeyTimes(prev.keys, new Set(entries.map(([key]) => key)))
+  for (const [key, value] of entries) {
+    const before = prev.keys[key]
+    const valueHash = hashData(value)
+    const floor = floors.get(settingsKeyGroup(key)) ?? 0
+    if (before && before.hash === valueHash && before.modified >= floor) {
+      keys[key] = before
+      continue
+    }
+    keys[key] = {
+      hash: valueHash,
+      modified: Math.max(before ? before.modified : inheritedKeyTime(prev.keys, key), floor)
+    }
+    changed = true
+  }
+  for (const key of Object.keys(prev.keys)) if (!(key in keys)) changed = true
+  return changed ? { ...prev, hash, keys } : prev
+}
+
+/**
+ * The time a key the entry did not know is seeded at: the newest of its group's other members
+ * (`SETTINGS_KEY_GROUPS`) the entry holds, else 0. Never raises the group's time – a sibling's
+ * time IS the group's – so the seed still beats no peer it did not beat before.
+ */
+function inheritedKeyTime(previous: Record<string, KeyMeta>, key: string): number {
+  const group = settingsKeyGroup(key)
+  const siblings = Object.entries(previous).filter(
+    ([other]) => other !== key && settingsKeyGroup(other) === group
+  )
+  return newestOf(
+    siblings.map(([, entry]) => entry.modified),
+    0
+  )
+}
+
+/**
+ * The other devices' settings records as one: each composite group from the device whose copy
+ * of it is newest (ties to the first read, as `newestByRecord` has always ruled), the record's
+ * `modified` the newest of them. One record per id would not do here: a device whose newest
+ * key is older than another's would never be read, so a key it alone edited could not reach a
+ * third device while the other is away. A single live record is taken as it is; tombstones
+ * count only when there is nothing else.
+ */
+function mergeSettingsRecords(records: SyncRecord[]): SyncRecord {
+  const live = records.filter((r) => !r.deleted && settingsEntries(r.data).length > 0)
+  if (live.length === 0) return records.reduce((a, b) => (b.modified > a.modified ? b : a))
+  if (live.length === 1) return live[0]
+  const best = new Map<string, { time: number; from: SyncRecord; members: string[] }>()
+  for (const r of live) {
+    for (const [group, members] of groupsOf(settingsEntries(r.data).map(([key]) => key))) {
+      const time = newestOf(
+        members.map((key) => settingsKeyTime(r, key)),
+        r.modified
+      )
+      const cur = best.get(group)
+      if (!cur || time > cur.time) best.set(group, { time, from: r, members })
+    }
+  }
+  const data: Record<string, unknown> = {}
+  const times: Record<string, number> = {}
+  for (const { from, members } of best.values()) {
+    for (const key of members) {
+      data[key] = (from.data as Record<string, unknown>)[key]
+      times[key] = settingsKeyTime(from, key)
+    }
+  }
+  return settingsRecord(SETTINGS_RECORD_ID, data, times, live[0].modified)
+}
+
+/**
+ * The keys of a peer's settings record that beat this device's, as a record of those keys
+ * alone – `applyRemote` lands what the record carries, so the winner IS the winning set. A
+ * composite group wins when the peer's time for it (its newest member) is strictly newer than
+ * this device's (the newest member it holds of the group, whether or not the peer carries that
+ * member: an old peer's retired key is weighed against this device's successor, `restoreSession`
+ * against `startup`, `newTabPhone` against `newTab`; a group it holds nothing of cannot be
+ * beaten) and a member's value differs – ties keep the local, as they always have per record
+ * (Chrome's preferences prefer the sync copy on a conflict, which a folder without a server
+ * cannot do). A device-local key (`DEVICE_LOCAL_SETTINGS`, still sent by an older build) is no
+ * one's to win. Null when nothing wins.
+ */
+function winningSettings(
+  mine: RecordMeta & { keys: Record<string, KeyMeta> },
+  r: SyncRecord
+): SyncRecord | null {
+  const entries = settingsEntries(r.data)
+  if (entries.length === 0) return null
+  const hashes = new Map(entries.map(([key, value]) => [key, hashData(value)] as const))
+  const held = groupsOf(Object.keys(mine.keys))
+  const won = new Set<string>()
+  for (const [group, members] of groupsOf(hashes.keys())) {
+    if (members.every(isDeviceLocalSetting)) continue
+    const theirs = newestOf(
+      members.map((key) => settingsKeyTime(r, key)),
+      r.modified
+    )
+    const ours = newestOf(
+      (held.get(group) ?? []).map((key) => mine.keys[key].modified),
+      Number.NEGATIVE_INFINITY
+    )
+    if (theirs <= ours) continue
+    if (!members.some((key) => mine.keys[key]?.hash !== hashes.get(key))) continue
+    for (const key of members) won.add(key)
+  }
+  if (won.size === 0) return null
+  const data: Record<string, unknown> = {}
+  const times: Record<string, number> = {}
+  for (const [key, value] of entries) {
+    if (!won.has(key)) continue
+    data[key] = value
+    times[key] = settingsKeyTime(r, key)
+  }
+  return settingsRecord(r.id, data, times, r.modified)
+}
+
+/**
+ * The metadata's settings entry once a peer's keys were applied: this device's entries with
+ * the winner's keys at the peer's times and value hashes (every key of the record when this
+ * device had no per-key entries – the record won whole; the device-local keys an older build's
+ * record carries never land, so they get no entry). The record hash is the winner's until the
+ * re-snapshot that follows an apply computes this device's own.
+ */
+function settingsMetaFromRemote(r: SyncRecord, mine: RecordMeta | undefined): RecordMeta {
+  const keys: Record<string, KeyMeta> = mine && !mine.deleted && mine.keys ? { ...mine.keys } : {}
+  for (const [key, value] of settingsEntries(r.data)) {
+    if (isDeviceLocalSetting(key)) continue
+    keys[key] = { hash: hashData(value), modified: settingsKeyTime(r, key) }
+  }
+  const modified = newestOf(
+    Object.values(keys).map((k) => k.modified),
+    r.modified
+  )
+  return { type: 'settings', hash: hashData(r.data), modified, deleted: false, keys }
+}
+
+/** The credential store's entries while it is unlocked. */
+export interface CredentialSources {
+  logins: Credential[]
+  passkeys: PasskeyEntry[]
+  /**
+   * The vault's addresses and payment cards (ID-45): one `address` record each under the
+   * `addresses` scope, one `payment-method` record each under `paymentMethods`; a source without
+   * the fields (a caller from before the types) publishes none.
+   */
+  addresses?: AddressEntry[]
+  cards?: PaymentCard[]
+}
+
+export interface LocalSources {
+  model: Model
+  settings: Settings
+  shortcutOverrides: Record<string, KeyBinding | null>
+  bookmarks: BookmarkNode[]
+  boosts: Boost[]
+  /**
+   * The credential store's entries, or null while the vault is locked (or absent): its records
+   * are then neither published nor tombstoned (`diffLocal`'s `frozen`) until it opens again.
+   */
+  credentials?: CredentialSources | null
+  /** The per-site cookie policy (`SiteDataService.policy()`); published with the settings. */
+  siteData?: SiteDataPolicy
+  /**
+   * The reading list (`BrowserState.readingList`), one `reading-list-entry` record per entry
+   * under the `readingList` scope; a source without the field (a record set from before the
+   * type, `__tests__/compat.test.ts`'s golden sources) publishes none.
+   */
+  readingList?: readonly ReadingListEntry[]
+  /**
+   * The Mods (`ModService.all()`), one `mod` record per Mod under the Mod's own id and the `mods`
+   * scope (services pass 15, ID-43); a source without the field (a record set from before the
+   * type, `__tests__/compat.test.ts`'s golden sources) publishes none.
+   */
+  mods?: readonly Mod[]
+  /**
+   * The installed extensions (`ExtensionHost.syncSources()` – the registry's projection, no
+   * manifest read; `ExtensionHost.list()` on a host without one), one `extension` record per
+   * extension whose `source` is a store id, under the extension's own id and the `extensions`
+   * scope (services pass 16, ID-44); a `.crx`, `.zip` or unpacked install, and a synced landing
+   * not yet approved here (`pendingApproval`), publish none. An extension whose winning record
+   * is with the host's applier and not committed yet (`ExtensionHost.syncedExtensionsInFlight`)
+   * is left out by `SyncEngine.sources` – its metadata entry stays frozen (`frozenRecords`)
+   * until the applier's commit publishes the applied state under a fresh stamp, so the copy
+   * the record found here never travels under the winner's time. On a host WITHOUT an applier
+   * (no `applySyncedExtensions`, the phone) the same holds for an extension whose record lost a
+   * round to a remote winner: nothing here could change it, so it is left out – the winner's
+   * entry frozen, nothing published under the id – until this device's own registry changes
+   * for it (`SyncEngine.sources`, `Persisted.unappliedExtensions`); a user's flip is that
+   * change, and goes out under a fresh stamp with its clock. A source without the field (a
+   * host without extensions; a record set from before the type, `__tests__/compat.test.ts`'s
+   * golden sources) publishes none.
+   */
+  extensions?: readonly ExtensionSyncSource[]
+  /**
+   * The store extensions that were installed on this device at the engine's previous read of
+   * `extensions` and are gone from it now – uninstalled here (`SyncEngine.sources` keeps the
+   * previous read's ids). `frozenRecords` reads it: an `extension` entry of the metadata whose
+   * extension is absent is FROZEN – its install has not landed or failed, or it waits for the
+   * user's approval – unless the id is here, where the absence is the uninstall it looks like
+   * and `diffLocal` tombstones it. Absent (no previous read; a source from before the type):
+   * nothing was removed.
+   */
+  removedExtensions?: ReadonlySet<string>
+}
+
+/** Snapshot of everything in scope as `{ id → { type, data } }`. */
+export function collectLocal(
+  src: LocalSources,
+  scope: SyncScope
+): Map<string, { type: RecordType; data: unknown }> {
+  const out = new Map<string, { type: RecordType; data: unknown }>()
+  const m = src.model
+  if (scope.spaces) {
+    for (const s of m.spaces) {
+      const data: SpaceData = {
+        name: s.name,
+        icon: s.icon,
+        containerId: s.containerId,
+        theme: s.theme,
+        pinnedCollapsed: s.pinnedCollapsed
+      }
+      if (s.agent) data.agent = s.agent
+      out.set(s.id, { type: 'space', data })
+    }
+    const order: OrderData = { ids: m.spaces.map((s) => s.id) }
+    out.set(ORDER_SPACES, { type: 'order', data: order })
+  }
+  if (scope.folders) {
+    for (const f of Object.values(m.folders)) {
+      if (!m.spaces.some((s) => s.id === f.spaceId)) continue
+      const data: FolderData = {
+        spaceId: f.spaceId,
+        name: f.name,
+        icon: f.icon,
+        collapsed: f.collapsed
+      }
+      if (f.color) data.color = f.color
+      if (f.agent) data.agent = f.agent
+      out.set(f.id, { type: 'folder', data })
+    }
+  }
+  if (scope.pinnedTabs || scope.essentials || scope.openTabs) {
+    const synced = (t: Tab | undefined): t is Tab => {
+      if (!t || t.windowId) return false
+      if (t.spaceId && m.localSpaces[t.spaceId]) return false
+      if (!t.essential && (!t.spaceId || !m.spaces.some((s) => s.id === t.spaceId))) return false
+      const wanted = t.essential ? scope.essentials : t.pinned ? scope.pinnedTabs : scope.openTabs
+      if (!wanted) return false
+      return !(t.url.startsWith('zen://') && !t.pinnedUrl)
+    }
+    for (const t of Object.values(m.tabs)) {
+      if (!synced(t)) continue
+      const data: TabData = {
+        url: t.url.startsWith('zen://') ? (t.pinnedUrl ?? t.url) : t.url,
+        pinnedUrl: t.pinnedUrl,
+        title: t.title,
+        customTitle: t.customTitle,
+        customIcon: t.customIcon,
+        favicon: wireFavicon(t.favicon) ?? null,
+        pinned: t.pinned,
+        essential: t.essential,
+        spaceId: t.essential ? null : t.spaceId,
+        folderId: t.folderId,
+        containerId: t.containerId,
+        muted: t.muted
+      }
+      out.set(t.id, { type: 'tab', data })
+    }
+    if (scope.essentials) {
+      const order: OrderData = { ids: m.essentialTabIds.filter((id) => synced(m.tabs[id])) }
+      out.set(ORDER_ESSENTIALS, { type: 'order', data: order })
+    }
+    for (const space of m.spaces) {
+      const order: OrderData = {
+        pinned: space.tabIds.filter((id) => synced(m.tabs[id]) && m.tabs[id].pinned),
+        regular: scope.openTabs
+          ? space.tabIds.filter((id) => synced(m.tabs[id]) && !m.tabs[id].pinned)
+          : []
+      }
+      if (order.pinned!.length || order.regular!.length)
+        out.set(orderTabsId(space.id), { type: 'order', data: order })
+    }
+  }
+  if (scope.containers) {
+    for (const c of m.containers) {
+      if (c.id === DEFAULT_CONTAINER_ID) continue
+      const data: ContainerData = { name: c.name, color: c.color, icon: c.icon }
+      out.set(c.id, { type: 'container', data })
+    }
+    const order: OrderData = {
+      ids: m.containers.filter((c) => c.id !== DEFAULT_CONTAINER_ID).map((c) => c.id)
+    }
+    out.set(ORDER_CONTAINERS, { type: 'order', data: order })
+  }
+  if (scope.bookmarks) {
+    for (const b of src.bookmarks) {
+      if (isBookmarkRoot(b.id) || b.parentId === null) continue
+      const data: BookmarkData = {
+        parentId: b.parentId,
+        index: b.index,
+        type: b.type,
+        title: b.title,
+        dateAdded: b.dateAdded
+      }
+      if (b.type === 'url') {
+        data.url = b.url
+        // The icon's address only (`wireFavicon`): a `data:` icon or the cache's own address
+        // stays home. Its departure from a record this device published before is the build's
+        // change, not the user's – the boot seed (`SyncEngine.seedMeta`) adopts the new hash at
+        // the record's old `modified`, so the upgrade republishes the node as no edit.
+        const favicon = wireFavicon(b.favicon)
+        if (favicon) data.favicon = favicon
+      }
+      out.set(b.id, { type: 'bookmark', data })
+    }
+  }
+  if (scope.readingList && src.readingList) {
+    for (const entry of src.readingList)
+      out.set(entry.id, { type: 'reading-list-entry', data: readingListEntryData(entry) })
+  }
+  if (scope.mods && src.mods) {
+    for (const mod of src.mods) out.set(mod.id, { type: 'mod', data: modData(mod) })
+  }
+  if (scope.extensions && src.extensions) {
+    // Store installs alone (Chrome syncs no unpacked extension; a `.crx` or `.zip` file names no
+    // store to install from), and never a landing this device has not approved yet: that is the
+    // peer's record, not this device's state – publishing its `enabled: false` would be stamped
+    // an edit and turn the extension off where it was on.
+    for (const ext of src.extensions) {
+      const store = extensionStoreOf(ext.source)
+      if (!store || ext.pendingApproval || !isExtensionId(ext.id)) continue
+      out.set(ext.id, { type: 'extension', data: extensionRecordData(ext, store) })
+    }
+  }
+  if (scope.settings) {
+    // The record carries the settings as they are and never a key they lack: a key invented here
+    // would change every device's record – its hash, so `diffLocal` stamps it `now` at the first
+    // sync after the upgrade, a whole-record edit no one made that beats and reverts a peer's
+    // settings change the device had not yet pulled. The phone menu's order (`menuOrder`) rides
+    // along only once the settings hold it: the empty list after a Reset (`shared/menuOrder.ts`),
+    // so the reset reaches the peers as an edit of the key, where a key the record lacks says
+    // nothing to `apply`.
+    const rest = withoutDeviceLocalSettings(src.settings)
+    const data: SettingsData = {
+      ...rest,
+      compactMode: { ...rest.compactMode, sidebarPersistent: false }
+    }
+    // The 0.4.x `restoreSession` switch rode beside its successor `startup` for one release
+    // (0.4.83, mirrored in the same group so an edit stamped both and a peer on the old build
+    // still heard this device's choice); the mirror came off 2026-09-26 (v0.5.5 out), so the
+    // record carries `startup` alone. The wire's READ side keeps the rename: an old peer's switch
+    // is still weighed against `startup` (`SETTINGS_KEY_GROUPS`, `winningSettings`) and folded at
+    // apply. The key's departure from this device's record is no edit of `startup`
+    // (`RETIRED_SETTINGS_KEYS`: no stamp, the group's time stands). A profile from before the key
+    // (the golden fixtures) still sends the record its build sent, switch and all: `...rest`
+    // spreads what the settings hold.
+    out.set(SETTINGS_RECORD_ID, { type: 'settings', data })
+    if (src.siteData) out.set(SITE_DATA_RECORD_ID, { type: 'site-data', data: src.siteData })
+  }
+  if (scope.shortcuts) {
+    const data: ShortcutsData = { overrides: src.shortcutOverrides }
+    out.set(SHORTCUTS_RECORD_ID, { type: 'shortcuts', data })
+  }
+  if (scope.boosts) {
+    for (const b of src.boosts) out.set(`boost:${b.domain}`, { type: 'boost', data: b })
+  }
+  if (scope.passwords && src.credentials) {
+    for (const c of src.credentials.logins) {
+      const data: LoginCredentialData = {
+        kind: 'login',
+        origin: c.origin,
+        url: c.url,
+        username: c.username,
+        password: c.password,
+        realm: c.realm,
+        notes: c.notes,
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt,
+        lastUsedAt: c.lastUsedAt,
+        ...leakFieldsOf(c)
+      }
+      out.set(c.id, { type: 'credential', data })
+    }
+    for (const p of src.credentials.passkeys) {
+      const data: PasskeyCredentialData = {
+        kind: 'passkey',
+        rpId: p.rpId,
+        rpName: p.rpName,
+        userName: p.userName,
+        userDisplayName: p.userDisplayName,
+        credentialId: p.credentialId,
+        origin: p.origin,
+        createdAt: p.createdAt,
+        lastUsedAt: p.lastUsedAt
+      }
+      out.set(p.id, { type: 'credential', data })
+    }
+  }
+  // The vault's addresses and cards, each type under its own key (ID-45), while the vault is
+  // open – a locked vault publishes none of its types (`credentials` null).
+  if (src.credentials && scope.addresses)
+    for (const a of src.credentials.addresses ?? [])
+      out.set(a.id, { type: 'address', data: addressData(a) })
+  if (src.credentials && scope.paymentMethods)
+    for (const c of src.credentials.cards ?? [])
+      out.set(c.id, { type: 'payment-method', data: paymentMethodData(c) })
+  return out
+}
+
+/**
+ * Records a device holds but does not sync right now: everything the full scope would collect
+ * that `scope` leaves out, plus (while the vault is locked) whatever credential records the last
+ * sync knew. `diffLocal` keeps their metadata as it was instead of tombstoning them, so turning a
+ * type off – or a locked vault – never deletes the other devices' copies (Chrome's toggles only
+ * stop syncing a type).
+ *
+ * The extensions (ID-44) add a rule of their own: an `extension` entry whose extension this
+ * device does not publish is frozen too, unless the extension was uninstalled here
+ * (`LocalSources.removedExtensions`). The type is the one whose apply is not instant – a won
+ * record starts a download from the store, which lands later, or fails, or lands turned off
+ * waiting for the user's approval (`pendingApproval`, which `collectLocal` leaves out) – so an
+ * absence in the local set is no removal: tombstoning it would uninstall the extension on the
+ * device that has it. The uninstall's tombstone comes from the commit that removed the record,
+ * where the engine's previous read of the list still held the id – unless the record removed
+ * was still `pendingApproval`: a synced landing removed before its approval is DECLINED on this
+ * device, not uninstalled everywhere (the lead's ruling, round 4), so `SyncEngine.sources`
+ * leaves it out of `removedExtensions` and the entry stays frozen. The same absence is how
+ * `SyncEngine.sources` holds a copy this device must not publish under a winner's stamp: an id
+ * in flight with the applier, and – on a host without one – an id whose record a remote copy
+ * won and nothing here could apply (`LocalSources.extensions`).
+ */
+export function frozenRecords(
+  src: LocalSources,
+  scope: SyncScope,
+  previous: MetaMap
+): (id: string, prev: RecordMeta) => boolean {
+  const synced = collectLocal(src, scope)
+  const held = new Set<string>()
+  for (const id of collectLocal(src, fullScope()).keys()) if (!synced.has(id)) held.add(id)
+  const vaultLocked = !src.credentials
+  const removed = src.removedExtensions
+  void previous
+  // `diffLocal` asks about the entries the local set lacks alone: an extension entry there is
+  // frozen unless its extension was uninstalled here.
+  return (id, prev) =>
+    held.has(id) ||
+    (vaultLocked && isVaultRecordType(prev.type)) ||
+    (prev.type === 'extension' && !(removed?.has(id) ?? false))
+}
+
+/**
+ * The extension records this device holds in its metadata as live but does not hold in its
+ * registry (ID-44): the installs the host has still to land – in flight, failed and waiting out
+ * a back-off, or landed and waiting for the user's approval (`pendingApproval`). `winningRemote`
+ * hands a record over once, when it wins; the metadata then carries it as applied
+ * (`metaFromRemote`), so the round hands the newest remote copy of each such record over AGAIN,
+ * every round, and the host takes what it has not done yet – idempotently, under its own
+ * per-id back-off. A record already among the winners is left to them; a tombstone is no
+ * request; a type turned off asks for nothing; an entry this device tombstoned (an uninstall
+ * here) is closed; a copy this build cannot read (`extensionRecordReadable`) is no request
+ * either – the metadata never took it, and the host could land nothing from it; and a record
+ * the user DECLINED here (`declined`: the landing removed before its approval, at that time –
+ * `Persisted.declinedExtensions`) is closed on this device while the decline stands against it
+ * (`extensionDeclineStands`), a record carrying an install made by hand AFTER the decline
+ * (`installedAt`) being the one re-offer.
+ */
+export function pendingExtensionRequests(
+  local: MetaMap,
+  held: ReadonlyMap<string, unknown>,
+  remote: ReadonlyMap<string, SyncRecord>,
+  winners: readonly SyncRecord[],
+  scope: SyncScope,
+  declined: Readonly<Record<string, number>> = {}
+): SyncRecord[] {
+  if (!scope.extensions) return []
+  const won = new Set(winners.map((w) => w.id))
+  const out: SyncRecord[] = []
+  for (const r of remote.values()) {
+    if (r.type !== 'extension' || r.deleted || won.has(r.id) || held.has(r.id)) continue
+    if (!extensionRecordReadable(r)) continue
+    if (extensionDeclineStands(declined[r.id], r)) continue
+    const mine = local[r.id]
+    if (!mine || mine.deleted) continue
+    out.push(r)
+  }
+  return out
+}
+
+/**
+ * Whether the user's decline of a synced extension on this device stands against `record`
+ * (ID-44; the lead's ruling, round 4; the criterion of round 5): the user removed the landing
+ * before approving it, at `declinedAt` (this device's time), which closes the request HERE
+ * alone – no tombstone, the other devices keep the extension – and the extension is not offered
+ * to this device again by any copy of the record whose install is not later than the decline.
+ * A live record carrying an `installedAt` LATER than the decline – a fresh install of the same
+ * id by hand on a peer after it (the doc at `ExtensionRecordData`) – beats the decline and is
+ * offered once more; the record's `modified` counts for nothing here – a flip of a switch on a
+ * peer stamps the record anew and re-offers nothing – nor does a landing of the extension on a
+ * third device; a record WITHOUT `installedAt` (a build before the field) never re-offers; a
+ * tombstone is no offer and beats nothing. Undefined `declinedAt`: no decline.
+ */
+export function extensionDeclineStands(
+  declinedAt: number | undefined,
+  record: Pick<SyncRecord, 'id' | 'deleted' | 'data'>
+): boolean {
+  if (declinedAt === undefined || record.deleted) return false
+  const installedAt = readExtensionData(record.id, record.data)?.installedAt ?? 0
+  return !(installedAt > declinedAt)
+}
+
+export interface DiffResult {
+  meta: MetaMap
+  records: SyncRecord[]
+  changed: boolean
+}
+
+export interface DiffLocalOptions {
+  /**
+   * The `modified` a record takes when its hash differs from its `previous` entry: the
+   * wall-clock moment the change was made, or `null` to keep the previous `modified`.
+   *
+   * THE RULE: an edit is stamped where it is MADE, never where it is NOTICED. The engine's state
+   * subscriber (`SyncEngine.onLocalChange`) runs at the commit that carries an edit and stamps
+   * it `now`; the engine's round (`SyncEngine.run`) only notices, and passes `null`. A hash the
+   * round alone finds changed was not a user's edit: a build's new settings default that the
+   * load spread onto the settings, a sanitiser's new normal form, this device normalising a
+   * remote value differently from the peer that sent it (the boot seed, `SyncEngine.seedMeta`,
+   * adopts the first two before any round). Stamped at the round, such a change would publish a
+   * whole-record edit no one made, which wins last-writer-wins over a peer's real change this
+   * device had not pulled – the settings record at every device's first sync after a release.
+   *
+   * A record without a previous entry takes `modified = 0` either way; a vanished record's
+   * tombstone is stamped `now` either way (its deletion is what the diff notices, and a device
+   * that stops holding a record has, so far, always done so by the user's hand or a merge).
+   */
+  stamp: number | null
+  tombstoneTtlMs?: number
+  frozen?: (id: string, prev: RecordMeta) => boolean
+}
+
+const TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * Compare the current local snapshot with the metadata of the last sync: changed records get
+ * `options.stamp` as their `modified` (or keep the previous one, see `DiffLocalOptions`),
+ * vanished records become tombstones at `now`, everything else keeps its timestamp. Without
+ * options the change is stamped `now` – the subscriber's mode, and the one the pre-move engine
+ * had (`__tests__/compat.test.ts` pins it).
+ *
+ * Records seen for the first time get `modified = 0`: they still replicate to devices that lack
+ * them, but a copy that already exists elsewhere wins – so joining a sync folder merges *into*
+ * the existing data instead of a fresh device overwriting everyone's settings and ordering.
+ *
+ * A record absent from `current` for which `frozen` answers true is held rather than deleted:
+ * its metadata stays as it was and it is left out of the published set (see `frozenRecords`).
+ *
+ * The settings record the metadata already knows is diffed key by key (`diffSettings`) and
+ * published with each key's time (`SyncRecord.keys`); first seen, it takes `0` like any other
+ * record, whole – every key at 0 – and gains its per-key entries at the next diff.
+ */
+export function diffLocal(
+  previous: MetaMap,
+  current: Map<string, { type: RecordType; data: unknown }>,
+  now: number,
+  options: DiffLocalOptions = { stamp: now }
+): DiffResult {
+  const { stamp, tombstoneTtlMs = TOMBSTONE_TTL_MS, frozen = () => false } = options
+  const meta: MetaMap = {}
+  const records: SyncRecord[] = []
+  let changed = false
+  for (const [id, { type, data }] of current) {
+    const prev = previous[id]
+    if (prev && !prev.deleted && isSettingsRecord(id, type)) {
+      const settings = diffSettings(prev, data, stamp)
+      if (settings.changed) changed = true
+      meta[id] = settings.meta
+      const times: Record<string, number> = {}
+      for (const [key, entry] of Object.entries(settings.meta.keys!)) times[key] = entry.modified
+      records.push(settingsRecord(id, data, times, settings.meta.modified))
+      continue
+    }
+    const hash = hashData(data)
+    let modified: number
+    if (!prev) modified = 0
+    else if (prev.hash === hash && !prev.deleted) modified = prev.modified
+    else modified = stamp ?? prev.modified
+    if (!prev || prev.hash !== hash || prev.deleted) changed = true
+    meta[id] = { type, hash, modified, deleted: false }
+    records.push({ id, type, modified, deleted: false, data })
+  }
+  for (const [id, prev] of Object.entries(previous)) {
+    if (current.has(id)) continue
+    if (prev.deleted) {
+      if (now - prev.modified > tombstoneTtlMs) continue
+      meta[id] = prev
+      records.push({ id, type: prev.type, modified: prev.modified, deleted: true, data: null })
+      continue
+    }
+    if (frozen(id, prev)) {
+      meta[id] = prev
+      continue
+    }
+    changed = true
+    meta[id] = { type: prev.type, hash: '', modified: now, deleted: true }
+    records.push({ id, type: prev.type, modified: now, deleted: true, data: null })
+  }
+  return { meta, records, changed }
+}
+
+/**
+ * Newest version of every record across all remote devices; the settings record merged key by
+ * key across them (`mergeSettingsRecords`).
+ */
+export function newestByRecord(remote: SyncRecord[][]): Map<string, SyncRecord> {
+  const out = new Map<string, SyncRecord>()
+  const settings: SyncRecord[] = []
+  for (const list of remote) {
+    for (const r of list) {
+      if (isSettingsRecord(r.id, r.type)) {
+        settings.push(r)
+        continue
+      }
+      const cur = out.get(r.id)
+      if (!cur || r.modified > cur.modified) out.set(r.id, r)
+    }
+  }
+  if (settings.length) out.set(SETTINGS_RECORD_ID, mergeSettingsRecords(settings))
+  return out
+}
+
+/**
+ * Remote records that beat the local copy (strictly newer). Local wins ties, and unchanged
+ * remote records (same hash) are skipped so nothing is re-applied needlessly. The settings
+ * record is judged key by key once this device holds per-key entries (`winningSettings`): what
+ * comes back is the record narrowed to the keys that won. Against an entry without them (a
+ * metadata from before per-key merge, a record first seen at the last diff) it is judged whole,
+ * as every record always was.
+ */
+export function winningRemote(local: MetaMap, remote: Map<string, SyncRecord>): SyncRecord[] {
+  const winners: SyncRecord[] = []
+  for (const r of remote.values()) {
+    const mine = local[r.id]
+    if (!mine) {
+      if (!r.deleted) winners.push(r)
+      continue
+    }
+    if (mine.keys && !mine.deleted && !r.deleted && isSettingsRecord(r.id, r.type)) {
+      const won = winningSettings(mine as RecordMeta & { keys: Record<string, KeyMeta> }, r)
+      if (won) winners.push(won)
+      continue
+    }
+    if (r.modified <= mine.modified) continue
+    if (!r.deleted && !mine.deleted && hashData(r.data) === mine.hash) continue
+    if (r.deleted && mine.deleted) continue
+    winners.push(r)
+  }
+  return winners
+}
+
+/**
+ * Meta entries for records we just applied from remote (so we do not echo them as our edits).
+ * The settings winner is a set of keys: given `local`, its entry is this device's with those
+ * keys at the peer's times (`settingsMetaFromRemote`).
+ */
+export function metaFromRemote(records: SyncRecord[], local?: MetaMap): MetaMap {
+  const meta: MetaMap = {}
+  for (const r of records) {
+    if (!r.deleted && isSettingsRecord(r.id, r.type)) {
+      meta[r.id] = settingsMetaFromRemote(r, local?.[r.id])
+      continue
+    }
+    meta[r.id] = {
+      type: r.type,
+      hash: r.deleted ? '' : hashData(r.data),
+      modified: r.modified,
+      deleted: r.deleted
+    }
+  }
+  return meta
+}
+
+/**
+ * Apply a synced ordering: known ids in the synced order first, anything the list does not
+ * mention keeps its relative position after them.
+ */
+export function applyOrder(current: string[], wanted: string[] | undefined): string[] {
+  if (!wanted) return current
+  const present = new Set(current)
+  const head = wanted.filter((id) => present.has(id))
+  const mentioned = new Set(head)
+  return [...head, ...current.filter((id) => !mentioned.has(id))]
+}
+
+export type { Space, Folder }

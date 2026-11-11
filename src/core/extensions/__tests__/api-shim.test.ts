@@ -1,0 +1,922 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  installExtensionApi,
+  type EventDelivery,
+  type InvokeResult,
+  type ShimHost
+} from '../api/shim'
+import { API_SPEC } from '../api/spec'
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- tests poke at the patched globals
+type Any = any
+
+interface FakeHost extends ShimHost {
+  calls: Array<{ namespace: string; method: string; args: unknown[] }>
+  notifications: Array<{ kind: string; payload: unknown }>
+  push(namespace: string, event: string, ...args: unknown[]): void
+  pushDelivery(namespace: string, event: string, args: unknown[], delivery: EventDelivery): void
+  respond: (namespace: string, method: string, args: unknown[]) => InvokeResult
+}
+
+function fakeHost(kind: 'frame' | 'worker' = 'worker'): FakeHost {
+  let listener:
+    ((namespace: string, event: string, args: unknown[], delivery?: EventDelivery) => void) | null =
+    null
+  const host: FakeHost = {
+    kind,
+    calls: [],
+    notifications: [],
+    respond: () => ({ ok: true, value: undefined }),
+    invoke(namespace, method, args) {
+      host.calls.push({ namespace, method, args })
+      return Promise.resolve(host.respond(namespace, method, args))
+    },
+    notify(kind, payload) {
+      host.notifications.push({ kind, payload })
+    },
+    onEvent(fn) {
+      listener = fn
+    },
+    push(namespace, event, ...args) {
+      listener?.(namespace, event, args)
+    },
+    pushDelivery(namespace, event, args, delivery) {
+      listener?.(namespace, event, args, delivery)
+    }
+  }
+  return host
+}
+
+/** A stand-in for Chromium's native bindings: a distinct `browser` object and inert members. */
+function installNativeGlobals(manifestVersion: 2 | 3 = 3): { chrome: Any; browser: Any } {
+  const g = globalThis as Any
+  const manifest = { manifest_version: manifestVersion, name: 'Probe', version: '1.0' }
+  const nativeStorageArea = (): Any => {
+    const items: Record<string, unknown> = {}
+    return {
+      get(keys: Any, cb: (items: Any) => void) {
+        if (keys === null || keys === undefined) return cb({ ...items })
+        const list =
+          typeof keys === 'string' ? [keys] : Array.isArray(keys) ? keys : Object.keys(keys)
+        const out: Any = {}
+        for (const k of list) if (k in items) out[k] = items[k]
+        cb(out)
+      },
+      set(next: Any, cb: () => void) {
+        Object.assign(items, next)
+        cb()
+      },
+      remove(keys: Any, cb: () => void) {
+        for (const k of typeof keys === 'string' ? [keys] : keys) delete items[k]
+        cb()
+      },
+      clear(cb: () => void) {
+        for (const k of Object.keys(items)) delete items[k]
+        cb()
+      },
+      onChanged: { addListener: vi.fn(), removeListener: vi.fn() }
+    }
+  }
+  const nativeEvent = (): Any => ({
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    hasListener: vi.fn(() => false)
+  })
+  const chrome: Any = {
+    runtime: {
+      id: 'abcdefghijklmnopabcdefghijklmnop',
+      getManifest: () => manifest,
+      getURL: (path: string) => `chrome-extension://abcdefghijklmnopabcdefghijklmnop/${path}`,
+      sendMessage: vi.fn(),
+      onMessage: nativeEvent(),
+      onInstalled: nativeEvent(),
+      onStartup: nativeEvent(),
+      openOptionsPage: () => Promise.reject(new Error('Could not create an options page.'))
+    },
+    storage: {
+      local: nativeStorageArea(),
+      session: nativeStorageArea(),
+      onChanged: nativeEvent()
+    },
+    tabs: {
+      query: vi.fn(),
+      getZoom: vi.fn(() => Promise.resolve(1)),
+      setZoom: vi.fn(() => Promise.resolve()),
+      sendMessage: vi.fn(),
+      onUpdated: nativeEvent()
+    },
+    alarms: { create: vi.fn(), get: vi.fn(), onAlarm: nativeEvent() },
+    action: { setBadgeText: () => Promise.resolve(), getBadgeText: () => Promise.resolve('') }
+  }
+  const browser: Any = { runtime: chrome.runtime, storage: chrome.storage }
+  Object.defineProperty(g, 'chrome', { value: chrome, configurable: true, writable: true })
+  Object.defineProperty(g, 'browser', { value: browser, configurable: true, writable: true })
+  return { chrome, browser }
+}
+
+function flush(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 0))
+}
+
+describe('installExtensionApi', () => {
+  const g = globalThis as Any
+  let host: FakeHost
+
+  beforeEach(() => {
+    installNativeGlobals()
+    host = fakeHost()
+  })
+
+  afterEach(() => {
+    delete g.chrome
+    delete g.browser
+    vi.restoreAllMocks()
+  })
+
+  it('aliases the browser global to the augmented chrome object and installs once', () => {
+    const diag = installExtensionApi(host, API_SPEC)
+    expect(diag.installed).toBe(true)
+    expect(diag.browserAliased).toBe(true)
+    expect(g.browser).toBe(g.chrome)
+    expect(typeof g.browser.tabs.create).toBe('function')
+    expect(typeof g.browser.windows.getAll).toBe('function')
+    const again = installExtensionApi(host, API_SPEC)
+    expect(again.installed).toBe(false)
+    expect(host.notifications.filter((n) => n.kind === 'hello')).toHaveLength(1)
+  })
+
+  it('keeps native members that work and replaces inert ones in place', () => {
+    const nativeGetZoom = g.chrome.tabs.getZoom
+    const nativeSendMessage = g.chrome.tabs.sendMessage
+    installExtensionApi(host, API_SPEC)
+    expect(g.chrome.tabs.getZoom).toBe(nativeGetZoom)
+    expect(g.chrome.tabs.sendMessage).toBe(nativeSendMessage)
+    expect(g.chrome.tabs.query).not.toBe(installNativeGlobals)
+    expect(Object.isFrozen(g.chrome)).toBe(false)
+    expect(g.chrome.tabs.TAB_ID_NONE).toBe(-1)
+    expect(g.chrome.action.getUserSettings).toBeTypeOf('function')
+    expect(g.chrome.browserAction).toBeUndefined()
+  })
+
+  it('gives action its onUserSettingsChanged event (Chrome 130), which browserAction lacks', () => {
+    installExtensionApi(host, API_SPEC)
+    const fn = vi.fn()
+    g.chrome.action.onUserSettingsChanged.addListener(fn)
+    expect(g.chrome.action.onUserSettingsChanged.hasListener(fn)).toBe(true)
+    // Every action sits on the toolbar here, so the event exists and stays quiet.
+    expect(fn).not.toHaveBeenCalled()
+    installNativeGlobals(2)
+    installExtensionApi(host, API_SPEC)
+    expect(g.chrome.browserAction.onClicked.addListener).toBeTypeOf('function')
+    expect(g.chrome.browserAction.onUserSettingsChanged).toBeUndefined()
+  })
+
+  it('routes the part-2 namespaces to the host and answers cookies.getPartitionKey itself', async () => {
+    installExtensionApi(host, API_SPEC)
+    host.respond = (namespace, method) => {
+      if (namespace === 'notifications' && method === 'create') return { ok: true, value: 'n1' }
+      if (namespace === 'notifications' && method === 'getPermissionLevel')
+        return { ok: true, value: 'granted' }
+      if (namespace === 'cookies' && method === 'getAll') return { ok: true, value: [] }
+      if (namespace === 'commands' && method === 'getAll') return { ok: true, value: [] }
+      return { ok: true, value: null }
+    }
+    await expect(g.chrome.notifications.create('n1', { type: 'basic' })).resolves.toBe('n1')
+    await expect(g.chrome.notifications.getPermissionLevel()).resolves.toBe('granted')
+    await expect(g.chrome.cookies.getAll({ domain: 'a.test' })).resolves.toEqual([])
+    await expect(g.chrome.cookies.get({ url: 'https://a.test', name: 'x' })).resolves.toBeNull()
+    await expect(g.chrome.webNavigation.getFrame({ tabId: 1, frameId: 0 })).resolves.toBeNull()
+    await expect(g.chrome.commands.getAll()).resolves.toEqual([])
+    expect(host.calls.map((c) => `${c.namespace}.${c.method}`)).toEqual([
+      'notifications.create',
+      'notifications.getPermissionLevel',
+      'cookies.getAll',
+      'cookies.get',
+      'webNavigation.getFrame',
+      'commands.getAll'
+    ])
+    // Ione has no per-site cookie partitions: the key is answered on this side.
+    await expect(g.chrome.cookies.getPartitionKey({ tabId: 1 })).resolves.toEqual({
+      partitionKey: {}
+    })
+    expect(host.calls).toHaveLength(6)
+    expect(g.chrome.contextMenus.ContextType.ACTION).toBe('action')
+    expect(g.chrome.declarativeNetRequest.DYNAMIC_RULESET_ID).toBe('_dynamic')
+    expect(g.browser.webNavigation.onCommitted).toBe(g.chrome.webNavigation.onCommitted)
+  })
+
+  it('contextMenus.create returns the id synchronously and keeps onclick on this side', async () => {
+    installExtensionApi(host, API_SPEC)
+    const clicks: unknown[] = []
+    const listened: unknown[] = []
+    g.chrome.contextMenus.onClicked.addListener((info: unknown) => listened.push(info))
+    let created = false
+    const id = g.chrome.contextMenus.create(
+      { id: 'zen', title: 'Zen', onclick: (...args: unknown[]) => clicks.push(args) },
+      () => (created = true)
+    )
+    expect(id).toBe('zen')
+    const generated = g.chrome.contextMenus.create({ title: 'x' })
+    expect(generated).toBe(1)
+    await flush()
+    expect(created).toBe(true)
+    // `onclick` is a function: it cannot cross to the host, a flag says one was given.
+    expect(host.calls[0]).toMatchObject({
+      namespace: 'contextMenus',
+      method: 'create',
+      args: [{ id: 'zen', title: 'Zen', onclick: true }, 'zen']
+    })
+    expect(host.calls[1]).toMatchObject({ method: 'create', args: [{ title: 'x' }, 1] })
+    host.push('contextMenus', 'onClicked', { menuItemId: 'zen', editable: false }, { id: 3 })
+    expect(clicks).toEqual([[{ menuItemId: 'zen', editable: false }, { id: 3 }]])
+    expect(listened).toEqual([{ menuItemId: 'zen', editable: false }])
+    await new Promise<void>((resolve) => g.chrome.contextMenus.removeAll(() => resolve()))
+    host.push('contextMenus', 'onClicked', { menuItemId: 'zen' })
+    expect(clicks).toHaveLength(1)
+  })
+
+  it("contextMenus.create and update throw Chrome's TypeError in the binding for a context or type outside the enum (SingleFile's probe of Firefox's tab context, caught by its try)", async () => {
+    installExtensionApi(host, API_SPEC)
+    const contextTypes =
+      'all, page, frame, selection, link, editable, image, video, audio, launcher, browser_action, page_action, action'
+    const created =
+      "Error in invocation of contextMenus.create(object createProperties, optional function callback): Error at parameter 'createProperties': "
+    // SingleFile's probe, verbatim from its worker: `await at.create({id:"temporary-id",contexts:["tab"],title:"title"})` in a try.
+    const probe = (): unknown =>
+      g.chrome.contextMenus.create({ id: 'temporary-id', contexts: ['tab'], title: 'title' })
+    expect(probe).toThrow(TypeError)
+    expect(probe).toThrow(
+      `${created}Error at property 'contexts': Error at index 0: Value must be one of ${contextTypes}.`
+    )
+    expect(() => g.chrome.contextMenus.create({ id: 'x', contexts: [], title: 't' })).toThrow(
+      `${created}Error at property 'contexts': Array must have at least 1 items; found 0.`
+    )
+    expect(() => g.chrome.contextMenus.create({ id: 'x', contexts: 'page', title: 't' })).toThrow(
+      `${created}Error at property 'contexts': Invalid type: expected array, found string.`
+    )
+    expect(() =>
+      g.chrome.contextMenus.create({ id: 'x', contexts: ['page', 7], title: 't' })
+    ).toThrow(
+      `${created}Error at property 'contexts': Error at index 1: Invalid type: expected string, found number.`
+    )
+    expect(() => g.chrome.contextMenus.create({ id: 'x', type: 'tab', title: 't' })).toThrow(
+      `${created}Error at property 'type': Value must be one of normal, checkbox, radio, separator.`
+    )
+    expect(() => g.chrome.contextMenus.update('x', { contexts: ['page', 'tab'] })).toThrow(
+      "Error in invocation of contextMenus.update(integer|string id, object updateProperties, optional function callback): Error at parameter 'updateProperties': Error at property 'contexts': Error at index 1: Value must be one of " +
+        `${contextTypes}.`
+    )
+    // The binding refused every one of them: nothing reached the host, no lastError was queued.
+    await flush()
+    expect(host.calls).toHaveLength(0)
+    // What Chrome admits goes through, an optional property given as null reading as absent.
+    expect(
+      g.chrome.contextMenus.create({
+        id: 'ok',
+        contexts: ['page', 'action'],
+        type: 'normal',
+        title: 'ok'
+      })
+    ).toBe('ok')
+    g.chrome.contextMenus.create({ id: 'nulls', contexts: null, type: null, title: 'n' })
+    g.chrome.contextMenus.update('ok', { type: 'checkbox', checked: true })
+    await flush()
+    expect(host.calls.map((c) => `${c.method}:${JSON.stringify(c.args[0])}`)).toEqual([
+      'create:{"id":"ok","contexts":["page","action"],"type":"normal","title":"ok"}',
+      'create:{"id":"nulls","contexts":null,"type":null,"title":"n"}',
+      'update:"ok"'
+    ])
+  })
+
+  it('registers URL-filtered listeners with the host and delivers by filter id', () => {
+    installExtensionApi(host, API_SPEC)
+    const everyone: unknown[] = []
+    const filtered: unknown[] = []
+    g.chrome.webNavigation.onCommitted.addListener((d: unknown) => everyone.push(d))
+    g.chrome.webNavigation.onCommitted.addListener((d: unknown) => filtered.push(d), {
+      url: [{ hostSuffix: 'example.com' }]
+    })
+    expect(host.notifications.filter((n) => n.kind === 'listen').map((n) => n.payload)).toEqual([
+      { event: 'webNavigation.onCommitted' },
+      {
+        event: 'webNavigation.onCommitted',
+        filterId: 1,
+        filters: [{ hostSuffix: 'example.com' }]
+      }
+    ])
+    expect(() =>
+      g.chrome.webNavigation.onCommitted.addListener(() => undefined, { url: 'nope' })
+    ).toThrow(/Expected array of UrlFilter objects/)
+    // The host addresses each delivery: everyone, or only the filters that matched.
+    host.pushDelivery('webNavigation', 'onCommitted', [{ url: 'https://a.test/' }], {
+      unfiltered: true,
+      matched: []
+    })
+    host.pushDelivery('webNavigation', 'onCommitted', [{ url: 'https://example.com/' }], {
+      unfiltered: true,
+      matched: [1]
+    })
+    host.push('webNavigation', 'onCommitted', { url: 'https://everyone.test/' })
+    expect(everyone.map((d: Any) => d.url)).toEqual([
+      'https://a.test/',
+      'https://example.com/',
+      'https://everyone.test/'
+    ])
+    expect(filtered.map((d: Any) => d.url)).toEqual([
+      'https://example.com/',
+      'https://everyone.test/'
+    ])
+  })
+
+  it('holds a delivery the host could not match to the filtered listener’s own UrlFilters', async () => {
+    // PDF Viewer's shape: a worker woken by the navigation registers its `file://*.pdf`-filtered
+    // `onBeforeNavigate` listener only once its script runs, after the host queued the event with
+    // its URL. Delivered unfiltered, the listener turns every http(s) tab into its viewer.
+    installExtensionApi(host, API_SPEC)
+    const seen: string[] = []
+    const everyone: string[] = []
+    const unmatched = (url: string): EventDelivery => ({ unfiltered: true, matched: [], url })
+    // Queued before any listener exists: what the router sends a worker it woke.
+    host.pushDelivery(
+      'webNavigation',
+      'onBeforeNavigate',
+      [{ url: 'http://fixture.test/sample.pdf' }],
+      unmatched('http://fixture.test/sample.pdf')
+    )
+    host.pushDelivery(
+      'webNavigation',
+      'onBeforeNavigate',
+      [{ url: 'file:///home/me/doc.pdf#page=2' }],
+      unmatched('file:///home/me/doc.pdf#page=2')
+    )
+    g.chrome.webNavigation.onBeforeNavigate.addListener((d: Any) => seen.push(d.url), {
+      url: [
+        { urlPrefix: 'file://', pathSuffix: '.pdf' },
+        { urlPrefix: 'file://', pathSuffix: '.PDF' }
+      ]
+    })
+    // The queue reaches the script's listeners in the task after it (F3 of round 8).
+    await flush()
+    expect(seen).toEqual(['file:///home/me/doc.pdf#page=2'])
+    // The queue is spent; a listener added later sees what follows.
+    g.chrome.webNavigation.onBeforeNavigate.addListener((d: Any) => everyone.push(d.url))
+    // Live listeners, a worker still in its start-up window: the same rule, the URL against
+    // this listener's filters when the host did not name it.
+    host.pushDelivery(
+      'webNavigation',
+      'onBeforeNavigate',
+      [{ url: 'chrome-extension://abc/content/web/viewer.html?file=x' }],
+      unmatched('chrome-extension://abc/content/web/viewer.html?file=x')
+    )
+    host.pushDelivery(
+      'webNavigation',
+      'onBeforeNavigate',
+      [{ url: 'file:///tmp/a.PDF' }],
+      unmatched('file:///tmp/a.PDF')
+    )
+    // Addressed by the host: its verdict stands even with the URL along.
+    host.pushDelivery('webNavigation', 'onBeforeNavigate', [{ url: 'file:///tmp/b.pdf' }], {
+      unfiltered: false,
+      matched: [1]
+    })
+    expect(seen).toEqual([
+      'file:///home/me/doc.pdf#page=2',
+      'file:///tmp/a.PDF',
+      'file:///tmp/b.pdf'
+    ])
+    expect(everyone).toEqual([
+      'chrome-extension://abc/content/web/viewer.html?file=x',
+      'file:///tmp/a.PDF'
+    ])
+  })
+
+  it('matches every events.UrlFilter condition the way the host does', () => {
+    installExtensionApi(host, API_SPEC)
+    const cases: Array<[Record<string, unknown>, string, boolean]> = [
+      [{ hostContains: '.foo' }, 'https://www.foobar.com/', true],
+      [{ hostContains: '.foo' }, 'https://barfoo.com/', false],
+      [{ hostEquals: 'example.com' }, 'https://example.com/a', true],
+      [{ hostEquals: 'example.com' }, 'https://www.example.com/a', false],
+      [{ hostPrefix: 'www' }, 'https://www.example.com/', true],
+      [{ hostSuffix: 'example.com' }, 'https://www.example.com/', true],
+      [{ hostSuffix: 'example.com' }, 'https://example.org/', false],
+      [{ pathContains: 'ad' }, 'https://a.test/loads/', true],
+      [{ pathEquals: '/x' }, 'https://a.test/x?q=1', true],
+      [{ pathPrefix: '/api' }, 'https://a.test/api/v1', true],
+      [{ pathSuffix: '.pdf' }, 'https://a.test/file.pdf#top', true],
+      [{ pathSuffix: '.pdf' }, 'https://a.test/file.pdf?dl=1', true],
+      [{ queryContains: 'dl=1' }, 'https://a.test/f?dl=1', true],
+      [{ queryEquals: '?dl=1' }, 'https://a.test/f?dl=1', true],
+      [{ queryPrefix: 'dl' }, 'https://a.test/f?dl=1', true],
+      [{ querySuffix: '=1' }, 'https://a.test/f?dl=1', true],
+      [{ urlContains: 'fixture' }, 'http://fixture.test/', true],
+      [{ urlEquals: 'http://fixture.test/a' }, 'http://fixture.test/a#frag', true],
+      [{ urlPrefix: 'file://' }, 'file:///tmp/a.pdf', true],
+      [{ urlPrefix: 'file://' }, 'http://a.test/a.pdf', false],
+      [{ urlSuffix: '.pdf' }, 'http://a.test/a.pdf', true],
+      [{ urlMatches: '^https://[^/]+/a$' }, 'https://a.test/a', true],
+      [{ urlMatches: '(' }, 'https://a.test/a', false],
+      [{ originAndPathMatches: '^https://a\\.test/a$' }, 'https://a.test/a?q=1', true],
+      [{ schemes: ['https'] }, 'https://a.test/', true],
+      [{ schemes: ['https'] }, 'http://a.test/', false],
+      [{ ports: [80, [8000, 8100]] }, 'http://a.test/', true],
+      [{ ports: [80, [8000, 8100]] }, 'http://a.test:8050/', true],
+      [{ ports: [80, [8000, 8100]] }, 'http://a.test:9000/', false],
+      [{ hostSuffix: 'a.test', pathPrefix: '/x' }, 'https://a.test/y', false],
+      [{}, 'https://anything.test/', true],
+      [{ hostEquals: 'a.test' }, 'not a url', false]
+    ]
+    let id = 0
+    for (const [filter, url, expected] of cases) {
+      const hits: string[] = []
+      const fn = (d: Any): void => void hits.push(d.url)
+      g.chrome.webNavigation.onCommitted.addListener(fn, { url: [filter] })
+      id += 1
+      host.pushDelivery('webNavigation', 'onCommitted', [{ url }], {
+        unfiltered: false,
+        matched: [],
+        url
+      })
+      expect(hits, `${JSON.stringify(filter)} against ${url}`).toEqual(expected ? [url] : [])
+      g.chrome.webNavigation.onCommitted.removeListener(fn)
+    }
+    expect(id).toBe(cases.length)
+  })
+
+  it('ignores a second addListener argument on events without filter support, as Chromium does', () => {
+    installExtensionApi(host, API_SPEC)
+    const seen: unknown[] = []
+    const fn = (...args: unknown[]): void => void seen.push(args)
+    // Violentmonkey: `tabs.onUpdated.addListener(fn, false)` and `(fn, cond && { properties })`.
+    expect(() => g.chrome.tabs.onUpdated.addListener(fn, false)).not.toThrow()
+    expect(() =>
+      g.chrome.tabs.onUpdated.addListener(() => undefined, { properties: ['status'] })
+    ).not.toThrow()
+    expect(() => g.chrome.tabs.onRemoved.addListener(() => undefined, 'nope', 3)).not.toThrow()
+    expect(g.chrome.tabs.onUpdated.hasListener(fn)).toBe(true)
+    expect(host.notifications.filter((n) => n.kind === 'listen').map((n) => n.payload)).toEqual([
+      { event: 'tabs.onUpdated' },
+      { event: 'tabs.onRemoved' }
+    ])
+    host.push('tabs', 'onUpdated', 4, { status: 'complete' }, { id: 4 })
+    expect(seen).toEqual([[4, { status: 'complete' }, { id: 4 }]])
+    // Events with filter support keep validating the argument.
+    expect(() => g.chrome.webNavigation.onCommitted.addListener(() => undefined, false)).toThrow(
+      /No matching signature/
+    )
+  })
+
+  it('defines the bridged namespaces only for extensions declaring their permission', () => {
+    const manifest = {
+      manifest_version: 3,
+      name: 'Probe',
+      version: '1.0',
+      permissions: ['bookmarks', 'identity'],
+      optional_permissions: ['tabGroups']
+    }
+    g.chrome.runtime.getManifest = () => manifest
+    installExtensionApi(host, API_SPEC)
+    expect(g.chrome.bookmarks.getTree).toBeTypeOf('function')
+    // Without the host's view of the grants, declaring counts: the optional namespace is there.
+    expect(g.chrome.tabGroups.query).toBeTypeOf('function')
+    expect(g.chrome.tabs.group).toBeTypeOf('function')
+    expect(g.chrome.identity.getRedirectURL()).toBe(
+      'https://abcdefghijklmnopabcdefghijklmnop.chromiumapp.org/'
+    )
+    for (const hidden of [
+      'history',
+      'downloads',
+      'sessions',
+      'topSites',
+      'sidePanel',
+      'browsingData',
+      'tts'
+    ]) {
+      expect(g.chrome[hidden]).toBeUndefined()
+    }
+  })
+
+  it('leaves an optional namespace undefined until its permission is granted, as Chrome does', async () => {
+    // Checker Plus for Gmail: `webRequest` optional, `if (chrome.webRequest) addListener(...)` at
+    // start-up. Chrome has no `chrome.webRequest` before the grant; a namespace that answered
+    // threw "The 'webRequest' permission is required." into the worker instead.
+    const manifest = {
+      manifest_version: 3,
+      name: 'Probe',
+      version: '1.0',
+      permissions: ['bookmarks', 'storage'],
+      optional_permissions: ['webRequest', 'tabGroups', 'userScripts']
+    }
+    g.chrome.runtime.getManifest = () => manifest
+    installExtensionApi(host, API_SPEC, {
+      granted: ['bookmarks', 'storage'],
+      toggles: { userScripts: true }
+    })
+    expect(g.chrome.bookmarks.getTree).toBeTypeOf('function')
+    expect(g.chrome.webRequest).toBeUndefined()
+    expect(g.chrome.tabGroups).toBeUndefined()
+    expect(g.chrome.userScripts).toBeUndefined()
+    expect(g.chrome.runtime.onUserScriptMessage).toBeUndefined()
+    expect(g.browser.webRequest).toBeUndefined()
+
+    // A grant made here: the namespace is defined before the caller hears the answer.
+    host.respond = (namespace, method) =>
+      namespace === 'permissions' && method === 'request'
+        ? { ok: true, value: true }
+        : { ok: true, value: undefined }
+    let seenInCallback: unknown = 'unread'
+    g.chrome.permissions.request({ permissions: ['webRequest'] }, (granted: boolean) => {
+      seenInCallback = granted && typeof g.chrome.webRequest?.onCompleted?.addListener
+    })
+    await flush()
+    expect(seenInCallback).toBe('function')
+    expect(host.calls.at(-1)).toEqual({
+      namespace: 'permissions',
+      method: 'request',
+      args: [{ permissions: ['webRequest'] }]
+    })
+    expect(g.chrome.webRequest.MAX_HANDLER_BEHAVIOR_CHANGED_CALLS_PER_10_MINUTES).toBe(20)
+    expect(g.browser.webRequest).toBe(g.chrome.webRequest)
+    // The promise form, for a permission whose namespace is toggled: it takes the toggle's side.
+    await expect(g.chrome.permissions.request({ permissions: ['userScripts'] })).resolves.toBe(true)
+    expect(g.chrome.userScripts.register).toBeTypeOf('function')
+    expect(g.chrome.runtime.onUserScriptMessage.addListener).toBeTypeOf('function')
+
+    // A refusal defines nothing.
+    host.respond = () => ({ ok: true, value: false })
+    await expect(g.chrome.permissions.request({ permissions: ['tabGroups'] })).resolves.toBe(false)
+    expect(g.chrome.tabGroups).toBeUndefined()
+
+    // The host's word on the whole set (a grant or removal made in another context) is followed
+    // both ways: what it adds is defined, what it drops is deleted.
+    host.push('__zen', 'grants', {
+      permissions: ['bookmarks', 'storage', 'tabGroups', 'userScripts']
+    })
+    expect(g.chrome.tabGroups.query).toBeTypeOf('function')
+    expect(g.chrome.webRequest).toBeUndefined()
+    host.respond = () => ({ ok: true, value: true })
+    await expect(g.chrome.permissions.remove({ permissions: ['userScripts'] })).resolves.toBe(true)
+    expect(g.chrome.userScripts).toBeUndefined()
+    expect(g.chrome.runtime.onUserScriptMessage).toBeUndefined()
+    // A required permission's namespace never goes, and `tabs.group` is on `tabs` regardless.
+    expect(g.chrome.bookmarks.getTree).toBeTypeOf('function')
+    expect(g.chrome.tabs.group).toBeTypeOf('function')
+  })
+
+  it('patches a permission-gated namespace the engine made, whatever the grants say', () => {
+    const manifest = {
+      manifest_version: 3,
+      name: 'Probe',
+      version: '1.0',
+      permissions: ['webRequest'],
+      optional_permissions: []
+    }
+    g.chrome.runtime.getManifest = () => manifest
+    g.chrome.webRequest = { onCompleted: { addListener: vi.fn(), removeListener: vi.fn() } }
+    installExtensionApi(host, API_SPEC, { granted: [] })
+    expect(g.chrome.webRequest.onBeforeRequest.addListener).toBeTypeOf('function')
+    host.push('__zen', 'grants', { permissions: [] })
+    expect(g.chrome.webRequest.onBeforeRequest.addListener).toBeTypeOf('function')
+  })
+
+  it('shows gcm as the shape of a profile with GCM off: registrations fail with GCM_DISABLED, the events never fire', async () => {
+    const manifest = { manifest_version: 3, name: 'Probe', version: '1.0', permissions: ['gcm'] }
+    g.chrome.runtime.getManifest = () => manifest
+    installExtensionApi(host, API_SPEC)
+    expect(g.chrome.gcm.MAX_MESSAGE_SIZE).toBe(4096)
+    const listener = vi.fn()
+    g.chrome.gcm.onMessage.addListener(listener)
+    expect(g.chrome.gcm.onMessage.hasListener(listener)).toBe(true)
+    expect(g.chrome.gcm.onMessagesDeleted.addListener).toBeTypeOf('function')
+    expect(g.chrome.gcm.onSendError.addListener).toBeTypeOf('function')
+    await expect(g.chrome.gcm.register(['1234567890'])).rejects.toThrow('GCM_DISABLED')
+    await expect(
+      g.chrome.gcm.send({ destinationId: 'x', messageId: '1', data: {} })
+    ).rejects.toThrow('GCM_DISABLED')
+    let seen: unknown
+    await new Promise<void>((resolve) => {
+      g.chrome.gcm.unregister(() => {
+        seen = g.chrome.runtime.lastError
+        resolve()
+      })
+    })
+    expect(seen).toEqual({ message: 'GCM_DISABLED' })
+    // Nothing of this reached the host, and nothing arrived for the listener.
+    expect(host.calls).toEqual([])
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('gives the gcm permission chrome.instanceID too, routed to the host (WPS PDF watches getID)', async () => {
+    const manifest = { manifest_version: 3, name: 'Probe', version: '1.0', permissions: ['gcm'] }
+    g.chrome.runtime.getManifest = () => manifest
+    installExtensionApi(host, API_SPEC)
+    host.respond = (_ns, method) =>
+      method === 'getID'
+        ? { ok: true, value: 'dJ8_Q1x2kYs' }
+        : { ok: false, error: 'Instance ID is disabled.' }
+    expect(await g.chrome.instanceID.getID()).toBe('dJ8_Q1x2kYs')
+    await expect(
+      g.chrome.instanceID.getToken({ authorizedEntity: '1234567890', scope: 'GCM' })
+    ).rejects.toThrow('Instance ID is disabled.')
+    expect(host.calls.map((c) => `${c.namespace}.${c.method}`)).toEqual([
+      'instanceID.getID',
+      'instanceID.getToken'
+    ])
+    expect(g.chrome.instanceID.onTokenRefresh.addListener).toBeTypeOf('function')
+    // Without the permission there is no namespace, as in Chrome.
+    installNativeGlobals(3)
+    g.chrome.runtime.getManifest = () => ({ ...manifest, permissions: ['storage'] })
+    installExtensionApi(host, API_SPEC)
+    expect(g.chrome.instanceID).toBeUndefined()
+  })
+
+  it('exposes browserAction instead of action for MV2', () => {
+    installNativeGlobals(2)
+    const diag = installExtensionApi(host, API_SPEC)
+    expect(diag.manifestVersion).toBe(2)
+    expect(typeof g.chrome.browserAction.setBadgeText).toBe('function')
+    g.chrome.browserAction.setBadgeText({ text: '3' })
+    expect(host.calls[0]).toMatchObject({ namespace: 'action', method: 'setBadgeText' })
+  })
+
+  it('returns a promise without a callback and calls back otherwise', async () => {
+    installExtensionApi(host, API_SPEC)
+    host.respond = () => ({ ok: true, value: [{ id: 7 }] })
+    const viaPromise = await g.chrome.tabs.query({})
+    expect(viaPromise).toEqual([{ id: 7 }])
+    const cb = vi.fn()
+    const ret = g.chrome.tabs.query({ active: true }, cb)
+    expect(ret).toBeUndefined()
+    await flush()
+    expect(cb).toHaveBeenCalledWith([{ id: 7 }])
+    expect(host.calls[1].args).toEqual([{ active: true }])
+  })
+
+  it('reports failures through runtime.lastError for callbacks and rejections for promises', async () => {
+    installExtensionApi(host, API_SPEC)
+    host.respond = () => ({ ok: false, error: 'No tab with id: 99.' })
+    await expect(g.chrome.tabs.get(99)).rejects.toThrow('No tab with id: 99.')
+    let seen: unknown = null
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    g.chrome.tabs.get(99, () => {
+      seen = g.chrome.runtime.lastError
+    })
+    await flush()
+    expect(seen).toEqual({ message: 'No tab with id: 99.' })
+    expect(g.chrome.runtime.lastError).toBeUndefined()
+    expect(errorSpy).not.toHaveBeenCalled()
+    g.chrome.tabs.get(99, () => undefined)
+    await flush()
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Unchecked runtime.lastError'))
+  })
+
+  it('skips optional arguments Chrome-style', () => {
+    installExtensionApi(host, API_SPEC)
+    g.chrome.tabs.update({ url: 'https://example.com' })
+    expect(host.calls[0].args).toEqual([undefined, { url: 'https://example.com' }])
+    g.chrome.tabs.update(3, { active: true })
+    expect(host.calls[1].args).toEqual([3, { active: true }])
+    g.chrome.tabs.reload()
+    expect(host.calls[2].args).toEqual([undefined, undefined])
+    expect(() => g.chrome.tabs.get('nope')).toThrow(/No matching signature/)
+  })
+
+  it('event objects register with the host once and dispatch pushed events', () => {
+    installExtensionApi(host, API_SPEC)
+    const ev = g.chrome.tabs.onUpdated
+    const a = vi.fn()
+    const b = vi.fn()
+    expect(ev.hasListeners()).toBe(false)
+    ev.addListener(a)
+    ev.addListener(b)
+    expect(ev.hasListener(a)).toBe(true)
+    expect(host.notifications.filter((n) => n.kind === 'listen')).toEqual([
+      { kind: 'listen', payload: { event: 'tabs.onUpdated' } }
+    ])
+    host.push('tabs', 'onUpdated', 5, { status: 'complete' }, { id: 5 })
+    expect(a).toHaveBeenCalledWith(5, { status: 'complete' }, { id: 5 })
+    expect(b).toHaveBeenCalledTimes(1)
+    ev.removeListener(a)
+    ev.removeListener(b)
+    expect(host.notifications.filter((n) => n.kind === 'unlisten')).toHaveLength(1)
+    expect(ev.hasListeners()).toBe(false)
+    expect(typeof ev.addRules).toBe('function')
+  })
+
+  it('queues events that arrive before the first listener (worker start-up) for a task after the registering script', async () => {
+    installExtensionApi(host, API_SPEC)
+    host.push('runtime', 'onInstalled', { reason: 'install' })
+    const fn = vi.fn()
+    g.chrome.runtime.onInstalled.addListener(fn)
+    // Chrome dispatches a wake-up event after the worker's evaluation, never from addListener.
+    expect(fn).not.toHaveBeenCalled()
+    await flush()
+    expect(fn).toHaveBeenCalledWith({ reason: 'install' })
+    const later = vi.fn()
+    g.chrome.runtime.onInstalled.addListener(later)
+    await flush()
+    expect(later).not.toHaveBeenCalled()
+  })
+
+  it('a queued event reaches a listener that read the wake-up as its own alarm without throwing (Rabby)', async () => {
+    installExtensionApi(host, API_SPEC)
+    host.push('alarms', 'onAlarm', { name: 'ALARMS_USER_ENABLE' })
+    // The module registers at its top level and fills `store` right after: with the replay inside
+    // addListener the listener read `store.sendEnableTime` of undefined and threw.
+    const service: { store?: { sendEnableTime: number } } = {}
+    const seen: number[] = []
+    g.chrome.alarms.onAlarm.addListener((alarm: { name: string }) => {
+      if (alarm.name !== 'ALARMS_USER_ENABLE') return
+      const store = service.store
+      if (!store)
+        throw new TypeError("Cannot read properties of undefined (reading 'sendEnableTime')")
+      seen.push(store.sendEnableTime)
+    })
+    service.store = { sendEnableTime: 7 }
+    await flush()
+    expect(seen).toEqual([7])
+  })
+
+  it('delivers action events to browserAction listeners as well', () => {
+    installNativeGlobals(2)
+    installExtensionApi(host, API_SPEC)
+    const fn = vi.fn()
+    g.chrome.browserAction.onClicked.addListener(fn)
+    host.push('action', 'onClicked', { id: 1 })
+    expect(fn).toHaveBeenCalledWith({ id: 1 })
+  })
+
+  it('wraps native storage.local writes to notify the host with Chrome change records', async () => {
+    installExtensionApi(host, API_SPEC)
+    await g.chrome.storage.local.set({ a: 1, b: 'x' })
+    await g.chrome.storage.local.set({ a: 2, b: 'x' })
+    await g.chrome.storage.local.remove('b')
+    await g.chrome.storage.local.clear()
+    const changes = host.notifications
+      .filter((n) => n.kind === 'storage-changed')
+      .map((n) => n.payload)
+    expect(changes).toEqual([
+      { area: 'local', changes: { a: { newValue: 1 }, b: { newValue: 'x' } } },
+      { area: 'local', changes: { a: { oldValue: 1, newValue: 2 } } },
+      { area: 'local', changes: { b: { oldValue: 'x' } } },
+      { area: 'local', changes: { a: { oldValue: 2 } } }
+    ])
+    expect(g.chrome.storage.local.QUOTA_BYTES).toBeUndefined()
+    const got = await new Promise((resolve) => g.chrome.storage.local.get(null, resolve))
+    expect(got).toEqual({})
+  })
+
+  it('notifies storage.local writes in the form Chrome stores: methods and undefined dropped, the write resolved (Rabby)', async () => {
+    installExtensionApi(host, API_SPEC)
+    // The host's transport clones structurally and refuses a function, as ipcRenderer does.
+    host.notify = (kind, payload) => {
+      const check = (value: unknown): void => {
+        if (typeof value === 'function') throw new Error('An object could not be cloned.')
+        if (value && typeof value === 'object') Object.values(value).forEach(check)
+      }
+      check(payload)
+      host.notifications.push({ kind, payload })
+    }
+    class Preference {
+      balanceMap = { a: 1 }
+      hidden = undefined
+      list = [1, (): number => 2, undefined]
+      patch(): void {
+        this.balanceMap.a += 1
+      }
+    }
+    await expect(
+      g.chrome.storage.local.set({ preference: new Preference(), fn: (): number => 1, n: 3 })
+    ).resolves.toBeUndefined()
+    const changes = host.notifications
+      .filter((n) => n.kind === 'storage-changed')
+      .map((n) => n.payload)
+    expect(changes).toEqual([
+      {
+        area: 'local',
+        changes: {
+          preference: { newValue: { balanceMap: { a: 1 }, list: [1, null, null] } },
+          n: { newValue: 3 }
+        }
+      }
+    ])
+    // The host-kept areas get the same form, which is what can cross to them.
+    await g.chrome.storage.sync.set({ preference: new Preference(), fn: (): number => 1 })
+    expect(host.calls.at(-1)).toEqual({
+      namespace: 'storage',
+      method: 'set',
+      args: ['sync', { preference: { balanceMap: { a: 1 }, list: [1, null, null] } }]
+    })
+  })
+
+  it('routes storage.sync and storage.managed through the host', async () => {
+    installExtensionApi(host, API_SPEC)
+    host.respond = (_ns, method) =>
+      method === 'get' ? { ok: true, value: { k: 1 } } : { ok: true, value: undefined }
+    expect(await g.chrome.storage.sync.get('k')).toEqual({ k: 1 })
+    await g.chrome.storage.sync.set({ k: 2 })
+    expect(host.calls.map((c) => [c.namespace, c.method, c.args])).toEqual([
+      ['storage', 'get', ['sync', 'k']],
+      ['storage', 'set', ['sync', { k: 2 }]]
+    ])
+    expect(g.chrome.storage.sync.QUOTA_BYTES).toBe(102400)
+    expect(g.chrome.storage.sync.MAX_ITEMS).toBe(512)
+    expect(g.browser.storage.managed).toBe(g.chrome.storage.managed)
+    const fn = vi.fn()
+    g.chrome.storage.onChanged.addListener(fn)
+    const syncFn = vi.fn()
+    g.chrome.storage.sync.onChanged.addListener(syncFn)
+    host.push('storage', 'onChanged', { k: { newValue: 3 } }, 'sync')
+    host.push('storage.sync', 'onChanged', { k: { newValue: 3 } })
+    expect(fn).toHaveBeenCalledWith({ k: { newValue: 3 } }, 'sync')
+    expect(syncFn).toHaveBeenCalledWith({ k: { newValue: 3 } })
+  })
+
+  it('aliases the legacy extension namespace onto runtime', () => {
+    installExtensionApi(host, API_SPEC)
+    expect(g.chrome.extension.getURL('x.html')).toBe(
+      'chrome-extension://abcdefghijklmnopabcdefghijklmnop/x.html'
+    )
+    expect(g.chrome.extension.inIncognitoContext).toBe(false)
+    expect(g.chrome.extension.onRequest).toBe(g.chrome.runtime.onMessage)
+    g.chrome.extension.sendRequest({ ping: 1 })
+    expect(g.chrome.runtime.sendMessage).toHaveBeenCalledWith({ ping: 1 })
+    expect(g.chrome.extension.ViewType.POPUP).toBe('popup')
+    // Workers have no views of their own.
+    expect(g.chrome.extension.getViews).toBeUndefined()
+  })
+
+  it('serialises ImageData for action.setIcon', () => {
+    installExtensionApi(host, API_SPEC)
+    const data = new Uint8ClampedArray([1, 2, 3, 4])
+    g.chrome.action.setIcon({ imageData: { width: 1, height: 1, data, extra: true } })
+    expect(host.calls[0].args[0]).toEqual({ imageData: { width: 1, height: 1, data } })
+  })
+
+  it('resolves action.setIcon paths against the calling context, as Chrome does', () => {
+    Object.defineProperty(g, 'location', {
+      value: { href: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/background/index.js' },
+      configurable: true,
+      writable: true
+    })
+    try {
+      installExtensionApi(host, API_SPEC)
+      g.chrome.action.setIcon({ path: { 19: '../icons/a19.png', 38: '/icons/a38.png' } })
+      g.chrome.action.setIcon({ path: 'x.png' })
+      expect(host.calls[0].args[0]).toEqual({
+        path: {
+          19: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/icons/a19.png',
+          38: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/icons/a38.png'
+        }
+      })
+      expect(host.calls[1].args[0]).toEqual({
+        path: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/background/x.png'
+      })
+    } finally {
+      delete g.location
+    }
+  })
+})
+
+describe('installExtensionApi in frames', () => {
+  const g = globalThis as Any
+
+  afterEach(() => {
+    delete g.chrome
+    delete g.browser
+    delete g.location
+  })
+
+  it('reports getViews from the host list and identifies the background page', () => {
+    installNativeGlobals(2)
+    g.chrome.runtime.getManifest = () => ({
+      manifest_version: 2,
+      name: 'Legacy',
+      version: '1',
+      background: { scripts: ['bg.js'] }
+    })
+    Object.defineProperty(g, 'location', {
+      value: {
+        href: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/_generated_background_page.html',
+        protocol: 'chrome-extension:',
+        host: 'abcdefghijklmnopabcdefghijklmnop'
+      },
+      configurable: true,
+      writable: true
+    })
+    const host = fakeHost('frame')
+    installExtensionApi(host, API_SPEC)
+    const hello = host.notifications.find((n) => n.kind === 'hello')?.payload as Any
+    expect(hello.isBackgroundPage).toBe(true)
+    expect(g.chrome.extension.getBackgroundPage()).toBe(g)
+    host.push('__zen', 'views', [
+      { url: g.location.href, type: 'background', self: true },
+      { url: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/popup.html', type: 'popup' }
+    ])
+    const views = g.chrome.extension.getViews()
+    expect(views).toHaveLength(2)
+    expect(views[0]).toBe(g)
+    expect(views[1].location.href).toContain('popup.html')
+    expect(g.chrome.extension.getViews({ type: 'popup' })).toHaveLength(1)
+  })
+})

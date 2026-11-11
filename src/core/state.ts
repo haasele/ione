@@ -1,0 +1,1523 @@
+import type {
+  AgentInfo,
+  AwayAgentInfo,
+  AgentServerStatus,
+  AgentSkillStatus,
+  AutofillUIState,
+  BlockedPopup,
+  Bookmark,
+  BookmarkNode,
+  BookmarkTreeData,
+  ArchivedTabEntry,
+  Boost,
+  ClosedEntry,
+  ImportProgress,
+  SelectionMenuState,
+  NavigationSnapshot,
+  NetworkStatus,
+  Container,
+  CrashRestoreOffer,
+  DefaultBrowserStatus,
+  DeviceChooser,
+  DeviceGrant,
+  DevicePairingPrompt,
+  DownloadItem,
+  DownloadsProgress,
+  ExtensionControl,
+  ExtensionInfo,
+  ExtensionUpdateCheck,
+  Folder,
+  HomepageSettings,
+  HostCapabilities,
+  KeyBinding,
+  LiveFolderConfig,
+  MediaState,
+  Mod,
+  NewTabDeviceState,
+  NewTabShortcut,
+  PageDialog,
+  PageWindowsDeviceState,
+  PasswordsDeviceState,
+  PrivateDeviceState,
+  ReadingListEntry,
+  ScreenCaptureRequest,
+  ShareRequest,
+  PasswordsStatus,
+  PageEnvironment,
+  PermissionPrompt,
+  PermissionRule,
+  Platform,
+  Rect,
+  ResourceSnapshot,
+  RevokedSitePermissions,
+  SafetyCheckResult,
+  SearchEngine,
+  SearchEngineControl,
+  SecurityPrompt,
+  Settings,
+  Shortcut,
+  ShortcutPreset,
+  SidePanelInfo,
+  Space,
+  SplitGroup,
+  SyncStatus,
+  Tab,
+  UIState
+} from '../shared/types'
+import type { TranslateUIState } from '../shared/translate'
+import type { ContentDefault } from '../shared/contentSettings'
+import type { InstalledWebApp } from '../shared/webApp'
+import type { ShareChooser } from '../shared/shareTarget'
+import {
+  DEFAULT_CONTAINER_ID,
+  PRIVATE_CONTAINER_ID,
+  emptyPageWindows,
+  emptyPasswordsDevice,
+  emptyPrivateDevice,
+  sanitizePageWindows,
+  sanitizePasswordsDevice,
+  sanitizePrivateDevice
+} from '../shared/types'
+import { sanitizeAppIcon } from '../shared/appIcon'
+import { isChromePageUrl, parseInternalPageUrl } from '../shared/internalPages'
+import {
+  DEFAULT_CONTAINERS,
+  DEFAULT_SETTINGS,
+  emptyAgentServerStatus,
+  emptyAgentSkillStatus,
+  emptyAutofillUIState,
+  emptyPasswordsStatus,
+  emptyResourceSnapshot,
+  sanitizeAutofillSettings,
+  sanitizePasswordSettings
+} from '../shared/defaults'
+import { sanitizePhoneBar } from '../shared/phoneBar'
+import { sanitizeMenuOrder } from '../shared/menuOrder'
+import { defaultHomepageOf, sanitizeHomepage } from '../shared/homepage'
+import { sanitizeToolbarLayout } from '../shared/toolbarLayout'
+import { sanitizeToolbarPins } from '../shared/toolbarPins'
+import { sanitizeDevtoolsDock } from '../shared/devtoolsDock'
+import {
+  allSearchEngines,
+  defaultSearchEngineOf,
+  isPickableSearchEngine,
+  sanitizeSearchEngines,
+  withDefaultSearchEngineActive
+} from '../shared/search'
+import {
+  applyShortcutOverrides,
+  defaultShortcuts,
+  isShortcutPreset,
+  migrateShortcutPreset
+} from '../shared/shortcuts'
+import {
+  BOOKMARK_SCHEMA_VERSION,
+  BookmarkTree,
+  createBookmarkRoots,
+  defaultBookmarkFolderId,
+  migrateLegacyBookmarks,
+  normalizeBookmarkNodes
+} from '../shared/bookmarks'
+import { sanitizeBookmarkRowDisplay, sanitizeBookmarkRowSortOrder } from '../shared/bookmarkRows'
+import { emptyReadingList, sanitizeReadingList, sortReadingList } from '../shared/readingList'
+import { JsonStore } from './store/JsonStore'
+import {
+  agentOwnedSpace,
+  createSpace,
+  createTabRecord,
+  emptyModel,
+  tabVisibleIn,
+  userSpaceInstead,
+  type Model
+} from './model'
+import { newSearchChoiceSeed, sanitizeSearchChoice, searchChoiceState } from './searchChoice'
+import { sanitizeResourceSettings } from './resources/switches'
+import { freshPerformanceDefaults } from './resources/energySaver'
+import { sanitizeAgentSettings } from './agent/settings'
+import { migrateStartupSettings } from './startup'
+import { emptyUpdateDotRecord, sanitizeUpdateDotRecord, type UpdateDotRecord } from './updateDot'
+import {
+  emptyUpdateStatus,
+  sanitizeUpdateSettings,
+  updateOsOf,
+  type UpdateStatus
+} from '../shared/updates'
+import { BLANK_URL } from '../shared/url'
+import { sanitizePromoState } from '../shared/defaultBrowser'
+import { sanitizeIphState } from '../shared/iph'
+import {
+  emptyBlockingStatus,
+  sanitizeBlockingSettings,
+  type BlockingStatus
+} from '../shared/blocking'
+import { DEFAULT_PAGE_ENVIRONMENT, sanitizePageControls } from '../shared/pageControls'
+import {
+  emptyPrivacyStatus,
+  sanitizeClearBrowsingDataRange,
+  sanitizePreloadPages,
+  sanitizePrivacySettings,
+  type PrivacyStatus
+} from '../shared/privacy'
+import { emptySiteDataStatus, type SiteDataStatus } from '../shared/siteData'
+import {
+  UNAVAILABLE_SPELLCHECK,
+  sanitizeSpellcheck,
+  type SpellcheckStatus
+} from '../shared/spellcheck'
+import { sanitizeReaderPreferences } from '../shared/reader'
+import { sanitizeReadAloudSettings, type ReadAloudState } from '../shared/readAloud'
+import { sanitizeFontSettings } from '../shared/fonts'
+import { sanitizeGameBestScore } from '../shared/game/bridge'
+import { sanitizeAppProxySettings, sanitizeTabProxyId } from '../shared/appProxy'
+import { defaultLanguages, sanitizeLanguages } from '../shared/languages'
+import {
+  emptyNewTabDevice,
+  migrateNewTabDevice,
+  migrateNewTabSettings,
+  sanitizeNewTabSettings
+} from '../shared/newTab'
+import { EXTENSION_SETTING_KEYS, type ExtensionLayer } from '../shared/extensionSettings'
+import { defer, type StoreIO } from './platform'
+import {
+  sanitizeArchivedEntries,
+  sanitizeClosedEntries,
+  sanitizeSnapshot,
+  summarizeClosed
+} from './session'
+import { defaultScope } from './sync/records'
+import {
+  closedNavigationOf,
+  closedTabIds,
+  NavigationStateStore,
+  withoutClosedHostState,
+  withoutHostState
+} from './navigationState'
+import type { ZenWindow } from './window'
+
+const BOOKMARKS_BAR_MODES: ReadonlyArray<Settings['bookmarksBar']> = ['always', 'newtab', 'never']
+const WINDOW_TRANSPARENCIES: ReadonlyArray<Settings['windowTransparency']> = [
+  'off',
+  'translucent',
+  'transparent'
+]
+const ENERGY_SAVER_MODES: ReadonlyArray<Settings['energySaver']> = [
+  'off',
+  'low-battery',
+  'on-battery'
+]
+
+/** A synced window as remembered between sessions (blank / private windows are never restored). */
+export interface PersistedWindow {
+  id: string
+  bounds: Rect | null
+  /** The display `bounds` were on (the host's id), so the window goes back to it when it is still there. */
+  displayId?: number | null
+  maximized: boolean
+  activeSpaceId: string
+  /**
+   * The user space the window left for an agent's (`ZenWindow.lastUserSpaceId`), where it goes
+   * back to when the agent's space is empty at the restore; absent in profiles written before it.
+   */
+  lastUserSpaceId?: string | null
+  /** Per-space selected tab. */
+  selection: Record<string, string>
+  compact: boolean
+  /** The name the user gave the window (`ZenWindow.name`); absent in profiles written before it. */
+  name?: string | null
+}
+
+/**
+ * `state.json`. v1: one window; v2: every synced window; v3: the bookmark tree; v4: the new tab
+ * page's shortcuts and its "Most visited" block list; v5: the new tab page's one model; v6: the
+ * rail's Expand on hover on by default (a stored value is a choice from v6 on).
+ */
+export interface Persisted {
+  version: 1 | 2 | 3 | 4 | 5 | 6
+  spaces: Space[]
+  tabs: Tab[]
+  essentialTabIds: string[]
+  activeSpaceId: string
+  containers: Container[]
+  folders: Folder[]
+  splitGroups: SplitGroup[]
+  settings: Settings
+  shortcutOverrides: Record<string, KeyBinding | null>
+  /** v1–v2: a flat list (newest first); v3: the tree, see `bookmarkTree`. */
+  bookmarks?: Bookmark[]
+  /** v3: the bookmark tree as a flat node list with its own schema version. */
+  bookmarkTree?: BookmarkTreeData
+  /** v1: the single window's bounds. */
+  windowBounds?: Rect | null
+  maximized?: boolean
+  /** v2: every synced window. */
+  windows?: PersistedWindow[]
+  /** v3: recently closed tabs and windows (newest first, 25 deep). */
+  recentlyClosed?: ClosedEntry[]
+  /**
+   * The Inactive tabs archive (TAB-20): the tabs the archive pass took out of the grid, newest
+   * first, each as a closed-tab entry with its `archivedAt`. Additive: a profile without it has
+   * none. Never with a stack's `hostState` (`navigation/`, as the recently closed entries).
+   */
+  archivedTabs?: ArchivedTabEntry[]
+  /**
+   * v3: the back/forward stack of every open tab, by tab id, so a restored tab has its history
+   * and (through each entry's page state) its scroll position back. Refreshed on every commit
+   * of a navigation and once more, for the page on screen, at a graceful shutdown. Never with a
+   * stack's `hostState`: that blob lives in `navigation/<tabId>.json` (`NavigationStateStore`).
+   */
+  navigation?: Record<string, NavigationSnapshot>
+  /**
+   * The clean-exit marker: false from the first write of a run, true only in the write a
+   * graceful shutdown makes. A profile that starts with it false was left by a crash, a kill or
+   * a power cut; the chrome then offers the pages instead of loading them (`crashRestore`).
+   */
+  cleanExit?: boolean
+  /** v4 only: the desktop's "My shortcuts" of the new tab page (local to this device). */
+  newTabShortcuts?: NewTabShortcut[]
+  /** v4 only: hosts removed from the new tab page's "Most visited" grid (local to this device). */
+  newTabHiddenHosts?: string[]
+  /**
+   * v5: the new tab page's device-local sets in one document – the user's shortcuts (the phone's
+   * pins of v4's `settings.newTabPhone` among them) and the removed hosts. Never synced.
+   */
+  newTabDevice?: NewTabDeviceState
+  /**
+   * Private browsing's device-local choices (the shape of `newTabDevice`): the phone's "Lock
+   * private tabs when you leave Ione". Never synced; missing before the switch existed.
+   */
+  privateDevice?: PrivateDeviceState
+  /**
+   * The password manager's device-local state (the same shape): the last Password Checkup's
+   * counts and time, which Safety Check reads while the vault is locked. Never synced; missing
+   * before the summary existed.
+   */
+  passwordsDevice?: PasswordsDeviceState
+  /**
+   * The update dot's device-local record (the same shape): the waiting update's version the app
+   * menu was last opened for, which clears the menu button's dot on every layout (TB-12; the
+   * desktop's since W8-F3). Never synced; missing before the dot had a cadence.
+   */
+  updateDot?: UpdateDotRecord
+  /**
+   * Where the pages' utility windows last stood, by page id (the task manager's, `WindowChrome`
+   * `page`): normal bounds and display. Never synced – a window's place is this screen's; missing
+   * before the task manager had a window.
+   */
+  pageWindowsDevice?: PageWindowsDeviceState
+  /**
+   * The reading list (W6-1): every page saved for later, one entry per URL, at most
+   * `READING_LIST_CAP` of them READ (`trimReadingList`: the oldest by `readAt` go past the cap;
+   * an unread entry is never trimmed – the unread half is unbounded, as Chrome's list is). The
+   * profile's, independent of the session (a restart keeps it, a window closing leaves it
+   * alone); additive – a profile without it has none. Synced one `reading-list-entry` record per
+   * entry, every field but `favicon` (`sync/records.ts`).
+   */
+  readingList?: ReadingListEntry[]
+}
+
+/**
+ * v5 folds the phone's `settings.newTabPhone` into `settings.newTab` and moves its pins and
+ * removed hosts, with the desktop's two v4 lists, into `newTabDevice` (`shared/newTab.ts`).
+ * v6 turns the rail's Expand on hover on by default: the settings are written whole, so a
+ * profile from before v6 holds the old default (`false`) whether or not the user ever saw the
+ * row, and `applyPersisted` reads that write-back as no choice; from v6 on a stored value is one.
+ */
+export const PERSISTED_VERSION = 6
+
+export type StateListener = () => void
+
+/** Feature state owned by other services but shown in the UI. */
+export interface StateExtras {
+  boosts: Boost[]
+  zappingTabId: string | null
+  liveFolders: Record<string, LiveFolderConfig>
+  extensions: ExtensionInfo[]
+  /** Extensions UI (W1-D): reconcile with the store PR on rebase. */
+  extensionUpdates: ExtensionUpdateCheck
+  sidePanel: SidePanelInfo | null
+  mods: Mod[]
+  webApps: InstalledWebApp[]
+  sync: SyncStatus
+  agents: AgentInfo[]
+  awayAgents: AwayAgentInfo[]
+  agentServer: AgentServerStatus
+  agentSkills: AgentSkillStatus
+  updates: UpdateStatus
+  passwords: PasswordsStatus
+  defaultBrowser: DefaultBrowserStatus
+  network: NetworkStatus
+  blockedPopups: Record<string, BlockedPopup[]>
+  permissionRules: PermissionRule[]
+  revokedUnusedPermissions: RevokedSitePermissions[]
+  permissionDefaults: Record<string, ContentDefault>
+  lastSafetyCheck: SafetyCheckResult | null
+  permissionPrompts: PermissionPrompt[]
+  securityPrompts: SecurityPrompt[]
+  deviceChoosers: DeviceChooser[]
+  devicePairings: DevicePairingPrompt[]
+  deviceGrants: DeviceGrant[]
+  pageDialogs: PageDialog[]
+  /** Tabs whose `requestClose` is in flight, their pages asked "Leave site?" (`TabManager.closingTabIds`). */
+  closingTabIds: string[]
+  screenCaptureRequests: ScreenCaptureRequest[]
+  shareRequests: ShareRequest[]
+  /** The share waiting on this window's chooser (MW-63), null while none does. */
+  shareChooser: ShareChooser | null
+  crashRestore: CrashRestoreOffer | null
+  autofill: AutofillUIState
+  blocking: BlockingStatus
+  privacy: PrivacyStatus
+  siteData: SiteDataStatus
+  translate: TranslateUIState
+  spellcheck: SpellcheckStatus
+  readAloud: ReadAloudState | null
+  selectionMenu: SelectionMenuState | null
+  import: ImportProgress | null
+}
+
+/** Translation state of a host without an engine (and before the service exists). */
+export function emptyTranslateState(): TranslateUIState {
+  return {
+    available: false,
+    preferences: {
+      preferred: ['en'],
+      alwaysTranslate: [],
+      neverTranslate: [],
+      neverTranslateSites: [],
+      autoOffer: true
+    },
+    languages: [],
+    installed: [],
+    downloading: [],
+    registryDate: '',
+    modelLicense: '',
+    tabs: {}
+  }
+}
+
+/**
+ * Single source of truth for everything the UI shows. Mutate freely, then call `commit()`;
+ * broadcasts to renderers and disk writes are coalesced. Shared between all windows – anything
+ * that differs per window lives on the `ZenWindow` and is overlaid in `snapshot(win)`.
+ */
+export class BrowserState {
+  model: Model
+  settings: Settings = structuredClone(DEFAULT_SETTINGS)
+  shortcutOverrides: Record<string, KeyBinding | null> = {}
+  /**
+   * The bookmark tree as a flat node list in display order (roots first, then each subtree
+   * depth first). Always a valid tree: `ensureValid` runs it through `normalizeBookmarkNodes`.
+   */
+  bookmarks: BookmarkNode[] = createBookmarkRoots(0)
+  /**
+   * The downloads a window may show and their aggregate progress; provided by the Browser once the
+   * download service exists (private windows see more than the rest).
+   */
+  downloadsFor: (win: ZenWindow) => {
+    downloads: DownloadItem[]
+    downloadsProgress: DownloadsProgress
+  } = () => ({
+    downloads: [],
+    downloadsProgress: { received: 0, total: 0, indeterminate: false, active: 0 }
+  })
+  /** Newest first; the `SessionService` owns the list, this is where it persists. */
+  recentlyClosed: ClosedEntry[] = []
+  /** The Inactive tabs archive, newest first; the `InactiveTabsService` owns it, this is where it persists. */
+  archivedTabs: ArchivedTabEntry[] = []
+  /**
+   * What loading the profile changed under the user (a migration that moved settings): shown as
+   * toasts once a window is ready, then forgotten. Never persisted.
+   */
+  readonly migrationNotices: string[] = []
+  /** Back/forward stacks of the open tabs, by tab id (`TabManager` keeps them current). */
+  readonly tabNavigation = new Map<string, NavigationSnapshot>()
+  /** The stacks' host-state blobs, one document per tab, kept out of `state.json`. */
+  readonly navigationState: NavigationStateStore
+  /** The new tab page's custom background image; provided by the Browser (the host owns the file). */
+  newTabBackgroundFor: () => UIState['newTabBackground'] = () => ({
+    image: false,
+    canPick: false,
+    accent: null
+  })
+  /**
+   * The new tab page's device-local sets: the user's shortcuts in grid order and the hosts
+   * removed from the most-visited tiles. Replaced whole by the `NewTabService` (never mutated in
+   * place), persisted with the profile, never synced.
+   */
+  newTabDevice: NewTabDeviceState = emptyNewTabDevice()
+  /**
+   * Private browsing's device-local choices, the same shape: the phone's "Lock private tabs when
+   * you leave Ione" switch (INC-05 / SET-17). Replaced whole, persisted with the profile,
+   * never synced – Chrome's "Lock Incognito tabs" is per device too, as it names this device's
+   * screen lock. The lock itself is the phone host's, in memory; the core keeps only the switch.
+   */
+  privateDevice: PrivateDeviceState = emptyPrivateDevice()
+  /**
+   * The update dot's device-local record, the same shape (`updateDot.ts`): the waiting update's
+   * version the app menu was last opened for on this device (TB-12 – Chrome Android's ⋮ badge
+   * clears on the menu's first open and returns on a state change). Written by
+   * `Menus.showAppMenu` on every host (`markUpdateMenuOpened`), read by the phone bar's ⋮, the
+   * tablet toolbar's menu button and the desktop's ⋯ (`updateDotShows`; W8-F3). Replaced whole,
+   * persisted with the profile, never synced – what this device's menu has shown is this
+   * device's.
+   */
+  updateDot: UpdateDotRecord = emptyUpdateDotRecord()
+  /**
+   * The password manager's device-local state, the same shape: the last Password Checkup's
+   * counts and time (`PasswordsStatus.checkupSummary`, Safety Check's Passwords row), kept
+   * outside the vault so a locked vault still tells what the last run found. Replaced whole by
+   * the `PasswordService`, persisted with the profile, never synced (the counts are this
+   * device's view of the vault; another device runs its own checkup).
+   */
+  passwordsDevice: PasswordsDeviceState = emptyPasswordsDevice()
+  /**
+   * Where each page's utility window last stood (the task manager's, `Browser.openPageWindow`):
+   * its normal bounds and display, so it comes back where it was left, as Chrome's task manager
+   * does. Written by the window's bounds report, persisted with the profile, never synced.
+   */
+  pageWindowsDevice: PageWindowsDeviceState = emptyPageWindows()
+  /**
+   * The reading list (W6-1), one entry per URL in no particular order (`sortReadingList` puts
+   * the unread first for the chrome). Written by the `ReadingListService` alone (the other
+   * devices' entries through its `applySynced` / `removeSynced`), replaced whole and committed;
+   * persisted with the profile and synced as `reading-list-entry` records under the
+   * `readingList` scope.
+   */
+  readingList: ReadingListEntry[] = emptyReadingList()
+  media: MediaState[] = []
+  devtoolsOpenFor = new Set<string>()
+  resources: ResourceSnapshot = emptyResourceSnapshot()
+  /** Device facts from the host (Android reports them at boot and on configuration changes). */
+  pageEnvironment: PageEnvironment = { ...DEFAULT_PAGE_ENVIRONMENT }
+  /**
+   * The host engine's reading of the colour scheme (null: the renderer reads its media query).
+   * The engine follows the source the setting gave it (CT-23), so this is the OS's answer
+   * exactly when `settings.colorScheme` is `system` – the one case the chrome reads it for.
+   */
+  systemDark: boolean | null = null
+  /**
+   * The OS accent colour as the host reads it, `#rrggbb` (`ThemeHost.systemAccent`); null where
+   * the host reads none. Volatile: the chrome's accent follows it under `useSystemAccent`.
+   */
+  systemAccent: string | null = null
+  windowBounds: Rect | null = null
+  /** Windows to restore on startup (from the previous session). */
+  restoredWindows: PersistedWindow[] = []
+  /** Live windows, registered by the Browser so persistence can capture them. */
+  liveWindows: () => ZenWindow[] = () => []
+  /** Provided by the Browser once its feature services exist. */
+  extras: (win: ZenWindow) => StateExtras = () => ({
+    boosts: [],
+    zappingTabId: null,
+    liveFolders: {},
+    extensions: [],
+    extensionUpdates: { lastCheckedAt: null, checking: false },
+    sidePanel: null,
+    mods: [],
+    webApps: [],
+    sync: {
+      enabled: false,
+      folder: null,
+      folderName: null,
+      folderLost: false,
+      deviceId: '',
+      deviceName: '',
+      scope: defaultScope(),
+      lastSyncAt: null,
+      lastError: null,
+      lastErrorKind: null,
+      syncing: false,
+      devices: [],
+      pendingMerge: false,
+      remoteTabsVersion: 0,
+      transport: 'folder',
+      webdav: null,
+      webdavAvailable: false,
+      authRefused: false,
+      accountAvailable: false,
+      account: null,
+      accountLink: null,
+      accountLinkFailure: null,
+      accountSignedOut: false
+    },
+    agents: [],
+    awayAgents: [],
+    agentServer: emptyAgentServerStatus(),
+    agentSkills: emptyAgentSkillStatus(this.version),
+    updates: emptyUpdateStatus(this.version, {
+      os: updateOsOf(this.platform),
+      arch: 'universal',
+      kind: 'dev'
+    }),
+    passwords: emptyPasswordsStatus(),
+    defaultBrowser: { isDefault: null, prompt: null },
+    network: { online: true },
+    blockedPopups: {},
+    permissionRules: [],
+    revokedUnusedPermissions: [],
+    permissionDefaults: {},
+    lastSafetyCheck: null,
+    permissionPrompts: [],
+    securityPrompts: [],
+    deviceChoosers: [],
+    devicePairings: [],
+    deviceGrants: [],
+    pageDialogs: [],
+    closingTabIds: [],
+    screenCaptureRequests: [],
+    shareRequests: [],
+    shareChooser: null,
+    crashRestore: null,
+    autofill: emptyAutofillUIState(),
+    blocking: emptyBlockingStatus(),
+    privacy: emptyPrivacyStatus(),
+    siteData: emptySiteDataStatus(),
+    translate: emptyTranslateState(),
+    spellcheck: UNAVAILABLE_SPELLCHECK,
+    readAloud: null,
+    selectionMenu: null,
+    import: null
+  })
+  /**
+   * The shipped engines plus the installed extensions' (`chrome_settings_overrides`) plus the
+   * user's (`settings.searchEngines`: added by hand or discovered through OpenSearch, synced with
+   * the settings), rebuilt when either list changes.
+   */
+  get searchEngines(): SearchEngine[] {
+    const user = this.settings.searchEngines
+    const extension = this.extensionSearch.engines
+    if (
+      !this.enginesCache ||
+      this.enginesCache.user !== user ||
+      this.enginesCache.extension !== extension
+    ) {
+      this.enginesCache = { user, extension, list: allSearchEngines(user, extension) }
+    }
+    return this.enginesCache.list
+  }
+  private enginesCache: {
+    user: SearchEngine[] | undefined
+    extension: SearchEngine[]
+    list: SearchEngine[]
+  } | null = null
+
+  /**
+   * What the installed extensions declare (`chrome_settings_overrides.search_provider`): their
+   * engines, and the one holding the default if any. Set by the extension host on load and
+   * unload; never persisted here, the extension is the record.
+   */
+  private extensionSearch: { engines: SearchEngine[]; control: SearchEngineControl | null } = {
+    engines: [],
+    control: null
+  }
+
+  setExtensionSearch(engines: SearchEngine[], control: SearchEngineControl | null): void {
+    this.extensionSearch = { engines, control }
+    this.commit()
+  }
+
+  get searchEngineControl(): SearchEngineControl | null {
+    return this.extensionSearch.control
+  }
+
+  /**
+   * The settings the installed extensions hold (`UIState.extensionControls`, the Settings page's
+   * "Controlled by <extension>" rows): set by the extension host from the layers its APIs keep
+   * over the settings, whole, as the layers change; never persisted here, the extensions' own
+   * values are the record.
+   */
+  private extensionControlMap: Record<string, ExtensionControl> = {}
+  private readonly extensionControlListeners = new Set<StateListener>()
+  /**
+   * The run's first publish of the privacy layer is still to land while an enabled extension
+   * has persisted `chrome.privacy` values (`ExtensionLayer.pending`): set by the platform at the
+   * extension host's load, cleared by the first publish that carries one of the privacy keys or
+   * by the load's settling, whichever comes first. The readers answer the strict pole meanwhile.
+   */
+  private layerPending = false
+  private layer: ExtensionLayer = { controls: this.extensionControlMap, pending: false }
+
+  setExtensionControls(controls: Record<string, ExtensionControl>): void {
+    this.extensionControlMap = controls
+    const landed =
+      this.layerPending &&
+      Object.values(EXTENSION_SETTING_KEYS).some((key) => controls[key] !== undefined)
+    if (landed) this.layerPending = false
+    this.layer = { controls, pending: this.layerPending }
+    for (const listener of this.extensionControlListeners) listener()
+    this.commit()
+  }
+
+  /**
+   * Mark (or end) the interval before the privacy layer's first publish: while `pending` every
+   * reader of the layer answers its setting's strict pole (`shared/extensionSettings.ts`). No-op
+   * when nothing changes; a change notifies the layer's listeners, so the hosts' flags are
+   * pushed again with the values now in effect.
+   */
+  setExtensionLayerPending(pending: boolean): void {
+    if (pending === this.layerPending) return
+    this.layerPending = pending
+    this.layer = { controls: this.extensionControlMap, pending }
+    for (const listener of this.extensionControlListeners) listener()
+    this.commit()
+  }
+
+  /**
+   * The layer the services read their effective values through (`shared/extensionSettings.ts`):
+   * the extension's value while one holds a setting, the user's own otherwise – Chrome's
+   * `PrefValueStore` order, the extension layer above the user's – and the strict pole while
+   * the run's first publish is pending. One object per change, so a reader may compare it.
+   */
+  get extensionLayer(): ExtensionLayer {
+    return this.layer
+  }
+
+  /** The published map alone (`UIState.extensionControls`, the Settings rows' holders). */
+  get extensionControls(): Readonly<Record<string, ExtensionControl>> {
+    return this.extensionControlMap
+  }
+
+  /**
+   * The layer changed (an extension set, cleared, was disabled or uninstalled; the pending
+   * interval began or ended): re-read what it holds.
+   */
+  onExtensionControlsChange(listener: StateListener): () => void {
+    this.extensionControlListeners.add(listener)
+    return () => this.extensionControlListeners.delete(listener)
+  }
+
+  /**
+   * The homepage a Home control follows: an extension's page while one holds the setting
+   * (`chrome_settings_overrides.homepage`, the `homepage` key of the controls map), else the
+   * user's own – read the way the engine is (`defaultHomepageOf`).
+   */
+  effectiveHomepage(): HomepageSettings {
+    return defaultHomepageOf(this.settings.homepage, this.extensionControls.homepage)
+  }
+
+  /**
+   * The engine a search goes to: the extension-controlled one while an extension holds the
+   * default, else the user's pick, else the first (`defaultSearchEngineOf`).
+   */
+  defaultSearchEngine(): SearchEngine {
+    return defaultSearchEngineOf(
+      this.searchEngines,
+      this.settings.searchEngineId,
+      this.extensionSearch.control
+    )
+  }
+  readonly version: string
+
+  private readonly store: JsonStore<Persisted>
+  private readonly listeners = new Set<StateListener>()
+  private scheduled = false
+  /** A persistent commit is waiting for the scheduled tick. */
+  private dirty = false
+  /** Callbacks waiting for the scheduled broadcast to have gone out. */
+  private afterBroadcastQueue: Array<() => void> = []
+  private shortcutsCache: { preset: ShortcutPreset; table: Shortcut[] } | null = null
+  /** The last set of synced windows written to disk (used once they are all closed). */
+  private lastWindows: PersistedWindow[] = []
+  /** After shutdown nothing may be written any more (windows closing would shrink the list). */
+  private frozen = false
+  /** The run is ending gracefully: what is written from now on carries the clean-exit marker. */
+  private exiting = false
+  /** The previous run did not end with a graceful shutdown (its profile lacks the marker). */
+  uncleanExit = false
+  /**
+   * The OS's languages (BCP 47, the UI locale first), set by the browser before `load()`: a
+   * profile without a languages list of its own starts from them (`defaultLanguages`, CT-41).
+   */
+  systemLocales: readonly string[] = []
+  /**
+   * This load found no languages list in the profile and took the OS's (a profile from before
+   * CT-41): the translate service folds the languages its own document listed into it, once.
+   */
+  languagesDefaulted = false
+  /**
+   * The OS's region (`PlatformInfo.region`; a tester's override in its place), set by the
+   * browser before `load()`: the EEA's search-engine choice screen is gated on it (W6-2).
+   */
+  searchChoiceRegion: string | null = null
+  /**
+   * The choice screen's run-only terms (`core/searchChoice.ts`): the list's order for this
+   * session, whether "Skip for now" put the screen off until the next run, and whether Settings
+   * asked for it again. Volatile – broadcast, never written; the record itself is a setting.
+   */
+  searchChoiceSession: { seed: number; skipped: boolean; askAgain: boolean } = {
+    seed: newSearchChoiceSeed(),
+    skipped: false,
+    askAgain: false
+  }
+
+  constructor(
+    io: StoreIO,
+    readonly platform: Platform,
+    readonly capabilities: HostCapabilities,
+    version: string
+  ) {
+    this.version = version
+    this.store = new JsonStore<Persisted>(io, 'state.json', { backup: true })
+    this.navigationState = new NavigationStateStore(io, (tabId) => this.navigationFor(tabId))
+    this.model = emptyModel(structuredClone(DEFAULT_CONTAINERS))
+  }
+
+  /** Load the profile from disk (or create the first-run defaults). */
+  load(): void {
+    const data = this.store.readSync()
+    if (data && [1, 2, 3, 4, 5, 6].includes(data.version)) {
+      this.applyPersisted(data)
+      // Profiles from before the marker count as clean; only an explicit false is a crash.
+      this.uncleanExit = data.cleanExit === false
+    } else {
+      // A fresh profile's preferred languages are the OS's (CT-41), as `applyPersisted` gives a
+      // profile from before the list; the defaults name English for a host without locales.
+      this.settings.languages = defaultLanguages(this.systemLocales)
+      this.languagesDefaulted = true
+      // A fresh desktop profile takes Chrome's Performance defaults (W8-2; pr-584 §D (2)(3)):
+      // Memory Saver at Balanced, 4 hours; Energy Saver at the 20 % threshold where the host
+      // reads a battery level, on-battery on Windows, where it cannot. Here and not in
+      // `DEFAULT_SETTINGS`: an existing profile keeps what it had – `applyPersisted` reads its
+      // timer as stored (the shipped 20 minutes, "Custom – 20 minutes" on the page) and gives
+      // one from before the mode's key the on-battery its budgets ran on – and the phone reads
+      // `DEFAULT_SETTINGS` unchanged (`freshPerformanceDefaults` is null there).
+      Object.assign(this.settings, freshPerformanceDefaults(this.platform))
+    }
+    this.ensureValid()
+    // The blobs' folder hears which ids the session refers to; the documents of the others go at
+    // the store's first fire (nothing is read here).
+    this.navigationState.load(
+      new Set([
+        ...this.tabNavigation.keys(),
+        ...closedTabIds(this.recentlyClosed),
+        ...closedTabIds(this.archivedTabs)
+      ])
+    )
+  }
+
+  /**
+   * What `navigation/<tabId>.json` is to hold: the open tab's stack (a private tab's never),
+   * else the stack a recently-closed or an Inactive tabs entry keeps for the id, else nothing.
+   */
+  private navigationFor(tabId: string): NavigationSnapshot | null {
+    const tab = this.model.tabs[tabId]
+    if (tab) {
+      if (tab.containerId === PRIVATE_CONTAINER_ID) return null
+      return this.tabNavigation.get(tabId) ?? null
+    }
+    return (
+      closedNavigationOf(this.recentlyClosed, tabId) ?? closedNavigationOf(this.archivedTabs, tabId)
+    )
+  }
+
+  /** The app is shutting down gracefully: the next write marks the profile as cleanly exited. */
+  markExiting(): void {
+    this.exiting = true
+  }
+
+  /**
+   * v3 stores the tree; v1/v2 stored a flat list that becomes the platform's default folder
+   * ("Other bookmarks", "Mobile bookmarks" on Android) in the same order with its dates kept.
+   * Both paths end in `normalizeBookmarkNodes`, so loading the result again changes nothing.
+   */
+  private loadBookmarks(data: Persisted): BookmarkNode[] {
+    const now = Date.now()
+    const fallback = defaultBookmarkFolderId(this.platform)
+    const tree = data.bookmarkTree
+    if (tree && typeof tree === 'object' && Array.isArray(tree.nodes)) {
+      return normalizeBookmarkNodes(tree.nodes, now, fallback)
+    }
+    if (Array.isArray(data.bookmarks)) return migrateLegacyBookmarks(data.bookmarks, fallback, now)
+    return createBookmarkRoots(now)
+  }
+
+  private applyPersisted(data: Persisted): void {
+    // Before v3 the recently closed list was in memory only: it starts empty.
+    this.recentlyClosed = data.version >= 3 ? sanitizeClosedEntries(data.recentlyClosed) : []
+    this.archivedTabs = sanitizeArchivedEntries(data.archivedTabs)
+    this.tabNavigation.clear()
+    if (data.navigation && typeof data.navigation === 'object') {
+      for (const [tabId, raw] of Object.entries(data.navigation)) {
+        const snapshot = sanitizeSnapshot(raw)
+        if (snapshot) this.tabNavigation.set(tabId, snapshot)
+      }
+    }
+    // The phone's frozen key of 0.3.x profiles (`settings.newTabPhone`) is folded into `newTab`
+    // below and kept nowhere else: it must not ride along into the settings (or a sync record).
+    // The 0.4.x "Restore previous session" switch (`restoreSession`) is folded into `startup` the
+    // same way (`migrateStartupSettings`: on → continue, off → the New Tab page).
+    const { newTabPhone, restoreSession, ...persistedSettings } = (data.settings ??
+      {}) as Settings & {
+      newTabPhone?: unknown
+      restoreSession?: unknown
+    }
+    this.settings = { ...structuredClone(DEFAULT_SETTINGS), ...persistedSettings }
+    this.settings.startup = migrateStartupSettings({
+      startup: data.settings?.startup,
+      restoreSession
+    })
+    this.settings.compactMode = { ...DEFAULT_SETTINGS.compactMode, ...data.settings?.compactMode }
+    // Compact mode's "persistent sidebar" toggle is transient by design.
+    this.settings.compactMode.sidebarPersistent = false
+    this.settings.appIcon = sanitizeAppIcon(data.settings?.appIcon)
+    this.settings.resources = sanitizeResourceSettings(data.settings?.resources)
+    this.settings.agents = sanitizeAgentSettings(data.settings?.agents)
+    this.settings.updates = sanitizeUpdateSettings(data.settings?.updates)
+    this.settings.phoneBar = sanitizePhoneBar(data.settings?.phoneBar)
+    // The phone menu's order: a list as persisted, the empty list (a Reset) included; absent
+    // when the profile holds none or something that is no list (`shared/menuOrder.ts`).
+    const menuOrder = sanitizeMenuOrder(data.settings?.menuOrder)
+    if (menuOrder !== undefined) this.settings.menuOrder = menuOrder
+    else delete this.settings.menuOrder
+    this.settings.homepage = sanitizeHomepage(data.settings?.homepage)
+    this.settings.passwords = sanitizePasswordSettings(data.settings?.passwords)
+    this.settings.autofill = sanitizeAutofillSettings(data.settings?.autofill)
+    this.settings.defaultBrowserPromo = sanitizePromoState(data.settings?.defaultBrowserPromo)
+    // The phone's hint bubbles' records (TB-19): a profile from before them reads the defaults.
+    this.settings.iph = sanitizeIphState(data.settings?.iph)
+    this.settings.blocking = sanitizeBlockingSettings(data.settings?.blocking)
+    this.settings.pageControls = sanitizePageControls(data.settings?.pageControls)
+    // Off only when the profile says so: an older profile, or anything but a boolean, reads on.
+    this.settings.splitEdgeZones = data.settings?.splitEdgeZones !== false
+    // Accessibility's "Swipe between pages using a touchpad" (Android; Chrome's
+    // `settings.a11y.touchpad_overscroll_history_navigation`): the same read – on until the
+    // profile says off, and anything but a boolean reads on.
+    this.settings.touchpadSwipeToNavigate = data.settings?.touchpadSwipeToNavigate !== false
+    // The rail's Expand on hover (tabs-03; W5-17): on by default since v6. A profile from before
+    // v6 was written whole by a build whose default was off, so its `false` is that default's
+    // write-back and not a choice – it reads on (a stored `true` was a choice and reads on too).
+    // From v6 on the stored value is the user's, off only where the profile says so.
+    this.settings.sidebarExpandOnHover =
+      data.version >= 6 ? data.settings?.sidebarExpandOnHover !== false : true
+    // On only when the profile says so (settings-116): an older profile, or anything but a
+    // boolean, reads off – Chrome's default.
+    this.settings.useSystemAccent = data.settings?.useSystemAccent === true
+    if (!BOOKMARKS_BAR_MODES.includes(this.settings.bookmarksBar)) {
+      this.settings.bookmarksBar = DEFAULT_SETTINGS.bookmarksBar
+    }
+    // Energy Saver's mode (W8-2): a profile from before the key reads the default; a value that
+    // is none of the three (a hand-edited profile) reads it too, as the bookmarks bar's does.
+    // The hover card's memory line (settings-29, W8-10): on only when the profile says so. Chrome
+    // 152's effective default is off – the local-state pref registers true (`RegisterBrowserPrefs`,
+    // `browser_ui_prefs.cc`) and `MigrateHoverCardMemoryPref` (`tab_strip_prefs.cc`, M131+) flips
+    // it to false once under Tab Declutter, on every desktop platform. A fresh setting flips with
+    // no migration: an older profile, or anything but a boolean, reads off.
+    this.settings.hoverCardMemoryUsage = data.settings?.hoverCardMemoryUsage === true
+    if (!ENERGY_SAVER_MODES.includes(this.settings.energySaver)) {
+      this.settings.energySaver = DEFAULT_SETTINGS.energySaver
+    }
+    // The phone's bookmark rows (HB-13): a profile from before the keys, or a value that is
+    // none of Chrome's, reads the defaults – manual order, and the compact row (Chrome's default
+    // is Visual; Compact is the lead's stated deviation, `shared/bookmarkRows.ts`).
+    this.settings.bookmarkRowSortOrder = sanitizeBookmarkRowSortOrder(
+      data.settings?.bookmarkRowSortOrder
+    )
+    this.settings.bookmarkRowDisplay = sanitizeBookmarkRowDisplay(data.settings?.bookmarkRowDisplay)
+    this.settings.toolbarLayout = sanitizeToolbarLayout(
+      data.settings?.toolbarLayout,
+      DEFAULT_SETTINGS.toolbarLayout
+    )
+    // Window transparency (Appearance): a profile from before the row, or a value that is none
+    // of the three (a hand-edited profile), reads off – the opaque frame every build had.
+    const transparency: unknown = data.settings?.windowTransparency
+    this.settings.windowTransparency =
+      typeof transparency === 'string' &&
+      (WINDOW_TRANSPARENCIES as readonly string[]).includes(transparency)
+        ? (transparency as Settings['windowTransparency'])
+        : DEFAULT_SETTINGS.windowTransparency
+    // Native frame on/off: a profile from before the key, or anything but a boolean, reads off.
+    this.settings.nativeWindowControls = data.settings?.nativeWindowControls === true
+    this.settings.toolbarPins = sanitizeToolbarPins(data.settings?.toolbarPins)
+    this.settings.devtoolsDock = sanitizeDevtoolsDock(
+      data.settings?.devtoolsDock,
+      DEFAULT_SETTINGS.devtoolsDock
+    )
+    this.settings.mutedHosts = Array.isArray(this.settings.mutedHosts)
+      ? this.settings.mutedHosts.filter((h): h is string => typeof h === 'string' && h !== '')
+      : []
+    // The user's engines (Settings > Search, OpenSearch discovery); the default among them is
+    // never dropped by the caps. `repair()` below falls the default back if its engine is gone.
+    this.settings.searchEngines = sanitizeSearchEngines(
+      data.settings?.searchEngines,
+      typeof data.settings?.searchEngineId === 'string' ? data.settings.searchEngineId : undefined
+    )
+    // The choice screen's record (W6-2): a profile from before it, or one that skipped, reads
+    // null – the screen is owed again in the EEA.
+    this.settings.searchChoice = sanitizeSearchChoice(data.settings?.searchChoice)
+    this.settings.privacy = sanitizePrivacySettings(data.settings?.privacy)
+    // Preload pages (PS-43): `standard` for a profile from before it (the fold of the desktop's
+    // "Block prerendering" is a read of nothing – see `sanitizePreloadPages`).
+    this.settings.preloadPages = sanitizePreloadPages(data.settings?.preloadPages)
+    // Off only when the profile says so (PS-41): an older profile, or anything but a boolean,
+    // reads on – Chrome's default.
+    this.settings.autoRevokeUnusedPermissions = data.settings?.autoRevokeUnusedPermissions !== false
+    // The Delete browsing data dialog's remembered range (seed #20): the last hour for a profile
+    // from before the key, or one holding a range no picker offers.
+    this.settings.clearBrowsingDataRange = sanitizeClearBrowsingDataRange(
+      data.settings?.clearBrowsingDataRange
+    )
+    this.settings.spellcheck = sanitizeSpellcheck(data.settings?.spellcheck)
+    this.settings.reader = sanitizeReaderPreferences(data.settings?.reader)
+    this.settings.readAloud = sanitizeReadAloudSettings(data.settings?.readAloud)
+    this.settings.fonts = sanitizeFontSettings(data.settings?.fonts)
+    // Roll's best (ERR-03): a whole number in the meter's range, 0 for a profile from before it.
+    this.settings.gameBestScore = sanitizeGameBestScore(data.settings?.gameBestScore)
+    this.settings.proxy = sanitizeAppProxySettings(data.settings?.proxy)
+    // A profile from before the list existed starts from the OS's languages, as a fresh Chrome
+    // profile's `intl.accept_languages` does; one that has a list keeps it (never empty).
+    const storedLanguages = sanitizeLanguages(data.settings?.languages)
+    this.languagesDefaulted = storedLanguages.length === 0
+    this.settings.languages =
+      storedLanguages.length > 0 ? storedLanguages : defaultLanguages(this.systemLocales)
+    // The new tab page's one model (v5). The migration reads the desktop's first shape and the
+    // phone's key, and runs before the sanitiser, which knows nothing of the earlier fields; it
+    // reads its own result unchanged, so a migrated profile loads as it was written.
+    this.settings.newTab = sanitizeNewTabSettings(
+      migrateNewTabSettings({ newTab: data.settings?.newTab, newTabPhone })
+    )
+    this.shortcutOverrides = data.shortcutOverrides ?? {}
+    const preset = migrateShortcutPreset(data.settings?.shortcutPreset, this.shortcutOverrides)
+    this.settings.shortcutPreset = preset.preset
+    // Shortcuts matter where there is a keyboard; a phone is not told about them.
+    if (preset.notice && this.platform !== 'android') this.migrationNotices.push(preset.notice)
+    this.bookmarks = this.loadBookmarks(data)
+    // v5's one document, or v4's two lists and the phone key's pins and removed hosts (before v4
+    // the page did not exist: every source is missing and the sets start empty).
+    this.newTabDevice = migrateNewTabDevice({
+      newTabDevice: data.newTabDevice,
+      newTabShortcuts: data.newTabShortcuts,
+      newTabHiddenHosts: data.newTabHiddenHosts,
+      newTabPhone
+    })
+    this.privateDevice = sanitizePrivateDevice(data.privateDevice)
+    this.updateDot = sanitizeUpdateDotRecord(data.updateDot)
+    this.passwordsDevice = sanitizePasswordsDevice(data.passwordsDevice)
+    this.pageWindowsDevice = sanitizePageWindows(data.pageWindowsDevice)
+    this.readingList = sanitizeReadingList(data.readingList)
+    if (Array.isArray(data.windows) && data.windows.length) {
+      this.restoredWindows = data.windows.filter((w) => w && typeof w.id === 'string')
+    } else {
+      // v1 profile: one window.
+      this.restoredWindows = [
+        {
+          id: 'window_main',
+          bounds: data.windowBounds ?? null,
+          maximized: Boolean(data.maximized),
+          activeSpaceId: data.activeSpaceId,
+          selection: {},
+          compact: Boolean(data.settings?.compactMode?.enabled)
+        }
+      ]
+    }
+    const containers =
+      Array.isArray(data.containers) && data.containers.length
+        ? data.containers
+        : structuredClone(DEFAULT_CONTAINERS)
+    if (!containers.some((c) => c.id === DEFAULT_CONTAINER_ID))
+      containers.unshift(DEFAULT_CONTAINERS[0])
+    const tabs: Record<string, Tab> = {}
+    for (const raw of Array.isArray(data.tabs) ? data.tabs : []) {
+      if (!raw || typeof raw.id !== 'string') continue
+      const tab = createTabRecord({
+        ...raw,
+        spaceId: raw.spaceId ?? null,
+        containerId: containers.some((c) => c.id === raw.containerId)
+          ? raw.containerId
+          : DEFAULT_CONTAINER_ID,
+        // Everything starts unloaded; the active tab is loaded by the TabManager on startup.
+        // A chrome page (Settings) holds no page to unload: it never reads as pending.
+        discarded: !isChromePageUrl(typeof raw.url === 'string' ? raw.url : ''),
+        // Opener relationships are a session's own (Chrome forgets them too).
+        openerTabId: null
+      })
+      tab.splitGroupId = raw.splitGroupId ?? null
+      tab.loading = false
+      tab.waiting = false
+      tab.progress = 0
+      tab.audible = false
+      // Live capture is a session's own: a restored page holds no camera until it asks again.
+      tab.alert = null
+      tab.capture = null
+      tab.errorCode = null
+      // A chrome page tab restored inside a section has the landing beneath it (PageService).
+      if (isChromePageUrl(tab.url)) tab.canGoBack = parseInternalPageUrl(tab.url)?.section != null
+      tab.proxyId = sanitizeTabProxyId(raw.proxyId, this.settings.proxy)
+      tabs[tab.id] = tab
+    }
+    this.model = {
+      tabs,
+      essentialTabIds: Array.isArray(data.essentialTabIds) ? data.essentialTabIds : [],
+      spaces: Array.isArray(data.spaces) ? data.spaces : [],
+      activeSpaceId: data.activeSpaceId,
+      containers,
+      folders: Object.fromEntries(
+        (Array.isArray(data.folders) ? data.folders : []).map((f) => [f.id, f])
+      ),
+      splitGroups: Object.fromEntries(
+        (Array.isArray(data.splitGroups) ? data.splitGroups : []).map((g) => [g.id, g])
+      ),
+      localSpaces: {}
+    }
+  }
+
+  /** Re-run the consistency checks after bulk changes (sync). */
+  repair(): void {
+    this.ensureValid()
+  }
+
+  /**
+   * "Restore previous session" is off: the open tabs of the last session are forgotten (pinned
+   * tabs and Essentials are part of the sidebar's structure and stay) and one window comes back
+   * with a fresh tab instead of its selection.
+   */
+  forgetSession(): void {
+    const m = this.model
+    for (const space of m.spaces) {
+      for (const id of space.tabIds) {
+        const tab = m.tabs[id]
+        if (tab && !tab.pinned && !tab.essential) delete m.tabs[id]
+      }
+      space.tabIds = space.tabIds.filter((id) => m.tabs[id])
+      space.activeTabId = null
+    }
+    this.restoredWindows = this.restoredWindows.slice(0, 1).map((w) => ({ ...w, selection: {} }))
+    this.ensureValid()
+  }
+
+  /** Repair any inconsistencies so the UI never sees dangling references. */
+  private ensureValid(): void {
+    const m = this.model
+    if (m.spaces.length === 0) {
+      const space = createSpace('Default', '')
+      m.spaces.push(space)
+    }
+    // Local (blank / private window) spaces never survive a restart.
+    m.spaces = m.spaces.filter((s) => !s.windowId)
+    m.localSpaces = {}
+    for (const space of m.spaces) {
+      space.tabIds = (space.tabIds ?? []).filter((id) => m.tabs[id] && !m.tabs[id].essential)
+      // Keep pinned tabs first.
+      const pinned = space.tabIds.filter((id) => m.tabs[id].pinned)
+      const regular = space.tabIds.filter((id) => !m.tabs[id].pinned)
+      space.tabIds = [...pinned, ...regular]
+      for (const id of space.tabIds) m.tabs[id].spaceId = space.id
+      if (!m.containers.some((c) => c.id === space.containerId))
+        space.containerId = DEFAULT_CONTAINER_ID
+      space.pinnedCollapsed = Boolean(space.pinnedCollapsed)
+      space.icon = space.icon ?? ''
+      space.theme = space.theme ?? null
+    }
+    m.essentialTabIds = m.essentialTabIds.filter((id) => m.tabs[id]?.essential)
+    for (const id of m.essentialTabIds) m.tabs[id].spaceId = null
+    // Drop tabs that are not referenced anywhere.
+    const referenced = new Set<string>([...m.essentialTabIds, ...m.spaces.flatMap((s) => s.tabIds)])
+    for (const id of Object.keys(m.tabs)) {
+      if (!referenced.has(id)) delete m.tabs[id]
+    }
+    // Window ownership: pinned tabs are always shared; with window sync on, so is everything
+    // else. Tabs of windows that are gone are re-homed to the first restored window.
+    const windowIds = new Set(this.restoredWindows.map((w) => w.id))
+    const firstWindow = this.restoredWindows[0]?.id ?? null
+    for (const tab of Object.values(m.tabs)) {
+      if (tab.pinned || tab.essential || this.settings.windowSync !== 'pinned') tab.windowId = null
+      else if (tab.windowId && !windowIds.has(tab.windowId)) tab.windowId = firstWindow
+    }
+    for (const space of m.spaces) {
+      const valid = new Set([...space.tabIds, ...m.essentialTabIds])
+      if (space.activeTabId && !valid.has(space.activeTabId)) space.activeTabId = null
+      if (!space.activeTabId)
+        space.activeTabId = space.tabIds.find((id) => !m.tabs[id].pinned) ?? space.tabIds[0] ?? null
+    }
+    if (!m.spaces.some((s) => s.id === m.activeSpaceId)) m.activeSpaceId = m.spaces[0].id
+    // An empty agents' space never stays the active space across a restore: the model's default
+    // (what a host with one window, or a window with nothing remembered, comes up on) goes back
+    // to the user's space, as each restored window's does below.
+    m.activeSpaceId = userSpaceInstead(
+      m.spaces,
+      m.activeSpaceId,
+      this.restoredWindows.find((w) => w.activeSpaceId === m.activeSpaceId)?.lastUserSpaceId ??
+        this.restoredWindows[0]?.lastUserSpaceId
+    )
+    for (const folder of Object.values(m.folders)) {
+      if (!m.spaces.some((s) => s.id === folder.spaceId)) delete m.folders[folder.id]
+    }
+    for (const tab of Object.values(m.tabs)) {
+      if (tab.folderId && !m.folders[tab.folderId]) tab.folderId = null
+    }
+    for (const group of Object.values(m.splitGroups)) {
+      group.tabIds = group.tabIds.filter((id) => m.tabs[id] && m.tabs[id].spaceId === group.spaceId)
+      if (group.tabIds.length < 2 || !m.spaces.some((s) => s.id === group.spaceId)) {
+        for (const id of group.tabIds) if (m.tabs[id]) m.tabs[id].splitGroupId = null
+        delete m.splitGroups[group.id]
+        continue
+      }
+      if (group.sizes?.length !== group.tabIds.length)
+        group.sizes = group.tabIds.map(() => 1 / group.tabIds.length)
+      // The split's link rule (split-13) reads on only when the record says `true`: a session
+      // from before it existed, a peer's record or anything else reads off, stored as absent.
+      if (group.linksToRight !== true) delete group.linksToRight
+      for (const id of group.tabIds) m.tabs[id].splitGroupId = group.id
+    }
+    for (const tab of Object.values(m.tabs)) {
+      if (tab.splitGroupId && !m.splitGroups[tab.splitGroupId]) tab.splitGroupId = null
+    }
+    // The tree is repaired as a whole (sync applies nodes one by one and repairs once here).
+    this.bookmarks = normalizeBookmarkNodes(
+      this.bookmarks,
+      Date.now(),
+      defaultBookmarkFolderId(this.platform)
+    )
+    const bookmarkTree = new BookmarkTree(this.bookmarks)
+    for (const tab of Object.values(m.tabs)) tab.bookmarked = bookmarkTree.hasUrl(tab.url)
+    if (!isPickableSearchEngine(this.searchEngines, this.settings.searchEngineId)) {
+      this.settings.searchEngineId = DEFAULT_SETTINGS.searchEngineId
+    }
+    // The default active (settings-43): a profile a peer's build wrote can carry `active: false`
+    // on the engine it made the default; the flag goes here as it goes in `updateSettings`.
+    if (this.settings.searchEngines)
+      this.settings.searchEngines = withDefaultSearchEngineActive(
+        this.settings.searchEngines,
+        this.settings.searchEngineId
+      )
+    for (const w of this.restoredWindows) {
+      if (!m.spaces.some((s) => s.id === w.activeSpaceId)) w.activeSpaceId = m.activeSpaceId
+      if (
+        w.lastUserSpaceId &&
+        !m.spaces.some((s) => s.id === w.lastUserSpaceId && !agentOwnedSpace(s))
+      )
+        w.lastUserSpaceId = null
+      // The window left on an agent's space that is empty now (a foreground session that closed
+      // its tabs) comes up on the user's space it left, else the first user space (W7-F3). On a
+      // user's space there is nothing to go back to: where the window stands is the last user space.
+      w.activeSpaceId = userSpaceInstead(m.spaces, w.activeSpaceId, w.lastUserSpaceId)
+      const active = m.spaces.find((s) => s.id === w.activeSpaceId)
+      if (active && !agentOwnedSpace(active)) w.lastUserSpaceId = null
+      w.selection = Object.fromEntries(
+        Object.entries(w.selection ?? {}).filter(([spaceId, tabId]) => {
+          const space = m.spaces.find((s) => s.id === spaceId)
+          return space && (space.tabIds.includes(tabId) || m.essentialTabIds.includes(tabId))
+        })
+      )
+    }
+  }
+
+  /** The active preset (a value another device synced that this build does not know falls back to Chrome). */
+  get shortcutPreset(): ShortcutPreset {
+    const preset = this.settings.shortcutPreset
+    return isShortcutPreset(preset) ? preset : 'chrome'
+  }
+
+  /** The active table: the preset's defaults under the user's overrides; rebuilt when either changes. */
+  get shortcuts(): Shortcut[] {
+    const preset = this.shortcutPreset
+    if (!this.shortcutsCache || this.shortcutsCache.preset !== preset) {
+      this.shortcutsCache = {
+        preset,
+        table: applyShortcutOverrides(
+          defaultShortcuts(this.platform, preset),
+          this.shortcutOverrides
+        )
+      }
+    }
+    return this.shortcutsCache.table
+  }
+
+  setShortcutOverride(id: string, binding: KeyBinding | null): void {
+    this.shortcutOverrides[id] = binding
+    this.shortcutsCache = null
+  }
+
+  resetShortcuts(): void {
+    this.shortcutOverrides = {}
+    this.shortcutsCache = null
+  }
+
+  setShortcutOverrides(overrides: Record<string, KeyBinding | null>): void {
+    this.shortcutOverrides = { ...overrides }
+    this.shortcutsCache = null
+  }
+
+  subscribe(listener: StateListener): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  /** What one window shows: the shared model filtered to that window plus its own UI state. */
+  snapshot(win: ZenWindow): UIState {
+    const m = this.model
+    const windowId = win.id
+    const cm = this.settings.compactMode
+    const settings: Settings = {
+      ...this.settings,
+      compactMode: {
+        ...cm,
+        enabled: win.compactEnabled,
+        sidebarPersistent: win.compactSidebarPersistent
+      }
+    }
+    let spaces: Space[]
+    let tabs: Record<string, Tab>
+    let essentialTabIds: string[]
+    let folders: Record<string, Folder>
+    let splitGroups: Record<string, SplitGroup>
+    if (win.kind === 'synced') {
+      spaces = m.spaces.map((s) => ({
+        ...s,
+        tabIds: s.tabIds.filter((id) => m.tabs[id] && tabVisibleIn(m.tabs[id], windowId)),
+        activeTabId: win.selectedTabIn(s)
+      }))
+      tabs = {}
+      for (const tab of Object.values(m.tabs)) {
+        if (!tabVisibleIn(tab, windowId)) continue
+        if (tab.spaceId && m.localSpaces[tab.spaceId]) continue
+        tabs[tab.id] = tab
+      }
+      essentialTabIds = m.essentialTabIds
+      // A blank or private window's folders and split views stay its own, as its tabs do; a
+      // folder whose space is gone (moved with its tabs into a blank window since closed) is
+      // no window's until the next load drops it, as load drops any folder without a space.
+      folders = {}
+      const persisted = new Set(m.spaces.map((s) => s.id))
+      for (const f of Object.values(m.folders)) if (persisted.has(f.spaceId)) folders[f.id] = f
+      splitGroups = {}
+      for (const g of Object.values(m.splitGroups))
+        if (!m.localSpaces[g.spaceId]) splitGroups[g.id] = g
+    } else {
+      const space = win.localSpace!
+      spaces = [{ ...space, activeTabId: win.selectedTabIn(space) }]
+      tabs = {}
+      for (const id of space.tabIds) if (m.tabs[id]) tabs[id] = m.tabs[id]
+      essentialTabIds = []
+      // The window's own folders: a folder moved into it with its tabs (`moveFolderToNewWindow`)
+      // lives in its space, as the window's split views do.
+      folders = {}
+      for (const f of Object.values(m.folders)) if (f.spaceId === space.id) folders[f.id] = f
+      splitGroups = {}
+      for (const g of Object.values(m.splitGroups))
+        if (g.spaceId === space.id) splitGroups[g.id] = g
+    }
+    return {
+      platform: this.platform,
+      capabilities: this.capabilities,
+      version: this.version,
+      systemDark: this.systemDark,
+      systemAccent: this.systemAccent,
+      tabs,
+      essentialTabIds,
+      spaces,
+      activeSpaceId: win.activeSpaceId,
+      containers: m.containers,
+      folders,
+      splitGroups,
+      settings,
+      shortcuts: this.shortcuts,
+      searchEngines: this.searchEngines,
+      searchEngineControl: this.extensionSearch.control,
+      searchChoice: searchChoiceState({
+        region: this.searchChoiceRegion,
+        record: settings.searchChoice,
+        skipped: this.searchChoiceSession.skipped,
+        askAgain: this.searchChoiceSession.askAgain,
+        seed: this.searchChoiceSession.seed
+      }),
+      extensionControls: this.extensionControls,
+      glance: win.glance,
+      compactSidebarRevealed: win.compactSidebarRevealed,
+      window: win.windowState(),
+      ...this.downloadsFor(win),
+      bookmarks: this.bookmarks,
+      readingList: this.readingListFor(),
+      newTabShortcuts: this.newTabDevice.shortcuts,
+      newTabHiddenHosts: this.newTabDevice.hiddenHosts,
+      newTabHiddenModules: this.newTabDevice.hiddenModules,
+      newTabSafetyHubCard: this.newTabDevice.safetyHubCard,
+      newTabEducationalTips: this.newTabDevice.educationalTips,
+      privateLockOnLeave: this.privateDevice.lockOnLeave,
+      updateDot: this.updateDot,
+      newTabBackground: this.newTabBackgroundFor(),
+      recentlyClosedCount: this.recentlyClosed.length,
+      recentlyClosed: this.recentlyClosed.slice(0, 10).map(summarizeClosed),
+      archivedTabCount: this.archivedTabs.length,
+      media: this.media,
+      findResult: win.findResult,
+      devtoolsOpenFor: [...this.devtoolsOpenFor],
+      foreignTabIds: win.foreignTabIds(),
+      windowCount: this.liveWindows().length,
+      ...this.extras(win),
+      resources: this.resources,
+      pageEnvironment: this.pageEnvironment
+    }
+  }
+
+  private sortedReadingList: ReadingListEntry[] = []
+  private sortedReadingListFor: ReadingListEntry[] | null = null
+
+  /** The list in the chrome's order, sorted once per write (every window's snapshot shares it). */
+  private readingListFor(): ReadingListEntry[] {
+    if (this.sortedReadingListFor !== this.readingList) {
+      this.sortedReadingList = sortReadingList(this.readingList)
+      this.sortedReadingListFor = this.readingList
+    }
+    return this.sortedReadingList
+  }
+
+  /** Broadcast + persist, coalesced to once per tick. */
+  commit(): void {
+    this.dirty = true
+    this.schedule()
+  }
+
+  /**
+   * Run `fn` once the broadcast a pending commit scheduled has gone out, or right away when
+   * nothing is pending. Events that name a freshly created record go through here so the window
+   * holds the record before it hears about it (the broadcast is deferred, a plain `emit` is not).
+   */
+  afterBroadcast(fn: () => void): void {
+    if (this.scheduled) this.afterBroadcastQueue.push(fn)
+    else fn()
+  }
+
+  /**
+   * One deferred broadcast per tick, whichever kind of commit asked first. A volatile commit that
+   * gets in ahead of a persistent one in the same tick must not swallow the disk write.
+   */
+  private schedule(): void {
+    if (this.scheduled) return
+    this.scheduled = true
+    defer(() => {
+      this.scheduled = false
+      const persist = this.dirty
+      this.dirty = false
+      for (const listener of this.listeners) listener()
+      if (persist && !this.frozen) this.store.write(this.toPersisted())
+      const queued = this.afterBroadcastQueue
+      this.afterBroadcastQueue = []
+      for (const fn of queued) fn()
+    })
+  }
+
+  /** Stop persisting (called once the final state has been flushed on quit). */
+  freeze(): void {
+    this.frozen = true
+    this.navigationState.freeze()
+  }
+
+  /** Update only volatile UI state (no disk write). */
+  commitVolatile(): void {
+    this.schedule()
+  }
+
+  private toPersisted(): Persisted {
+    const m = this.model
+    const windows = this.liveWindows().filter((w) => w.kind === 'synced')
+    if (windows.length > 0) this.lastWindows = windows.map((w) => w.toPersisted())
+    const persistedWindows: PersistedWindow[] =
+      this.lastWindows.length > 0 ? this.lastWindows : this.restoredWindows
+    // Glance tabs, tabs of blank / private windows and private tabs are transient – never
+    // persist them.
+    const transient = new Set<string>()
+    for (const w of this.liveWindows()) if (w.glance) transient.add(w.glance.tabId)
+    return {
+      version: PERSISTED_VERSION,
+      spaces: m.spaces,
+      tabs: Object.values(m.tabs)
+        .filter(
+          (t) =>
+            !transient.has(t.id) &&
+            !(t.spaceId && m.localSpaces[t.spaceId]) &&
+            t.containerId !== PRIVATE_CONTAINER_ID
+        )
+        .map((t) => ({
+          ...t,
+          loading: false,
+          waiting: false,
+          progress: 0,
+          audible: false,
+          alert: null,
+          capture: null,
+          // A toolbox is a session's own: the key is not written (Android's records never carry it).
+          devtools: undefined,
+          // A pinned tab's attention dot is the session's too: seen or not, a restart clears it.
+          attention: undefined,
+          // A hung renderer is the session's; the page is a fresh one after a restart.
+          unresponsive: undefined,
+          hung: undefined,
+          // A form in progress died with the page's document (OS-37).
+          formEdited: undefined,
+          // The document generation counts this session's documents: the key is not written.
+          documentGeneration: undefined,
+          // So is a wake from sleep: the leaf's number is this session's (`Tabs.load`).
+          memorySaver: undefined,
+          errorCode: null,
+          // A certificate proceeded past is a decision of the session, not of the tab.
+          certificateError: null,
+          blockedCount: 0,
+          // The tracker report behind that count is the document's own: the key is not written.
+          blockedSites: undefined,
+          // Restored by us, not sent by an app that is long gone (Chrome: FROM_RESTORE).
+          fromIntent: false,
+          // The page posts its manifest again on the next load; the document stays compact.
+          webApp: null,
+          url: t.url.startsWith('zen://error') ? (safeOriginalUrl(t.url) ?? BLANK_URL) : t.url
+        })),
+      essentialTabIds: m.essentialTabIds,
+      activeSpaceId: m.activeSpaceId,
+      containers: m.containers,
+      folders: Object.values(m.folders),
+      splitGroups: Object.values(m.splitGroups).filter((g) => !m.localSpaces[g.spaceId]),
+      settings: this.settings,
+      shortcutOverrides: this.shortcutOverrides,
+      bookmarkTree: { schemaVersion: BOOKMARK_SCHEMA_VERSION, nodes: this.bookmarks },
+      windows: persistedWindows,
+      // The stacks travel without their host-state blobs, which `navigation/` holds.
+      recentlyClosed: withoutClosedHostState(this.recentlyClosed),
+      archivedTabs: withoutClosedHostState(this.archivedTabs),
+      navigation: this.persistedNavigation(m.tabs),
+      cleanExit: this.exiting,
+      newTabDevice: this.newTabDevice,
+      privateDevice: this.privateDevice,
+      updateDot: this.updateDot,
+      passwordsDevice: this.passwordsDevice,
+      pageWindowsDevice: this.pageWindowsDevice,
+      readingList: this.readingList
+    }
+  }
+
+  /** The stacks of the tabs being written (a stack whose tab is gone goes with it). */
+  private persistedNavigation(tabs: Record<string, Tab>): Record<string, NavigationSnapshot> {
+    const out: Record<string, NavigationSnapshot> = {}
+    for (const [tabId, snapshot] of this.tabNavigation) {
+      const tab = tabs[tabId]
+      if (!tab || tab.containerId === PRIVATE_CONTAINER_ID) {
+        this.tabNavigation.delete(tabId)
+        // Its document follows: a closed entry holding the id keeps it, else it goes.
+        this.navigationState.touch(tabId)
+        continue
+      }
+      out[tabId] = withoutHostState(snapshot)
+    }
+    return out
+  }
+
+  async flush(): Promise<void> {
+    if (this.frozen) return
+    this.store.write(this.toPersisted())
+    await this.store.flush()
+    await this.navigationState.flush()
+  }
+
+  flushSync(): void {
+    if (this.frozen) return
+    this.store.write(this.toPersisted())
+    this.store.flushSync()
+    this.navigationState.flushSync()
+  }
+}
+
+function safeOriginalUrl(errorUrl: string): string | null {
+  try {
+    return new URL(errorUrl).searchParams.get('url')
+  } catch {
+    return null
+  }
+}

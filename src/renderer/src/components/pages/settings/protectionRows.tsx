@@ -1,0 +1,500 @@
+import type { Settings, UIState } from '@shared/types'
+import {
+  HTTPS_ONLY_LABELS,
+  HTTPS_ONLY_PERMISSION,
+  PRELOAD_PAGES_LABELS,
+  SECURE_DNS_CUSTOM,
+  type HttpsOnlyMode,
+  type PrivacySettings,
+  type SafeBrowsingFeedStatus
+} from '@shared/privacy'
+import { run } from '@renderer/lib/api'
+import { commitApiKey, commitCustomResolver } from '@renderer/lib/protectionCommits'
+import {
+  apiKeyRowText,
+  feedDetail,
+  PROTECTION_TEXT,
+  resolverOptions,
+  resolverPatch,
+  resolverValue,
+  secureDnsText,
+  updateRowText
+} from '@renderer/lib/protectionUi'
+import { relativeTime } from '@renderer/lib/utils'
+import { extensionControlled } from './controlled'
+import { choice, type RowControl, type RowGroup, type SettingsRow } from './model'
+import { AddSiteForm } from './protectionBlocks'
+
+/**
+ * The protection groups of the phone's Settings > Privacy and Security (design language v2
+ * §10.3–10.4), as the `privacySection` builder in `sections.tsx` spreads them between its own:
+ * Safe Browsing (`safe-browsing-*`), the related sites third-party cookies stay allowed on
+ * (`cookies-*`; the setting itself is Cookies and site data's, `siteDataRows.tsx`),
+ * HTTPS-only mode with the sites allowed over plaintext (`https-only-*`), secure DNS – the
+ * host's resolver, or the system's Private DNS screen where the host has none (`secure-dns-*`) –
+ * and the privacy signals (`signals-*`). Every row reads `settings.privacy` and writes it back
+ * through `set`, or runs the protection service's commands, exactly as the desktop pane
+ * (`overlays/ProtectionSection.tsx`) does with the same words (`lib/protectionUi.ts`), so the
+ * two platforms say and do the same thing. Gated as the desktop pane is: the resolver rows
+ * behind `capabilities.secureDns`, the Private DNS row where that is off.
+ */
+
+type Set = (patch: Partial<Settings>) => void
+
+/**
+ * A switch's state while an extension holds its setting (`RowBase.controlled`, §10.5): the
+ * extension's value, the one in effect, over the user's own – the held switch shows it, as
+ * Chrome's disabled toggle shows the preference's effective value. No extension, the user's.
+ * Shared by the rows over the `chrome.privacy` booleans (`sections.tsx`, `siteDataRows.tsx`).
+ */
+export function heldSwitch(control: RowControl | undefined, own: boolean): boolean {
+  return typeof control?.value === 'boolean' ? control.value : own
+}
+
+/** A patch of `settings.privacy` on top of what is there. */
+function patcher(state: UIState, set: Set): (patch: Partial<PrivacySettings>) => void {
+  return (patch) => set({ privacy: { ...state.settings.privacy, ...patch } })
+}
+
+/** A row that only lists something, and the sheet of rows that act on it. */
+function listItem(
+  id: string,
+  label: string,
+  description: string,
+  rows: SettingsRow[],
+  disabled = false
+): SettingsRow {
+  return {
+    kind: 'item',
+    id,
+    label,
+    description,
+    disabled,
+    sheet: { title: label, description, groups: [{ id: `${id}-actions`, heading: null, rows }] }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Safe Browsing
+// ---------------------------------------------------------------------------
+
+type SafeBrowsingLevel = 'standard' | 'off'
+
+/**
+ * The level as Chrome's Safe Browsing screen puts it – standard protection or none – over the
+ * one switch the desktop has, a value row under the group's heading (so named "Protection
+ * level", not the heading again); the optional Google key as a §9.12 field row that never shows
+ * its value; then the feeds under their own heading: Update feeds now and one item per feed with
+ * its homepage and its own refresh.
+ */
+export function safeBrowsingGroups(state: UIState, set: Set): RowGroup[] {
+  const p = state.settings.privacy
+  const setP = patcher(state, set)
+  const status = state.privacy.safeBrowsing
+  // An extension holding `chrome.privacy.services.safeBrowsingEnabled` holds the level row
+  // (Chrome marks its Safe Browsing radios); the key row and its gate follow the value in effect.
+  const control = extensionControlled(state, 'privacy.safeBrowsingEnabled')
+  const on = heldSwitch(control, p.safeBrowsingEnabled)
+  const text = PROTECTION_TEXT.safeBrowsing
+  return [
+    {
+      id: 'safe-browsing',
+      heading: text.heading,
+      description: text.description,
+      rows: [
+        choice<SafeBrowsingLevel>({
+          id: 'safe-browsing-level',
+          label: text.level,
+          keywords: ['safe browsing', 'malware', 'phishing', 'dangerous sites', 'protection'],
+          controlled: control,
+          value: on ? 'standard' : 'off',
+          options: [
+            {
+              value: 'standard',
+              label: text.standard.label,
+              description: text.standard.description
+            },
+            { value: 'off', label: text.none.label, description: text.none.description }
+          ],
+          onChange: (level) => setP({ safeBrowsingEnabled: level === 'standard' })
+        }),
+        {
+          kind: 'field',
+          id: 'safe-browsing-api-key',
+          label: text.apiKey.label,
+          description: text.apiKey.description,
+          keywords: ['google', 'key', 'remote lookups'],
+          value: p.safeBrowsingApiKey,
+          display: apiKeyRowText(status, p.safeBrowsingApiKey),
+          input: 'text',
+          // A 39-character key is unreadable in the inline form's 160: the field stands under
+          // the label across the row (§9.12), the phone's field sheet as before.
+          form: 'stacked',
+          placeholder: text.apiKey.placeholder,
+          secret: true,
+          disabled: !on,
+          // The §9.30 busy form: the key is tried against the API before it is kept.
+          onCommit: (value) => commitApiKey(p.safeBrowsingApiKey, value, setP)
+        }
+      ]
+    },
+    {
+      id: 'safe-browsing-feeds',
+      heading: text.feeds.heading,
+      description: text.feeds.description,
+      rows: [
+        {
+          kind: 'action',
+          id: 'safe-browsing-update',
+          label: text.update,
+          description: updateRowText(status, relativeTime),
+          keywords: ['refresh', 'feeds'],
+          busy: status.updating,
+          disabled: !on || !status.ready,
+          button: 'Update now',
+          onPress: () => run('protection.updateFeeds', {})
+        },
+        ...status.feeds.map((feed) => feedItem(feed, !on))
+      ]
+    }
+  ]
+}
+
+function feedItem(feed: SafeBrowsingFeedStatus, disabled: boolean): SettingsRow {
+  const text = PROTECTION_TEXT.safeBrowsing
+  return listItem(
+    `safe-browsing-feed:${feed.id}`,
+    feed.name,
+    feedDetail(feed, relativeTime),
+    [
+      {
+        kind: 'action',
+        id: `safe-browsing-feed:${feed.id}:update`,
+        label: text.updateFeed,
+        busy: feed.updating,
+        onPress: () => run('protection.updateFeeds', { id: feed.id })
+      },
+      {
+        kind: 'action',
+        id: `safe-browsing-feed:${feed.id}:homepage`,
+        label: text.homepage(feed.name),
+        description: `${feed.homepage.replace(/^https?:\/\//, '')} · ${feed.licence}`,
+        leaves: 'external',
+        onPress: () => run('app.openExternal', { url: feed.homepage })
+      }
+    ],
+    disabled
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Third-party cookies: the related sites
+// ---------------------------------------------------------------------------
+
+/**
+ * The related sites – the hosts third-party cookies stay allowed on whatever the block says:
+ * each an item whose sheet removes it, and the add form as the last row (§9.12 in a sheet).
+ * The mode itself is the Cookies and site data default's (`siteDataRows.tsx`: the middle radio
+ * with its private-only switch – the #322 ruling on Q3 folded the Third-party cookies group into
+ * that one), so these groups follow it there; while nothing blocks third-party cookies (the
+ * default allows all, or blocks all and the exceptions have nothing to relax) the list is a
+ * dependent group at .4 (§10.4).
+ */
+export function relatedSitesGroups(state: UIState, set: Set, blocking: boolean): RowGroup[] {
+  const p = state.settings.privacy
+  const setP = patcher(state, set)
+  const exceptions = p.thirdPartyCookieExceptions
+  const related = PROTECTION_TEXT.relatedSites
+  return [
+    {
+      id: 'cookies-related-sites',
+      heading: related.heading,
+      description: related.description,
+      rows: exceptions.map((site) =>
+        listItem(
+          `cookies-site:${site}`,
+          site,
+          related.keeps,
+          [
+            {
+              kind: 'action',
+              id: `cookies-site:${site}:remove`,
+              label: related.remove(site),
+              onPress: () =>
+                setP({ thirdPartyCookieExceptions: exceptions.filter((s) => s !== site) })
+            }
+          ],
+          !blocking
+        )
+      ),
+      empty: related.empty
+    },
+    {
+      id: 'cookies-add-site',
+      heading: null,
+      rows: [
+        {
+          kind: 'action',
+          id: 'cookies-add-site',
+          label: related.add,
+          description: related.addDescription,
+          keywords: ['exception', 'related sites'],
+          disabled: !blocking,
+          button: 'Add…',
+          form: {
+            title: related.add,
+            description: related.description,
+            render: (close) => (
+              <AddSiteForm
+                exists={(site) => exceptions.includes(site)}
+                onAdd={(site) => setP({ thirdPartyCookieExceptions: [...exceptions, site] })}
+                close={close}
+              />
+            )
+          }
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// HTTPS-only mode
+// ---------------------------------------------------------------------------
+
+const HTTPS_ONLY_MODES: HttpsOnlyMode[] = ['off', 'ask', 'always']
+
+/**
+ * The mode as one choice whose sheet opens on the group's description as its title block, then
+ * the sites the warning page was answered "continue" for – for good (the `https-only`
+ * permission) or until the browser closes – each an item whose sheet asks again.
+ */
+export function httpsOnlyGroups(state: UIState, set: Set): RowGroup[] {
+  const p = state.settings.privacy
+  const setP = patcher(state, set)
+  const text = PROTECTION_TEXT.httpsOnly
+  const sites = PROTECTION_TEXT.plaintextSites
+  const stored = state.privacy.httpsOnlyExceptions
+  const session = state.privacy.httpsOnlySessionExceptions.filter((s) => !stored.includes(s))
+  return [
+    {
+      id: 'https-only',
+      heading: text.heading,
+      description: text.description,
+      rows: [
+        choice<HttpsOnlyMode>({
+          id: 'https-only-mode',
+          label: text.heading,
+          keywords: ['https', 'secure connections', 'plaintext', 'http'],
+          value: p.httpsOnly,
+          options: HTTPS_ONLY_MODES.map((mode) => ({ value: mode, ...HTTPS_ONLY_LABELS[mode] })),
+          sheetDescription: text.description,
+          onChange: (httpsOnly) => setP({ httpsOnly })
+        })
+      ]
+    },
+    {
+      id: 'https-only-sites',
+      heading: sites.heading,
+      description: sites.description,
+      rows: [
+        ...stored.map((site) =>
+          listItem(`https-only-site:${site}`, site, sites.stored, [
+            {
+              kind: 'action',
+              id: `https-only-site:${site}:forget`,
+              label: sites.askAgain(site),
+              button: 'Ask again',
+              onPress: () =>
+                run('permissions.set', {
+                  origin: `http://${site}`,
+                  permission: HTTPS_ONLY_PERMISSION,
+                  decision: null
+                })
+            }
+          ])
+        ),
+        ...session.map((site) =>
+          listItem(`https-only-session:${site}`, site, sites.session, [
+            {
+              kind: 'action',
+              id: `https-only-session:${site}:forget`,
+              label: sites.askAgain(site),
+              button: 'Ask again',
+              onPress: () => run('protection.forgetPlaintext', { host: site })
+            }
+          ])
+        )
+      ],
+      empty: sites.empty
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Secure DNS
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the host has a resolver of its own (`capabilities.secureDns`): the switch, one resolver
+ * choice folding the desktop's two radios and the menulist (the system resolver, the providers,
+ * the custom entry), and the custom resolver's field when that is the pick – a §9.30 busy form
+ * that asks the resolver one question before keeping it. Where it has none (Android), encrypted
+ * DNS is the system's Private DNS setting and the one row opens that screen (§10.4).
+ */
+export function secureDnsGroups(state: UIState, set: Set): RowGroup[] {
+  const text = PROTECTION_TEXT.secureDns
+  if (!state.capabilities.secureDns) {
+    const dns = PROTECTION_TEXT.privateDns
+    return [
+      {
+        id: 'secure-dns',
+        heading: text.heading,
+        description: dns.description,
+        rows: [
+          {
+            kind: 'action',
+            id: 'secure-dns-private-dns',
+            label: dns.open.label,
+            description: dns.open.description,
+            keywords: ['dns', 'private dns', 'encrypted', 'doh', 'dot'],
+            leaves: 'external',
+            onPress: () => run('protection.openPrivateDnsSettings', undefined)
+          }
+        ]
+      }
+    ]
+  }
+  const p = state.settings.privacy
+  const setP = patcher(state, set)
+  const on = p.secureDnsMode !== 'off'
+  const custom = p.secureDnsMode === 'provider' && p.secureDnsProvider === SECURE_DNS_CUSTOM
+  const rows: SettingsRow[] = [
+    {
+      kind: 'switch',
+      id: 'secure-dns-enabled',
+      label: text.use,
+      description: secureDnsText(p, state.privacy.secureDns),
+      keywords: ['dns', 'encrypted', 'doh', 'resolver'],
+      checked: on,
+      onChange: (v) => setP({ secureDnsMode: v ? 'automatic' : 'off' })
+    },
+    choice({
+      id: 'secure-dns-resolver',
+      label: text.resolver.label,
+      value: resolverValue(p),
+      options: resolverOptions(),
+      sheetDescription: text.resolver.description,
+      disabled: !on,
+      onChange: (value) => setP(resolverPatch(value))
+    })
+  ]
+  if (custom) {
+    rows.push({
+      kind: 'field',
+      id: 'secure-dns-custom',
+      label: text.custom.label,
+      description: text.custom.description,
+      keywords: ['doh', 'template', 'nextdns', 'adguard'],
+      value: p.secureDnsCustomUrl,
+      display: p.secureDnsCustomUrl || text.custom.unset,
+      input: 'text',
+      placeholder: text.custom.placeholder,
+      disabled: !on,
+      // The §9.30 busy form: the resolver is asked one question before it is kept.
+      onCommit: (value) => commitCustomResolver(p.secureDnsCustomUrl, value, setP)
+    })
+  }
+  return [{ id: 'secure-dns', heading: text.heading, description: text.description, rows }]
+}
+
+// ---------------------------------------------------------------------------
+// Preload pages (PS-43)
+// ---------------------------------------------------------------------------
+
+/**
+ * Chrome's "Preload pages" as a value row (a menulist on the desktop, a sheet of the options on
+ * the phone – §9.13) with the two levels both hosts can honour: Standard preloading and No
+ * preloading. Chrome's Extended needs its prediction service, which neither host has, so a
+ * profile or a peer holding `extended` reads – and shows – as Standard, and choosing Standard
+ * writes `standard`. Writes `Settings.preloadPages`, its own synced key; the desktop folded its
+ * Resources "Block prerendering" switch into No preloading (`shared/privacy.ts`). No relaunch
+ * notice: the level acts the moment it changes on both hosts – the desktop's request engine
+ * refuses every speculative request live (the prerender's own first fetch among them), the
+ * phone's WebViews take `SPECULATIVE_LOADING_DISABLED` – and no startup switch waits behind it.
+ */
+export function preloadGroups(state: UIState, set: Set): RowGroup[] {
+  const own = state.settings.preloadPages === 'none' ? 'none' : 'standard'
+  // `chrome.privacy.network.networkPredictionEnabled` holds the level (Chrome marks its "Preload
+  // pages" control): the extension's `false` is No preloading, its `true` the user's own level,
+  // as the service reads it (`effectivePreloadPages`).
+  const control = extensionControlled(state, 'privacy.preloadPages')
+  const level = control?.value === false ? 'none' : own
+  return [
+    {
+      id: 'preload',
+      heading: 'Preload pages',
+      description:
+        'Ione can load pages you’re likely to open next before you open them, so they appear faster.',
+      rows: [
+        choice({
+          id: 'preload-pages',
+          label: 'Preload pages',
+          description: PRELOAD_PAGES_LABELS[level].description,
+          keywords: ['preload', 'prefetch', 'prerender', 'speculation', 'network prediction'],
+          value: level,
+          controlled: control,
+          options: (['standard', 'none'] as const).map((value) => ({
+            value,
+            label: PRELOAD_PAGES_LABELS[value].label,
+            description: PRELOAD_PAGES_LABELS[value].description
+          })),
+          onChange: (preloadPages) => set({ preloadPages })
+        })
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Privacy signals
+// ---------------------------------------------------------------------------
+
+export function signalsGroups(state: UIState, set: Set): RowGroup[] {
+  const p = state.settings.privacy
+  const setP = patcher(state, set)
+  const text = PROTECTION_TEXT.signals
+  // `chrome.privacy.websites.doNotTrackEnabled` holds the Do Not Track switch (Chrome marks its
+  // "Send a Do Not Track request" toggle) under the key the protection service reads for the
+  // header and `navigator.doNotTrack` (`EXTENSION_SETTING_KEYS.doNotTrack`); GPC is Ione's
+  // own, no API reaches it.
+  const dntControl = extensionControlled(state, 'privacy.doNotTrack')
+  return [
+    {
+      id: 'signals',
+      heading: text.heading,
+      description: text.description,
+      rows: [
+        {
+          kind: 'switch',
+          id: 'signals-gpc',
+          label: text.gpc.label,
+          description: text.gpc.description,
+          keywords: ['gpc', 'global privacy control', 'sec-gpc'],
+          checked: p.gpc,
+          onChange: (gpc) => setP({ gpc })
+        },
+        {
+          kind: 'switch',
+          id: 'signals-dnt',
+          label: text.dnt.label,
+          description: text.dnt.description,
+          keywords: ['dnt', 'do not track'],
+          controlled: dntControl,
+          checked: heldSwitch(dntControl, p.dnt),
+          onChange: (dnt) => setP({ dnt })
+        }
+      ]
+    }
+  ]
+}

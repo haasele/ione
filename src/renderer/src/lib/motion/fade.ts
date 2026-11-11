@@ -1,0 +1,40 @@
+/**
+ * The reduced-motion fade (design language v2 §11.3): with `prefers-reduced-motion: reduce` an
+ * appearance or departure is a 120 ms opacity fade in place, nothing travels. Written per frame,
+ * because the reduced-motion stylesheet removes every CSS transition it does not re-declare, so
+ * a transition could not carry it. `SpringAnimation` jumps under the same preference; a surface
+ * whose spring carried its arrival runs this instead – on the same clock (§6).
+ */
+import { cancelFrame, requestFrame } from './clock'
+import { MOTION_STATE_MS } from './tokens'
+
+/** How long the fade takes: the state change's length (motion spec §0.5, §1). */
+export const REDUCED_FADE_MS = MOTION_STATE_MS
+
+/**
+ * Fade `el` from its present inline opacity (or the far end when it has none) to `to`, then run
+ * `done`. Returns a cancel: a cancelled fade leaves the element where it was and never calls
+ * `done`.
+ */
+export function fadeOpacity(el: HTMLElement, to: 0 | 1, done?: () => void): () => void {
+  const present = Number.parseFloat(el.style.opacity)
+  const from = Number.isFinite(present) ? present : 1 - to
+  let frame: number | null = null
+  const startedAt = performance.now()
+  el.style.opacity = from.toFixed(3)
+  const step = (now: number): void => {
+    const t = Math.min(1, (now - startedAt) / REDUCED_FADE_MS)
+    el.style.opacity = (from + (to - from) * t).toFixed(3)
+    if (t < 1) {
+      frame = requestFrame(step)
+      return
+    }
+    frame = null
+    done?.()
+  }
+  frame = requestFrame(step)
+  return () => {
+    if (frame !== null) cancelFrame(frame)
+    frame = null
+  }
+}

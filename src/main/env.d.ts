@@ -1,0 +1,33 @@
+/** Build-time constants (`define` in electron.vite.config.ts). */
+declare const __IONE_APPLE_TEAM_ID__: string
+
+/**
+ * Vite's `?raw` import of a Markdown file as text: the `ione-browser` Agent Skill
+ * (`resources/skills/ione-browser/SKILL.md`) is bundled into the main process this way, so the
+ * installer writes the same text in development and in the packaged app.
+ */
+declare module '*.md?raw' {
+  const text: string
+  export default text
+}
+
+/**
+ * The held-key notice's script for a DevTools toolbox (`platform/devtoolsQuitHoldPanel.ts`),
+ * bundled at build time into one IIFE (`scripts/inline-script.ts`) for the main process to run
+ * in the frontend's document (`platform/devtoolsKeys.ts`).
+ */
+declare module 'virtual:ione-devtools-quit-hold-panel' {
+  const source: string
+  export default source
+}
+
+/**
+ * Roll's runtime (`shared/game/runtimeEntry.ts`), bundled at build time into one minified IIFE
+ * (`scripts/inline-script.ts`) that `shared/zenPages.ts` writes inline into the two documents
+ * that carry the game (`shared/game/inlineRuntime.ts`); every host that builds `zenPages.ts`
+ * registers the plugin.
+ */
+declare module 'virtual:ione-game-runtime' {
+  const source: string
+  export default source
+}

@@ -1,0 +1,233 @@
+import { useEffect, useSyncExternalStore } from 'react'
+import { classifyViewport, touchLayout, type ViewportMetrics } from '@shared/formFactor'
+import type { FormFactor, WindowChrome } from '@shared/types'
+import { run } from './api'
+import { browserStore } from './browserStore'
+import { livePointerHover, onLivePointerChange } from './livePointer'
+import { createStore } from './store'
+
+export type { FormFactor }
+
+/**
+ * How the chrome should lay itself out. Derived from the window and its pointer, not from the
+ * platform (see `classifyViewport`): a narrow window on a laptop gets the phone one, and a phone
+ * stays a phone whichever way it is held.
+ *
+ *  - `phone`   – bottom bar, sidebar in a drawer, sheets instead of popovers.
+ *  - `tablet`  – a touch screen 600 px or more on its short side: the vertical sidebar as the tab
+ *                surface, sized for a finger, under a toolbar row of its own (`TabletShell`).
+ *  - `desktop` – everything else.
+ *
+ * The pointer is the media queries' primary pointer. Android's WebView names the touch screen
+ * whenever there is one, so a tablet with a mouse and a Samsung DeX desktop keep the tablet
+ * layout (OS-12: the row's own word), and the mouse's hover reaches the chrome another way –
+ * the root's `data-hover` follows the live pointer (`livePointer.ts`), which is what the
+ * stylesheets gate their hover fills on.
+ *
+ * Toolbar-only popup windows (`window.open` with a size) are the exception: a page-sized popup
+ * on a laptop is not a phone, so they keep the desktop layout at any width.
+ */
+export interface ViewportInfo extends ViewportMetrics {
+  formFactor: FormFactor
+}
+
+/**
+ * `classifyViewport`, except that a popup, app or page window never becomes a phone however
+ * small it is, and neither does the popup surface's document (`index.html?surface=popup`, a
+ * small view floated over the page by the desktop host for the autofill picker or the
+ * selection's mini menu): it draws desktop rows whatever its size.
+ */
+export function formFactorFor(
+  metrics: ViewportMetrics,
+  chrome: WindowChrome | null,
+  surface: string | null = chromeSurface()
+): FormFactor {
+  if (chrome === 'popup' || chrome === 'app' || chrome === 'page' || surface === 'popup')
+    return metrics.coarse ? 'tablet' : 'desktop'
+  return classifyViewport(metrics)
+}
+
+/**
+ * Loaded without a viewport (a pure-logic test importing a module that imports this one, with
+ * no window or a stub of one without media queries): a desktop, unwatched.
+ */
+const NO_WINDOW: ViewportInfo = {
+  formFactor: 'desktop',
+  width: 0,
+  height: 0,
+  coarse: false,
+  hover: true
+}
+
+function hasViewport(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    typeof document !== 'undefined'
+  )
+}
+
+/**
+ * Which chrome document this is: null for a window's chrome, `popup` for the popup surface
+ * (`?surface=popup`, see `PopupSurface`).
+ */
+export function chromeSurface(): string | null {
+  if (typeof location === 'undefined') return null
+  return new URLSearchParams(location.search).get('surface')
+}
+
+const FORM_FACTORS: readonly FormFactor[] = ['phone', 'tablet', 'desktop']
+
+/**
+ * A layout forced through the chrome document's URL (`index.html?formFactor=tablet`): the
+ * preview host and the screenshot scripts show a layout at any window size and with any pointer,
+ * so a tablet's chrome can be looked at in a desktop browser. A real host never passes it.
+ */
+export function forcedFormFactor(search: string | null = chromeSearch()): FormFactor | null {
+  if (!search) return null
+  const value = new URLSearchParams(search).get('formFactor')
+  return (FORM_FACTORS as readonly string[]).includes(value ?? '') ? (value as FormFactor) : null
+}
+
+function chromeSearch(): string | null {
+  return typeof location === 'undefined' ? null : location.search
+}
+
+function compute(): ViewportInfo {
+  if (!hasViewport()) return NO_WINDOW
+  const width = window.innerWidth
+  const height = window.innerHeight
+  const forced = forcedFormFactor()
+  if (forced) {
+    // The pointer follows the forced layout: a phone or tablet is a finger, a desktop a mouse.
+    const touch = forced !== 'desktop'
+    return { formFactor: forced, width, height, coarse: touch, hover: !touch }
+  }
+  const hover = window.matchMedia('(hover: hover)').matches
+  // Android's WebView reports `pointer: fine` on plain touch screens; a touch digitiser without
+  // hover is a finger. A mouse (DeX, tablet trackpad) brings hover back and gets desktop sizing.
+  const coarse =
+    window.matchMedia('(pointer: coarse)').matches || (navigator.maxTouchPoints > 0 && !hover)
+  const metrics = { width, height, coarse, hover }
+  const chrome = browserStore.get().state?.window?.chrome ?? null
+  return { formFactor: formFactorFor(metrics, chrome), ...metrics }
+}
+
+export const viewportStore = createStore<ViewportInfo>(compute(), 'viewport')
+
+function refresh(): void {
+  const next = compute()
+  const prev = viewportStore.get()
+  if (
+    prev.formFactor !== next.formFactor ||
+    prev.width !== next.width ||
+    prev.height !== next.height ||
+    prev.coarse !== next.coarse ||
+    prev.hover !== next.hover
+  ) {
+    viewportStore.set(next)
+  }
+  const root = document.documentElement
+  root.dataset.formFactor = next.formFactor
+  root.dataset.pointer = next.coarse ? 'coarse' : 'fine'
+  root.dataset.hover = hoverAttribute(next.hover, livePointerHover())
+}
+
+/**
+ * The root's `data-hover`: the media query's `hover` stands (a desktop's mouse; the forced
+ * desktop of the preview host); where the primary pointer cannot hover, the pointer that last
+ * moved over the chrome decides – a mouse or a pen (`hover`), a finger (`none`) – and a touch
+ * screen no pointer has touched yet has none.
+ */
+export function hoverAttribute(
+  mediaHover: boolean,
+  live: 'hover' | 'none' | null
+): 'hover' | 'none' {
+  if (mediaHover) return 'hover'
+  return live === 'hover' ? 'hover' : 'none'
+}
+
+/**
+ * The chrome's hover as the root's `data-hover` says it: whether the pointer over the chrome
+ * can hover (a desktop's mouse; a mouse or a pen on a touch screen – Samsung DeX, §9.36) or not
+ * (a finger, or a touch screen no pointer has touched yet). What the stylesheets gate the hover
+ * fills on, for the code that gates on the same – a gesture hint is a touch pointer's and does
+ * not show under a mouse.
+ */
+export function chromeHover(): 'hover' | 'none' {
+  return hoverAttribute(viewportStore.get().hover, livePointerHover())
+}
+
+function subscribeChromeHover(listener: () => void): () => void {
+  const viewport = viewportStore.subscribe(listener)
+  const pointer = onLivePointerChange(listener)
+  return () => {
+    viewport()
+    pointer()
+  }
+}
+
+/** `chromeHover()` as a subscription: the media query flipping or the live pointer changing kind re-renders the reader. */
+export function useChromeHover(): 'hover' | 'none' {
+  return useSyncExternalStore(subscribeChromeHover, chromeHover, () => 'none')
+}
+
+/**
+ * The live pointer changed kind (a mouse after fingers, a finger after a mouse): only the root's
+ * `data-hover` moves. The layout is the media queries' and the store's viewport stands as it is –
+ * a pointer event re-derives nothing and publishes nothing.
+ */
+function refreshHover(): void {
+  document.documentElement.dataset.hover = chromeHover()
+}
+
+/**
+ * Re-derive the layout from the window as it stands now (the resize listener's own step): for
+ * a report that says the window changed shape another way – a fold's posture (`lib/posture.ts`)
+ * – so the class follows the width whether or not the resize was heard first. Nothing without
+ * a viewport.
+ */
+export function refreshViewport(): void {
+  if (hasViewport()) refresh()
+}
+
+const flags = globalThis as unknown as { __zenViewportWatched?: boolean }
+if (!flags.__zenViewportWatched && hasViewport()) {
+  flags.__zenViewportWatched = true
+  refresh()
+  window.addEventListener('resize', refresh)
+  for (const query of ['(pointer: coarse)', '(hover: hover)']) {
+    window.matchMedia(query).addEventListener('change', refresh)
+  }
+  onLivePointerChange(refreshHover)
+  // Subscribed at import, ahead of any React subscription: the first snapshot re-derives the
+  // layout before the shell renders, so a popup window never flashes the phone chrome.
+  browserStore.subscribe(refresh)
+}
+
+export function useViewport(): ViewportInfo {
+  return viewportStore.use()
+}
+
+/**
+ * Tell the core which layout the chrome shows: it builds the app menu and the command list for
+ * it. Sent once the chrome is up (the API exists by then) and again whenever the class changes.
+ */
+export function useFormFactorReport(formFactor: FormFactor): void {
+  useEffect(() => {
+    run('window.formFactor', { formFactor })
+  }, [formFactor])
+}
+
+export function isPhone(): boolean {
+  return viewportStore.get().formFactor === 'phone'
+}
+
+/**
+ * The layouts a finger drives – the phone's and the tablet's (`touchLayout`): they share the
+ * chrome the desktop has no use for (the overview, the docked read-aloud player, the private
+ * theme on the window while a private tab is in view), while each keeps its own composition.
+ */
+export function isTouchLayout(formFactor: FormFactor = viewportStore.get().formFactor): boolean {
+  return touchLayout(formFactor)
+}

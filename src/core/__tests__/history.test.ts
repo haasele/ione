@@ -1,0 +1,1526 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { HistoryEntry, HistoryVisit } from '../../shared/types'
+import type { StoreIO } from '../platform'
+import {
+  dayKeyOf,
+  groupByDay,
+  HistoryService,
+  type HistoryVisitsEvent,
+  type ImportedVisit,
+  isHttpsUpgrade,
+  isRecordableUrl,
+  matchesAtWordStart,
+  MAX_ENTRIES,
+  MAX_REDIRECT_HOPS,
+  MAX_VISITS,
+  migrateHistory,
+  prune,
+  redirectChain,
+  RETENTION_MS,
+  scoreFrecency,
+  scoreHistoryMatch,
+  searchVisits,
+  selectRange,
+  topSites
+} from '../history'
+import { JsonStore } from '../store/JsonStore'
+
+const DAY = 86_400_000
+const NOW = Date.UTC(2026, 8, 17, 12, 0, 0)
+
+function visit(partial: Partial<HistoryVisit> & { url: string; visitTime: number }): HistoryVisit {
+  return {
+    id: partial.id ?? `visit_${partial.url}_${partial.visitTime}`,
+    url: partial.url,
+    title: partial.title ?? partial.url,
+    favicon: partial.favicon ?? null,
+    visitTime: partial.visitTime,
+    transition: partial.transition ?? 'link',
+    ...(partial.tabId ? { tabId: partial.tabId } : {})
+  }
+}
+
+function entry(partial: Partial<HistoryEntry> & { url: string }): HistoryEntry {
+  return {
+    url: partial.url,
+    title: partial.title ?? partial.url,
+    visitCount: partial.visitCount ?? 1,
+    lastVisit: partial.lastVisit ?? NOW,
+    favicon: partial.favicon ?? null,
+    firstVisit: partial.firstVisit,
+    typedCount: partial.typedCount
+  }
+}
+
+function fakeIo(initial: Record<string, string> = {}): StoreIO & { docs: Record<string, string> } {
+  const io = {
+    docs: { ...initial },
+    readSync: (name: string) => io.docs[name] ?? null,
+    write: async (name: string, text: string) => {
+      io.docs[name] = text
+    },
+    writeSync: (name: string, text: string) => {
+      io.docs[name] = text
+    }
+  }
+  return io
+}
+
+describe('isRecordableUrl', () => {
+  it('keeps chrome pages, view-source and inline documents out of history', () => {
+    for (const url of [
+      'zen://blank',
+      'zen://newtab',
+      'zen://history',
+      'zen://error?code=-105',
+      'about:blank',
+      'chrome://gpu',
+      'view-source:https://example.com/',
+      'data:text/html,hi',
+      ''
+    ])
+      expect(isRecordableUrl(url), url).toBe(false)
+    expect(isRecordableUrl('https://example.com/')).toBe(true)
+    expect(isRecordableUrl('http://localhost:8000/a.html')).toBe(true)
+    expect(isRecordableUrl('file:///tmp/a.html')).toBe(true)
+  })
+})
+
+describe('migrateHistory', () => {
+  it('turns a v1 document into aggregates plus one restored visit each', () => {
+    const data = migrateHistory({
+      version: 1,
+      entries: [
+        { url: 'https://a.test/', title: 'A', visitCount: 7, lastVisit: 1000, favicon: null },
+        { url: 'https://b.test/', title: 'B', visitCount: 2, lastVisit: 3000, favicon: 'data:x' }
+      ]
+    })
+    expect(data.entries).toHaveLength(2)
+    expect(data.entries[0]).toMatchObject({
+      url: 'https://a.test/',
+      visitCount: 7,
+      firstVisit: 1000
+    })
+    expect(data.visits.map((v) => v.url)).toEqual(['https://a.test/', 'https://b.test/'])
+    expect(data.visits.every((v) => v.transition === 'restored')).toBe(true)
+    expect(data.visits[1]).toMatchObject({ visitTime: 3000, favicon: 'data:x', title: 'B' })
+    expect(new Set(data.visits.map((v) => v.id)).size).toBe(2)
+  })
+
+  it('keeps a v2 document, sorted oldest first, dropping malformed records', () => {
+    const data = migrateHistory({
+      version: 2,
+      entries: [
+        { url: 'https://a.test/', title: 'A', visitCount: 1, lastVisit: 5, favicon: null },
+        7
+      ],
+      visits: [
+        visit({ url: 'https://a.test/', visitTime: 9 }),
+        { nope: true },
+        visit({ url: 'https://a.test/', visitTime: 5 })
+      ]
+    })
+    expect(data.entries).toHaveLength(1)
+    expect(data.visits.map((v) => v.visitTime)).toEqual([5, 9])
+  })
+
+  it('starts empty for garbage or unknown versions', () => {
+    expect(migrateHistory(null)).toEqual({ entries: [], visits: [] })
+    expect(migrateHistory('x')).toEqual({ entries: [], visits: [] })
+    expect(migrateHistory({ version: 9, entries: [] })).toEqual({ entries: [], visits: [] })
+  })
+
+  it('reads the redirect-chain flags as written and leaves them off where an older store had none (history-23)', () => {
+    const data = migrateHistory({
+      version: 2,
+      entries: [],
+      visits: [
+        visit({ url: 'https://a.test/', visitTime: 1 }),
+        { ...visit({ url: 'https://sho.rt/x', visitTime: 2 }), redirectSource: true },
+        {
+          ...visit({ url: 'https://b.test/', visitTime: 2 }),
+          redirectedFrom: ['https://sho.rt/x']
+        },
+        // Hand-edited garbage: a string flag, a chain naming the landing itself and a chrome page.
+        { ...visit({ url: 'https://c.test/', visitTime: 3 }), redirectSource: 'yes' },
+        {
+          ...visit({ url: 'https://d.test/', visitTime: 4 }),
+          redirectedFrom: ['https://d.test/', 'zen://blank', 7]
+        }
+      ]
+    })
+    expect(data.visits.map((v) => [v.url, v.redirectSource, v.redirectedFrom])).toEqual([
+      ['https://a.test/', undefined, undefined],
+      ['https://sho.rt/x', true, undefined],
+      ['https://b.test/', undefined, ['https://sho.rt/x']],
+      ['https://c.test/', undefined, undefined],
+      ['https://d.test/', undefined, undefined]
+    ])
+  })
+})
+
+describe('redirectChain (history-23)', () => {
+  it('keeps recordable, distinct hops other than the landing, the last MAX_REDIRECT_HOPS of them', () => {
+    const landing = 'https://final.test/'
+    expect(redirectChain(undefined, landing)).toBeNull()
+    expect(redirectChain([], landing)).toBeNull()
+    expect(redirectChain([landing, 'about:blank', 'zen://newtab', 3], landing)).toBeNull()
+    expect(
+      redirectChain(['https://a.test/', 'https://a.test/', 'http://b.test/', landing], landing)
+    ).toEqual(['https://a.test/', 'http://b.test/'])
+    const long = Array.from({ length: MAX_REDIRECT_HOPS + 5 }, (_, i) => `https://h${i}.test/`)
+    const kept = redirectChain(long, landing)
+    expect(kept).toHaveLength(MAX_REDIRECT_HOPS)
+    expect(kept?.[0]).toBe('https://h5.test/')
+    expect(kept?.at(-1)).toBe(`https://h${MAX_REDIRECT_HOPS + 4}.test/`)
+  })
+})
+
+describe('prune', () => {
+  it('expires visits older than the retention window and their aggregates', () => {
+    const old = visit({ url: 'https://old.test/', visitTime: NOW - RETENTION_MS - 1 })
+    const edge = visit({ url: 'https://edge.test/', visitTime: NOW - RETENTION_MS })
+    const fresh = visit({ url: 'https://fresh.test/', visitTime: NOW - DAY })
+    const out = prune(
+      [fresh, old, edge],
+      [
+        entry({ url: 'https://old.test/', lastVisit: old.visitTime }),
+        entry({ url: 'https://edge.test/', lastVisit: edge.visitTime }),
+        entry({ url: 'https://fresh.test/', lastVisit: fresh.visitTime })
+      ],
+      NOW
+    )
+    expect(out.visits.map((v) => v.url)).toEqual(['https://edge.test/', 'https://fresh.test/'])
+    expect(out.entries.map((e) => e.url).sort()).toEqual([
+      'https://edge.test/',
+      'https://fresh.test/'
+    ])
+  })
+
+  it('caps visits at the newest MAX_VISITS', () => {
+    const visits: HistoryVisit[] = []
+    for (let i = 0; i < MAX_VISITS + 10; i++)
+      visits.push(visit({ id: `v${i}`, url: 'https://a.test/', visitTime: NOW - i * 1000 }))
+    const out = prune(visits, [entry({ url: 'https://a.test/' })], NOW)
+    expect(out.visits).toHaveLength(MAX_VISITS)
+    expect(out.visits[out.visits.length - 1].id).toBe('v0')
+    expect(out.visits[0].id).toBe(`v${MAX_VISITS - 1}`)
+  })
+
+  it('caps aggregates at the most recent MAX_ENTRIES and drops their orphaned visits', () => {
+    const entries: HistoryEntry[] = []
+    const visits: HistoryVisit[] = []
+    for (let i = 0; i < MAX_ENTRIES + 5; i++) {
+      const url = `https://s${i}.test/`
+      entries.push(entry({ url, lastVisit: NOW - i * 1000 }))
+      visits.push(visit({ url, visitTime: NOW - i * 1000 }))
+    }
+    const out = prune(visits, entries, NOW)
+    expect(out.entries).toHaveLength(MAX_ENTRIES)
+    expect(out.visits).toHaveLength(MAX_ENTRIES)
+    expect(out.entries.some((e) => e.url === `https://s${MAX_ENTRIES + 4}.test/`)).toBe(false)
+    expect(out.entries.some((e) => e.url === 'https://s0.test/')).toBe(true)
+  })
+})
+
+describe('scoreFrecency', () => {
+  it('weighs recent pages more and typed visits double', () => {
+    const today = entry({ url: 'https://a.test/', visitCount: 3, lastVisit: NOW - DAY })
+    const lastMonth = entry({ url: 'https://b.test/', visitCount: 3, lastVisit: NOW - 20 * DAY })
+    const ancient = entry({ url: 'https://c.test/', visitCount: 3, lastVisit: NOW - 200 * DAY })
+    expect(scoreFrecency(today, NOW)).toBeGreaterThan(scoreFrecency(lastMonth, NOW))
+    expect(scoreFrecency(lastMonth, NOW)).toBeGreaterThan(scoreFrecency(ancient, NOW))
+    const typed = entry({
+      url: 'https://d.test/',
+      visitCount: 3,
+      typedCount: 1,
+      lastVisit: NOW - DAY
+    })
+    expect(scoreFrecency(typed, NOW)).toBe(scoreFrecency(today, NOW) + 2 * 100)
+  })
+})
+
+describe('matchesAtWordStart', () => {
+  it('finds the term at the start of the text or after a non-letter, not inside a word', () => {
+    expect(matchesAtWordStart('Docs home', 'docs')).toBe(true)
+    expect(matchesAtWordStart('example.com/docs/intro', 'docs')).toBe(true)
+    expect(matchesAtWordStart('example.com/my-docs', 'docs')).toBe(true)
+    expect(matchesAtWordStart('Googledocs', 'docs')).toBe(false)
+    expect(matchesAtWordStart('example.com/googledocs', 'docs')).toBe(false)
+    // A later occurrence at a word start counts even when an earlier one is mid-word.
+    expect(matchesAtWordStart('Googledocs – docs', 'docs')).toBe(true)
+    expect(matchesAtWordStart('anything', '')).toBe(false)
+  })
+
+  it('reads letters and digits of every script as word characters', () => {
+    expect(matchesAtWordStart('Überdocs', 'docs')).toBe(false)
+    expect(matchesAtWordStart('über docs', 'docs')).toBe(true)
+    expect(matchesAtWordStart('v2docs', 'docs')).toBe(false)
+  })
+})
+
+describe('scoreHistoryMatch (omnibox-02: HistoryURL + HistoryQuick)', () => {
+  const base = { visitCount: 3, lastVisit: NOW - DAY }
+
+  it('is null when a term is missing, a number when every term is somewhere', () => {
+    const e = entry({ url: 'https://news.example/', title: 'Daily news', ...base })
+    expect(scoreHistoryMatch(e, ['news', 'weekly'], NOW)).toBeNull()
+    expect(scoreHistoryMatch(e, ['daily', 'news'], NOW)).not.toBeNull()
+  })
+
+  it('typed visits count three times a plain visit', () => {
+    const plain = entry({ url: 'https://a.example/', title: 'A', ...base, visitCount: 4 })
+    const typed = entry({
+      url: 'https://b.example/',
+      title: 'B',
+      ...base,
+      visitCount: 1,
+      typedCount: 1
+    })
+    expect(scoreHistoryMatch(typed, ['example'], NOW)).toBe(
+      scoreHistoryMatch(plain, ['example'], NOW)
+    )
+    const typedMore = entry({ ...typed, typedCount: 3 })
+    expect(scoreHistoryMatch(typedMore, ['example'], NOW)!).toBeGreaterThan(
+      scoreHistoryMatch(plain, ['example'], NOW)!
+    )
+  })
+
+  it('a term inside a word is no match: Chrome finds "docs" in "Team docs", never in "Googledocs" (history-03)', () => {
+    const wordStart = entry({ url: 'https://x.example/docs/', title: 'Team docs', ...base })
+    const midWord = entry({ url: 'https://y.example/googledocs', title: 'Googledocs', ...base })
+    expect(scoreHistoryMatch(wordStart, ['docs'], NOW)).not.toBeNull()
+    expect(scoreHistoryMatch(midWord, ['docs'], NOW)).toBeNull()
+    // Every term must start a word somewhere; one inside a word fails the whole query.
+    const oneMid = entry({ url: 'https://z.example/googledocs', title: 'Team pages', ...base })
+    const bothStart = entry({ url: 'https://z.example/google/docs', title: 'Team pages', ...base })
+    expect(scoreHistoryMatch(oneMid, ['google', 'docs'], NOW)).toBeNull()
+    expect(scoreHistoryMatch(bothStart, ['google', 'docs'], NOW)).not.toBeNull()
+  })
+
+  it('terms found in the title outrank the same terms found in the address alone, by their share', () => {
+    const inTitle = entry({ url: 'https://a.example/', title: 'React docs', ...base })
+    const inUrl = entry({ url: 'https://b.example/react/docs', title: 'Home', ...base })
+    const half = entry({ url: 'https://c.example/react', title: 'The docs', ...base })
+    const title = scoreHistoryMatch(inTitle, ['react', 'docs'], NOW)!
+    const url = scoreHistoryMatch(inUrl, ['react', 'docs'], NOW)!
+    const mixed = scoreHistoryMatch(half, ['react', 'docs'], NOW)!
+    expect(title).toBeGreaterThan(mixed)
+    expect(mixed).toBeGreaterThan(url)
+    expect(title - url).toBeCloseTo(1)
+  })
+
+  it('reads the address without its scheme and www., so "https" and "www" find nothing', () => {
+    const e = entry({ url: 'https://www.example.org/path', title: 'Example', ...base })
+    expect(scoreHistoryMatch(e, ['https'], NOW)).toBeNull()
+    expect(scoreHistoryMatch(e, ['www'], NOW)).toBeNull()
+    expect(scoreHistoryMatch(e, ['example'], NOW)).not.toBeNull()
+    expect(scoreHistoryMatch(e, ['path'], NOW)).not.toBeNull()
+  })
+
+  it('the start of the address (scheme and www. aside) counts on top of a word start', () => {
+    const host = entry({ url: 'https://www.docs.example/', title: 'Home', ...base })
+    const path = entry({ url: 'https://other.example/docs', title: 'Home', ...base })
+    expect(scoreHistoryMatch(host, ['docs'], NOW)!).toBeGreaterThan(
+      scoreHistoryMatch(path, ['docs'], NOW)!
+    )
+  })
+
+  it('recency still tells two otherwise equal pages apart', () => {
+    const fresh = entry({
+      url: 'https://a.example/docs',
+      title: 'Docs',
+      visitCount: 2,
+      lastVisit: NOW
+    })
+    const stale = entry({
+      url: 'https://b.example/docs',
+      title: 'Docs',
+      visitCount: 2,
+      lastVisit: NOW - 30 * DAY
+    })
+    expect(scoreHistoryMatch(fresh, ['docs'], NOW)!).toBeGreaterThan(
+      scoreHistoryMatch(stale, ['docs'], NOW)!
+    )
+  })
+})
+
+describe('selectRange', () => {
+  it('takes fromMs inclusive, toMs exclusive, newest first', () => {
+    const visits = [1, 2, 3, 4].map((t) => visit({ url: `https://t${t}.test/`, visitTime: t }))
+    expect(selectRange(visits, 2, 4).map((v) => v.visitTime)).toEqual([3, 2])
+  })
+})
+
+describe('searchVisits', () => {
+  const visits = [
+    visit({ url: 'https://docs.example.com/guide', title: 'The Guide', visitTime: 30 }),
+    visit({ url: 'https://example.com/', title: 'Example Domain', visitTime: 20 }),
+    visit({ url: 'https://other.test/guide', title: 'Other guide', visitTime: 10 })
+  ]
+
+  it('matches every term against title and URL, case-insensitively, newest first', () => {
+    expect(searchVisits(visits, { text: 'GUIDE', limit: 10 }).map((v) => v.visitTime)).toEqual([
+      30, 10
+    ])
+    expect(searchVisits(visits, { text: 'guide other', limit: 10 }).map((v) => v.url)).toEqual([
+      'https://other.test/guide'
+    ])
+    expect(searchVisits(visits, { text: 'nothing here', limit: 10 })).toEqual([])
+  })
+
+  it('matches a term where it starts a word, never inside one – Chrome’s history search (history-03)', () => {
+    const pages = [
+      visit({ url: 'https://docs.google.com/document/d/1', title: 'Googledocs', visitTime: 50 }),
+      visit({ url: 'https://example.com/my-docs_v2/intro', title: 'Intro', visitTime: 40 }),
+      visit({ url: 'https://other.test/', title: 'Über docs für alle', visitTime: 30 }),
+      visit({ url: 'https://camel.test/', title: 'ReactDocs', visitTime: 20 })
+    ]
+    const found = (text: string): number[] =>
+      searchVisits(pages, { text, limit: 10 }).map((v) => v.visitTime)
+    // The host's word, a path segment after `/`, a piece after `-` or `_`: word starts all.
+    expect(found('docs')).toEqual([50, 40, 30])
+    expect(found('v2')).toEqual([40])
+    // A prefix of a word is enough (Chrome's prefix match); the middle of a word is not.
+    expect(found('goo')).toEqual([50])
+    expect(found('ogle')).toEqual([])
+    // camelCase is one word.
+    expect(found('reactdocs')).toEqual([20])
+    expect(found('Docs')).not.toContain(20)
+    // Every term must match, anywhere between title and address.
+    expect(found('docs intro')).toEqual([40])
+    expect(found('docs nowhere')).toEqual([])
+    // Case folding across scripts; a term typed in another normalisation form still matches.
+    expect(found('über')).toEqual([30])
+    expect(found('ÜBER')).toEqual([30])
+    expect(found('u\u0308ber')).toEqual([30])
+    // The scheme and www. are not words of the address.
+    expect(found('https')).toEqual([])
+  })
+
+  it('filters by host including subdomains, by time range, and pages with offset/limit', () => {
+    expect(
+      searchVisits(visits, { host: 'example.com', limit: 10 }).map((v) => v.visitTime)
+    ).toEqual([30, 20])
+    expect(searchVisits(visits, { host: 'www.example.com', limit: 10 })).toHaveLength(2)
+    expect(
+      searchVisits(visits, { fromMs: 10, toMs: 30, limit: 10 }).map((v) => v.visitTime)
+    ).toEqual([20, 10])
+    expect(searchVisits(visits, { limit: 1, offset: 1 }).map((v) => v.visitTime)).toEqual([20])
+    expect(searchVisits(visits, { limit: 0 })).toEqual([])
+  })
+})
+
+describe('groupByDay', () => {
+  it('groups by local calendar day, newest day and newest visit first', () => {
+    const d1 = Date.UTC(2026, 8, 15, 23, 30)
+    const d2a = Date.UTC(2026, 8, 16, 0, 10)
+    const d2b = Date.UTC(2026, 8, 16, 18, 0)
+    const groups = groupByDay(
+      [
+        visit({ url: 'https://a.test/', visitTime: d2a }),
+        visit({ url: 'https://b.test/', visitTime: d1 }),
+        visit({ url: 'https://c.test/', visitTime: d2b })
+      ],
+      'UTC'
+    )
+    expect(groups.map((g) => g.dayKey)).toEqual(['2026-09-16', '2026-09-15'])
+    expect(groups[0].visits.map((v) => v.url)).toEqual(['https://c.test/', 'https://a.test/'])
+  })
+
+  it('honours the time zone when splitting days', () => {
+    const late = Date.UTC(2026, 8, 16, 23, 30)
+    expect(groupByDay([visit({ url: 'https://a.test/', visitTime: late })], 'UTC')[0].dayKey).toBe(
+      '2026-09-16'
+    )
+    expect(
+      groupByDay([visit({ url: 'https://a.test/', visitTime: late })], 'Asia/Tokyo')[0].dayKey
+    ).toBe('2026-09-17')
+  })
+})
+
+describe('topSites', () => {
+  it('folds pages by host, ranks by summed frecency and skips excluded or non-web pages', () => {
+    const entries = [
+      entry({ url: 'https://news.test/a', visitCount: 2, lastVisit: NOW - DAY }),
+      entry({ url: 'https://news.test/b', visitCount: 5, lastVisit: NOW - DAY, title: 'News B' }),
+      entry({ url: 'https://www.shop.test/', visitCount: 6, lastVisit: NOW - DAY }),
+      entry({ url: 'https://hidden.test/', visitCount: 50, lastVisit: NOW - DAY }),
+      entry({ url: 'file:///tmp/x.html', visitCount: 50, lastVisit: NOW - DAY })
+    ]
+    const sites = topSites(entries, 5, ['www.hidden.test'], NOW)
+    expect(sites.map((s) => s.url)).toEqual(['https://news.test/b', 'https://www.shop.test/'])
+    expect(sites[0]).toMatchObject({ title: 'News B', score: 700 })
+    expect(topSites(entries, 1, [], NOW)).toHaveLength(1)
+  })
+})
+
+describe('HistoryService', () => {
+  let clock = NOW
+  const now = (): number => clock
+
+  beforeEach(() => {
+    clock = NOW
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('records visits with aggregates, keeps the 3-argument call working, and skips chrome pages', () => {
+    const io = fakeIo()
+    const h = new HistoryService(io, now)
+    h.visit('https://a.test/', 'A', null)
+    clock += 1000
+    h.visit('https://a.test/', 'A again', 'data:icon', { transition: 'typed', tabId: 't1' })
+    h.visit('zen://blank', 'Blank', null)
+    h.visit('zen://newtab', 'New Tab', null)
+    h.visit('view-source:https://a.test/', 'src', null)
+    expect(h.count(0, Infinity)).toBe(2)
+    const [latest, first] = h.visits({ limit: 10 })
+    expect(latest).toMatchObject({ url: 'https://a.test/', transition: 'typed', tabId: 't1' })
+    expect(first.transition).toBe('link')
+    expect(latest.favicon).toBe('data:icon')
+    expect(h.recent(5)[0]).toMatchObject({
+      url: 'https://a.test/',
+      title: 'A again',
+      visitCount: 2,
+      typedCount: 1,
+      firstVisit: NOW,
+      lastVisit: NOW + 1000
+    })
+  })
+
+  it('persists as version 2 and migrates a version 1 file on load', async () => {
+    const io = fakeIo({
+      'history.json': JSON.stringify({
+        version: 1,
+        entries: [
+          { url: 'https://a.test/', title: 'A', visitCount: 3, lastVisit: NOW - DAY, favicon: null }
+        ]
+      })
+    })
+    const h = new HistoryService(io, now)
+    expect(h.visits({ limit: 10 })).toHaveLength(1)
+    expect(h.visits({ limit: 10 })[0].transition).toBe('restored')
+    h.flushSync()
+    const stored = JSON.parse(io.docs['history.json']) as { version: number; visits: unknown[] }
+    expect(stored.version).toBe(2)
+    expect(stored.visits).toHaveLength(1)
+    // The migrated document loads again unchanged.
+    const again = new HistoryService(io, now)
+    expect(again.recent(5)[0].visitCount).toBe(3)
+  })
+
+  it('prunes expired visits when loading', () => {
+    const io = fakeIo({
+      'history.json': JSON.stringify({
+        version: 2,
+        entries: [entry({ url: 'https://old.test/', lastVisit: NOW - RETENTION_MS - DAY })],
+        visits: [visit({ url: 'https://old.test/', visitTime: NOW - RETENTION_MS - DAY })]
+      })
+    })
+    const h = new HistoryService(io, now)
+    expect(h.count(0, Infinity)).toBe(0)
+    expect(h.recent(5)).toEqual([])
+  })
+
+  it('deletes single visits and recomputes the aggregate; the last visit takes the page with it', () => {
+    const h = new HistoryService(fakeIo(), now)
+    h.visit('https://a.test/', 'A', null, { transition: 'typed' })
+    clock += 1000
+    h.visit('https://a.test/', 'A', null)
+    const visits = h.visits({ limit: 10 })
+    h.deleteVisits([visits[0].id])
+    expect(h.recent(5)[0]).toMatchObject({ visitCount: 1, lastVisit: NOW, typedCount: 1 })
+    h.deleteVisits([visits[1].id])
+    expect(h.recent(5)).toEqual([])
+  })
+
+  it('deletes by URL, by day and by range', () => {
+    const h = new HistoryService(fakeIo(), now)
+    clock = Date.UTC(2026, 8, 15, 12)
+    h.visit('https://a.test/', 'A', null)
+    clock = Date.UTC(2026, 8, 16, 12)
+    h.visit('https://b.test/', 'B', null)
+    h.visit('https://c.test/', 'C', null)
+    clock = Date.UTC(2026, 8, 17, 12)
+    h.visit('https://d.test/', 'D', null)
+    h.deleteUrls(['https://d.test/'])
+    expect(h.count(0, Infinity)).toBe(3)
+    const dayOfB = h
+      .groupedByDay({ limit: 100 })
+      .find((g) => g.visits.some((v) => v.url === 'https://b.test/'))
+    h.deleteDay(dayOfB!.dayKey)
+    expect(h.visits({ limit: 10 }).map((v) => v.url)).toEqual(['https://a.test/'])
+    expect(h.deleteRange(0, Date.UTC(2026, 8, 16))).toBe(1)
+    expect(h.deleteRange(0, Infinity)).toBe(0)
+  })
+
+  it('groups visits by day and ranks top sites', () => {
+    const h = new HistoryService(fakeIo(), now)
+    h.visit('https://a.test/x', 'A', null)
+    h.visit('https://a.test/y', 'A2', null)
+    h.visit('https://b.test/', 'B', null)
+    expect(h.groupedByDay({ limit: 100 })).toHaveLength(1)
+    expect(h.groupedByDay({ limit: 100 })[0].visits).toHaveLength(3)
+    expect(h.topSites(5).map((s) => s.url)).toEqual(['https://a.test/x', 'https://b.test/'])
+    expect(h.topSites(5, ['b.test'])).toHaveLength(1)
+  })
+
+  it('notifies listeners: visits throttled, deletions at once', () => {
+    const h = new HistoryService(fakeIo(), now)
+    const kinds: string[] = []
+    const off = h.onChange((kind) => kinds.push(kind))
+    h.visit('https://a.test/', 'A', null)
+    h.visit('https://b.test/', 'B', null)
+    expect(kinds).toEqual([])
+    vi.advanceTimersByTime(600)
+    expect(kinds).toEqual(['visit'])
+    h.deleteUrls(['https://a.test/'])
+    expect(kinds).toEqual(['visit', 'delete'])
+    h.clear()
+    expect(kinds).toEqual(['visit', 'delete', 'clear'])
+    off()
+    h.visit('https://c.test/', 'C', null)
+    vi.advanceTimersByTime(600)
+    expect(kinds).toHaveLength(3)
+  })
+
+  it('propagates title updates to the visits of a page', () => {
+    const h = new HistoryService(fakeIo(), now)
+    h.visit('https://a.test/', '', null)
+    h.updateTitle('https://a.test/', 'Real Title')
+    expect(h.visits({ limit: 1 })[0].title).toBe('Real Title')
+    expect(h.search('real', 5)[0].title).toBe('Real Title')
+  })
+
+  /** The stored visit list, in the order it is kept. */
+  function storedVisits(io: { docs: Record<string, string> }): HistoryVisit[] {
+    return (JSON.parse(io.docs['history.json']) as { visits: HistoryVisit[] }).visits
+  }
+
+  describe('visit with at', () => {
+    it('records a dated visit at its place: first/last and the count follow, the title and favicon only the newest', () => {
+      const io = fakeIo()
+      const h = new HistoryService(io, now)
+      h.visit('https://a.test/', 'Current', 'data:new')
+      h.visit('https://a.test/', 'Old title', 'data:old', {
+        at: NOW - 2 * DAY,
+        transition: 'typed'
+      })
+      h.visit('https://a.test/', 'Middle', null, { at: NOW - DAY })
+      h.visit('https://b.test/', 'B', null, { at: NOW - 3 * DAY })
+      expect(h.count(0, Infinity)).toBe(4)
+      expect(h.visits({ limit: 10 }).map((v) => [v.title, v.visitTime])).toEqual([
+        ['Current', NOW],
+        ['Middle', NOW - DAY],
+        ['Old title', NOW - 2 * DAY],
+        ['B', NOW - 3 * DAY]
+      ])
+      expect(h.recent(5)[0]).toMatchObject({
+        url: 'https://a.test/',
+        title: 'Current',
+        favicon: 'data:new',
+        visitCount: 3,
+        typedCount: 1,
+        firstVisit: NOW - 2 * DAY,
+        lastVisit: NOW
+      })
+      // The list itself is kept oldest first, the dated visits inserted at their place.
+      h.flushSync()
+      expect(storedVisits(io).map((v) => v.visitTime)).toEqual([
+        NOW - 3 * DAY,
+        NOW - 2 * DAY,
+        NOW - DAY,
+        NOW
+      ])
+      // Day groups put the dated visit on its own day.
+      const groups = h.groupedByDay({ limit: 100 })
+      expect(groups.map((g) => g.dayKey)).toEqual([
+        dayKeyOf(NOW),
+        dayKeyOf(NOW - DAY),
+        dayKeyOf(NOW - 2 * DAY),
+        dayKeyOf(NOW - 3 * DAY)
+      ])
+      expect(groups[2].visits.map((v) => v.title)).toEqual(['Old title'])
+    })
+
+    it('lets a newer dated visit retitle the page and keeps a visit ordered after an equal time', () => {
+      const io = fakeIo()
+      const h = new HistoryService(io, now)
+      h.visit('https://a.test/', 'Old', null, { at: NOW - DAY })
+      h.visit('https://a.test/', 'New', 'data:icon', { at: NOW - 3_600_000 })
+      expect(h.recent(5)[0]).toMatchObject({
+        title: 'New',
+        favicon: 'data:icon',
+        firstVisit: NOW - DAY,
+        lastVisit: NOW - 3_600_000
+      })
+      h.visit('https://a.test/', 'Same time', null, { at: NOW - 3_600_000 })
+      expect(h.recent(5)[0]).toMatchObject({ title: 'Same time', visitCount: 3 })
+      h.flushSync()
+      expect(storedVisits(io).map((v) => v.title)).toEqual(['Old', 'New', 'Same time'])
+    })
+
+    it('clamps a future or unusable at to now and records nothing past the retention window', () => {
+      const h = new HistoryService(fakeIo(), now)
+      h.visit('https://future.test/', 'F', null, { at: NOW + DAY })
+      h.visit('https://nan.test/', 'N', null, { at: Number.NaN })
+      expect(h.visits({ limit: 10 }).map((v) => v.visitTime)).toEqual([NOW, NOW])
+      expect(h.recent(5).map((e) => [e.firstVisit, e.lastVisit])).toEqual([
+        [NOW, NOW],
+        [NOW, NOW]
+      ])
+      h.visit('https://old.test/', 'O', null, { at: NOW - RETENTION_MS - 1 })
+      expect(h.count(0, Infinity)).toBe(2)
+      expect(h.recent(5).some((e) => e.url === 'https://old.test/')).toBe(false)
+      h.visit('https://edge.test/', 'E', null, { at: NOW - RETENTION_MS })
+      expect(h.count(0, Infinity)).toBe(3)
+    })
+  })
+
+  describe('importVisits', () => {
+    beforeEach(() => {
+      vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    })
+    afterEach(() => {
+      vi.restoreAllMocks()
+    })
+
+    it('writes a batch, keeps the list sorted and answers newest first', () => {
+      const io = fakeIo()
+      const h = new HistoryService(io, now)
+      const result = h.importVisits(
+        [
+          { url: 'https://a.test/', title: 'A', at: NOW - 3 * DAY },
+          { url: 'https://b.test/', title: 'B', at: NOW - DAY, transition: 'typed' },
+          { url: 'https://a.test/', title: 'A newer', at: NOW - 2 * DAY, favicon: 'data:a' }
+        ],
+        { source: 'chrome' }
+      )
+      expect(result).toEqual({ imported: 3, skipped: 0 })
+      expect(h.visits({ limit: 10 }).map((v) => [v.url, v.visitTime, v.transition])).toEqual([
+        ['https://b.test/', NOW - DAY, 'typed'],
+        ['https://a.test/', NOW - 2 * DAY, 'link'],
+        ['https://a.test/', NOW - 3 * DAY, 'link']
+      ])
+      expect(h.visits({ host: 'a.test', limit: 5 }).map((v) => v.favicon)).toEqual([
+        'data:a',
+        'data:a'
+      ])
+      expect(new Set(h.visits({ limit: 10 }).map((v) => v.id)).size).toBe(3)
+      h.flushSync()
+      expect(storedVisits(io).map((v) => v.visitTime)).toEqual([
+        NOW - 3 * DAY,
+        NOW - 2 * DAY,
+        NOW - DAY
+      ])
+    })
+
+    it('skips duplicates by (url, at) against stored visits and within the batch', () => {
+      const h = new HistoryService(fakeIo(), now)
+      h.visit('https://a.test/', 'A', null, { at: NOW - DAY })
+      const result = h.importVisits(
+        [
+          { url: 'https://a.test/', at: NOW - DAY },
+          { url: 'https://a.test/', at: NOW - 2 * DAY },
+          { url: 'https://a.test/', at: NOW - 2 * DAY, title: 'Again' },
+          { url: 'https://b.test/', at: NOW - 2 * DAY }
+        ],
+        { source: 'edge' }
+      )
+      expect(result).toEqual({ imported: 2, skipped: 2 })
+      expect(h.count(0, Infinity)).toBe(3)
+      expect(h.recent(5).find((e) => e.url === 'https://a.test/')).toMatchObject({
+        visitCount: 2,
+        firstVisit: NOW - 2 * DAY,
+        lastVisit: NOW - DAY
+      })
+    })
+
+    it('skips pages that never enter history, an unusable at, and visits past retention', () => {
+      const h = new HistoryService(fakeIo(), now)
+      const result = h.importVisits(
+        [
+          { url: 'zen://history', at: NOW - DAY },
+          { url: 'data:text/html,hi', at: NOW - DAY },
+          { url: 'view-source:https://a.test/', at: NOW - DAY },
+          { url: '', at: NOW - DAY },
+          { url: 'https://nan.test/', at: Number.NaN },
+          { url: 'https://inf.test/', at: Infinity },
+          { url: 'https://text.test/', at: '1' as unknown as number },
+          { url: 'https://future.test/', at: NOW + 1 },
+          { url: 'https://old.test/', at: NOW - RETENTION_MS - 1 },
+          { url: 'https://edge.test/', at: NOW - RETENTION_MS },
+          { url: 'https://ok.test/', at: NOW }
+        ],
+        { source: 'firefox' }
+      )
+      expect(result).toEqual({ imported: 2, skipped: 9 })
+      expect(h.visits({ limit: 10 }).map((v) => v.url)).toEqual([
+        'https://ok.test/',
+        'https://edge.test/'
+      ])
+    })
+
+    it('folds a batch into the aggregates once per page with the title and favicon rules', () => {
+      const h = new HistoryService(fakeIo(), now)
+      h.visit('https://a.test/', 'Live title', 'data:live', { at: NOW - DAY })
+      h.visit('https://b.test/', '', null, { at: NOW - DAY })
+      h.visit('https://e.test/', 'E old', 'data:eold', { at: NOW - DAY })
+      const result = h.importVisits(
+        [
+          // Older than a.test's last visit: counted, never retitles it.
+          {
+            url: 'https://a.test/',
+            title: 'Stale',
+            favicon: 'data:stale',
+            at: NOW - 5 * DAY,
+            transition: 'typed'
+          },
+          { url: 'https://a.test/', title: 'Stale 2', at: NOW - 4 * DAY },
+          // Older than b.test's last visit, but b.test has no title or icon: fills them.
+          { url: 'https://b.test/', title: 'Filled', favicon: 'data:filled', at: NOW - 3 * DAY },
+          // A new page: the newest visit's title and icon stand for it.
+          { url: 'https://c.test/', title: 'C old', favicon: 'data:cold', at: NOW - 2 * DAY },
+          { url: 'https://c.test/', title: 'C new', at: NOW - DAY, transition: 'typed' },
+          { url: 'https://c.test/', at: NOW - 3_600_000 },
+          // Newer than e.test's last visit: replaces its title and icon.
+          { url: 'https://e.test/', title: 'E new', favicon: 'data:enew', at: NOW - 3_600_000 }
+        ],
+        { source: 'chrome' }
+      )
+      expect(result).toEqual({ imported: 7, skipped: 0 })
+      const byUrl = new Map(h.recent(10).map((e) => [e.url, e]))
+      expect(byUrl.get('https://a.test/')).toMatchObject({
+        title: 'Live title',
+        favicon: 'data:live',
+        visitCount: 3,
+        typedCount: 1,
+        firstVisit: NOW - 5 * DAY,
+        lastVisit: NOW - DAY
+      })
+      expect(byUrl.get('https://b.test/')).toMatchObject({
+        title: 'Filled',
+        favicon: 'data:filled',
+        visitCount: 2,
+        typedCount: 0,
+        firstVisit: NOW - 3 * DAY,
+        lastVisit: NOW - DAY
+      })
+      expect(byUrl.get('https://c.test/')).toMatchObject({
+        title: 'C new',
+        favicon: 'data:cold',
+        visitCount: 3,
+        typedCount: 1,
+        firstVisit: NOW - 2 * DAY,
+        lastVisit: NOW - 3_600_000
+      })
+      expect(byUrl.get('https://e.test/')).toMatchObject({
+        title: 'E new',
+        favicon: 'data:enew',
+        visitCount: 2,
+        firstVisit: NOW - DAY,
+        lastVisit: NOW - 3_600_000
+      })
+      expect(h.visits({ host: 'c.test', limit: 1 })[0]).toMatchObject({
+        title: 'https://c.test/',
+        favicon: 'data:cold'
+      })
+    })
+
+    it('applies retention and the caps once: a batch over MAX_VISITS keeps the newest', () => {
+      const h = new HistoryService(fakeIo(), now)
+      const writes = vi.spyOn(JsonStore.prototype, 'write')
+      const batch: ImportedVisit[] = []
+      for (let i = 0; i < 60_000; i++)
+        batch.push({ url: `https://s${i % 100}.test/`, at: NOW - i * 1000 })
+      expect(h.importVisits(batch, { source: 'chrome' })).toEqual({ imported: 60_000, skipped: 0 })
+      expect(h.count(0, Infinity)).toBe(MAX_VISITS)
+      const oldestKept = NOW - (MAX_VISITS - 1) * 1000
+      expect(h.count(0, oldestKept)).toBe(0)
+      expect(h.count(oldestKept, oldestKept + 1)).toBe(1)
+      expect(h.visits({ limit: 1 })[0].visitTime).toBe(NOW)
+      expect(h.recent(200)).toHaveLength(100)
+      expect(writes).toHaveBeenCalledTimes(1)
+    })
+
+    it('notifies and persists once per batch, imports nothing twice, and is silent on an empty batch', () => {
+      const io = fakeIo()
+      const h = new HistoryService(io, now)
+      const writes = vi.spyOn(JsonStore.prototype, 'write')
+      const kinds: string[] = []
+      h.onChange((kind) => kinds.push(kind))
+      const batch: ImportedVisit[] = [
+        { url: 'https://a.test/', title: 'A', at: NOW - DAY },
+        { url: 'https://b.test/', title: 'B', at: NOW - 2 * DAY },
+        { url: 'https://c.test/', title: 'C', at: NOW - 3 * DAY }
+      ]
+      expect(h.importVisits(batch, { source: 'safari' })).toEqual({ imported: 3, skipped: 0 })
+      expect(writes).toHaveBeenCalledTimes(1)
+      expect(kinds).toEqual([])
+      vi.advanceTimersByTime(600)
+      expect(kinds).toEqual(['visit'])
+      expect(h.importVisits(batch, { source: 'safari' })).toEqual({ imported: 0, skipped: 3 })
+      expect(h.importVisits([], { source: 'safari' })).toEqual({ imported: 0, skipped: 0 })
+      expect(writes).toHaveBeenCalledTimes(1)
+      vi.advanceTimersByTime(600)
+      expect(kinds).toEqual(['visit'])
+      // Stored visits count as duplicates after a reload too.
+      h.flushSync()
+      expect(storedVisits(io)).toHaveLength(3)
+      const again = new HistoryService(io, now)
+      expect(again.importVisits(batch, { source: 'safari' })).toEqual({ imported: 0, skipped: 3 })
+      expect(again.count(0, Infinity)).toBe(3)
+    })
+  })
+
+  describe('exportVisits (sync, W4-3)', () => {
+    it('pages the visits since a time, oldest first, in the import shape, without writing', () => {
+      const io = fakeIo()
+      const h = new HistoryService(io, now)
+      for (let i = 0; i < 7; i += 1)
+        h.visit(
+          `https://p${i}.test/`,
+          i === 3 ? '' : `P${i}`,
+          i === 1 ? 'https://p1.test/icon.png' : 'data:icon',
+          {
+            at: NOW - (7 - i) * DAY,
+            transition: i === 2 ? 'typed' : 'link'
+          }
+        )
+      h.flushSync()
+      const writes = vi.spyOn(JsonStore.prototype, 'write')
+      const first = h.exportVisits({ since: NOW - 6 * DAY, limit: 3 })
+      expect(first.visits).toEqual([
+        {
+          url: 'https://p1.test/',
+          title: 'P1',
+          at: NOW - 6 * DAY,
+          transition: 'link',
+          favicon: 'https://p1.test/icon.png'
+        },
+        { url: 'https://p2.test/', title: 'P2', at: NOW - 5 * DAY, transition: 'typed' },
+        // An untitled page carries no title (the store's URL stand-in is not one); a data: icon stays home.
+        { url: 'https://p3.test/', at: NOW - 4 * DAY, transition: 'link' }
+      ])
+      expect(first.next).not.toBeNull()
+      const second = h.exportVisits({ since: NOW - 6 * DAY, limit: 3, cursor: first.next })
+      expect(second.visits.map((v) => v.url)).toEqual([
+        'https://p4.test/',
+        'https://p5.test/',
+        'https://p6.test/'
+      ])
+      expect(second.next).toBeNull()
+      // `until` bounds the page and ends the export.
+      const bounded = h.exportVisits({ since: NOW - 6 * DAY, until: NOW - 4 * DAY, limit: 10 })
+      expect(bounded.visits.map((v) => v.url)).toEqual(['https://p1.test/', 'https://p2.test/'])
+      expect(bounded.next).toBeNull()
+      expect(h.exportVisits({ since: NOW + DAY })).toEqual({ visits: [], next: null })
+      expect(writes).not.toHaveBeenCalled()
+      // One device's export is another's import unchanged.
+      const other = new HistoryService(fakeIo(), now)
+      expect(other.importVisits([...first.visits, ...second.visits], { source: 'sync' })).toEqual({
+        imported: 6,
+        skipped: 0
+      })
+      expect(other.recent(10).find((e) => e.url === 'https://p2.test/')?.typedCount).toBe(1)
+    })
+
+    it('resumes after the cursor key among same-time visits and survives a deletion in between', () => {
+      const h = new HistoryService(fakeIo(), now)
+      const at = NOW - DAY
+      for (const u of ['a', 'b', 'c', 'd']) h.visit(`https://${u}.test/`, u, null, { at })
+      h.visit('https://e.test/', 'e', null, { at: at + 1 })
+      const page1 = h.exportVisits({ since: 0, limit: 2 })
+      expect(page1.visits.map((v) => v.url)).toEqual(['https://a.test/', 'https://b.test/'])
+      const page2 = h.exportVisits({ since: 0, limit: 2, cursor: page1.next })
+      expect(page2.visits.map((v) => v.url)).toEqual(['https://c.test/', 'https://d.test/'])
+      // The cursor's own visit is gone: the page starts at that time again (a repeat dedupes downstream).
+      h.deleteUrls(['https://d.test/'])
+      const page3 = h.exportVisits({ since: 0, limit: 5, cursor: page2.next })
+      expect(page3.visits.map((v) => v.url)).toEqual([
+        'https://a.test/',
+        'https://b.test/',
+        'https://c.test/',
+        'https://e.test/'
+      ])
+      expect(page3.next).toBeNull()
+      expect(h.exportVisits({ since: 0, cursor: 'garbage' }).visits).toHaveLength(4)
+    })
+  })
+
+  describe('onVisits (sync, W4-3)', () => {
+    it('reports additions with their payload, once per visit and once per import batch, beside onChange', () => {
+      const h = new HistoryService(fakeIo(), now)
+      const events: unknown[] = []
+      const kinds: string[] = []
+      h.onVisits((e) => events.push(e))
+      h.onChange((k) => kinds.push(k))
+      h.visit('https://a.test/', 'A', 'data:x', { transition: 'typed' })
+      expect(events).toEqual([
+        {
+          type: 'added',
+          visits: [{ url: 'https://a.test/', title: 'A', at: NOW, transition: 'typed' }]
+        }
+      ])
+      h.visit('zen://settings', 'Settings', null)
+      expect(events).toHaveLength(1)
+      vi.spyOn(console, 'info').mockImplementation(() => undefined)
+      h.importVisits(
+        [
+          { url: 'https://b.test/', title: 'B', at: NOW - DAY },
+          { url: 'https://a.test/', at: NOW }, // duplicate by (url, at): not reported
+          { url: 'https://c.test/', at: NOW - 2 * DAY, favicon: 'https://c.test/i.png' }
+        ],
+        { source: 'sync' }
+      )
+      expect(events).toHaveLength(2)
+      expect(events[1]).toEqual({
+        type: 'added',
+        visits: [
+          {
+            url: 'https://c.test/',
+            at: NOW - 2 * DAY,
+            transition: 'link',
+            favicon: 'https://c.test/i.png'
+          },
+          { url: 'https://b.test/', title: 'B', at: NOW - DAY, transition: 'link' }
+        ]
+      })
+      // The payload-less channel is untouched: one throttled 'visit' for all of it.
+      expect(kinds).toEqual([])
+      vi.advanceTimersByTime(600)
+      expect(kinds).toEqual(['visit'])
+      vi.restoreAllMocks()
+    })
+
+    it('reports deletions as keys, ranges and clear; a range travels even when nothing matched here', () => {
+      const h = new HistoryService(fakeIo(), now)
+      h.visit('https://a.test/', 'A', null, { at: NOW - 3 * DAY })
+      h.visit('https://b.test/', 'B', null, { at: NOW - 2 * DAY })
+      h.visit('https://b.test/', 'B', null, { at: NOW - DAY })
+      h.visit('https://c.test/', 'C', null, { at: NOW - 1000 })
+      const events: unknown[] = []
+      h.onVisits((e) => events.push(e))
+      const id = h.visits({ host: 'a.test', limit: 1 })[0].id
+      h.deleteVisits([id])
+      h.deleteUrls(['https://b.test/'])
+      expect(events).toEqual([
+        { type: 'removed', keys: [{ url: 'https://a.test/', at: NOW - 3 * DAY }] },
+        {
+          type: 'removed',
+          keys: [
+            { url: 'https://b.test/', at: NOW - 2 * DAY },
+            { url: 'https://b.test/', at: NOW - DAY }
+          ]
+        }
+      ])
+      expect(h.deleteRange(NOW - 10 * DAY, NOW - 9 * DAY)).toBe(0)
+      expect(events[2]).toEqual({ type: 'range-removed', from: NOW - 10 * DAY, to: NOW - 9 * DAY })
+      const day = dayKeyOf(NOW - 1000)
+      h.deleteDay(day)
+      const dayEvent = events[3] as { type: string; from: number; to: number }
+      expect(dayEvent.type).toBe('range-removed')
+      expect(dayEvent.from).toBeLessThanOrEqual(NOW - 1000)
+      expect(dayEvent.to).toBeGreaterThan(NOW - 1000)
+      expect(dayEvent.to - dayEvent.from).toBeGreaterThanOrEqual(23 * 3_600_000)
+      expect(h.count(0, Infinity)).toBe(0)
+      h.visit('https://d.test/', 'D', null)
+      h.clear()
+      expect(events.at(-1)).toEqual({ type: 'cleared' })
+      // Nothing to delete: no keys event (the deletion changed nothing anywhere).
+      h.deleteUrls(['https://never.test/'])
+      expect(events).toHaveLength(6)
+    })
+
+    it('deleteByKeys removes by (url, at), recomputes the aggregate and reports the keys that went', () => {
+      const h = new HistoryService(fakeIo(), now)
+      h.visit('https://a.test/', 'A', null, { at: NOW - 2 * DAY, transition: 'typed' })
+      h.visit('https://a.test/', 'A', null, { at: NOW - DAY })
+      h.visit('https://b.test/', 'B', null, { at: NOW - DAY })
+      const events: unknown[] = []
+      h.onVisits((e) => events.push(e))
+      expect(
+        h.deleteByKeys([
+          { url: 'https://a.test/', at: NOW - 2 * DAY },
+          { url: 'https://a.test/', at: NOW - 5 * DAY }, // unknown: ignored
+          { url: 'https://b.test/', at: NOW - DAY }
+        ])
+      ).toBe(2)
+      expect(events).toEqual([
+        {
+          type: 'removed',
+          keys: [
+            { url: 'https://a.test/', at: NOW - 2 * DAY },
+            { url: 'https://b.test/', at: NOW - DAY }
+          ]
+        }
+      ])
+      expect(h.recent(5)).toHaveLength(1)
+      expect(h.recent(5)[0]).toMatchObject({ url: 'https://a.test/', visitCount: 1, typedCount: 0 })
+      expect(h.deleteByKeys([{ url: 'https://a.test/', at: 0 }])).toBe(0)
+      expect(events).toHaveLength(1)
+    })
+  })
+
+  describe('redirect chains (history-23)', () => {
+    const SHORT = 'https://sho.rt/abc'
+    const HTTP = 'http://example.test/page'
+    const LANDING = 'https://example.test/page'
+
+    /** A typed shortener address that bounced through the http origin onto the https page. */
+    function chained(h: HistoryService): void {
+      h.visit(LANDING, 'Example', 'data:icon', {
+        transition: 'typed',
+        tabId: 't1',
+        redirectedFrom: [SHORT, HTTP]
+      })
+    }
+
+    it('records one visit per hop at the landing’s time: hops flagged, the first keeping the transition, the landing carrying its chain', () => {
+      const h = new HistoryService(fakeIo(), now)
+      const events: unknown[] = []
+      h.onVisits((e) => events.push(e))
+      chained(h)
+      const all = h.visits({ limit: 10, includeRedirectSources: true })
+      expect(
+        all.map((v) => [
+          v.url,
+          v.transition,
+          v.redirectSource,
+          v.redirectedFrom,
+          v.visitTime,
+          v.tabId
+        ])
+      ).toEqual([
+        [SHORT, 'typed', true, undefined, NOW, 't1'],
+        [HTTP, 'redirect', true, undefined, NOW, 't1'],
+        [LANDING, 'redirect', undefined, [SHORT, HTTP], NOW, 't1']
+      ])
+      // Every address counts as visited; the typed credit went to the one the user asked for.
+      expect(h.visited(SHORT)).toBe(true)
+      expect(h.visited(HTTP)).toBe(true)
+      expect(h.visited(LANDING)).toBe(true)
+      expect(h.visited('https://never.test/')).toBe(false)
+      const counts = new Map(h.recent(5).map((e) => [e.url, [e.visitCount, e.typedCount]]))
+      expect(counts.get(SHORT)).toEqual([1, 1])
+      expect(counts.get(HTTP)).toEqual([1, 0])
+      expect(counts.get(LANDING)).toEqual([1, 0])
+      // One event, every hop in it with its flag – a peer stores the chain as this device did.
+      expect(events).toEqual([
+        {
+          type: 'added',
+          visits: [
+            { url: SHORT, at: NOW, transition: 'typed', redirectSource: true },
+            { url: HTTP, at: NOW, transition: 'redirect', redirectSource: true },
+            {
+              url: LANDING,
+              at: NOW,
+              title: 'Example',
+              transition: 'redirect',
+              redirectedFrom: [SHORT, HTTP]
+            }
+          ]
+        }
+      ])
+      expect(h.redirectChainOf(SHORT)).toEqual([SHORT, HTTP, LANDING])
+      expect(h.redirectChainOf(LANDING)).toEqual([SHORT, HTTP, LANDING])
+      expect(h.redirectChainOf('https://never.test/')).toEqual(['https://never.test/'])
+    })
+
+    it('credits a typed http address that only moved to its https twin to the https page, as Chrome transfers it', () => {
+      const h = new HistoryService(fakeIo(), now)
+      h.visit('https://www.example.test/a?b=1', 'A', null, {
+        transition: 'typed',
+        redirectedFrom: ['http://example.test:8080/a?b=1']
+      })
+      const counts = new Map(h.recent(5).map((e) => [e.url, e.typedCount]))
+      expect(counts.get('http://example.test:8080/a?b=1')).toBe(0)
+      expect(counts.get('https://www.example.test/a?b=1')).toBe(1)
+      // The label moves with the credit: what a reader recounts from agrees with what was credited.
+      expect(
+        h
+          .visits({ limit: 5, includeRedirectSources: true })
+          .map((v) => [v.url, v.transition, v.redirectSource ?? false])
+      ).toEqual([
+        ['http://example.test:8080/a?b=1', 'redirect', true],
+        ['https://www.example.test/a?b=1', 'typed', false]
+      ])
+      // A peer importing the chain credits the same page …
+      const peer = new HistoryService(fakeIo(), now)
+      vi.spyOn(console, 'info').mockImplementation(() => undefined)
+      peer.importVisits(h.exportVisits({ since: 0 }).visits, { source: 'sync' })
+      vi.restoreAllMocks()
+      const peerCounts = new Map(peer.recent(5).map((e) => [e.url, e.typedCount]))
+      expect(peerCounts.get('http://example.test:8080/a?b=1')).toBe(0)
+      expect(peerCounts.get('https://www.example.test/a?b=1')).toBe(1)
+      // … and so does this store's recount after another visit of the page goes.
+      clock += 500
+      h.visit('https://www.example.test/a?b=1', 'A', null)
+      const later = h.visits({ limit: 1 })[0]
+      h.deleteVisits([later.id])
+      const recounted = new Map(h.recent(5).map((e) => [e.url, e.typedCount]))
+      expect(recounted.get('http://example.test:8080/a?b=1')).toBe(0)
+      expect(recounted.get('https://www.example.test/a?b=1')).toBe(1)
+      // The typed http address bounced elsewhere first: the credit stays with what was typed.
+      clock += 1000
+      h.visit('https://other.test/', 'O', null, {
+        transition: 'typed',
+        redirectedFrom: ['http://go.test/', 'https://go.test/']
+      })
+      const again = new Map(h.recent(9).map((e) => [e.url, e.typedCount]))
+      expect(again.get('http://go.test/')).toBe(0)
+      expect(again.get('https://go.test/')).toBe(1)
+      expect(again.get('https://other.test/')).toBe(0)
+      expect(isHttpsUpgrade('http://a.test/x', 'https://a.test/y')).toBe(false)
+      expect(isHttpsUpgrade('https://a.test/', 'https://a.test/')).toBe(false)
+      expect(isHttpsUpgrade('http://a.test/', 'https://www.a.test/')).toBe(true)
+    })
+
+    it('hides the hops from the history page’s list, search, day groups and count; getVisits-style readers opt in', () => {
+      const h = new HistoryService(fakeIo(), now)
+      chained(h)
+      clock += 1000
+      h.visit('https://other.test/', 'Other', null)
+      expect(h.visits({ limit: 10 }).map((v) => v.url)).toEqual(['https://other.test/', LANDING])
+      expect(h.visits({ text: 'sho.rt', limit: 10 })).toEqual([])
+      expect(h.visits({ host: 'sho.rt', limit: 10 })).toEqual([])
+      expect(h.visits({ host: 'sho.rt', limit: 10, includeRedirectSources: true })).toHaveLength(1)
+      expect(h.groupedByDay({ limit: 100 })[0].visits.map((v) => v.url)).toEqual([
+        'https://other.test/',
+        LANDING
+      ])
+      expect(h.count(0, Infinity)).toBe(2)
+      expect(h.visits({ limit: 10, includeRedirectSources: true })).toHaveLength(4)
+    })
+
+    it('offers a chain once in the omnibox: the best-ranked member stands for the whole chain (CullRedirects)', () => {
+      const h = new HistoryService(fakeIo(), now)
+      chained(h)
+      // The landing's title reaches the hops, as Chrome titles the whole chain.
+      h.updateTitle(LANDING, 'Example Site')
+      expect(h.titleFor(SHORT)).toBe('Example Site')
+      expect(h.titleFor(HTTP)).toBe('Example Site')
+      // "example" matches all three entries (the title now, and two addresses): one suggestion.
+      expect(h.search('example', 5).map((e) => e.url)).toEqual([LANDING])
+      // A term only a hop matches finds the hop – a visited address the omnibox may still offer.
+      expect(h.search('sho.rt', 5).map((e) => e.url)).toEqual([SHORT])
+      // Another page of the site is not part of the chain and keeps its own place.
+      clock += 1000
+      h.visit('https://example.test/other', 'Example other', null)
+      expect(
+        h
+          .search('example', 5)
+          .map((e) => e.url)
+          .sort()
+      ).toEqual(['https://example.test/other', LANDING].sort())
+    })
+
+    it('maps the landing’s favicon onto the chain and keeps a hop’s given title over its address', () => {
+      const h = new HistoryService(fakeIo(), now)
+      chained(h)
+      h.updateTitle(LANDING, 'Example Site')
+      h.updateFavicon(LANDING, 'https://example.test/icon.png')
+      expect(h.faviconFor(SHORT)).toBe('https://example.test/icon.png')
+      expect(h.faviconFor(HTTP)).toBe('https://example.test/icon.png')
+      // The shortener is followed again: its entry is bumped, its title stays the page's.
+      clock += 1000
+      chained(h)
+      expect(h.recent(5).find((e) => e.url === SHORT)).toMatchObject({
+        visitCount: 2,
+        title: 'Example Site'
+      })
+    })
+
+    it('removing the landing from the list takes its hops along; removing the page by URL leaves them hidden', () => {
+      const h = new HistoryService(fakeIo(), now)
+      chained(h)
+      clock += 1000
+      h.visit('https://other.test/', 'Other', null)
+      const events: unknown[] = []
+      h.onVisits((e) => events.push(e))
+      const landing = h.visits({ host: 'example.test', limit: 1 })[0]
+      h.deleteVisits([landing.id])
+      expect(h.visits({ limit: 10, includeRedirectSources: true }).map((v) => v.url)).toEqual([
+        'https://other.test/'
+      ])
+      expect(h.visited(SHORT)).toBe(false)
+      expect(events).toEqual([
+        {
+          type: 'removed',
+          keys: [
+            { url: SHORT, at: NOW },
+            { url: HTTP, at: NOW },
+            { url: LANDING, at: NOW }
+          ]
+        }
+      ])
+      // Deleting by URL is the page's own visits only (Chrome's DeleteURLs).
+      clock += 1000
+      chained(h)
+      h.deleteUrls([LANDING])
+      expect(h.visits({ limit: 10 }).map((v) => v.url)).toEqual(['https://other.test/'])
+      expect(h.visited(SHORT)).toBe(true)
+      expect(h.count(0, Infinity)).toBe(1)
+    })
+
+    it('round-trips through the store and the sync wire, and reads a store without the flags as landings only', () => {
+      const io = fakeIo()
+      const h = new HistoryService(io, now)
+      chained(h)
+      h.flushSync()
+      const stored = storedVisits(io)
+      expect(stored.map((v) => [v.url, v.redirectSource, v.redirectedFrom])).toEqual([
+        [SHORT, true, undefined],
+        [HTTP, true, undefined],
+        [LANDING, undefined, [SHORT, HTTP]]
+      ])
+      const again = new HistoryService(io, now)
+      expect(again.visits({ limit: 10 }).map((v) => v.url)).toEqual([LANDING])
+      expect(again.redirectChainOf(HTTP)).toEqual([SHORT, HTTP, LANDING])
+      expect(again.visited(SHORT)).toBe(true)
+      // The export carries the flags; an import of it rebuilds the chain on the other device.
+      const exportedPage = again.exportVisits({ since: 0 })
+      expect(exportedPage.visits.map((v) => [v.url, v.redirectSource, v.redirectedFrom])).toEqual([
+        [SHORT, true, undefined],
+        [HTTP, true, undefined],
+        [LANDING, undefined, [SHORT, HTTP]]
+      ])
+      const peer = new HistoryService(fakeIo(), now)
+      vi.spyOn(console, 'info').mockImplementation(() => undefined)
+      peer.importVisits(exportedPage.visits, { source: 'sync' })
+      vi.restoreAllMocks()
+      expect(peer.visits({ limit: 10 }).map((v) => v.url)).toEqual([LANDING])
+      expect(peer.visits({ limit: 10, includeRedirectSources: true })).toHaveLength(3)
+      expect(peer.redirectChainOf(SHORT)).toEqual([SHORT, HTTP, LANDING])
+      // A store written before the flags existed: every visit is a landing.
+      const old = new HistoryService(
+        fakeIo({
+          'history.json': JSON.stringify({
+            version: 2,
+            entries: [entry({ url: SHORT })],
+            visits: [visit({ url: SHORT, visitTime: NOW })]
+          })
+        }),
+        now
+      )
+      expect(old.visits({ limit: 10 }).map((v) => v.url)).toEqual([SHORT])
+      expect(old.redirectChainOf(SHORT)).toEqual([SHORT])
+    })
+
+    it('skips what is not a chain: an empty list, the landing itself, chrome pages', () => {
+      const h = new HistoryService(fakeIo(), now)
+      h.visit(LANDING, 'Example', null, { redirectedFrom: [] })
+      h.visit(LANDING, 'Example', null, { redirectedFrom: [LANDING, 'about:blank'] })
+      const all = h.visits({ limit: 10, includeRedirectSources: true })
+      expect(all).toHaveLength(2)
+      expect(all.every((v) => v.transition === 'link' && !v.redirectedFrom)).toBe(true)
+    })
+
+    describe('client redirects (a page that replaced itself, Chrome’s PAGE_TRANSITION_CLIENT_REDIRECT with did_replace_entry)', () => {
+      const GATE = 'https://example.test/gate'
+      const HOME = 'https://example.test/home'
+
+      /** Every visit as stored, oldest first, hops included: `[url, transition, redirectSource, redirectedFrom, at]`. */
+      function all(h: HistoryService): unknown[] {
+        return h
+          .exportVisits({ since: 0 })
+          .visits.map((v) => [v.url, v.transition, v.redirectSource, v.redirectedFrom, v.at])
+      }
+
+      it('folds the page into the landing’s chain: one row, the landing’s, the page a hop that keeps its typed credit, title and favicon', () => {
+        const h = new HistoryService(fakeIo(), now)
+        h.visit(GATE, 'Gate', 'https://example.test/gate.png', { transition: 'typed', tabId: 't1' })
+        const events: unknown[] = []
+        h.onVisits((e) => events.push(e))
+        clock += 400
+        h.visit(HOME, 'Home', null, { transition: 'link', tabId: 't1', clientRedirectFrom: GATE })
+        expect(all(h)).toEqual([
+          [GATE, 'typed', true, undefined, NOW + 400],
+          [HOME, 'redirect', undefined, [GATE], NOW + 400]
+        ])
+        expect(h.visits({ limit: 10 }).map((v) => v.url)).toEqual([HOME])
+        expect(h.count(0, Infinity)).toBe(1)
+        expect(h.redirectChainOf(GATE)).toEqual([GATE, HOME])
+        // The typed credit stays with the address the user asked for; the landing earns none.
+        const entries = new Map(h.recent(5).map((e) => [e.url, e]))
+        expect(entries.get(GATE)).toMatchObject({
+          visitCount: 1,
+          typedCount: 1,
+          title: 'Gate',
+          favicon: 'https://example.test/gate.png'
+        })
+        expect(entries.get(HOME)).toMatchObject({ visitCount: 1, typedCount: 0, title: 'Home' })
+        // The wire sees the page's visit go and come back as a hop, then the landing: a peer
+        // replaying the two ends where this store is.
+        expect(events).toEqual([
+          { type: 'removed', keys: [{ url: GATE, at: NOW }] },
+          {
+            type: 'added',
+            visits: [
+              {
+                url: GATE,
+                at: NOW + 400,
+                title: 'Gate',
+                transition: 'typed',
+                redirectSource: true
+              },
+              {
+                url: HOME,
+                at: NOW + 400,
+                title: 'Home',
+                transition: 'redirect',
+                redirectedFrom: [GATE]
+              }
+            ]
+          }
+        ])
+        // The landing's late title reaches the page it replaced, as the chain's title (Chrome's).
+        h.updateTitle(HOME, 'Example Home')
+        expect(h.titleFor(GATE)).toBe('Example Home')
+      })
+
+      it('carries the chain the page came by and the server hops of the new navigation; the landing takes them all with it when removed', () => {
+        const h = new HistoryService(fakeIo(), now)
+        chained(h)
+        clock += 500
+        h.visit(HOME, 'Home', null, {
+          tabId: 't1',
+          clientRedirectFrom: LANDING,
+          redirectedFrom: [GATE]
+        })
+        expect(all(h)).toEqual([
+          [SHORT, 'typed', true, undefined, NOW + 500],
+          [HTTP, 'redirect', true, undefined, NOW + 500],
+          [LANDING, 'redirect', true, undefined, NOW + 500],
+          [GATE, 'redirect', true, undefined, NOW + 500],
+          [HOME, 'redirect', undefined, [SHORT, HTTP, LANDING, GATE], NOW + 500]
+        ])
+        expect(h.visits({ limit: 10 }).map((v) => v.url)).toEqual([HOME])
+        expect(h.redirectChainOf(SHORT)).toEqual([SHORT, HTTP, LANDING, GATE, HOME])
+        expect(h.recent(9).find((e) => e.url === SHORT)?.typedCount).toBe(1)
+        // Search offers the chain once, by its best member.
+        h.updateTitle(HOME, 'Example Home')
+        expect(h.search('example', 5).map((e) => e.url)).toEqual([HOME])
+        const events: unknown[] = []
+        h.onVisits((e) => events.push(e))
+        h.deleteVisits([h.visits({ limit: 1 })[0].id])
+        expect(h.visits({ limit: 10, includeRedirectSources: true })).toEqual([])
+        expect(events).toEqual([
+          {
+            type: 'removed',
+            keys: [SHORT, HTTP, LANDING, GATE, HOME].map((url) => ({ url, at: NOW + 500 }))
+          }
+        ])
+      })
+
+      it('dates the landing a millisecond after a page it replaced within the same one, so the moved visit never meets its own tombstone', () => {
+        const h = new HistoryService(fakeIo(), now)
+        h.visit(GATE, 'Gate', null, { transition: 'typed', tabId: 't1' })
+        const events: HistoryVisitsEvent[] = []
+        h.onVisits((e) => events.push(e))
+        h.visit(HOME, 'Home', null, { tabId: 't1', clientRedirectFrom: GATE })
+        expect(all(h)).toEqual([
+          [GATE, 'typed', true, undefined, NOW + 1],
+          [HOME, 'redirect', undefined, [GATE], NOW + 1]
+        ])
+        // A peer that held the page's visit replays the events (later, as a peer does: an
+        // import takes no visit from the future): the tombstone takes the old visit, the import
+        // brings the chain – one row, the credit where it was.
+        clock += 1
+        const peer = new HistoryService(fakeIo(), now)
+        vi.spyOn(console, 'info').mockImplementation(() => undefined)
+        peer.importVisits([{ url: GATE, at: NOW, title: 'Gate', transition: 'typed' }], {
+          source: 'sync'
+        })
+        for (const e of events) {
+          if (e.type === 'removed') peer.deleteByKeys(e.keys)
+          if (e.type === 'added') peer.importVisits(e.visits, { source: 'sync' })
+        }
+        vi.restoreAllMocks()
+        expect(peer.visits({ limit: 10 }).map((v) => v.url)).toEqual([HOME])
+        expect(peer.redirectChainOf(GATE)).toEqual([GATE, HOME])
+        expect(peer.recent(5).find((e) => e.url === GATE)?.typedCount).toBe(1)
+      })
+
+      it('keeps the https twin’s transferred credit and a linked page’s link transition; the new navigation earns nothing', () => {
+        const h = new HistoryService(fakeIo(), now)
+        h.visit('https://www.example.test/', 'Example', null, {
+          transition: 'typed',
+          tabId: 't1',
+          redirectedFrom: ['http://example.test/']
+        })
+        clock += 300
+        h.visit(HOME, 'Home', null, {
+          transition: 'typed',
+          tabId: 't1',
+          clientRedirectFrom: 'https://www.example.test/'
+        })
+        const counts = new Map(h.recent(9).map((e) => [e.url, e.typedCount]))
+        expect(counts.get('http://example.test/')).toBe(0)
+        expect(counts.get('https://www.example.test/')).toBe(1)
+        expect(counts.get(HOME)).toBe(0)
+        expect(all(h)).toEqual([
+          ['http://example.test/', 'redirect', true, undefined, NOW + 300],
+          ['https://www.example.test/', 'typed', true, undefined, NOW + 300],
+          [
+            HOME,
+            'redirect',
+            undefined,
+            ['http://example.test/', 'https://www.example.test/'],
+            NOW + 300
+          ]
+        ])
+        clock += 300
+        h.visit(GATE, 'Gate', null, { transition: 'link', tabId: 't2' })
+        clock += 300
+        h.visit('https://other.test/', 'Other', null, { tabId: 't2', clientRedirectFrom: GATE })
+        expect(all(h).slice(-2)).toEqual([
+          [GATE, 'link', true, undefined, NOW + 900],
+          ['https://other.test/', 'redirect', undefined, [GATE], NOW + 900]
+        ])
+      })
+
+      it('folds nothing without a visit of the page in the tab, for the page’s own address, or for an address history never records', () => {
+        const h = new HistoryService(fakeIo(), now)
+        h.visit(GATE, 'Gate', null, { transition: 'typed', tabId: 't1' })
+        clock += 100
+        // Another tab's commit: the page it shows is not this one.
+        h.visit(HOME, 'Home', null, { tabId: 't2', clientRedirectFrom: GATE })
+        clock += 100
+        // A page never visited (an error page stood there).
+        h.visit('https://b.test/', 'B', null, {
+          tabId: 't1',
+          clientRedirectFrom: 'https://c.test/'
+        })
+        clock += 100
+        // A chrome page cannot be a hop.
+        h.visit('https://d.test/', 'D', null, { tabId: 't1', clientRedirectFrom: 'zen://newtab' })
+        clock += 100
+        // The page came back to its own address (a reload reads the same to the host).
+        h.visit(GATE, 'Gate', null, { tabId: 't1', clientRedirectFrom: GATE })
+        expect(all(h)).toEqual([
+          [GATE, 'typed', undefined, undefined, NOW],
+          [HOME, 'link', undefined, undefined, NOW + 100],
+          ['https://b.test/', 'link', undefined, undefined, NOW + 200],
+          ['https://d.test/', 'link', undefined, undefined, NOW + 300],
+          [GATE, 'link', undefined, undefined, NOW + 400]
+        ])
+        expect(h.count(0, Infinity)).toBe(5)
+        // Without a tab, the page's most recent visit anywhere is the one.
+        clock += 100
+        h.visit(HOME, 'Home', null, { clientRedirectFrom: GATE })
+        expect(all(h).slice(-2)).toEqual([
+          [GATE, 'link', true, undefined, NOW + 500],
+          [HOME, 'redirect', undefined, [GATE], NOW + 500]
+        ])
+        expect(h.recent(9).find((e) => e.url === GATE)).toMatchObject({
+          visitCount: 2,
+          typedCount: 1
+        })
+      })
+    })
+  })
+})

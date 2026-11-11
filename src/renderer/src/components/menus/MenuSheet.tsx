@@ -1,0 +1,1172 @@
+import type { JSX } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Building2, Check, ChevronLeft, ChevronRight, Globe, Mail, Phone } from 'lucide-react'
+import { applyMenuOrder, isDefaultMenuOrder } from '@shared/menuOrder'
+import type { MenuDescriptor, MenuHeader, MenuItemDescriptor } from '@shared/types'
+import { useMenuAsList } from '@renderer/lib/accessibilityState'
+import { anchorOf, placeUnder, popOrigin, type Anchor } from '@renderer/lib/anchor'
+import { run } from '@renderer/lib/api'
+import { useBackSurface } from '@renderer/lib/back'
+import { useViewport } from '@renderer/lib/formFactor'
+import { APP_MENU_BUTTON } from '@renderer/lib/mediaHub'
+import {
+  isChangeMenuItem,
+  joinMenuSections,
+  menuSectionsOrder,
+  sameMenuOrder,
+  splitMenuSections,
+  type MenuSections
+} from '@renderer/lib/menuEdit'
+import { isIconRow } from '@renderer/lib/menuIconRow'
+import { handleMenuKey } from '@renderer/lib/menuKeys'
+import {
+  HOVER_TO_OPEN_MS,
+  closedTo,
+  focusAfterClose,
+  focusAfterOpen,
+  openedAt,
+  type PathFocus
+} from '@renderer/lib/menuPath'
+import { sourceTitle } from '@renderer/lib/menuTitle'
+import { useSheetLeave } from '@renderer/lib/motion/presence'
+import { reducedMotion } from '@renderer/lib/motion/spring'
+import { holdExpanded, openedFromKeyboard } from '@renderer/lib/popover'
+import {
+  ChromePortal,
+  besideOrigin,
+  intrinsicSize,
+  layoutRect,
+  placeBeside,
+  popoverStyle,
+  rowRect,
+  useLightDismiss,
+  viewportSize,
+  type PopoverBox
+} from '@renderer/lib/portals'
+import { dismissQrCode, downloadQrCode } from '@renderer/lib/qrCode'
+import {
+  SHARE_SEAM_BUSY_MS,
+  SHARE_SEAM_OUT_MS,
+  handsOverToSharePanel
+} from '@renderer/lib/shareSeam'
+import {
+  beginShareSeam,
+  browserStore,
+  closeMenu,
+  lastPointer,
+  pickMenuItem,
+  uiStore
+} from '@renderer/lib/ui'
+import { cn } from '@renderer/lib/utils'
+import { DeviceGlyph, anyDeviceKind } from '../DeviceGlyph'
+import { GroupGlyph } from '../GroupGlyph'
+import { RowFavicon } from '../phone/PhoneList'
+import { useLongPress } from '../phone/useLongPress'
+import {
+  QR_CODE_TITLE_ID,
+  QrCodeFooter,
+  QrCodeHandOff,
+  useHandOffOutgoing
+} from '../qr/QrCodeSheet'
+import { SharePanelContent, SharePanelPreview, useHostedQrCode } from '../share/SharePanelSheet'
+import { Spinner } from '../siteControls/primitives'
+import { BottomSheet, type BottomSheetHandle } from '../sheet/BottomSheet'
+import { TabletMenu } from '../tablet/TabletMenu'
+import { MenuEditor } from './MenuEditor'
+import { MenuItemGlyph } from './MenuGlyphView'
+
+/**
+ * Renders a `menu.show` descriptor for hosts without native popup menus. A phone gets a bottom
+ * sheet with drill-in submenus; a tablet gets the §9.20 popover anchored to its button or the
+ * finger's point, with cascading submenus (`TabletMenu`, v2 §9.36: a sheet at the foot of a
+ * 1280 window is a reach away from the ⋯ that opened it – the shared `.zen-v2-menu` in its
+ * tablet pose); a mouse (DeX, tablets with a trackpad) gets the shared `.zen-v2-menu` popover
+ * with cascading submenus (`Popover` below), the vocabulary every menu the renderer draws shares
+ * with `LocalMenu` and the bookmarks bar's folder panels.
+ */
+export function MenuSheet({ menu }: { menu: MenuDescriptor }): JSX.Element {
+  const viewport = useViewport()
+  if (viewport.formFactor === 'tablet') return <TabletMenu menu={menu} />
+  return viewport.coarse ? <MenuBottomSheet menu={menu} /> : <Popover menu={menu} />
+}
+
+/**
+ * Escape closes either variant (hardware keyboards exist on tablets and DeX too). A menu that is
+ * `leaving` – its request gone, its sheet on its way down under `SheetPresence` (§11.1) – lets
+ * the key by: it answers nothing any more, and a menu that popped above it does.
+ */
+function useEscape(close: () => void, leaving = false): void {
+  const latest = useRef({ close, leaving })
+  useEffect(() => {
+    latest.current = { close, leaving }
+  })
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape' && !latest.current.leaving) {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        latest.current.close()
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [])
+}
+
+// ---------------------------------------------------------------------------
+// Bottom sheet (touch)
+// ---------------------------------------------------------------------------
+
+interface MenuNav {
+  path: MenuItemDescriptor[]
+  /** Which way the last drill went; 0 until the first one, so the root list does not slide in. */
+  direction: 1 | -1 | 0
+}
+
+/**
+ * The menu as a draggable sheet, laid out like the rest of the chrome: rows in the sidebar's
+ * type and radius, sections told apart by spacing alone, a title row like the drawer's. Picking
+ * a row slides the sheet away first, so the host never snapshots the menu when it dims the page
+ * for whatever the row opens.
+ *
+ * The icon row's two poses (A11Y-04): six icon buttons across one row at rest; under touch
+ * exploration (TalkBack) or at large text (`lib/accessibilityState.ts`) the same items as a
+ * list of §10.3 rows, the glyph leading and the label the visible text, so every action is
+ * one full-width stop with its name under the finger and its label in the enlarged type. The
+ * pose follows the state live while the sheet stands.
+ *
+ * The app menu's root has a third pose, the edit mode (Edge's Change menu, TB-22): its last row,
+ * Change Menu, swaps the body for `MenuEditor` in place – the same items, held and dragged into
+ * the user's order, a Reset row – under the title "Change Menu" and a Done control. The order
+ * edited is a draft here (`MenuDraft`); the pose ending saves it – Done, the back gesture or
+ * Escape, and the sheet's own dismissal alike, so no way out loses a reorder – as
+ * `settings.menuOrder` (the default order saves as the empty list, which the core keeps as the
+ * setting's value and the peers read as the reset), and the normal pose shows the draft's order
+ * from then on, ahead of the core's next composition. A pose that ends on the order last saved
+ * writes nothing (`sameMenuOrder`), so the empty list and an absent setting never trade places
+ * over an opening that changed nothing.
+ *
+ * The app menu's Share row, below Android 14, is the one pick the sheet does not leave for
+ * (`lib/shareSeam.ts`, v2 draft §9.38's hand-off): the host gathers the share panel's row while
+ * the menu stands, its rows inert – the tapped row taking §9.30's spinner in its trailing slot
+ * once the gather has run 150 ms, the others as they were – and the request that comes back
+ * takes this very chassis –
+ * the header becomes the share's preview, the body the panel's chips and apps, the two contents
+ * crossfading (the rows out over §11's 120 ms, the panel in over 250 ms) while the sheet
+ * re-detents to the panel's height on its own spring (`contentKey`); one sheet, no bare page
+ * between the two. From then on the sheet is the panel's: back and Escape dismiss it to the
+ * page (Chrome's share sheet closes to the page too), the handle reads "Dismiss", an answer
+ * closes the sheet with the panel, and a dismissal releases the share (`closeMenu`). Under
+ * reduced motion the contents cut (`main.css`). The panel's QR code chip hands the same chassis
+ * on once more (`lib/shareSeam.ts`'s code seam): the code sheet's content rises over the
+ * panel's fading copy, the footer comes with Close | Download, and the sheet is the code's –
+ * its ways out end the code at the landing, the panel's request with it (`SharePanelSheet.tsx`).
+ */
+function MenuBottomSheet({ menu }: { menu: MenuDescriptor }): JSX.Element {
+  const [nav, setNav] = useState<MenuNav>({ path: [], direction: 0 })
+  const { path } = nav
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState<MenuDraft | null>(null)
+  // The root as the sheet shows it: the draft's order once there is one for these items.
+  const sections = useMemo(
+    () => (draft?.source === menu.items ? draft.sections : splitMenuSections(menu.items)),
+    [draft, menu.items]
+  )
+  const items = useMemo(
+    () => (draft?.source === menu.items ? joinMenuSections(sections) : menu.items),
+    [draft, menu.items, sections]
+  )
+  const title = editing
+    ? 'Change Menu'
+    : path.length
+      ? path[path.length - 1].label
+      : (menu.title ?? sourceTitle(menu.source))
+  const groups = useMemo(
+    () => groupItems(path.length ? (path[path.length - 1].submenu ?? []) : items),
+    [path, items]
+  )
+  const iconsAsList = useMenuAsList()
+  const sheet = useRef<BottomSheetHandle>(null)
+  const titleId = useId()
+
+  // The share seam (§9.38): `gathering` while the host puts the panel's row together for this
+  // menu's Share row, `hosted` the panel's request once this sheet draws it.
+  const sharePanelStandsIn = browserStore.use((s) => s.state?.capabilities.sharePanel === true)
+  const seam = uiStore.use((s) => s.shareSeam)
+  const panel = uiStore.use((s) => s.sharePanel)
+  const gatheringRow = seam?.phase === 'gathering' && seam.menuId === menu.id ? seam.itemId : null
+  const gathering = gatheringRow !== null
+  const hosted =
+    seam?.phase === 'hosting' && seam.menuId === menu.id && panel?.id === seam.panelId
+      ? panel
+      : null
+  // The gather's sign of life (§9.30): a gather still running after 150 ms puts the spinner in
+  // the tapped row's trailing slot – the row at full opacity, `aria-busy`, the other rows as
+  // they are. A fast host's request is in before it and nothing shows. The sign stands for the
+  // gather it belongs to, rides the rows' fading copy through the hand-off, and goes when the
+  // seam does, not before.
+  const [busyRow, setBusyRow] = useState<string | null>(null)
+  useEffect(() => {
+    if (gatheringRow === null) return
+    const timer = window.setTimeout(() => setBusyRow(gatheringRow), SHARE_SEAM_BUSY_MS)
+    return () => window.clearTimeout(timer)
+  }, [gatheringRow])
+  const busy = busyRow !== null && (busyRow === gatheringRow || hosted !== null) ? busyRow : null
+  // The rows fade out over the panel as it rises – drawn once more, inert, for the fade's
+  // length, from the hand-off's first frame – unless motion is reduced, when the panel simply
+  // stands where the rows were.
+  const [faded, setFaded] = useState<string | null>(null)
+  const hostedId = hosted?.id ?? null
+  const outgoing = hostedId !== null && faded !== hostedId && !reducedMotion()
+  useEffect(() => {
+    if (hostedId === null) return
+    const timer = window.setTimeout(() => setFaded(hostedId), SHARE_SEAM_OUT_MS)
+    return () => window.clearTimeout(timer)
+  }, [hostedId])
+  const pickShare = (then: () => void): void => sheet.current?.dismiss(then)
+  // The code sheet in this chassis after the panel's QR code chip (the second hand-off): the
+  // panel's preview and rows fade as its copy over the code's content.
+  const hostedCode = useHostedQrCode(hosted?.id ?? null)
+  const codeOutgoing = useHandOffOutgoing(hostedCode?.id ?? null)
+  // Where the list stood when Share was tapped: the chassis starts new content at its top, so
+  // the fading copy of the rows is drawn shifted by the offset, where the user was looking.
+  const [seamScroll, setSeamScroll] = useState(0)
+
+  const keyOf = (item: MenuItemDescriptor): string | undefined => item.key
+  const defaultOrder = menu.defaultOrder
+  const atDefault = (s: MenuSections): boolean =>
+    defaultOrder !== undefined &&
+    isDefaultMenuOrder(s.row, keyOf, defaultOrder) &&
+    isDefaultMenuOrder(s.list, keyOf, defaultOrder)
+  const beginEditing = (): void => {
+    setDraft((d) => d ?? { source: menu.items, sections, saved: menu.items })
+    setEditing(true)
+  }
+  const changeDraft = (next: MenuSections): void =>
+    setDraft((d) => ({ source: menu.items, saved: d?.saved ?? menu.items, sections: next }))
+  const resetDraft = (): void => {
+    if (!defaultOrder) return
+    changeDraft({
+      ...sections,
+      row: applyMenuOrder(sections.row, keyOf, defaultOrder),
+      list: applyMenuOrder(sections.list, keyOf, defaultOrder)
+    })
+  }
+  /** The pose ends: what the draft says is saved, once, if it differs from what was saved last. */
+  const saveDraft = (): void => {
+    if (!draft) return
+    const shown = joinMenuSections(draft.sections)
+    if (sameMenuOrder(shown, draft.saved)) return
+    setDraft({ ...draft, saved: shown })
+    run('settings.update', {
+      menuOrder: atDefault(draft.sections) ? [] : menuSectionsOrder(draft.sections)
+    })
+  }
+  const finishEditing = (): void => {
+    saveDraft()
+    setEditing(false)
+  }
+  const latest = useRef({ saveDraft })
+  useLayoutEffect(() => {
+    latest.current = { saveDraft }
+  })
+
+  // The system back gesture drives the sheet's own dismissal: the finger pulls it down, commit
+  // slides it away, cancel springs it back; the back button and Escape slide it away too. On
+  // its way out with its request gone (the chassis's leave) the sheet absorbs the gesture and
+  // the menu lets Escape by. In the edit pose the gesture ends the pose instead (the sheet stays
+  // where it is while the finger is down), as Escape does. Hosting the share panel the sheet is
+  // the panel's surface: the gesture dismisses it to the page, as the panel's own sheet does.
+  useBackSurface({
+    name: hosted ? 'share-panel' : 'menu',
+    onProgress: (progress) => {
+      if (!editing) sheet.current?.backProgress(progress)
+    },
+    onCommit: () => {
+      if (editing) finishEditing()
+      else sheet.current?.commitBack()
+    },
+    onCancel: () => {
+      if (!editing) sheet.current?.cancelBack()
+    }
+  })
+  useEscape(() => {
+    if (editing) finishEditing()
+    else sheet.current?.dismiss()
+  }, useSheetLeave()?.leaving)
+
+  const rows = editing ? (
+    <div key="edit" className="zen-animate-fade">
+      <MenuEditor
+        sections={sections}
+        onChange={changeDraft}
+        onReset={resetDraft}
+        canReset={defaultOrder !== undefined && !atDefault(sections)}
+      />
+    </div>
+  ) : (
+    <div
+      key={path.length}
+      className={cn(
+        'flex flex-col pb-2',
+        nav.direction > 0 && 'zen-drawer-right',
+        nav.direction < 0 && 'zen-drawer-left',
+        nav.direction === 0 && draft !== null && 'zen-animate-fade'
+      )}
+    >
+      {groups.map((group, index) =>
+        isIconRow(group) ? (
+          <ul
+            key={index}
+            className={iconsAsList ? 'zen-menu-icon-list' : 'zen-menu-icon-row'}
+            aria-label="Page actions"
+          >
+            {group.map((item) => (
+              <li key={item.id} className={iconsAsList ? undefined : 'flex'}>
+                <IconRowButton
+                  item={item}
+                  list={iconsAsList}
+                  onPick={() => {
+                    if (!gathering) sheet.current?.dismiss(() => pickMenuItem(item.id))
+                  }}
+                />
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <ul key={index} className="flex flex-col">
+            {index > 0 && <li aria-hidden className="zen-sheet-sep" />}
+            {group.map((item) => (
+              <li key={item.id}>
+                {item.note ? (
+                  // An empty state's sentence (§9.17): a row of the group, not a command.
+                  <p className="zen-sheet-note">{item.label}</p>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={!item.enabled}
+                    className={cn('zen-sheet-item', item.danger && 'text-[var(--zen-danger)]')}
+                    // A checked row draws a check; the tree carries the state (A11Y-01), as the
+                    // extensions sheet's rows do.
+                    role={
+                      item.type === 'checkbox'
+                        ? 'menuitemcheckbox'
+                        : item.type === 'radio'
+                          ? 'menuitemradio'
+                          : undefined
+                    }
+                    aria-checked={
+                      item.type === 'checkbox' || item.type === 'radio' ? item.checked : undefined
+                    }
+                    // The Share row at work (§9.30): busy, not disabled – its opacity and its
+                    // width kept, the spinner in its trailing slot.
+                    aria-busy={busy === item.id || undefined}
+                    onClick={(e) => {
+                      // The rows stand inert while the host gathers the share panel's row.
+                      if (gathering) return
+                      // The Change Menu row opens the edit pose in place: the sheet stays.
+                      if (isChangeMenuItem(item)) beginEditing()
+                      else if (item.submenu)
+                        setNav((n) => ({ path: [...n.path, item], direction: 1 }))
+                      // The Share row hands the sheet to the panel (§9.38): the pick runs with
+                      // the sheet standing, and the panel's request takes the chassis over.
+                      else if (handsOverToSharePanel(item, { sharePanel: sharePanelStandsIn })) {
+                        setSeamScroll(e.currentTarget.closest('.zen-sheet-scroll')?.scrollTop ?? 0)
+                        beginShareSeam(menu.id, item.id)
+                      } else sheet.current?.dismiss(() => pickMenuItem(item.id))
+                    }}
+                  >
+                    <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                    {/* The trailing slot's indicators are 16 on both platforms (§9.3); the row's
+                        leading glyph is the 20. */}
+                    {(item.type === 'checkbox' || item.type === 'radio') && item.checked && (
+                      <Check className="h-4 w-4 shrink-0" strokeWidth={1.75} aria-hidden />
+                    )}
+                    {item.mark === 'managed' && (
+                      // Chrome's `ic_domain` on the Managed Browser row (TB-13), in the trailing
+                      // slot the chevron takes on a row with a submenu: the row's label reads
+                      // as every other row's, the mark says whose the setting is.
+                      <Building2
+                        className="zen-sheet-item-secondary h-4 w-4 shrink-0"
+                        strokeWidth={1.75}
+                        aria-hidden
+                        data-mark="managed"
+                      />
+                    )}
+                    {item.submenu && (
+                      <ChevronRight
+                        className="zen-sheet-item-secondary h-4 w-4 shrink-0"
+                        strokeWidth={1.75}
+                        aria-hidden
+                      />
+                    )}
+                    {busy === item.id && <Spinner className="h-4 w-4" />}
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )
+      )}
+    </div>
+  )
+
+  return (
+    <BottomSheet
+      ref={sheet}
+      onDismissed={() => {
+        latest.current.saveDraft()
+        // A code the chassis was drawing ends with it (the panel's request too; the host heard
+        // the pick already).
+        if (hostedCode) dismissQrCode()
+        // Past the Share row's pick the host has heard of the menu already (`menu.click`):
+        // the sheet's leave is the panel's dismissal or the gather's end, not a menu's close.
+        closeMenu(!gathering && !hosted)
+      }}
+      contentKey={
+        hostedCode
+          ? `qr:${hostedCode.id}`
+          : hosted
+            ? hosted.id
+            : `${menu.id}:${editing ? 'edit' : path.map((item) => item.id).join('/')}`
+      }
+      handleLabel={hosted ? 'Dismiss' : 'Resize menu'}
+      labelledBy={hostedCode ? QR_CODE_TITLE_ID : titleId}
+      className={hosted && !hostedCode ? 'zen-share-panel' : undefined}
+      footer={
+        hostedCode ? (
+          <QrCodeFooter
+            prompt={hostedCode}
+            className="zen-share-seam-in"
+            onClose={() => pickShare(dismissQrCode)}
+            onDownload={() => pickShare(downloadQrCode)}
+          />
+        ) : undefined
+      }
+      header={
+        hostedCode ? undefined : hosted ? (
+          // The menu's title fades where it stood as the share's preview rises in the header's
+          // place (the preview a direct child of the header, as a link's header is).
+          <>
+            {outgoing && (
+              <div className="zen-share-seam-out" data-title aria-hidden inert>
+                <span className="zen-sheet-title">{title}</span>
+              </div>
+            )}
+            <SharePanelPreview request={hosted} titleId={titleId} className="zen-share-seam-in" />
+          </>
+        ) : (
+          <>
+            {path.length > 0 && !editing && (
+              <button
+                type="button"
+                className="zen-sheet-header-control"
+                data-side="leading"
+                onClick={() => setNav((n) => ({ path: n.path.slice(0, -1), direction: -1 }))}
+                aria-label="Back"
+              >
+                <ChevronLeft className="h-5 w-5" strokeWidth={1.75} aria-hidden />
+              </button>
+            )}
+            {menu.header && path.length === 0 && !editing ? (
+              <LinkHeader header={menu.header} titleId={titleId} />
+            ) : (
+              <h2 id={titleId} className="zen-sheet-title">
+                {title}
+              </h2>
+            )}
+            {editing && (
+              <button
+                type="button"
+                className="zen-sheet-header-control"
+                data-side="trailing"
+                data-text
+                data-menu-done
+                onClick={finishEditing}
+              >
+                Done
+              </button>
+            )}
+          </>
+        )
+      }
+    >
+      {hostedCode && hosted ? (
+        // The second hand-off: the panel's preview and rows once more, inert and fading, over
+        // the code sheet's content rising in their place.
+        <QrCodeHandOff
+          prompt={hostedCode}
+          outgoing={
+            codeOutgoing ? (
+              <>
+                <SharePanelPreview request={hosted} titleId={`${titleId}-out`} />
+                <SharePanelContent request={hosted} pick={() => undefined} />
+              </>
+            ) : null
+          }
+        />
+      ) : hosted ? (
+        // The hand-off: the rows once more, inert and fading, over the panel rising in their
+        // place – one chassis, its height following the panel's on the sheet's spring.
+        <div className="zen-share-seam" data-seam="share-panel">
+          {outgoing && (
+            <div className="zen-share-seam-out" aria-hidden inert>
+              <div
+                className="zen-share-seam-scrolled"
+                style={seamScroll > 0 ? { transform: `translateY(${-seamScroll}px)` } : undefined}
+              >
+                {rows}
+              </div>
+            </div>
+          )}
+          <div className="zen-share-seam-in">
+            <SharePanelContent request={hosted} pick={pickShare} />
+          </div>
+        </div>
+      ) : (
+        rows
+      )}
+    </BottomSheet>
+  )
+}
+
+/**
+ * The order the edit pose works on: the sections cut from `source` (the descriptor's items the
+ * draft belongs to – a fresh descriptor starts afresh), and the root as it stood at the last
+ * save (the descriptor's own to begin with), which a pose ending on the same order writes
+ * nothing over.
+ */
+interface MenuDraft {
+  source: MenuItemDescriptor[]
+  sections: MenuSections
+  saved: MenuItemDescriptor[]
+}
+
+// ---------------------------------------------------------------------------
+// The link's header (PUI-18; Chrome for Android's context-menu header)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a link's or an image's menu opens on: a §10.3 two-line row in the §9.16 header's place –
+ * the site's favicon at 20 (the globe at 69% when the cache holds none, as a list row's
+ * stand-in; a number's or an email address's own glyph at full ink, since it is a kind and not
+ * a page without a picture – §9.31) or the image itself as a 40 thumbnail, the title 15/600
+ * over the address 13 in the deemphasised ink, one line each. A tap expands the address to its
+ * full length (the row grows; the sheet measures its detents again); a long-press copies it, the
+ * host's toast or Android 13's clipboard chip saying so. The title names the sheet
+ * (`aria-labelledby`). The share chooser opens on the same header for a shared link (MW-63).
+ */
+export function LinkHeader({
+  header,
+  titleId
+}: {
+  header: MenuHeader
+  titleId: string
+}): JSX.Element {
+  const [expanded, setExpanded] = useState(false)
+  const press = useLongPress(() =>
+    run('clipboard.writeText', { text: header.url, confirmation: header.copied })
+  )
+  const standIn =
+    header.scheme === 'tel' ? (
+      <Phone className="h-5 w-5" strokeWidth={1.75} />
+    ) : header.scheme === 'mailto' ? (
+      <Mail className="h-5 w-5" strokeWidth={1.75} />
+    ) : (
+      <Globe className="zen-list-standin h-5 w-5" strokeWidth={1.75} />
+    )
+  return (
+    <button
+      type="button"
+      className="zen-menu-link-header"
+      aria-expanded={expanded}
+      data-expanded={expanded || undefined}
+      {...press.handlers}
+      onClick={() => {
+        if (press.swallowsClick()) return
+        setExpanded((was) => !was)
+      }}
+    >
+      {header.thumbnail ? (
+        <img
+          src={header.thumbnail}
+          alt=""
+          className="zen-menu-link-thumbnail"
+          referrerPolicy="no-referrer"
+          draggable={false}
+        />
+      ) : (
+        <span className="zen-menu-link-favicon" aria-hidden>
+          <RowFavicon src={header.favicon} fallback={standIn} />
+        </span>
+      )}
+      <span className="zen-menu-link-text">
+        <span id={titleId} className="zen-menu-link-title">
+          {header.title}
+        </span>
+        <span className="zen-menu-link-url">{header.url}</span>
+      </span>
+    </button>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// The icon row (the phone app menu's first group; `lib/menuIconRow.ts` says which group)
+// ---------------------------------------------------------------------------
+
+/**
+ * One button of the row: the shared v2 icon button (§9.3: 44 × 44, a 20 px glyph, the press
+ * fill; disabled at .4, §9.30) named by the item's label (§9.22), drawing the glyph the core
+ * named. Picking it slides the sheet away and then runs the item, as a text row does.
+ *
+ * As a `list` row (A11Y-04) the same item is a §10.3 sheet row: the glyph in the 20 leading
+ * slot at the gutter, the label as the row's visible text 12 after it (the labels aligned at
+ * 48, as the site-information sheet's rows), the row's full width the target and its height the
+ * line box's (it grows with the text). The name is the label either way – written for the
+ * glyph button, read from the text for the row – so what Voice Access hears matches what the
+ * eye reads, and `data-glyph` / `data-filled` say the same in both poses.
+ *
+ * The star is the row's one stateful glyph (`StarGlyph`, shared with the bar's Bookmark):
+ * `checked` is the page's bookmark. A press on an unfilled star fills it at once, on the fill's
+ * spring, as the sheet starts to leave – the core saves the bookmark once the sheet is gone
+ * (`pickMenuItem` runs the item then), so the fill would otherwise land on a sheet nobody can
+ * see. A filled star opens the bookmark's editor (Chrome's flow) and stays filled.
+ */
+function IconRowButton({
+  item,
+  onPick,
+  list = false
+}: {
+  item: MenuItemDescriptor
+  onPick: () => void
+  list?: boolean
+}): JSX.Element {
+  const star = item.glyph === 'star'
+  const [filled, setFilled] = useState(item.checked)
+  const glyph = <MenuItemGlyph glyph={item.glyph} filled={filled} />
+  const pick = (): void => {
+    if (star && !filled) setFilled(true)
+    onPick()
+  }
+  if (list)
+    return (
+      <button
+        type="button"
+        className="zen-sheet-item"
+        disabled={!item.enabled}
+        data-glyph={item.glyph}
+        data-filled={star ? filled : undefined}
+        onClick={pick}
+      >
+        <span className="zen-sheet-item-glyph" aria-hidden>
+          {glyph}
+        </span>
+        <span className="min-w-0 flex-1 truncate">{item.label}</span>
+      </button>
+    )
+  return (
+    <button
+      type="button"
+      className="zen-v2-icon-button"
+      disabled={!item.enabled}
+      aria-label={item.label}
+      data-glyph={item.glyph}
+      data-filled={star ? filled : undefined}
+      onClick={pick}
+    >
+      {glyph}
+    </button>
+  )
+}
+
+/** Rows between separators form a group; the separators themselves are not drawn. */
+function groupItems(items: MenuItemDescriptor[]): MenuItemDescriptor[][] {
+  const groups: MenuItemDescriptor[][] = []
+  let group: MenuItemDescriptor[] = []
+  for (const item of items) {
+    if (item.type === 'separator') {
+      if (group.length) groups.push(group)
+      group = []
+    } else {
+      group.push(item)
+    }
+  }
+  if (group.length) groups.push(group)
+  return groups
+}
+
+// ---------------------------------------------------------------------------
+// Popover (mouse)
+// ---------------------------------------------------------------------------
+
+/** One open panel of the cascade: the row whose submenu it lists (null at the root), and its rows. */
+interface Level {
+  parentId: string | null
+  items: MenuItemDescriptor[]
+}
+
+/** Where a level goes once measured, and where its pop grows from. */
+interface Placement {
+  box: PopoverBox
+  origin: string
+}
+
+/**
+ * Where the keyboard is to land once the level at `depth` stands: its first row (a level the
+ * keyboard opened), the row that had opened a deeper level (that level closed), or the panel
+ * itself, which hears the keys without highlighting a row (opened by the pointer, §9.22).
+ */
+type FocusWanted = PathFocus | { depth: number; target: 'panel' }
+
+/**
+ * The levels open for `path` – the ids of the submenu rows open at each depth – from the root's
+ * items down; a path through a row that has no submenu (or is disabled) stops there.
+ */
+function cascadeLevels(items: MenuItemDescriptor[], path: readonly string[]): Level[] {
+  const levels: Level[] = [{ parentId: null, items }]
+  for (const id of path) {
+    const row = levels[levels.length - 1].items.find((item) => item.id === id)
+    if (!row?.submenu || !row.enabled) break
+    levels.push({ parentId: id, items: row.submenu })
+  }
+  return levels
+}
+
+/** The rows of a panel, in order. */
+function menuRows(panel: HTMLElement | null | undefined): HTMLElement[] {
+  return [...(panel?.querySelectorAll<HTMLElement>('[role^="menuitem"]') ?? [])]
+}
+
+/**
+ * The control the app menu hangs from: the "⋯" button on screen – the sidebar's toolbar row's
+ * (`APP_MENU_BUTTON`) or a web app window's title bar's – read live as the menu mounts, since
+ * the row remounts its buttons with the tab and the width. None for any other menu, or for an
+ * app menu asked for with no button laid out (the compact sidebar's row away): that one hangs
+ * from the point the descriptor names, as a context menu does.
+ */
+function appMenuButton(menu: MenuDescriptor): HTMLElement | null {
+  if (menu.source !== 'app') return null
+  const button = document.querySelector<HTMLElement>(APP_MENU_BUTTON)
+  return button?.isConnected && button.checkVisibility() ? button : null
+}
+
+/**
+ * The descriptor as the shared `.zen-v2-menu` (§4, §5, §6 menus; the vocabulary `LocalMenu` and
+ * the bookmarks bar's folder panels draw in), through the chrome layer: a `--v2-panel` at radius
+ * 8 – 6 for a context menu, every source but the `···`'s app menu (§2) – with 6 of padding and
+ * 31 rows at the 14 px chrome menu size, intrinsic within 232–332 by its longest row, the chord
+ * of a bound row after its label in the deemphasised ink. A context menu hangs from the point
+ * the descriptor names (a control's bottom-left, the pointer); the app menu from the "⋯" button
+ * it finds on screen, as the chrome's other popovers hang from their controls (`placeUnder`,
+ * §9.20: flush under the bar the button sits in – gap 0 – end-aligned when the button is in the
+ * bar's trailing half, flipped or slid inside the window's 8 margin), the button wearing
+ * `aria-expanded` and its pressed fill while the menu stands. A checked row draws its check in the 16
+ * glyph slot, a row with a favicon the favicon there; a submenu row trails the chevron and
+ * opens its panel beside the one it is in (`placeBeside`, `placePopover`'s cascade mode: first
+ * row on the row that opened it) after the pointer rests on it, or at once from the keyboard –
+ * the row keeping the fill while its panel stands (`aria-expanded`).
+ *
+ * The keyboard is §9.22's, Chrome's native menus as the rule book: opened from the keyboard the
+ * first row takes the focus, by pointer the panel itself does and Down starts at the first row;
+ * the arrows, Home and End move within the level, Tab and Shift+Tab walk it too and wrap – the
+ * menu is the keyboard's while it stands, nothing under it is reachable – Right opens a submenu
+ * row's panel on its first row, Left and Backspace close the deepest level onto the row that
+ * opened it (at the root, the menu), a letter goes to or runs the row it names (mnemonics,
+ * a11y-08), Enter and Space run the row; Escape closes the deepest level, then the menu – onto
+ * the control that opened it when a control of the chrome's had the focus as the menu came (the
+ * ··· the pointer pressed or the keyboard opened from; the app menu's button whenever it is on
+ * screen), which keeps the keyboard, as `LocalMenu` does through `usePopover`; the page takes
+ * it back only when it had it (§9.22). Light dismiss is the chrome layer's (§9.20 amended): a
+ * press outside the cascade, a scroll, a resize or another popover closes it, and a press on the
+ * button that opened it closes it without reopening, the keyboard staying on the button. The
+ * host is told of a pick (`pickMenuItem`) and of a close (`closeMenu`).
+ */
+function Popover({ menu }: { menu: MenuDescriptor }): JSX.Element {
+  useBackSurface({ name: 'menu', onCommit: () => closeMenu() })
+  // The "⋯" button an app menu hangs from, if one is on screen (read once, as the menu mounts).
+  const [button] = useState(() => appMenuButton(menu))
+  // Anchor at the button's box in its bar, else at the point that opened the menu: the control's
+  // edge when the core named one, else the pointer position captured before the round trip.
+  const anchor = useMemo<Anchor>(
+    () =>
+      button
+        ? anchorOf(button)
+        : { x: menu.x ?? lastPointer.x, y: menu.y ?? lastPointer.y, width: 0, height: 0 },
+    [button, menu.id, menu.x, menu.y] // eslint-disable-line react-hooks/exhaustive-deps
+  )
+  const [fromKeyboard] = useState(() => menu.keyboard ?? openedFromKeyboard())
+  const context = menu.source !== 'app'
+
+  const [path, setPath] = useState<string[]>([])
+  const levels = useMemo(() => cascadeLevels(menu.items, path), [menu.items, path])
+  const groupRef = useRef<HTMLDivElement>(null)
+  const panelEls = useRef<(HTMLDivElement | null)[]>([])
+
+  // The button keeps its pressed fill and says what it has open while the menu stands (§9.20);
+  // at rest it is the toolbar's own again. Held through the shared count, since the media hub's
+  // popover hangs from the same "⋯" while its toolbar button has folded (§9.29) and opens from
+  // this menu's "Media Controls…" row as the menu leaves: the button stays expanded while either
+  // stands, and the menu's leave takes nothing off it that the hub still holds.
+  useLayoutEffect(() => (button ? holdExpanded(button) : undefined), [button])
+
+  // The control the menu opened from – what had the focus as the menu mounted, the ··· the
+  // pointer pressed or the keyboard opened from, else the app menu's button itself – for
+  // Escape's way back (§9.22, as `usePopover` reads it). None when nothing of the chrome's had
+  // the focus (the page did, or a control the press did not focus) and no button is on screen:
+  // the page takes the keyboard back then, as after any overlay.
+  const [opener] = useState<HTMLElement | null>(() =>
+    document.activeElement instanceof HTMLElement && document.activeElement !== document.body
+      ? document.activeElement
+      : button
+  )
+  const returning = useRef(false)
+  /** The keyboard closes the whole menu (Escape, Left or Backspace at the root). */
+  const closeFromKeyboard = (): void => {
+    returning.current = opener !== null && opener.isConnected
+    closeMenu(true, { keepKeyboard: returning.current })
+  }
+  useLayoutEffect(
+    () => () => {
+      // A layout cleanup runs before React removes the nodes: the focus, if it is still in the
+      // cascade, has not fallen to the body yet, and the opener can take it back in one step.
+      if (!returning.current || !opener?.isConnected) return
+      if (!groupRef.current?.contains(document.activeElement)) return
+      opener.focus({ preventScroll: true })
+    },
+    [opener]
+  )
+  const [focusWanted, setFocusWanted] = useState<FocusWanted | null>(() => ({
+    depth: 0,
+    target: fromKeyboard ? 'first' : 'panel'
+  }))
+  const onFocused = useCallback((): void => setFocusWanted(null), [])
+
+  const openLevel = useCallback((depth: number, rowId: string, focus: boolean): void => {
+    setFocusWanted(focus ? focusAfterOpen(depth) : null)
+    setPath((p) => openedAt(p, depth, rowId))
+  }, [])
+  /** Close the levels deeper than `depth` (level `depth` stays); `focus` lands on the row that opened them. */
+  const closeTo = useCallback(
+    (depth: number, focus: boolean): void => {
+      setFocusWanted(focus ? focusAfterClose(path, depth) : null)
+      setPath((p) => closedTo(p, depth))
+    },
+    [path]
+  )
+
+  // A press on the button that opened it closes the menu without reopening (the registry
+  // swallows the rest of the press) and leaves the keyboard on the button (§9.22); any other
+  // press outside, a scroll or a resize closes it and the page takes the keyboard back.
+  useLightDismiss(groupRef, (reason) => closeMenu(true, { keepKeyboard: reason === 'anchor' }), {
+    anchor: () => button
+  })
+  useEscape(() => {
+    if (path.length) closeTo(path.length - 1, true)
+    else closeFromKeyboard()
+  })
+
+  // The pointer: a submenu row opens beside after a rest, any other row closes what is deeper.
+  const hover = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cancelHover = useCallback((): void => {
+    if (hover.current !== null) clearTimeout(hover.current)
+    hover.current = null
+  }, [])
+  useEffect(() => cancelHover, [cancelHover])
+  const hoverRow = (depth: number, item: MenuItemDescriptor): void => {
+    cancelHover()
+    const wanted = item.submenu && item.enabled ? item.id : null
+    if (wanted === (path[depth] ?? null)) return
+    hover.current = setTimeout(() => {
+      hover.current = null
+      if (wanted) openLevel(depth, wanted, false)
+      else closeTo(depth, false)
+    }, HOVER_TO_OPEN_MS)
+  }
+
+  const activate = (depth: number, item: MenuItemDescriptor, focus: boolean): void => {
+    cancelHover()
+    if (item.submenu) openLevel(depth, item.id, focus)
+    else pickMenuItem(item.id)
+  }
+
+  /** The level the keyboard is in: the one holding the focus, else the deepest. */
+  const focusedDepth = (): number => {
+    const active = document.activeElement
+    const at = panelEls.current.findIndex((el) => el?.contains(active))
+    return at === -1 ? levels.length - 1 : at
+  }
+
+  const onKeyDown = (e: React.KeyboardEvent): void => {
+    const depth = focusedDepth()
+    const rows = menuRows(panelEls.current[depth])
+    const at = rows.indexOf(document.activeElement as HTMLElement)
+    const current = at === -1 ? undefined : levels[depth]?.items.filter(isRow)[at]
+    switch (e.key) {
+      case 'ArrowRight':
+        if (current?.submenu && current.enabled) openLevel(depth, current.id, true)
+        break
+      case 'ArrowLeft':
+      case 'Backspace':
+        if (depth > 0) closeTo(depth - 1, true)
+        else closeFromKeyboard()
+        break
+      default:
+        // The arrows, Home, End and a letter, as in Chrome's native menus (lib/menuKeys.ts); Tab
+        // and Shift+Tab walk the level too and wrap, nothing under the menu being reachable.
+        if (!handleMenuKey(e, rows, { mnemonics: true, tab: true })) return
+        e.stopPropagation()
+        return
+    }
+    e.preventDefault()
+    e.stopPropagation()
+  }
+
+  // Placement: the root under its anchor (flush under the bar the button sits in, else under
+  // the point), every other level beside the row that opened it. A menu is exempt from §9.20's
+  // 60% cap (§6 "Menus"): it takes the room down to the window's 8 px bottom margin and scrolls
+  // only past that, so the app menu stands whole on an 800 px window.
+  const place = useCallback(
+    (depth: number, parentId: string | null, el: HTMLElement): Placement | null => {
+      const viewport = viewportSize()
+      // The used size, with the fraction of a pixel the longest row runs to: pinned to the
+      // offsets' rounded width the row would end in an ellipsis (§5).
+      const size = intrinsicSize(el)
+      if (depth === 0 || parentId === null) {
+        const box = placeUnder(anchor, { measured: size.width }, size.height, viewport, undefined, {
+          capHeight: false
+        })
+        return { box, origin: popOrigin(anchor, box) }
+      }
+      const parent = panelEls.current[depth - 1]
+      const row = parent?.querySelector<HTMLElement>(`[data-menu-row="${parentId}"]`)
+      if (!parent || !row) return null
+      const parentBox = layoutRect(parent)
+      const rowBox = rowRect(row, parent, parentBox)
+      const box = placeBeside(rowBox, parentBox, viewport, size)
+      const height = Math.min(size.height, box.maxHeight)
+      return { box, origin: besideOrigin(rowBox, box, viewport, height) }
+    },
+    [anchor]
+  )
+
+  return (
+    <ChromePortal>
+      {/* A menu the keyboard opened paints the focused row as the cursor from its first focus
+          (§9.22): from Alt+F / F10 while the page had the keyboard no key event reaches this
+          document, so `:focus-visible` alone would leave the first row bare. */}
+      <div
+        ref={groupRef}
+        className={cn('contents', fromKeyboard && 'zen-v2-menu-keyboard')}
+        onKeyDown={onKeyDown}
+      >
+        {levels.map((level, depth) => (
+          <MenuLevel
+            key={`${depth}/${level.parentId ?? ''}`}
+            ref={(el) => {
+              panelEls.current[depth] = el
+            }}
+            depth={depth}
+            level={level}
+            label={
+              depth === 0 ? (menu.title ?? sourceTitle(menu.source)) : levelTitle(levels, depth)
+            }
+            context={context}
+            openId={path[depth] ?? null}
+            focus={focusWanted?.depth === depth ? focusWanted.target : null}
+            onFocused={onFocused}
+            place={place}
+            onEnterPanel={cancelHover}
+            onHoverRow={hoverRow}
+            onActivate={(item, focus) => activate(depth, item, focus)}
+            onScrolled={() => closeTo(depth, false)}
+          />
+        ))}
+      </div>
+    </ChromePortal>
+  )
+}
+
+/** The items drawn as menuitems, in the order `menuRows` finds them: no separator, no note. */
+const isRow = (item: MenuItemDescriptor): boolean => item.type !== 'separator' && !item.note
+
+/** A submenu level's name to the tree: the label of the row that opened it. */
+function levelTitle(levels: Level[], depth: number): string {
+  const parentId = levels[depth]?.parentId
+  const row = levels[depth - 1]?.items.find((item) => item.id === parentId)
+  return row?.label ?? 'Menu'
+}
+
+/**
+ * One panel of the cascade. It renders hidden at the window's origin first, so its intrinsic
+ * width and height can be measured (layout size, not the client rect the pop animation's first
+ * frame scales to .94), then takes the place `place` gives it; the placed width and height cap
+ * are lifted for the measure when its rows change. Once it stands it takes the focus asked of it.
+ */
+function MenuLevel({
+  ref,
+  depth,
+  level,
+  label,
+  context,
+  openId,
+  focus,
+  onFocused,
+  place,
+  onEnterPanel,
+  onHoverRow,
+  onActivate,
+  onScrolled
+}: {
+  ref: (el: HTMLDivElement | null) => void
+  depth: number
+  level: Level
+  label: string
+  context: boolean
+  /** The submenu row whose panel is open beside this one. */
+  openId: string | null
+  /** Where the keyboard lands once the panel stands, if it is this panel's turn. */
+  focus: FocusWanted['target'] | null
+  onFocused: () => void
+  place: (depth: number, parentId: string | null, el: HTMLElement) => Placement | null
+  onEnterPanel: () => void
+  onHoverRow: (depth: number, item: MenuItemDescriptor) => void
+  /** `focus`: the keyboard did it (Enter, a mnemonic), so a submenu's level takes the focus. */
+  onActivate: (item: MenuItemDescriptor, focus: boolean) => void
+  /** The rows scrolled: whatever stood beside one of them no longer lines up. */
+  onScrolled: () => void
+}): JSX.Element {
+  const el = useRef<HTMLDivElement | null>(null)
+  const { parentId, items } = level
+  const [placed, setPlaced] = useState<Placement | null>(null)
+  useLayoutEffect(() => {
+    const node = el.current
+    if (!node) return
+    node.style.width = ''
+    node.style.maxHeight = ''
+    setPlaced(place(depth, parentId, node))
+  }, [depth, parentId, items.length, place])
+  useLayoutEffect(() => {
+    const node = el.current
+    if (!node || !placed || !focus) return
+    const rows = menuRows(node)
+    const row =
+      focus === 'panel'
+        ? null
+        : focus === 'first'
+          ? rows[0]
+          : rows.find((r) => r.dataset.menuRow === focus.id)
+    ;(row ?? node).focus({ preventScroll: true })
+    onFocused()
+  }, [focus, onFocused, placed])
+  // The device rows (the Send to Your Devices submenu) draw their kind glyphs while any device
+  // of the level announced a kind (`anyDeviceKind`, §10.4's condition; the #453 lead check): the
+  // kinds at the full ink, the stand-in for the rest – and none at all when no device did, so
+  // a submenu of older builds' rows reads as plain rows, not a column of stand-ins.
+  const deviceGlyphs = anyDeviceKind(items.flatMap((item) => (item.device ? [item.device] : [])))
+  // The glyph slot stands before every label when any row of the level has something to put in
+  // it – a favicon, a group's mark, a device's kind, a check – so the labels share one edge.
+  const withGlyphs = items.some(
+    (item) =>
+      item.icon ||
+      item.group ||
+      (item.device && deviceGlyphs) ||
+      item.type === 'checkbox' ||
+      item.type === 'radio'
+  )
+  return (
+    <div
+      ref={(node) => {
+        el.current = node
+        ref(node)
+      }}
+      role="menu"
+      aria-label={label}
+      // The panel is the keyboard's in its own right (§9.22: opened by the pointer it holds the
+      // focus, Tab and the arrows walk its rows from there), and 0 rather than -1 says so where
+      // it counts: past the height cap the level scrolls, and axe's scrollable-region-focusable
+      // (the CI walkthrough's audit) reads a scroller's own tabindex – a -1 fails it while every
+      // row stands at -1 too. Nothing in the order changes: Tab wraps inside an open menu, and a
+      // closed one is unmounted.
+      tabIndex={0}
+      className="zen-v2 zen-v2-panel zen-v2-menu zen-animate-pop fixed select-none"
+      data-context={context || undefined}
+      style={{
+        ...(placed ? popoverStyle(placed.box) : { left: 0, top: 0 }),
+        visibility: placed ? 'visible' : 'hidden',
+        transformOrigin: placed?.origin
+      }}
+      onPointerEnter={onEnterPanel}
+      onScroll={onScrolled}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      {items.map((item) => {
+        if (item.type === 'separator')
+          return <div key={item.id} className="zen-v2-menu-separator" role="separator" />
+        // An empty state's sentence (§9.17): a row in the deemphasised ink that is not a
+        // menuitem – the arrows, Tab and the pointer pass it by – keeping the labels' edge.
+        if (item.note)
+          return (
+            <div key={item.id} className="zen-v2-menu-note" data-menu-note>
+              {withGlyphs && <span className="zen-v2-menu-glyph" aria-hidden />}
+              <span className="min-w-0 flex-1 truncate">{item.label}</span>
+            </div>
+          )
+        const checkable = item.type === 'checkbox' || item.type === 'radio'
+        return (
+          <button
+            key={item.id}
+            type="button"
+            role={
+              item.type === 'checkbox'
+                ? 'menuitemcheckbox'
+                : item.type === 'radio'
+                  ? 'menuitemradio'
+                  : 'menuitem'
+            }
+            tabIndex={-1}
+            data-menu-row={item.id}
+            data-danger={item.danger || undefined}
+            disabled={!item.enabled}
+            aria-checked={checkable ? item.checked : undefined}
+            aria-haspopup={item.submenu ? 'menu' : undefined}
+            aria-expanded={item.submenu ? openId === item.id : undefined}
+            className="zen-v2-menu-item"
+            onPointerEnter={() => onHoverRow(depth, item)}
+            // A click the keyboard made (Enter, Space, a mnemonic's: `detail` 0) is the
+            // keyboard's activation, so a submenu's level takes the focus.
+            onClick={(e) => onActivate(item, e.detail === 0)}
+          >
+            {withGlyphs && (
+              <span className="zen-v2-menu-glyph" aria-hidden>
+                {checkable && item.checked ? (
+                  <Check />
+                ) : item.group ? (
+                  // A saved group's row (the Tab Folders submenu): the one group glyph (§9.37)
+                  // in the slot, the ring of its colour, or the folder's own icon.
+                  <GroupGlyph folder={item.group} saved={item.group.saved} />
+                ) : item.device && deviceGlyphs ? (
+                  // Another device's row (the Send to Your Devices submenu): the device's kind
+                  // glyph, the stand-in for a kind it did not announce.
+                  <DeviceGlyph kind={item.device.kind} />
+                ) : item.icon ? (
+                  <img src={item.icon} alt="" className="h-4 w-4 rounded-sm" draggable={false} />
+                ) : null}
+              </span>
+            )}
+            <span className="min-w-0 flex-1 truncate">{item.label}</span>
+            {item.hint && (
+              <span className="zen-v2-menu-hint" aria-hidden>
+                {item.hint}
+              </span>
+            )}
+            {item.mark === 'managed' && (
+              // Chrome's `ic_domain` on the Managed Browser row (TB-13), in the trailing slot.
+              <Building2 className="zen-v2-menu-mark" aria-hidden data-mark="managed" />
+            )}
+            {item.submenu && <ChevronRight className="zen-v2-menu-chevron" aria-hidden />}
+          </button>
+        )
+      })}
+    </div>
+  )
+}

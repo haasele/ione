@@ -1,0 +1,910 @@
+import type { Rect, Tab, WebAppBanner, WebAppInstallPrompt } from '../shared/types'
+import { resolveTheme, rgbToHex } from '../shared/theme'
+import {
+  displayIcon,
+  fallbackShortcutTitle,
+  installFailedMessage,
+  isInstallable,
+  isShortcutRecord,
+  isWithinScope,
+  launcherName,
+  markDismissed,
+  markPrompted,
+  parseWebAppManifest,
+  pinnedAppFor,
+  recordVisit,
+  shortcutIcon,
+  shouldPrompt,
+  tileColor,
+  type EngagementRecord,
+  type InstalledWebApp,
+  type InstallSurface,
+  type PinnedWebApp,
+  type WebAppInfo
+} from '../shared/webApp'
+import { appBadgeOf, sameAppBadge, type AppBadge } from '../shared/appBadge'
+import {
+  shareTargetAccepts,
+  shareTargetLaunch,
+  type ShareChooserApp,
+  type ShareKind,
+  type SharedFields
+} from '../shared/shareTarget'
+import type { Browser } from './browser'
+import { getSpace } from './model'
+import type { PageMessage, ShortcutRequest, StoreIO } from './platform'
+import { surfaceMounted, type ZenWindow } from './window'
+
+/** An installed app's badge changed: the new badge, or null for none (`WebAppService.onBadgeChange`). */
+export type AppBadgeListener = (appId: string, badge: AppBadge | null) => void
+
+/** The persisted document: shortcuts on the Home screen and how often each app was visited. */
+interface WebAppsDocument {
+  version: 1
+  pinned: PinnedWebApp[]
+  engagement: Record<string, EngagementRecord>
+}
+
+const STORE_NAME = 'webapps.json'
+/** Engagement records kept (least recently visited go first when the cap is reached). */
+const MAX_ENGAGEMENT = 200
+/**
+ * After `beforeinstallprompt` fires, a site that wants to run the prompt itself cancels the
+ * event synchronously; its `deferred` message needs one round trip to arrive.
+ */
+const DEFER_GRACE_MS = 1200
+/**
+ * After `webapp.banner` is emitted, the chrome's word that the card is drawn
+ * (`webapp.bannerShown`) is due within this long; a surface that draws banners mounts the card
+ * at once and reports in the same turn. Without the word the prompt counts as undrawn (#740).
+ */
+export const BANNER_SHOWN_GRACE_MS = 1000
+/** Fetching a manifest the page could not (CSP) goes through the host with this budget. */
+const MANIFEST_FETCH_TIMEOUT_MS = 8000
+const MAX_MANIFEST_BYTES = 256 * 1024
+
+export interface WebAppServiceOptions {
+  now?: () => number
+}
+
+/**
+ * Web apps: the manifest a page declares becomes `tab.webApp`; "Add to Home screen" (from the
+ * app menu, the ambient banner or a site's deferred `prompt()`) opens the install sheet, whose
+ * "Add" asks the host to pin a launcher shortcut (on the desktop with the dialog's "Open as
+ * window" – a window of the app's own or a tab in Ione); the launcher's confirmation lands in
+ * `onPinned`, which toasts, records the app for the "Open <app>" menu label and fires the page's
+ * `appinstalled`. On the desktop a page without a manifest is recorded too, as a shortcut
+ * (`PinnedWebApp.kind` `shortcut`): listed, launched and uninstalled like an app, claiming no
+ * page. The engagement counter behind the ambient banner lives here too.
+ */
+export class WebAppService {
+  private pinned: PinnedWebApp[] = []
+  private engagement: Record<string, EngagementRecord> = {}
+  /** Tabs whose site cancelled `beforeinstallprompt` (it will call `prompt()` itself). */
+  private readonly deferred = new Set<string>()
+  /** Tabs where a site-initiated `prompt()` awaits the sheet's outcome. */
+  private readonly sitePrompts = new Set<string>()
+  /** Tabs with the install sheet up (no ambient banner behind it). */
+  private readonly installOpen = new Set<string>()
+  /** Tabs with an ambient banner up (value: the app it advertises). */
+  private readonly banners = new Map<string, string>()
+  /**
+   * Tabs whose banner a surface ACCEPTED but has not drawn yet (`bannerShown` with `visible`
+   * false: the page-edge band holding the card back under a cover): the grace is spent, the
+   * cooldown is not – it waits for the card's first drawn frame (seed #43).
+   */
+  private readonly unseen = new Set<string>()
+  /** Pin requests the launcher has not confirmed yet, by shortcut id. */
+  private readonly pendingPins = new Map<
+    string,
+    { tabId: string; title: string; url: string; openAsWindow?: boolean }
+  >()
+  /** The manifests behind pending pins, so a confirmation can register the app after the tab moved on. */
+  private readonly pendingApps = new Map<string, WebAppInfo>()
+  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>()
+  private saveTimer: ReturnType<typeof setTimeout> | null = null
+  private readonly now: () => number
+  /**
+   * Each installed app's badge (MW-51), by app id – the count or flag its page last set through
+   * `navigator.setAppBadge`, absent while it has none. In memory only, as Chrome keeps its
+   * (`BadgeManager`'s map): a badge does not outlive the run, nor the app's last open window.
+   */
+  private readonly appBadges = new Map<string, AppBadge>()
+  private readonly badgeListeners = new Set<AppBadgeListener>()
+
+  constructor(
+    private readonly browser: Browser,
+    private readonly io: StoreIO,
+    options: WebAppServiceOptions = {}
+  ) {
+    this.now = options.now ?? Date.now
+    this.load()
+  }
+
+  // ---------------------------------------------------------------------------
+  // Persistence
+  // ---------------------------------------------------------------------------
+
+  private load(): void {
+    const raw = this.io.readSync(STORE_NAME)
+    if (!raw) return
+    try {
+      const doc = JSON.parse(raw) as Partial<WebAppsDocument>
+      if (Array.isArray(doc.pinned))
+        this.pinned = doc.pinned.filter(
+          (p): p is PinnedWebApp =>
+            Boolean(p) && typeof p.id === 'string' && typeof p.scope === 'string'
+        )
+      if (doc.engagement && typeof doc.engagement === 'object')
+        this.engagement = { ...doc.engagement }
+    } catch {
+      /* a broken document starts over */
+    }
+  }
+
+  private document(): WebAppsDocument {
+    return { version: 1, pinned: this.pinned, engagement: this.engagement }
+  }
+
+  private save(): void {
+    if (this.saveTimer) return
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null
+      void this.io.write(STORE_NAME, JSON.stringify(this.document()))
+    }, 500)
+  }
+
+  flushSync(): void {
+    if (!this.saveTimer) return
+    clearTimeout(this.saveTimer)
+    this.saveTimer = null
+    this.io.writeSync(STORE_NAME, JSON.stringify(this.document()))
+  }
+
+  // ---------------------------------------------------------------------------
+  // Queries
+  // ---------------------------------------------------------------------------
+
+  /** Whether this host can pin pages at all (the menu item hides otherwise). */
+  get supported(): boolean {
+    return Boolean(
+      this.browser.platform.capabilities.pinShortcuts && this.browser.platform.shortcuts
+    )
+  }
+
+  /**
+   * Where an installed app lands: on hosts with windows it opens in a standalone window of its
+   * own from a desktop launcher (Chrome's installed apps); a one-window host puts a tile on the
+   * Home screen.
+   */
+  get surface(): InstallSurface {
+    return this.browser.state.capabilities.windows ? 'desktop' : 'homeScreen'
+  }
+
+  /**
+   * The pinned app whose scope contains `url` (the app menu says "Open <name>" inside it, the
+   * install surfaces stand down). Never a shortcut: it has no scope and claims no page
+   * (`pinnedAppFor`), so a page with a shortcut is still offered as an app, or as a shortcut
+   * again – a second Create updates the launcher under the same id.
+   */
+  pinnedFor(url: string): PinnedWebApp | null {
+    return pinnedAppFor(url, this.pinned)
+  }
+
+  /** The installed app with this id, if it is still installed. */
+  pinnedById(appId: string): PinnedWebApp | null {
+    return this.pinned.find((p) => p.id === appId) ?? null
+  }
+
+  /**
+   * The record a launcher's `--app=<url>` is of (`Browser.openAppWindow`): the shortcut made for
+   * exactly `url` – a shortcut claims no page but its own, so nothing but its launcher's URL
+   * finds it, and it comes before an app whose scope merely holds the URL, since the launcher
+   * that ran is the shortcut's – else the installed app whose scope holds `url`.
+   */
+  appForLaunch(url: string): PinnedWebApp | null {
+    return this.pinned.find((p) => isShortcutRecord(p) && p.startUrl === url) ?? this.pinnedFor(url)
+  }
+
+  /**
+   * Open an installed app the way its launcher does: in an app window of its own on hosts with
+   * windows (MW-23), as a tab at its start URL elsewhere – and on the desktop too for an app
+   * whose shortcut was made with "Open as window" off (`openAsWindow` false), whose launcher
+   * opens a tab. A shortcut to a page opens the same way, its window its own (the record's id
+   * is the window's, so it comes forward on the next launch and closes on uninstall). An id
+   * that is no app's does nothing.
+   */
+  launch(appId: string, win?: ZenWindow): void {
+    const app = this.pinnedById(appId)
+    if (!app) return
+    if (this.opensWindow(app)) {
+      // An open window of the app comes forward rather than a second one (Chrome's behaviour).
+      const open = this.browser.allWindows().find((w) => w.app?.appId === app.id && !w.isClosing)
+      if (open) {
+        open.host.show()
+        open.host.focus()
+        return
+      }
+      const opened = this.browser.openAppWindow(app.startUrl, { from: win, appId: app.id })
+      opened?.host.show()
+      opened?.host.focus()
+      return
+    }
+    const active = win ? this.browser.tabs.activeTabFor(win) : undefined
+    if (active && isWithinScope(active.url, app.scope))
+      this.browser.tabs.navigate(active.id, app.startUrl)
+    else this.browser.tabs.createTab({ url: app.startUrl, active: true }, win)
+  }
+
+  /**
+   * Whether the app opens in a window of its own here: a host with windows, unless the record
+   * says its launcher opens a tab (`openAsWindow` false). A record from before the box
+   * travelled, or installed from the pill's popover, has no say and opens a window.
+   */
+  private opensWindow(app: Pick<PinnedWebApp, 'openAsWindow'>): boolean {
+    return this.surface === 'desktop' && app.openAsWindow !== false
+  }
+
+  // ---------------------------------------------------------------------------
+  // Share targets (MW-63)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The installed apps a share of `kind` can go to – those whose manifest declared a
+   * `share_target` with a field for it – as the chooser's rows, in the order of installing. A
+   * shortcut to a page has no manifest, so no target: never a row (Chrome's share targets are
+   * the manifest's too).
+   */
+  shareTargetsFor(kind: ShareKind): ShareChooserApp[] {
+    return this.pinned
+      .filter((app) => app.shareTarget && shareTargetAccepts(app.shareTarget, kind))
+      .map((app) => ({ id: app.id, name: app.name, icon: app.icon ?? null }))
+  }
+
+  /**
+   * Hand a share to an installed app: its target's launch – a GET of the action with the
+   * fields as the query, or a POST with them as the form body – opened the way the app's
+   * launcher opens it (`launch`): an app window of its own on hosts with windows (unless the
+   * shortcut was made to open a tab), a tab another app sent (`fromIntent`) elsewhere. An id
+   * that is no app's, an app whose target takes none of the share, or a shortcut to a page –
+   * no manifest, so no target (`shareTargetsFor`) – does nothing and says so.
+   */
+  launchShare(appId: string, fields: SharedFields, win?: ZenWindow): boolean {
+    const app = this.pinnedById(appId)
+    // The share's kind as the chooser offered it: a link when it carries one, text otherwise.
+    // The chooser only offers apps that take the kind, so this guard is the comment's word.
+    const kind: ShareKind = fields.url !== null ? 'url' : 'text'
+    if (!app?.shareTarget || !shareTargetAccepts(app.shareTarget, kind)) return false
+    const launch = shareTargetLaunch(app.shareTarget, fields)
+    const post = launch.method === 'POST' ? launch.post : undefined
+    if (this.opensWindow(app)) {
+      const opened = this.browser.openAppWindow(launch.url, { from: win, post, appId: app.id })
+      opened?.host.show()
+      opened?.host.focus()
+      return true
+    }
+    const target = win ?? this.browser.focusedWindow()
+    this.browser.tabs.createTab({ url: launch.url, active: true, fromIntent: true, post }, target)
+    target.host.show()
+    target.host.focus()
+    return true
+  }
+
+  /**
+   * Remove an installed app, or a shortcut: its launcher where the host made one, then the
+   * record; open windows of the app close (Chrome closes them on uninstall too).
+   */
+  async uninstall(appId: string): Promise<void> {
+    const app = this.pinnedById(appId)
+    if (!app) return
+    try {
+      await this.browser.platform.shortcuts?.unpin?.(app.id)
+    } catch {
+      /* the record goes either way; a stale launcher just opens the app as a page */
+    }
+    this.pinned = this.pinned.filter((p) => p.id !== appId)
+    this.save()
+    for (const w of this.browser.allWindows()) {
+      if (w.app?.appId === appId) {
+        w.closeApproved = true
+        w.host.close()
+      }
+    }
+    // The badge goes with the record (Chrome clears an uninstalled app's), ahead of the
+    // windows' own closing, which the host may finish later.
+    this.setBadge(appId, null)
+    this.browser.state.commitVolatile()
+  }
+
+  // ---------------------------------------------------------------------------
+  // Badges (MW-51)
+  // ---------------------------------------------------------------------------
+
+  /** The badge an installed app's page last set, or null while it has none. */
+  badgeOf(appId: string): AppBadge | null {
+    return this.appBadges.get(appId) ?? null
+  }
+
+  /** Every installed app with a badge up, by app id. */
+  badges(): ReadonlyMap<string, AppBadge> {
+    return this.appBadges
+  }
+
+  /**
+   * Hosts that draw badges (the desktop's taskbar overlay and dock badge) hear each change: the
+   * app and its new badge, null once it is cleared. Returns the unsubscribe.
+   */
+  onBadgeChange(listener: AppBadgeListener): () => void {
+    this.badgeListeners.add(listener)
+    return () => this.badgeListeners.delete(listener)
+  }
+
+  /**
+   * Set or clear an installed app's badge. The same badge again is nothing; a record that is no
+   * app's (uninstalled meanwhile) takes none.
+   */
+  setBadge(appId: string, badge: AppBadge | null): void {
+    const current = this.badgeOf(appId)
+    if (badge && !this.pinnedById(appId)) return
+    if (sameAppBadge(current, badge)) return
+    if (badge) this.appBadges.set(appId, badge)
+    else this.appBadges.delete(appId)
+    for (const listener of this.badgeListeners) listener(appId, badge)
+  }
+
+  /**
+   * A page's `setAppBadge` / `clearAppBadge` (the page script's `webapp: 'badge'`): it counts
+   * for the app whose window shows the tab, while the tab is inside the app's scope – the page
+   * script sends nothing otherwise (`PageFlags.installedApp`), and the core holds the same line
+   * against a message that arrived late or forged. A shortcut's window is its record's too
+   * (`Browser.openAppWindow`, bounded by the origin), so a page in it badges the shortcut's
+   * icon as Chrome badges any installed app's window; a shortcut that opens a tab has no window
+   * and no badge, as a tab-mode app has none. A malformed badge is dropped.
+   */
+  private onBadge(tabId: string, value: unknown): void {
+    const badge = appBadgeOf(value)
+    if (badge === undefined) return
+    const tab = this.browser.tabs.tab(tabId)
+    const app = this.browser.tabs.windowFor(tabId)?.app
+    if (!tab || !app?.appId || !isWithinScope(tab.url, app.scope)) return
+    this.setBadge(app.appId, badge)
+  }
+
+  /**
+   * A window closed: an app's badge goes with its last window – there is no icon left to show it
+   * on, and the next launch starts clean, as Chrome's app does when its last window closes.
+   */
+  onWindowClosed(win: ZenWindow): void {
+    const appId = win.app?.appId
+    if (!appId || !this.appBadges.has(appId)) return
+    const another = this.browser
+      .allWindows()
+      .some((w) => w !== win && w.app?.appId === appId && !w.isClosing)
+    if (!another) this.setBadge(appId, null)
+  }
+
+  /** An app window moved or resized: the next launch of the app opens where it stood. */
+  rememberBounds(appId: string, bounds: Rect | null): void {
+    const app = this.pinnedById(appId)
+    if (!app || !bounds) return
+    const b = app.bounds
+    if (
+      b &&
+      b.x === bounds.x &&
+      b.y === bounds.y &&
+      b.width === bounds.width &&
+      b.height === bounds.height
+    )
+      return
+    app.bounds = { ...bounds }
+    this.save()
+  }
+
+  /** Whether "Add to Home screen" applies to the tab: a web page, not private, host able. */
+  canPin(tab: Tab | undefined, win: ZenWindow): boolean {
+    if (!tab || !this.supported || win.isPrivate) return false
+    return /^https?:\/\//i.test(tab.url)
+  }
+
+  /**
+   * The installed apps as the UI snapshot lists them (`UIState.webApps`): every record, in the
+   * order of installing – the shortcuts to pages among them, as chrome://apps lists Chrome's
+   * shortcuts beside its apps, each with the Open and Uninstall its launcher and record take –
+   * with how many of its windows stand open – the windows `uninstall` closes, which Settings ›
+   * Apps asks about first when there are any (§9.23's notice; the #435 lead check). A window on
+   * its way out is not counted, as `launch` does not bring one forward; a host whose apps open
+   * as tabs has no app windows and counts none.
+   */
+  installed(): InstalledWebApp[] {
+    const open = new Map<string, number>()
+    for (const w of this.browser.allWindows()) {
+      const id = w.app?.appId
+      if (id && !w.isClosing) open.set(id, (open.get(id) ?? 0) + 1)
+    }
+    return this.pinned.map((app) => ({ ...app, windows: open.get(app.id) ?? 0 }))
+  }
+
+  // ---------------------------------------------------------------------------
+  // Page script messages
+  // ---------------------------------------------------------------------------
+
+  handleMessage(tabId: string, message: PageMessage): void {
+    switch (message.webapp) {
+      case 'manifest':
+        this.onManifest(tabId, message)
+        return
+      case 'deferred':
+        this.deferred.add(tabId)
+        this.hideBanner(tabId)
+        return
+      case 'prompt': {
+        const win = this.browser.tabs.windowFor(tabId)
+        this.sitePrompts.add(tabId)
+        this.openInstall(tabId, win)
+        return
+      }
+      case 'badge':
+        this.onBadge(tabId, message.badge)
+        return
+    }
+  }
+
+  private onManifest(tabId: string, message: PageMessage): void {
+    const tab = this.browser.tabs.tab(tabId)
+    if (!tab || typeof message.manifestUrl !== 'string') return
+    if (message.manifest && typeof message.manifest === 'object') {
+      this.applyManifest(tabId, parseWebAppManifest(message.manifest, message.manifestUrl, tab.url))
+      return
+    }
+    // The page could not fetch its own manifest (a strict connect-src); fetch it from the host.
+    const documentUrl = tab.url
+    const manifestUrl = message.manifestUrl
+    void this.browser.platform.net
+      .fetchText(manifestUrl, {
+        headers: { Accept: 'application/manifest+json, application/json;q=0.9, */*;q=0.5' },
+        timeoutMs: MANIFEST_FETCH_TIMEOUT_MS
+      })
+      .then((res) => {
+        if (!res.ok || !res.text || res.text.length > MAX_MANIFEST_BYTES) return
+        const current = this.browser.tabs.tab(tabId)
+        if (!current || current.url !== documentUrl) return
+        let raw: unknown
+        try {
+          raw = JSON.parse(res.text)
+        } catch {
+          return
+        }
+        this.applyManifest(tabId, parseWebAppManifest(raw, manifestUrl, documentUrl))
+      })
+      .catch(() => undefined)
+  }
+
+  /** The tab's manifest is known: keep it, tell the page when it is installable, count the visit. */
+  applyManifest(tabId: string, info: WebAppInfo | null): void {
+    const tab = this.browser.tabs.tab(tabId)
+    if (!tab) return
+    tab.webApp = info
+    this.browser.state.commitVolatile()
+    if (!info || !this.supported || this.browser.tabs.isPrivate(tab)) return
+    if (!isInstallable(info) || this.pinnedFor(tab.url)) return
+
+    this.browser.tabs.view(tabId)?.postToPage?.({ type: 'webapp', action: 'installable' })
+
+    const now = this.now()
+    const record = recordVisit(this.engagement[info.id], now)
+    this.engagement[info.id] = record
+    this.trimEngagement()
+    this.save()
+    if (!shouldPrompt(record, now)) return
+    // Every surface is offered: the phone draws the banner as its card, the desktop as the
+    // pill's "Install <app>?" popover (#754). A window whose chrome draws neither gives no word
+    // inside the grace, and the cooldown is not spent on it (`bannerUndrawn`, seed #42).
+    this.schedule(`banner:${tabId}`, DEFER_GRACE_MS, () => {
+      const current = this.browser.tabs.tab(tabId)
+      if (!current || current.webApp?.id !== info.id || this.deferred.has(tabId)) return
+      // Meanwhile the user may have gone ahead through the menu: no banner behind the sheet,
+      // none for an app that is on the Home screen by now.
+      if (this.installOpen.has(tabId) || this.pinnedFor(current.url)) return
+      this.showBanner(tabId, current, info)
+    })
+  }
+
+  private trimEngagement(): void {
+    const ids = Object.keys(this.engagement)
+    if (ids.length <= MAX_ENGAGEMENT) return
+    ids.sort((a, b) => this.engagement[a].lastVisitAt - this.engagement[b].lastVisitAt)
+    for (const id of ids.slice(0, ids.length - MAX_ENGAGEMENT)) delete this.engagement[id]
+  }
+
+  // ---------------------------------------------------------------------------
+  // Navigation / lifecycle
+  // ---------------------------------------------------------------------------
+
+  /** A tab moved to `url`: the manifest stays while the page is still inside the app's scope. */
+  onNavigated(tabId: string, url: string, inPage: boolean): void {
+    const tab = this.browser.tabs.tab(tabId)
+    if (!tab) return
+    if (tab.webApp && !isWithinScope(url, tab.webApp.scope)) {
+      tab.webApp = null
+      this.hideBanner(tabId)
+    } else if (!inPage && this.banners.has(tabId)) {
+      // A new document inside the scope posts its manifest again; the banner returns if due.
+      this.hideBanner(tabId, 'timeout')
+    }
+    if (!inPage) {
+      // The page script starts over with the new document.
+      this.deferred.delete(tabId)
+      this.settleSitePrompt(tabId, 'dismissed')
+      this.clear(`banner:${tabId}`)
+    }
+  }
+
+  onTabRemoved(tabId: string): void {
+    this.deferred.delete(tabId)
+    this.sitePrompts.delete(tabId)
+    this.installOpen.delete(tabId)
+    this.banners.delete(tabId)
+    this.unseen.delete(tabId)
+    this.clear(`banner:${tabId}`)
+    this.clear(`banner-shown:${tabId}`)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ambient banner (PWA-03)
+  // ---------------------------------------------------------------------------
+
+  private showBanner(tabId: string, tab: Tab, info: WebAppInfo): void {
+    const win = this.browser.tabs.windowFor(tabId)
+    if (this.browser.tabs.activeTabFor(win)?.id !== tabId) return
+    this.banners.set(tabId, info.id)
+    this.unseen.delete(tabId)
+    const banner: WebAppBanner = {
+      tabId,
+      name: launcherName(info, this.surface),
+      origin: originOf(tab.url),
+      icon: displayIcon(info),
+      tint: this.tileColorFor(info, tab)
+    }
+    this.browser.emit('webapp.banner', banner, win)
+    // The cooldown is stamped on the chrome's word that the card is drawn (`bannerShown`), not
+    // here: a card no surface drew would spend it on a prompt nobody saw (#740, seed #42). The
+    // prompt's clock is the chrome's too – the page-edge band's one offer clock (the Design
+    // Lead's ruling: one offer, one clock) – so the core runs none: it hears the clock ran out
+    // as `dismissBanner('timeout')`, which records no dismissal.
+    this.schedule(`banner-shown:${tabId}`, BANNER_SHOWN_GRACE_MS, () => this.bannerUndrawn(tabId))
+  }
+
+  /**
+   * The chrome's word that the banner's card is mounted on a surface that draws banners: the
+   * prompt counts as shown from now, so the app's `promptedAt` is stamped (the day's interval
+   * before the next offer; a swipe later lengthens it to the dismissal's). One stamp per banner;
+   * a word for a tab with no banner awaiting one – none up, the grace already run out, or the
+   * preview host's card, which the core never raised – changes nothing.
+   *
+   * A cover is not a view: a surface that ACCEPTED the card but holds it back (`visible` false
+   * – the page-edge band under a sheet, the keyboard or the open tab overview) spends the grace,
+   * so the prompt is not undrawn and the card stays the core's, but stamps nothing. The cooldown
+   * is spent on a card seen: the stamp lands on the word with `visible` true (or absent) at the
+   * card's first drawn frame, once – or never, if a take-down (the chrome's dismissal, another
+   * tab to the front, a navigation, the tab closing) comes first (seed #43, the Lead's S3).
+   */
+  bannerShown(tabId: string, visible = true): void {
+    const inGrace = this.timers.has(`banner-shown:${tabId}`)
+    if (!inGrace && !this.unseen.has(tabId)) return
+    this.clear(`banner-shown:${tabId}`)
+    if (!visible) {
+      this.unseen.add(tabId)
+      return
+    }
+    this.unseen.delete(tabId)
+    const appId = this.banners.get(tabId)
+    const record = appId ? this.engagement[appId] : undefined
+    if (!appId || !record) return
+    this.engagement[appId] = markPrompted(record, this.now())
+    this.save()
+  }
+
+  /**
+   * The grace ran out with no word of the card: the window's chrome drew nothing within it –
+   * no surface that draws banners is mounted there, or the one mounted could not open the card.
+   * Nobody saw the prompt, so the cooldown is not spent and the engagement record keeps
+   * counting; the tab leaves `banners` and the chrome hears `bannerHide`, so a surface mounting
+   * late never shows a card the core has let go of.
+   */
+  private bannerUndrawn(tabId: string): void {
+    if (!this.banners.has(tabId)) return
+    this.banners.delete(tabId)
+    this.unseen.delete(tabId)
+    this.browser.emit('webapp.bannerHide', { tabId }, this.browser.tabs.windowFor(tabId))
+  }
+
+  /**
+   * The chrome reports the banner went away – the user sent it off (`swipe`: the cooldown
+   * starts) or its clock ran out (`timeout`: nothing is recorded; the day's stamp holds) – or
+   * the core takes it down itself.
+   */
+  dismissBanner(tabId: string, reason: 'swipe' | 'timeout'): void {
+    const appId = this.banners.get(tabId)
+    this.banners.delete(tabId)
+    this.unseen.delete(tabId)
+    this.clear(`banner-shown:${tabId}`)
+    if (!appId) return
+    const record = this.engagement[appId]
+    if (record && reason === 'swipe') {
+      this.engagement[appId] = markDismissed(record, this.now())
+      this.save()
+    }
+  }
+
+  private hideBanner(tabId: string, reason: 'swipe' | 'timeout' = 'timeout'): void {
+    if (!this.banners.has(tabId)) return
+    this.dismissBanner(tabId, reason)
+    this.browser.emit('webapp.bannerHide', { tabId }, this.browser.tabs.windowFor(tabId))
+  }
+
+  // ---------------------------------------------------------------------------
+  // Install sheet (PWA-01 / PWA-04)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Open the install sheet (with a manifest) or the name-edit sheet (without). A window whose
+   * chrome has no install surface up (`ChromeSurface`: the phone's sheet; the desktop's dialog
+   * is UI work to come) settles the site's `prompt()` as dismissed at once, the answer Chrome's
+   * closed dialog gives, and shows nothing.
+   */
+  openInstall(tabId: string, win: ZenWindow): void {
+    const tab = this.browser.tabs.tab(tabId)
+    if (!this.canPin(tab, win) || !tab || !surfaceMounted(win, 'install')) {
+      this.settleSitePrompt(tabId, 'dismissed')
+      return
+    }
+    // The user went ahead through the menu: a banner up or pending is moot.
+    this.hideBanner(tabId)
+    this.clear(`banner:${tabId}`)
+    this.installOpen.add(tabId)
+    const info = tab.webApp
+    const prompt: WebAppInstallPrompt = {
+      tabId,
+      title: info ? launcherName(info, this.surface) : fallbackShortcutTitle(tab.title, tab.url),
+      url: info?.startUrl ?? tab.url,
+      origin: originOf(tab.url),
+      icon: (info && displayIcon(info)) ?? tab.favicon,
+      info,
+      tint: this.tileColorFor(info, tab),
+      surface: this.surface
+    }
+    this.browser.emit('webapp.install', prompt, win)
+  }
+
+  /**
+   * The sheet's "Add" / the dialog's "Create": ask the host to pin the page. `openAsWindow` is
+   * the desktop dialog's "Open as window" box, handed to the host as it stands – a window of
+   * the app's own (`--app=`) or a tab in Ione – and kept on the record the confirmation
+   * writes, so `launch` opens the app the way its launcher does. A caller without the box (the
+   * phone sheet, the pill's popover) sends none and the request reads as before: the host's
+   * own rule.
+   */
+  async pin(tabId: string, title: string, win: ZenWindow, openAsWindow?: boolean): Promise<void> {
+    this.installOpen.delete(tabId)
+    const tab = this.browser.tabs.tab(tabId)
+    const host = this.browser.platform.shortcuts
+    if (!tab || !host || !this.canPin(tab, win)) {
+      this.settleSitePrompt(tabId, 'dismissed')
+      return
+    }
+    const info = tab.webApp
+    const name =
+      title.replace(/\s+/g, ' ').trim().slice(0, 60) ||
+      (info ? launcherName(info, this.surface) : fallbackShortcutTitle(tab.title, tab.url))
+    const icon = info ? shortcutIcon(info) : null
+    const request: ShortcutRequest = {
+      id: info?.id ?? tab.url,
+      url: info?.startUrl ?? tab.url,
+      title: name,
+      iconUrl: icon?.url ?? tab.favicon,
+      iconKind: icon ? icon.kind : tab.favicon ? 'any' : null,
+      background: this.tileColorFor(info, tab),
+      iconBackground: info?.backgroundColor ?? null,
+      ...(info
+        ? {
+            display: info.display,
+            scope: info.scope,
+            themeColor: hexColor(info.themeColor),
+            backgroundColor: hexColor(info.backgroundColor)
+          }
+        : {}),
+      ...(openAsWindow === undefined ? {} : { openAsWindow })
+    }
+    this.pendingPins.set(request.id, {
+      tabId,
+      title: name,
+      url: request.url,
+      ...(openAsWindow === undefined ? {} : { openAsWindow })
+    })
+    if (info) this.pendingApps.set(request.id, { ...info, name })
+    let ok = false
+    try {
+      ok = await host.pin(request)
+    } catch {
+      ok = false
+    }
+    if (!ok) {
+      this.pendingPins.delete(request.id)
+      this.pendingApps.delete(request.id)
+      this.browser.toast(installFailedMessage(this.surface), 'error', win)
+      this.settleSitePrompt(tabId, 'dismissed')
+    }
+  }
+
+  /** The sheet closed without pinning. */
+  cancelInstall(tabId: string): void {
+    this.installOpen.delete(tabId)
+    this.settleSitePrompt(tabId, 'dismissed')
+  }
+
+  /**
+   * The launcher confirmed the shortcut (NOT-20): register the app, tell the page, and have the
+   * chrome toast "Added <name> to Home screen" (the desktop's "Installed <name>") with an Open
+   * action for the shortcut's URL. On the desktop a page without a manifest becomes a shortcut
+   * record (`PinnedWebApp.kind` `shortcut`: listed in Settings › Apps, launched and uninstalled
+   * like an app, claiming no page), and the core toasts "Shortcut created" itself, with no
+   * action – Chrome offers none for a shortcut, and a window shortcut's page is in its window
+   * already – and sends the chrome no `webapp.pinned` (the Design Lead's ruling on #761's first
+   * seam, seed D5). The phone keeps no record of a plain page: its Home-screen tile is the
+   * launcher's own, which the core could not take back again (no `unpin`), and Chrome Android
+   * lists none. A desktop host confirms with the icon it kept (`details.icon`); a record whose
+   * launcher opens a window – an app with a manifest, a shortcut with "Open as window" on – then
+   * opens in its own window at once and the installing tab goes with it, as Chrome moves the tab
+   * into the new app window; a shortcut made to open a tab ("Open as window" off) leaves the tab
+   * where it is, as Chrome leaves it.
+   */
+  onPinned(id: string, details: { icon?: string | null } = {}): void {
+    const pending = this.pendingPins.get(id)
+    this.pendingPins.delete(id)
+    const info = this.pendingApps.get(id)
+    this.pendingApps.delete(id)
+    const win = pending ? this.browser.tabs.windowFor(pending.tabId) : undefined
+    const title = pending?.title ?? info?.name ?? 'Shortcut'
+    const surface = this.surface
+    const previous = this.pinnedById(id)
+    // The mode this pin asked of the launcher, so `launch` opens the app the same way; a pin
+    // without the box (the popover, the phone) rewrote the launcher on the host's rule and the
+    // record says nothing, whatever an earlier shortcut asked.
+    const mode = pending?.openAsWindow === undefined ? {} : { openAsWindow: pending.openAsWindow }
+    let record: PinnedWebApp | null = null
+    if (info) {
+      record = {
+        id,
+        name: title,
+        startUrl: info.startUrl,
+        scope: info.scope,
+        pinnedAt: this.now(),
+        // The host's kept icon first; where the launcher owns the tile and the host keeps
+        // none (Android), the manifest's own icon address, so the record can be drawn.
+        icon: details.icon ?? previous?.icon ?? displayIcon(info),
+        bounds: previous?.bounds ?? null,
+        shareTarget: info.shareTarget ?? null,
+        ...mode
+      }
+    } else if (surface === 'desktop' && pending) {
+      // A shortcut: the page's URL is its id (as the pin request's), its start URL and – a
+      // claim on no page but its own – its scope; the icon is the one the host drew into the
+      // launcher, the only one a page without a manifest has.
+      record = {
+        id,
+        kind: 'shortcut',
+        name: title,
+        startUrl: pending.url,
+        scope: pending.url,
+        pinnedAt: this.now(),
+        icon: details.icon ?? previous?.icon ?? null,
+        bounds: previous?.bounds ?? null,
+        ...mode
+      }
+    }
+    if (record) {
+      this.pinned = this.pinned.filter((p) => p.id !== id)
+      this.pinned.push(record)
+      this.save()
+    }
+    if (surface === 'desktop' && !info) {
+      // A shortcut, not an install: its "Installed <name>" would say what did not happen, and
+      // Chrome offers no Open after creating one.
+      this.browser.toast('Shortcut created', 'info', win)
+    } else {
+      this.browser.emit(
+        'webapp.pinned',
+        {
+          tabId: pending?.tabId ?? null,
+          name: title,
+          url: pending?.url ?? info?.startUrl ?? null,
+          surface,
+          appId: info ? id : null
+        },
+        win
+      )
+    }
+    if (pending) {
+      this.hideBanner(pending.tabId)
+      this.settleSitePrompt(pending.tabId, 'accepted')
+      this.browser.tabs.view(pending.tabId)?.postToPage?.({ type: 'webapp', action: 'installed' })
+    }
+    this.browser.state.commitVolatile()
+    if (record && pending && this.opensWindow(record)) this.moveIntoAppWindow(pending.tabId, id)
+  }
+
+  /**
+   * Chrome's install: the page the user installed from carries on in the app's new window and
+   * its browser tab closes – unless the tab has meanwhile left the app, in which case the app
+   * window opens at its start URL and the tab stays. The window is the record's (`appId`), a
+   * shortcut's as an app's.
+   */
+  private moveIntoAppWindow(tabId: string, appId: string): void {
+    const app = this.pinnedById(appId)
+    const tab = this.browser.tabs.tab(tabId)
+    if (!app) return
+    const inside = tab && isWithinScope(tab.url, app.scope)
+    const win = this.browser.openAppWindow(inside ? tab.url : app.startUrl, { appId })
+    if (!win) return
+    if (inside && tab) this.browser.tabs.closeTab(tab.id)
+    win.host.show()
+    win.host.focus()
+  }
+
+  /** A site's deferred `prompt()` learns how the sheet ended. */
+  private settleSitePrompt(tabId: string, outcome: 'accepted' | 'dismissed'): void {
+    if (!this.sitePrompts.delete(tabId)) return
+    this.browser.tabs.view(tabId)?.postToPage?.({ type: 'webapp', action: 'result', outcome })
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The colour behind the app's letter tile, as `#rrggbb`: the manifest's theme colour when it
+   * is paintable, else the space's accent. The same value reaches the sheet, the banner and the
+   * host's pin request, so the preview tile and the launcher tile agree.
+   */
+  private tileColorFor(info: WebAppInfo | null, tab: Tab): string {
+    return tileColor(info?.themeColor ?? null, this.accentFor(tab))
+  }
+
+  /** The space's accent colour as a hex string. */
+  private accentFor(tab: Tab): string {
+    const space = getSpace(this.browser.state.model, tab.spaceId)
+    const dark = this.browser.state.settings.colorScheme === 'dark'
+    return rgbToHex(resolveTheme(space?.theme ?? null, dark).accent)
+  }
+
+  private schedule(key: string, delay: number, fn: () => void): void {
+    this.clear(key)
+    this.timers.set(
+      key,
+      setTimeout(() => {
+        this.timers.delete(key)
+        fn()
+      }, delay)
+    )
+  }
+
+  private clear(key: string): void {
+    const timer = this.timers.get(key)
+    if (timer) clearTimeout(timer)
+    this.timers.delete(key)
+  }
+}
+
+function originOf(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return url
+  }
+}
+
+/** A manifest colour as `#rrggbb` for a host that paints natively with it; null for none it can read. */
+function hexColor(css: string | null): string | null {
+  if (!css) return null
+  return tileColor(css, '') || null
+}

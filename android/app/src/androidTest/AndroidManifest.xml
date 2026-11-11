@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The instrumentation APK's own manifest, merged with the one AGP generates. It adds the pretend
+  third-party app the custom tabs demo opens Ione from (CustomTabCallerActivity.java): a real
+  other package and process, so a custom tab it starts is a genuine cross-app custom tab and
+  closing it lands back in it. Exported because the driver, which runs in Ione's process,
+  starts it; singleTask so a later start hands it the next custom tab to open (onNewIntent).
+
+  And the share target the share panel demo sends to (ShareTargetActivity.java): "Nimbus Notes",
+  a text/plain ACTION_SEND handler Ione's <queries> make visible, so the panel's row has an app
+  whose window the driver can read back. Exported as any share target is; singleTop so the
+  second share of the ranking check lands in onNewIntent.
+
+  And the accessibility service the harness enables for every run (EventsTapService.java): a
+  listener for every event type that does nothing with them, so a current WebView – which sends
+  an event only when some enabled service asked for its type, and UiAutomation is none – sends
+  them at all. Declared as any accessibility service is: bound by the system under
+  BIND_ACCESSIBILITY_SERVICE, its asks in res/xml/events_tap_service.xml.
+
+  And the device admin the managed-configuration driver needs (ManagedTestAdmin.java): the shell
+  makes this test package the device owner for the run, and as the owner the package hands Ione
+  an app-restrictions bundle through DevicePolicyManager – the way an EMM does – so the app reads
+  it through RestrictionsManager as it would in the field. Declared as any device admin is, with
+  no policies of its own (res/xml/device_admin.xml). The owner's calls have to come from this
+  package's own uid, and the driver runs in Ione's process, so it sends them to
+  ManagedSeedReceiver.java – a receiver of this package, reached by an explicit ordered
+  broadcast, exported for that – which sets the bundle and, when the driver is done, clears it
+  and gives the ownership back.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="Nimbus News">
+        <receiver
+            android:name="app.zen.chromium.ManagedTestAdmin"
+            android:exported="true"
+            android:label="Demo harness managed-configuration admin"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name="app.zen.chromium.ManagedSeedReceiver"
+            android:exported="true" />
+        <service
+            android:name="app.zen.chromium.EventsTapService"
+            android:exported="true"
+            android:label="Demo harness events tap"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/events_tap_service" />
+        </service>
+        <activity
+            android:name="app.zen.chromium.CustomTabCallerActivity"
+            android:exported="true"
+            android:label="Nimbus News"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+        <activity
+            android:name="app.zen.chromium.ShareTargetActivity"
+            android:exported="true"
+            android:label="Nimbus Notes"
+            android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

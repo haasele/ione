@@ -1,0 +1,4 @@
+{
+  "name": { "message": "Ione Probe" },
+  "hello": { "message": "Hello from $WHO$", "placeholders": { "who": { "content": "$1" } } }
+}

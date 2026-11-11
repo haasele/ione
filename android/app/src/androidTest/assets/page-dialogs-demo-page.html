@@ -1,0 +1,104 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Page dialogs</title>
+<style>
+  body { margin: 0; font-family: sans-serif; color: #15141a; background: #fff; }
+  h1 { font-size: 24px; margin: 0; padding: 16px 24px 0; }
+  button { display: block; width: calc(100% - 48px); margin: 8px 24px; height: 52px; font-size: 20px; border: 0; border-radius: 12px; color: #fff; }
+  #alert { background: #1b4332; }
+  #confirm { background: #2d6a4f; }
+  #prompt { background: #40916c; }
+  #long { background: #6c757d; }
+  #later { background: #52796f; }
+  #arm { background: #7b5ea7; }
+  #arm[data-armed] { background: #c9184a; }
+  #arm-slow { background: #5e548e; }
+  #arm-slow[data-armed] { background: #c9184a; }
+  #frame { display: block; width: calc(100% - 48px); height: 52px; margin: 8px 24px; border: 0; border-radius: 12px; }
+  #link { display: block; padding: 12px 24px; font-size: 20px; color: #1b4332; }
+  #log { margin: 0; padding: 4px 24px 24px; font: 14px/1.4 monospace; color: #444; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Page dialogs</h1>
+<button id="alert">alert()</button>
+<button id="confirm">confirm()</button>
+<button id="prompt">prompt()</button>
+<button id="long">alert() with a long message</button>
+<!-- Another origin's document (the frame server, one port up): its dialog is "An embedded page at … says". -->
+<iframe id="frame" src="" title="An embedded frame"></iframe>
+<button id="later">alert() in 12 s</button>
+<button id="arm">Arm beforeunload</button>
+<button id="arm-slow">Arm a slow beforeunload</button>
+<a id="link" href="/second.html">A link to the second page</a>
+<pre id="log"></pre>
+<script>
+  // What the page's calls returned, for the driver to read once the dialog has gone (the page
+  // is blocked inside each call while its dialog is up).
+  var log = window.__log = { alerts: 0, confirms: 0, prompts: 0, confirm: null, prompt: null, armed: false, slow: false, beforeunloads: 0, pagehide: 0, unload: 0 };
+  function show() { document.getElementById('log').textContent = JSON.stringify(log, null, 1); }
+  // The document's leaving as the page sees it: pagehide (every document on its way out) and
+  // unload (where the engine still fires it), counted in the log – readable while the document
+  // is still there – and told to the server as a beacon, the count that outlives the document.
+  // Scene 13 reads off both that nothing but the one navigation that went fired them: the
+  // host's unload probe ahead of a typed address commits nothing and takes no document away.
+  window.addEventListener('pagehide', function () { log.pagehide++; navigator.sendBeacon('/beacon/pagehide'); });
+  window.addEventListener('unload', function () { log.unload++; navigator.sendBeacon('/beacon/unload'); });
+  document.getElementById('alert').onclick = function () { alert('Hello from the page.'); log.alerts++; show(); };
+  document.getElementById('confirm').onclick = function () { log.confirm = confirm('Delete the draft?'); log.confirms++; show(); };
+  document.getElementById('prompt').onclick = function () { log.prompt = prompt('What is your name?', 'Ada'); log.prompts++; show(); };
+  // Twelve paragraphs: some three times what the sheet can show between its pinned title block
+  // and its pinned footer on a phone (the sheet stands at most 40 dp under the status bar), so
+  // the message has to scroll whatever the screen.
+  document.getElementById('long').onclick = function () {
+    var paragraphs = [];
+    for (var i = 1; i <= 12; i++) {
+      paragraphs.push(i + '. This is the page\'s own message, as it wrote it, and it runs on for long enough that the ' +
+        'sheet cannot show it whole: the title block stays put at the top, the buttons stay put at the bottom, and ' +
+        'the message scrolls between them under a hairline, the way a long page dialog reads in the browser.');
+    }
+    alert(paragraphs.join('\n\n'));
+    log.alerts++;
+    show();
+  };
+  // The background tab's dialog: the timer leaves the driver time to swipe to the other tab first
+  // (a settled pill swipe on the emulator's software GPU is the better part of three seconds).
+  document.getElementById('later').onclick = function () {
+    setTimeout(function () { alert('Hello from a background tab.'); log.alerts++; show(); }, 12000);
+  };
+  document.getElementById('arm').onclick = function () {
+    if (log.armed) return;
+    log.armed = true;
+    this.setAttribute('data-armed', '');
+    this.textContent = 'beforeunload armed';
+    window.addEventListener('beforeunload', function (e) { log.beforeunloads++; e.preventDefault(); e.returnValue = 'unsaved'; return 'unsaved'; });
+    show();
+  };
+  // A handler busy past Chromium's beforeunload budget (500 ms) before it objects: the renderer's
+  // answer always comes after the browser's hang monitor has given up on it, the way a busy
+  // renderer's does – the race scene 13 judges without a timing window.
+  document.getElementById('arm-slow').onclick = function () {
+    if (log.slow) return;
+    log.slow = true;
+    log.armed = true;
+    this.setAttribute('data-armed', '');
+    this.textContent = 'slow beforeunload armed';
+    window.addEventListener('beforeunload', function (e) {
+      log.beforeunloads++;
+      var until = performance.now() + 800;
+      while (performance.now() < until) {}
+      e.preventDefault();
+      e.returnValue = 'unsaved';
+      return 'unsaved';
+    });
+    show();
+  };
+  // The frame's origin is the page's host one port up (the driver's second server).
+  document.getElementById('frame').src = location.protocol + '//' + location.hostname + ':' + (Number(location.port) + 1) + '/frame.html';
+  show();
+</script>
+</body>
+</html>

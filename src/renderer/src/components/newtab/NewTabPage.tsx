@@ -1,0 +1,634 @@
+import type { CSSProperties, JSX, ReactNode, UIEvent } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  Building2,
+  Camera,
+  ClipboardPen,
+  Cookie,
+  Globe,
+  History,
+  Mic,
+  Radio,
+  Settings,
+  VenetianMask
+} from 'lucide-react'
+import type { PhoneBarPosition, Tab, UIState } from '@shared/types'
+import type { PrivateThirdPartyCookieStatus } from '@shared/privacy'
+import { defaultSearchEngineOf } from '@shared/search'
+import { MAX_NEW_TAB_SHORTCUTS, newTabSections, openTabFavicons } from '@shared/newTab'
+import { qrScanAvailable } from '@shared/qrScan'
+import { voiceSearchAvailable } from '@shared/voice'
+import { useFakeboxSurface } from '@renderer/hooks/useFakeboxSurface'
+import { run } from '@renderer/lib/api'
+import {
+  fakeboxMorphStore,
+  fakeboxScrolled,
+  registerFakebox,
+  tapFakebox
+} from '@renderer/lib/fakeboxMorph'
+import { useViewport } from '@renderer/lib/formFactor'
+import { PROTECTION_TEXT } from '@renderer/lib/protectionUi'
+import { topSites, type TopSite } from '@renderer/lib/historyAdapter'
+import {
+  composeTiles,
+  loadWallpaperImage,
+  newTabGrowStore,
+  openCustomize,
+  tileLabel,
+  wallpaperImageStore,
+  type TopSiteTile
+} from '@renderer/lib/newtab'
+import { isPrivateTab } from '@renderer/lib/privateTabs'
+import { startQrScan } from '@renderer/lib/qrScan'
+import { contentAreaStore } from '@renderer/lib/ui'
+import { cn } from '@renderer/lib/utils'
+import { startVoiceSearch } from '@renderer/lib/voiceSearch'
+import { useLongPress } from '../phone/useLongPress'
+import { EngineFieldGlyph } from '../urlbar/EngineFieldGlyph'
+import { MagicStack } from './MagicStack'
+import { TileIcon } from './TileIcon'
+import { useTileFlip, useTileReorder, type TileReorder } from './tileReorder'
+
+interface Props {
+  state: UIState
+  /** The blank tab the page stands in for. */
+  tab: Tab
+  /** Chrome that takes the frame over (the omnibox) is up: keep the page but do not paint it. */
+  hidden: boolean
+}
+
+/**
+ * The phone's new tab page, drawn in the content frame where the blank page would be. The one
+ * route is keyed on the tab's container: a private tab's blank page is the private new tab page
+ * (NTP-31), every other blank tab's the space's page with its field and tiles. The two are
+ * components of their own, so a blank tab changing hands between the modes mounts the other page
+ * rather than re-using one's hooks.
+ */
+export function NewTabPage({ state, tab, hidden }: Props): JSX.Element {
+  if (isPrivateTab(tab)) return <PrivateNewTabPage state={state} tab={tab} hidden={hidden} />
+  return <SpaceNewTabPage state={state} tab={tab} hidden={hidden} />
+}
+
+/**
+ * The bare page is the window's own gradient: drawn at the window's size and offset by the
+ * frame's position, so the frame reads as a window onto the space rather than a second copy.
+ */
+function useWindowBackdrop(): CSSProperties | undefined {
+  const area = contentAreaStore.use((s) => s.area)
+  const viewport = useViewport()
+  return area
+    ? {
+        backgroundSize: `${viewport.width}px ${viewport.height}px`,
+        backgroundPosition: `${-area.x}px ${-area.y}px`
+      }
+    : undefined
+}
+
+/**
+ * The space's new tab page: the space gradient as the page (a new tab in Zen is the window
+ * itself), a search field on the floating URL bar's surface, and the most visited sites as
+ * Essentials-style tiles. What the page shows is the preset's (or the customise sheet's) choice,
+ * and the wallpaper presets put the space's colours – or a picked image under a legibility scrim
+ * – behind it all.
+ *
+ * The page has one geometry, measured from the bar's edge (NTP-29, v2 §9.29, keyed on
+ * `phoneBarPosition`): the column's free height splits 3 : 5 with the block – the field, 24, the
+ * tiles – on the bar's side, so the field's centre sits on the frame's third nearest the bar
+ * (224 from the bar at 920 tall) and the tiles stand 24 beyond it on the side away from the
+ * bar; the customise gear is 12 into the corner opposite the bar. With the bar at the top that
+ * is the field high and the tiles under it, as Chrome's page has them; with the bar at the
+ * bottom the same picture upside down – the tiles above, the field's centre on the two-thirds
+ * line, inside the thumb's reach – never the block huddled against the bar, where the field and
+ * the bar's empty well read as two boxes for the one control (§11.8). The field is the morph's
+ * origin wherever it rests (#243: `registerFakebox` measures it there), so a tap at either dock
+ * is the same travel into the bar's slot.
+ */
+function SpaceNewTabPage({ state, tab, hidden }: Props): JSX.Element {
+  const settings = state.settings.newTab
+  const sections = newTabSections(settings)
+  const dock: PhoneBarPosition = state.settings.phoneBarPosition
+  const growPhase = newTabGrowStore.use((s) => s.phase)
+  const image = wallpaperImageStore.use()
+  const backdrop = useWindowBackdrop()
+  // The gear fades under the arriving omnibox with the column (`.zen-ntp-fades`): it carries the
+  // morph's value itself (lib/fakeboxMorph.ts; the column is registered with the field).
+  const gearRef = useRef<HTMLButtonElement>(null)
+  useFakeboxSurface(gearRef)
+
+  useEffect(() => {
+    if (sections.wallpaper) void loadWallpaperImage()
+  }, [sections.wallpaper])
+
+  const wallpaper: 'none' | 'space' | 'image' = !sections.wallpaper
+    ? 'none'
+    : settings.background === 'image' && image.dataUrl
+      ? 'image'
+      : 'space'
+
+  const style: CSSProperties | undefined =
+    wallpaper === 'none'
+      ? backdrop
+      : wallpaper === 'image' && image.dataUrl
+        ? { backgroundImage: `url("${image.dataUrl}")` }
+        : undefined
+
+  return (
+    // A window surface (design language v2 §9.29): the page is the space's gradient, and the
+    // tiles, their captions and the gear draw in the window family; the field is a panel on it.
+    <div
+      className="zen-ntp absolute inset-0 flex flex-col"
+      data-surface="window"
+      data-wallpaper={wallpaper}
+      data-dock={dock}
+      data-hidden={hidden || undefined}
+      data-grow={growPhase !== 'idle' ? growPhase : undefined}
+      style={style}
+    >
+      {wallpaper === 'image' && <div className="zen-ntp-scrim absolute inset-0" aria-hidden />}
+      {/* The column scrolls where its content overflows the frame (a short viewport, large type),
+          and its scroll carries the field toward the bar's pill slot (lib/fakeboxMorph.ts); the
+          whole of it fades under the arriving omnibox. */}
+      <div
+        className="zen-ntp-scroll zen-ntp-fades relative flex min-h-0 flex-1 flex-col items-center overflow-y-auto px-4"
+        style={{ overscrollBehavior: 'contain' }}
+        onScroll={onNewTabScroll}
+      >
+        {dock === 'bottom' ? (
+          // The top layout's spacers the other way round: 5 parts above the block, 3 below it.
+          // The Magic Stack keeps to the block's far side from the bar (NTP-16): under the tiles
+          // at a top dock, above them here, so the field stays the bar's neighbour (§11.8).
+          <>
+            <div className="min-h-6" style={{ flex: 5 }} />
+            <MagicStack state={state} tab={tab} dock={dock} />
+            {sections.shortcuts && <TopSites state={state} tab={tab} dock={dock} />}
+            {sections.searchBox && <SearchField state={state} tab={tab} dock={dock} />}
+            <div className="min-h-6" style={{ flex: 3 }} />
+          </>
+        ) : (
+          <>
+            <div className="min-h-6" style={{ flex: 3 }} />
+            {sections.searchBox && <SearchField state={state} tab={tab} dock={dock} />}
+            {sections.shortcuts && <TopSites state={state} tab={tab} dock={dock} />}
+            <MagicStack state={state} tab={tab} dock={dock} />
+            <div className="min-h-6" style={{ flex: 5 }} />
+          </>
+        )}
+      </div>
+      <button
+        ref={gearRef}
+        type="button"
+        className="zen-ntp-fades zen-toolbar-button absolute h-11 w-11"
+        style={dock === 'bottom' ? { right: 12, top: 12 } : { right: 12, bottom: 12 }}
+        aria-label="Customise the new tab page"
+        onClick={openCustomize}
+      >
+        <Settings className="h-5 w-5" strokeWidth={1.75} />
+      </button>
+    </div>
+  )
+}
+
+const PRIVATE_TITLE = "You're browsing privately"
+const PRIVATE_DESCRIPTION =
+  'Pages you open in private tabs leave nothing behind once the last one closes, and other ' +
+  "people using this device won't see them. Downloads you save and bookmarks you add are kept."
+
+/** What the private page tells (NTP-31): a heading and its rows, each a glyph and one line. */
+const PRIVATE_EXPLAINER: Array<{ heading: string; rows: Array<[ReactNode, string]> }> = [
+  {
+    heading: "Ione won't save",
+    rows: [
+      [<History key="history" />, 'Browsing history'],
+      [<Cookie key="cookies" />, 'Cookies and site data'],
+      [<ClipboardPen key="forms" />, 'Information entered in forms']
+    ]
+  },
+  {
+    heading: 'Still visible to',
+    rows: [
+      [<Globe key="sites" />, 'Websites you visit'],
+      [<Building2 key="work" />, 'Your employer or school'],
+      [<Radio key="isp" />, 'Your internet service provider']
+    ]
+  }
+]
+
+/**
+ * The private new tab page (NTP-31; Chrome's Incognito and Edge's InPrivate page): the window's
+ * gradient – the private theme's, which the window surfaces have blended to (§9.29) – with the
+ * search field on it and an explainer of what Ione keeps from the session and what it does
+ * not, in the window family. The explainer is the first run's page vocabulary (§9.26, §9.27,
+ * §9.2): the title block 22/600 with the mask glyph on its start and a description 15 at 69%,
+ * then groups of one-line rows under 15/600 headings, all at the 16 gutter, and last Chrome's
+ * Block third-party cookies switch over the core's setting (`ThirdPartyCookiesRow`). No tiles –
+ * the most visited sites are the regular history's – and no customise gear: the page has one
+ * look.
+ */
+function PrivateNewTabPage({ state, tab, hidden }: Props): JSX.Element {
+  const growPhase = newTabGrowStore.use((s) => s.phase)
+  const backdrop = useWindowBackdrop()
+  return (
+    <div
+      className="zen-ntp zen-ntp-private absolute inset-0 flex flex-col"
+      data-surface="window"
+      data-wallpaper="none"
+      data-private
+      data-hidden={hidden || undefined}
+      data-grow={growPhase !== 'idle' ? growPhase : undefined}
+      data-testid="private-ntp"
+      style={backdrop}
+    >
+      <div
+        className="zen-ntp-scroll zen-ntp-fades relative flex min-h-0 flex-1 flex-col overflow-y-auto"
+        style={{ overscrollBehavior: 'contain' }}
+        onScroll={onNewTabScroll}
+      >
+        <div className="mx-auto flex w-full max-w-[520px] flex-col px-4 pb-6 pt-8">
+          <SearchField state={state} tab={tab} />
+          <div className="zen-firstrun-intro mt-8 flex flex-col gap-1">
+            <h1 className="zen-firstrun-title flex items-center gap-2">
+              <VenetianMask
+                className="h-5 w-5 shrink-0"
+                strokeWidth={1.75}
+                aria-hidden
+                data-testid="private-ntp-glyph"
+              />
+              <span>{PRIVATE_TITLE}</span>
+            </h1>
+            <p className="zen-firstrun-body zen-firstrun-deemphasized">{PRIVATE_DESCRIPTION}</p>
+          </div>
+          {PRIVATE_EXPLAINER.map(({ heading, rows }) => (
+            <section key={heading} className="zen-firstrun-group -mx-4 flex flex-col">
+              <h2 className="zen-firstrun-heading px-4 pb-1">{heading}</h2>
+              <ul className="flex flex-col">
+                {rows.map(([glyph, label]) => (
+                  <li key={label} className="zen-firstrun-row">
+                    <span className="zen-firstrun-row-glyph" aria-hidden>
+                      {glyph}
+                    </span>
+                    <span className="min-w-0 flex-1">{label}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))}
+          <ThirdPartyCookiesRow state={state} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const COOKIES_SWITCH_LABEL = 'Block third-party cookies'
+// The description at 13 px in the row's text column (about 300 px on a 412 px phone), a full
+// stop like the page's other description lines: the switch's own line fits one line; the locked
+// line by Settings (56 characters) wraps to a second on the phone, and `line-clamp-2` holds a
+// holder's long name to two – the row grows to 84 with it (§9.1's stack). The locked line names
+// the pane by its actual name behind the language's path glyph (the lead's ruling on #522), or
+// the extension whose `chrome.privacy` hold locks the switch (§10.5's controlled rows name theirs).
+const COOKIES_SWITCH_DESCRIPTION = 'Blocks third-party cookies in private tabs.'
+const COOKIES_SWITCH_LOCKED = 'Blocked in every tab by Settings › Privacy and Security.'
+
+/**
+ * The locked line while an extension holds `thirdPartyCookiesAllowed`, at either pole – "Blocked"
+ * under `false`, "Allowed" under `true` (the switch off and locked: a tap would spring back) –
+ * naming the holder where the name is to hand.
+ */
+function cookiesLockedByExtension(blocked: boolean, name: string): string {
+  const verb = blocked ? 'Blocked' : 'Allowed'
+  return name.trim()
+    ? `${verb} in every tab by the extension ${name.trim()}.`
+    : `${verb} in every tab by an extension.`
+}
+
+/**
+ * Why the private switch is locked (`PrivacyStatus.privateThirdPartyCookies`): the extension
+ * holding the cookie setting (`lockedByExtension`, the effective value over the user's mode –
+ * Chrome's one cookie pref), else the user's own global block in Settings.
+ */
+function cookiesLockedLine(cookies: PrivateThirdPartyCookieStatus): string {
+  return cookies.lockedByExtension === undefined
+    ? COOKIES_SWITCH_LOCKED
+    : cookiesLockedByExtension(cookies.blocked, cookies.lockedByExtension)
+}
+
+/**
+ * Chrome's Incognito page's "Block third-party cookies" switch (NTP-31), private-only as
+ * Chrome's is: it reads the core's `privacy.privateThirdPartyCookies` (#218's status of the
+ * private contexts' setting, `Settings.privacy.thirdPartyCookiesPrivate`) – `blocked` is its
+ * position – and writes through `privacy.setThirdPartyCookiesPrivate`: `block` when turned on,
+ * `allow` when turned off, never `default`, so the choice survives a later change of the global
+ * mode. Regular tabs keep the global mode whatever this switch says. While the global mode blocks
+ * third-party cookies everywhere the status is `locked`: the switch shows on and disabled (§9.30:
+ * the whole row laid out at .4, full size, inert), the description giving the reason, and the row
+ * never writes in that state (the engine would keep a write for when the lock lifts, but the
+ * chrome does not offer one). An extension holding `chrome.privacy`'s cookie setting locks it at
+ * either pole – on under a block, off under an allow – the description naming the extension, as
+ * a tap would otherwise write an override the layer above does not read and spring back with no
+ * word. A §10.4 switch row on the shared row primitive with its window
+ * modifier (`.zen-ntp-row`): the whole row is the switch, the glyph on the first line as the
+ * explainer rows' are, the description 13 at 69 % under the label (a row's own description,
+ * §9.1's stack), the switch centred on the row. The heading is the Settings cookies group's, so
+ * the two surfaces name the setting alike.
+ */
+function ThirdPartyCookiesRow({ state }: { state: UIState }): JSX.Element {
+  const cookies = state.privacy.privateThirdPartyCookies
+  const { blocked, locked } = cookies
+  return (
+    <section className="zen-firstrun-group -mx-4 flex flex-col">
+      <h2 className="zen-firstrun-heading px-4 pb-1">{PROTECTION_TEXT.cookies.heading}</h2>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={blocked}
+        aria-disabled={locked || undefined}
+        className="zen-v2-row zen-ntp-row"
+        data-testid="private-ntp-cookies"
+        onClick={() => {
+          if (locked) return
+          run('privacy.setThirdPartyCookiesPrivate', { mode: blocked ? 'allow' : 'block' })
+        }}
+      >
+        <span className="zen-firstrun-row-glyph self-start" aria-hidden>
+          <Cookie />
+        </span>
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="zen-firstrun-body">{COOKIES_SWITCH_LABEL}</span>
+          <span className="zen-firstrun-small zen-firstrun-deemphasized line-clamp-2">
+            {locked ? cookiesLockedLine(cookies) : COOKIES_SWITCH_DESCRIPTION}
+          </span>
+        </span>
+        <span className="zen-v2-switch" aria-hidden />
+      </button>
+    </section>
+  )
+}
+
+/** The page's scroll carries the field toward the bar's pill slot (NTP-02, the scroll scrub). */
+function onNewTabScroll(e: UIEvent<HTMLDivElement>): void {
+  fakeboxScrolled(e.currentTarget.scrollTop)
+}
+
+/**
+ * The search field: the floating URL bar's field with a placeholder, the search glyph and the
+ * trailing icon buttons – the mic where the host has a speech recogniser (OMN-19: the listening
+ * sheet, its result loading in this tab), the camera where it has a back camera (OMN-22, NTP-04:
+ * the scan sheet, its payload loading in this tab). A tap on the field opens the omnibox for
+ * this tab – the field itself never takes input, so what is typed goes where every other
+ * address does. The field does not cut to the omnibox: it morphs into it (NTP-02 / MOT-08,
+ * lib/fakeboxMorph.ts), which registers the field here and paints its double while it is on
+ * its way (`data-away`: the page's own field yields to the double). The field is registered
+ * again when the page lays out for the other bar edge (`dock`, NTP-29): its resting rectangle is
+ * the morph's origin, read at the registration, and the bar can be carried to the other edge
+ * with this page in view (lib/gestures/dock.ts).
+ */
+function SearchField({
+  state,
+  tab,
+  dock
+}: {
+  state: UIState
+  tab: Tab
+  dock?: PhoneBarPosition
+}): JSX.Element {
+  const fieldRef = useRef<HTMLDivElement>(null)
+  const away = fakeboxMorphStore.use((s) => s.tabId === tab.id && !s.pageField)
+  useLayoutEffect(() => {
+    const field = fieldRef.current
+    if (!field) return
+    return registerFakebox(tab.id, field, field.closest<HTMLElement>('.zen-ntp-scroll'))
+  }, [tab.id, dock])
+  const voice = voiceSearchAvailable(state.capabilities)
+  const camera = qrScanAvailable(state.capabilities)
+  const trailing = voice || camera
+  // The engine a search from here goes to, for the field's mark (NTP-09): the same resolution
+  // as the omnibox's, so the page's field and the field it morphs into agree.
+  const engine = defaultSearchEngineOf(
+    state.searchEngines,
+    state.settings.searchEngineId,
+    state.searchEngineControl
+  )
+  return (
+    // The floating URL bar's field is an opaque panel on the window: a page surface of its own.
+    <div
+      ref={fieldRef}
+      role="group"
+      aria-label="Search"
+      className="zen-ntp-field flex w-full max-w-[520px]"
+      data-surface="page"
+      data-away={away || undefined}
+    >
+      <button
+        type="button"
+        className={cn(
+          'zen-ntp-field-main flex h-full min-w-0 flex-1 items-center gap-3 pl-4 text-left',
+          !trailing && 'pr-4'
+        )}
+        onClick={tapFakebox}
+      >
+        {/* The engine's favicon at 20 leads the resting field (v2 §6; NTP-09), the magnifier until
+            it loads or for an engine without one: the double the morph paints carries the same
+            mark (FakeboxMorphLayer). */}
+        <EngineFieldGlyph engine={engine} fallback="magnifier" className="zen-ntp-placeholder" />
+        {/* The pill's words (PhoneShell), one string for the address wherever it is asked for. */}
+        <span className="zen-ntp-placeholder min-w-0 flex-1 truncate">Search or enter address</span>
+      </button>
+      {trailing && (
+        <span className="flex shrink-0 items-center gap-0.5 pr-1.5">
+          {voice && (
+            <button
+              type="button"
+              className="zen-toolbar-button h-11 w-11"
+              aria-label="Search by voice"
+              onClick={() => void startVoiceSearch({ tabId: tab.id, newTab: false })}
+            >
+              <Mic className="h-5 w-5" strokeWidth={1.75} />
+            </button>
+          )}
+          {camera && (
+            <button
+              type="button"
+              className="zen-toolbar-button h-11 w-11"
+              aria-label="Scan a QR code"
+              onClick={() => void startQrScan({ tabId: tab.id, newTab: false })}
+            >
+              <Camera className="h-5 w-5" strokeWidth={1.75} />
+            </button>
+          )}
+        </span>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Two rows of four tiles: the pinned sites first, then the most visited ones by frecency, without
+ * the hosts the user removed. The list is fetched when the page comes up and again when a pin or
+ * a removal changes it; until then the page shows the field alone, and nothing at all when the
+ * history is empty.
+ *
+ * The grid is one FLIP set (`useTileFlip`): a tile whose slot changes – a pin, a removal, a
+ * drag's draft – glides there on the one spring rather than jumping. The pinned tiles can be
+ * reordered by hold-and-drag (`useTileReorder`, NTP-06): the tile in the hand is drawn by its
+ * own transform and is out of the set while held (its cell is the hole the others glide round),
+ * and the pins are composed in the drag's draft order until the core's list has it. A tile that
+ * has run its entrance fade is marked (`data-entered`), since a cell React moves in the DOM
+ * would run the fade again.
+ */
+function TopSites({
+  state,
+  tab,
+  dock
+}: {
+  state: UIState
+  tab: Tab
+  dock: PhoneBarPosition
+}): JSX.Element | null {
+  const { mode } = state.settings.newTab
+  const { newTabShortcuts: pinned, newTabHiddenHosts: hiddenHosts } = state
+  const [ranked, setRanked] = useState<TopSite[] | null>(null)
+  const hiddenKey = hiddenHosts.join('\n')
+  const gridRef = useRef<HTMLUListElement>(null)
+  const flip = useTileFlip(gridRef)
+  const reorder = useTileReorder(pinned, flip)
+
+  useEffect(() => {
+    let cancelled = false
+    void topSites(MAX_NEW_TAB_SHORTCUTS, hiddenHosts).then((sites) => {
+      if (!cancelled) setRanked(sites)
+    })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the hosts are compared by content
+  }, [hiddenKey])
+
+  // Open tabs know icons the history may not have yet (a pinned site never visited since).
+  const favicons = useMemo(() => openTabFavicons(Object.values(state.tabs)), [state.tabs])
+
+  // The pins in the order drawn: a drag's draft while one stands, the list's own otherwise (a
+  // pin the draft does not know – added meanwhile – follows the ones it does).
+  const drawnPinned = useMemo(() => {
+    const draft = reorder.order
+    if (!draft) return pinned
+    const byUrl = new Map(pinned.map((s) => [s.url, s]))
+    const ordered = draft.flatMap((url) => byUrl.get(url) ?? [])
+    return [...ordered, ...pinned.filter((s) => !draft.includes(s.url))]
+  }, [pinned, reorder.order])
+
+  const tiles = useMemo(
+    () =>
+      ranked
+        ? composeTiles({
+            pinned: drawnPinned,
+            ranked,
+            style: mode,
+            n: MAX_NEW_TAB_SHORTCUTS,
+            favicons
+          })
+        : [],
+    [ranked, drawnPinned, mode, favicons]
+  )
+  // The slots a drag may aim at are the pinned tiles as drawn this commit.
+  const pinnedUrls = tiles.filter((t) => t.pinned).map((t) => t.url)
+  useLayoutEffect(() => {
+    reorder.observe(pinnedUrls)
+  })
+
+  // Nothing until the history has answered; once it has and there is nothing to show, the empty
+  // state (v2 section 9.17): one sentence, anchored where the tiles would be – above the field
+  // at a bottom dock, under it at a top dock – no next step.
+  if (ranked === null) return null
+  if (tiles.length === 0) {
+    return (
+      <p
+        className={cn(
+          'zen-ntp-empty w-full px-8 text-center',
+          dock === 'bottom' ? 'mb-12' : 'mt-12'
+        )}
+        role="status"
+      >
+        {mode === 'my-shortcuts'
+          ? 'Shortcuts you pin will appear here'
+          : 'Sites you visit often will appear here'}
+      </p>
+    )
+  }
+  return (
+    <ul
+      ref={gridRef}
+      className={cn(
+        'grid w-full max-w-[420px] grid-cols-4 gap-3',
+        dock === 'bottom' ? 'mb-6' : 'mt-6'
+      )}
+      aria-label="Most visited"
+    >
+      {tiles.map((site, index) => {
+        const held = reorder.held === site.url
+        return (
+          <li
+            key={site.url}
+            className="zen-ntp-site relative flex min-w-0 justify-center"
+            data-cell={held ? undefined : site.url}
+            data-held={held || undefined}
+            style={{ '--zen-ntp-i': index } as CSSProperties}
+            // The mark is the node's own, written as its fade ends: it travels with the node
+            // when React moves it, and React (which does not know the attribute) leaves it be.
+            onAnimationEnd={(e) => {
+              if (e.target === e.currentTarget) e.currentTarget.dataset.entered = ''
+            }}
+          >
+            <TopSiteTile site={site} tabId={tab.id} reorder={reorder} />
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+/**
+ * A 56 tile at radius 8 with the site's icon and, 8 below, its name (§9.29's phone sizes; the
+ * look is the shared `zen-ntp-*` rules'). A hold lifts a pinned tile and the finger then carries
+ * it to another slot (`TileReorder`); a hold that lifts without moving opens the tile's menu
+ * (Open in New Tab, Copy Link, Edit Shortcut, Pin / Unpin, Remove) as the finger comes off.
+ */
+function TopSiteTile({
+  site,
+  tabId,
+  reorder
+}: {
+  site: TopSiteTile
+  tabId: string
+  reorder: TileReorder
+}): JSX.Element {
+  const label = tileLabel(site.title, site.url)
+  const ref = useRef<HTMLButtonElement>(null)
+  const hold = useLongPress(
+    () => run('newtab.tileContextMenu', { url: site.url, title: site.title, tabId }),
+    {
+      onHold: () => {
+        if (ref.current) reorder.hold(site.url, ref.current)
+      },
+      onDrag: (e) => (ref.current ? reorder.drag(site.url, ref.current, e) : null),
+      onHoldEnd: () => reorder.unhold()
+    }
+  )
+  return (
+    <button
+      ref={ref}
+      type="button"
+      className="zen-v2-shortcut flex w-full min-w-0 flex-col items-center gap-2"
+      aria-label={label}
+      {...hold.handlers}
+      onClick={() => {
+        if (hold.swallowsClick()) return
+        run('tab.navigate', { tabId, input: site.url })
+      }}
+    >
+      <span className="zen-ntp-tile flex h-14 w-14 items-center justify-center">
+        <TileIcon favicon={site.favicon} url={site.url} label={label} size={24} />
+      </span>
+      <span className="zen-ntp-caption w-full truncate text-center">{label}</span>
+    </button>
+  )
+}

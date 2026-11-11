@@ -1,0 +1,156 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  formatWindowTitle,
+  normalizeWindowName,
+  TITLE_JOINER,
+  TITLE_UPDATE_INTERVAL_MS,
+  TitleThrottle,
+  WINDOW_NAME_MAX
+} from '../windowTitle'
+
+describe('formatWindowTitle', () => {
+  it('suffixes the active tab title with the product name behind the one joiner, the spaced em dash (§9.1)', () => {
+    expect(formatWindowTitle('Example Domain', false)).toBe('Example Domain — Ione')
+    expect(TITLE_JOINER).toBe(' — ')
+    expect(formatWindowTitle('Example Domain', false)).toBe(`Example Domain${TITLE_JOINER}Ione`)
+  })
+
+  it('marks private windows', () => {
+    expect(formatWindowTitle('Example Domain', true)).toBe('Example Domain — Ione (Private)')
+  })
+
+  it('shows the bare product name with no active tab or an untitled one', () => {
+    expect(formatWindowTitle(null, false)).toBe('Ione')
+    expect(formatWindowTitle(undefined, false)).toBe('Ione')
+    expect(formatWindowTitle('', false)).toBe('Ione')
+    expect(formatWindowTitle('   ', false)).toBe('Ione')
+    expect(formatWindowTitle(null, true)).toBe('Ione (Private)')
+  })
+
+  it('trims whitespace around the tab title', () => {
+    expect(formatWindowTitle('  Docs \n', false)).toBe('Docs — Ione')
+  })
+
+  it('reads a named window as "<name> — Ione" whatever its active tab (Name Window…) – the tab form’s joiner, one for both – still marked private', () => {
+    expect(formatWindowTitle('Example Domain', false, null, 'Work')).toBe('Work — Ione')
+    expect(formatWindowTitle(null, false, null, 'Work')).toBe('Work — Ione')
+    expect(formatWindowTitle('Example Domain', true, null, 'Work')).toBe('Work — Ione (Private)')
+    expect(formatWindowTitle('Example Domain', false, null, '  Research  ')).toBe(
+      'Research — Ione'
+    )
+    // A cleared or blank name falls back to the tab's title.
+    expect(formatWindowTitle('Example Domain', false, null, null)).toBe('Example Domain — Ione')
+    expect(formatWindowTitle('Example Domain', false, null, '   ')).toBe('Example Domain — Ione')
+    // A web app's window is the app's: a window name does not reach its title.
+    expect(formatWindowTitle('Inbox', false, 'Mail', 'Work')).toBe('Inbox')
+  })
+})
+
+describe('normalizeWindowName', () => {
+  it('trims, clears an empty name and cuts one that runs past the limit', () => {
+    expect(normalizeWindowName('  Work  ')).toBe('Work')
+    expect(normalizeWindowName('')).toBeNull()
+    expect(normalizeWindowName('   ')).toBeNull()
+    expect(normalizeWindowName(null)).toBeNull()
+    expect(normalizeWindowName(undefined)).toBeNull()
+    expect(normalizeWindowName('a'.repeat(WINDOW_NAME_MAX + 40))).toBe('a'.repeat(WINDOW_NAME_MAX))
+  })
+})
+
+describe('TitleThrottle', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  function throttle(initial: string | null = null): { applied: string[]; t: TitleThrottle } {
+    const applied: string[] = []
+    const t = new TitleThrottle(
+      (title) => applied.push(title),
+      initial,
+      () => Date.now()
+    )
+    return { applied, t }
+  }
+
+  it('applies the first title at once', () => {
+    const { applied, t } = throttle()
+    t.set('A — Ione')
+    expect(applied).toEqual(['A — Ione'])
+  })
+
+  it('drops a title equal to the one the window already carries', () => {
+    const { applied, t } = throttle('Ione')
+    t.set('Ione')
+    expect(applied).toEqual([])
+    t.set('A — Ione')
+    vi.advanceTimersByTime(TITLE_UPDATE_INTERVAL_MS)
+    t.set('A — Ione')
+    expect(applied).toEqual(['A — Ione'])
+  })
+
+  it('coalesces a burst inside the interval into one trailing apply of the latest title', () => {
+    const { applied, t } = throttle()
+    t.set('1')
+    vi.advanceTimersByTime(10)
+    t.set('2')
+    vi.advanceTimersByTime(10)
+    t.set('3')
+    vi.advanceTimersByTime(10)
+    t.set('4')
+    expect(applied).toEqual(['1'])
+    vi.advanceTimersByTime(TITLE_UPDATE_INTERVAL_MS - 30)
+    expect(applied).toEqual(['1', '4'])
+  })
+
+  it('never applies more than ten titles a second under a continuous stream', () => {
+    const appliedAt: number[] = []
+    const t = new TitleThrottle(
+      () => appliedAt.push(Date.now()),
+      null,
+      () => Date.now()
+    )
+    for (let ms = 0; ms < 3000; ms += 5) {
+      t.set(`title ${ms}`)
+      vi.advanceTimersByTime(5)
+    }
+    expect(appliedAt.length).toBeGreaterThanOrEqual(30)
+    // Any eleven consecutive applies span at least a second: at most ten fall in any 1 s window.
+    for (let i = 0; i + 10 < appliedAt.length; i++)
+      expect(appliedAt[i + 10] - appliedAt[i]).toBeGreaterThanOrEqual(1000)
+  })
+
+  it('does not lose the last title of a burst', () => {
+    const { applied, t } = throttle()
+    for (let ms = 0; ms < 1000; ms += 5) {
+      t.set(`title ${ms}`)
+      vi.advanceTimersByTime(5)
+    }
+    vi.advanceTimersByTime(TITLE_UPDATE_INTERVAL_MS)
+    expect(applied.at(-1)).toBe('title 995')
+  })
+
+  it('applies at once again after the interval has passed', () => {
+    const { applied, t } = throttle()
+    t.set('1')
+    vi.advanceTimersByTime(TITLE_UPDATE_INTERVAL_MS)
+    t.set('2')
+    expect(applied).toEqual(['1', '2'])
+  })
+
+  it('skips the trailing apply when the burst ends on the applied title', () => {
+    const { applied, t } = throttle()
+    t.set('1')
+    t.set('2')
+    t.set('1')
+    vi.advanceTimersByTime(TITLE_UPDATE_INTERVAL_MS)
+    expect(applied).toEqual(['1'])
+  })
+
+  it('cancel drops a pending trailing update', () => {
+    const { applied, t } = throttle()
+    t.set('1')
+    t.set('2')
+    t.cancel()
+    vi.advanceTimersByTime(TITLE_UPDATE_INTERVAL_MS)
+    expect(applied).toEqual(['1'])
+  })
+})

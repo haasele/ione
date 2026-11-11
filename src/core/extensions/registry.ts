@@ -1,0 +1,522 @@
+/**
+ * The installed-extensions registry: what a host persists about each extension (where it came
+ * from, where its files are, what the user decided) and the migration from the first schema,
+ * which only remembered `{ path, enabled }` for unpacked folders.
+ *
+ * Platform-agnostic on purpose: Electron and the Android host both keep a document of this shape,
+ * and the fields mirror what the management UI shows (`ExtensionInfo` in shared/types).
+ */
+import type { CrxPublisher } from './crx'
+import { isMatchPattern } from './manifest'
+import type { StoreId } from './store'
+import { resolveStartupOverride, sanitizeStartupPages, type StartupOverride } from '../startup'
+
+export type ExtensionSource = StoreId | 'crx' | 'zip' | 'unpacked'
+
+export interface ExtensionRecord {
+  id: string
+  source: ExtensionSource
+  /** The directory the host loads; for managed installs `<root>/<id>/<version>`. */
+  path: string
+  version: string
+  /** Who signed the package (`null` for unpacked folders and unsigned zips). */
+  publisher: CrxPublisher | null
+  /** `manifest.update_url`, or the store's update endpoint for store installs; null when none. */
+  updateUrl: string | null
+  installedAt: number
+  updatedAt: number
+  enabled: boolean
+  /** Pinned extensions are skipped by update checks. */
+  pinned: boolean
+  /**
+   * Shown as a toolbar button; the rest live in the puzzle-piece panel. Off by default like
+   * Chrome's `pinned_extensions` (the install toast offers to pin).
+   */
+  toolbarPinned: boolean
+  /**
+   * When `enabled` / `toolbarPinned` were last written on this device (ms) – each switch's own
+   * clock for the sync merge (ID-44): a peer's record lands a switch only when its clock for
+   * that switch is the later one, so one device's pin and another's disable both survive. Set
+   * by the desktop host at install and on every flip, by the phone's on every flip made there
+   * (`AndroidExtensions.setEnabled` / `setToolbarPinned`; its install writes none); absent on a
+   * record from before the clocks and on a switch a host never flipped, which the merge reads
+   * as written at 0 – older than any clocked switch (`syncedExtensionData`). Never written by
+   * the shared `newRecord`, so an install stamps no clock over a peer's later flip.
+   */
+  enabledAt?: number
+  toolbarPinnedAt?: number
+  /** Chrome's "Allow access to file URLs" toggle; off by default like Chrome. */
+  allowFileAccess: boolean
+  /**
+   * Chrome's "Allow in Incognito": whether the extension's request rules and listeners reach
+   * private windows. Off by default; the private session itself loads no extension yet.
+   */
+  allowPrivate: boolean
+  /**
+   * Chrome's "Allow user scripts" toggle: whether `chrome.userScripts` is available to the
+   * extension and its registered user scripts run. Off by default like Chrome; meaningless for an
+   * extension without the `userScripts` permission.
+   */
+  allowUserScripts: boolean
+  manifestVersion: number
+  name: string
+  description: string
+  /** API permissions (MV2 host patterns listed under `permissions` land in `hostPermissions`). */
+  permissions: string[]
+  hostPermissions: string[]
+  /** `options_ui.page` or `options_page`, relative to the extension root. */
+  optionsPage: string | null
+  /** `action.default_popup` (or the MV2 `browser_action` equivalent). */
+  popup: string | null
+  /** `chrome_url_overrides.newtab`, relative to the extension root; null when not declared. */
+  newTabPage: string | null
+  /**
+   * The user let this extension's `newTabPage` replace new tabs. Off by default (Chrome asks
+   * before a fresh install takes the page over); at most one record has it on.
+   */
+  newTabOverride: boolean
+  /**
+   * `chrome_settings_overrides.startup_pages` as web addresses (`sanitizeStartupPages`); null
+   * when not declared. Kept on the record so the boot – which opens its windows before the
+   * extensions load – can follow an enabled extension's startup pages (`core/startup.ts`).
+   * Records from before the field existed are backfilled from the manifest on load.
+   */
+  startupPages?: string[] | null
+  /**
+   * Warning lines an update added over the version the user approved. Chrome keeps such an
+   * extension disabled until the user accepts them again; the host clears this on approval.
+   */
+  pendingWarnings: string[] | null
+  /**
+   * Installed by sync from another device's `extension` record (ID-44) and not approved here
+   * yet: the record landed with `enabled: false` and is never loaded until the user accepts the
+   * install prompt – its permission warnings – from the Extensions page's switch, where the host
+   * clears this. Absent (never written) on an extension the user installed on this device, so a
+   * registry from before the field reads as it was persisted.
+   */
+  pendingApproval?: true
+  /**
+   * The install time this device's copy PUBLISHES in place of its own `installedAt` (ID-44,
+   * round 5): the `installedAt` the `extension` record carried when sync landed the extension
+   * here – when the extension was installed by hand, on whichever device did – or 0 when that
+   * record carried none (a build before the field). A landing is nobody's install: `installedAt`
+   * above stays this device's own (the time shown, the "newest install wins" resolutions), and
+   * a decline elsewhere (`extensionDeclineStands`) is re-offered by an install made by hand
+   * alone, never by a landing. Set by the desktop host at a synced install and when the merge
+   * adopts a later time from a peer's record (`ExtensionSyncApplier.mergeSwitches`); read by its
+   * `syncSources()` (`syncedInstalledAt ?? installedAt`). Never written by the shared
+   * `newRecord`, so an install made by hand publishes its own time; absent on the phone, whose
+   * every install is one made by hand (its `list()` projects `installedAt`).
+   */
+  syncedInstalledAt?: number
+  /**
+   * An update downloaded and unpacked but not applied yet (see [StagedUpdate]); absent or null
+   * when none waits.
+   */
+  staged?: StagedUpdate | null
+}
+
+/**
+ * An update found while the extension was running that Chrome would not install at once: with
+ * a background page, one whose page listens for `runtime.onUpdateAvailable` (the event told it,
+ * and it applies the update with `runtime.reload()` when it is ready); with a worker or no
+ * background, one whose extension is busy (a page open, the worker running) until it goes idle.
+ * The new version is unpacked next to the running one, so applying it is a swap of the record:
+ * at `runtime.reload()`, when the extension goes idle, when the user asks, or at the next start.
+ */
+export interface StagedUpdate {
+  version: string
+  /** The unpacked version directory, `<root>/<id>/<version>`. */
+  path: string
+  publisher: CrxPublisher | null
+  /** The record fields of the new manifest, read when the package was unpacked. */
+  fields: ManifestFields
+  /** Warning lines the new version adds over the approved one; `pendingWarnings` once applied. */
+  addedWarnings: string[]
+  stagedAt: number
+}
+
+export interface ExtensionRegistry {
+  version: 2
+  extensions: ExtensionRecord[]
+  /** When the last update check finished (any outcome), or null when none ran yet. */
+  lastUpdateCheck: number | null
+}
+
+/** The fields of a record that come straight from a manifest. */
+export type ManifestFields = Pick<
+  ExtensionRecord,
+  | 'version'
+  | 'manifestVersion'
+  | 'name'
+  | 'description'
+  | 'permissions'
+  | 'hostPermissions'
+  | 'optionsPage'
+  | 'popup'
+  | 'newTabPage'
+> & { updateUrl: string | null; startupPages: string[] | null }
+
+interface LooseManifest {
+  manifest_version?: unknown
+  name?: unknown
+  version?: unknown
+  description?: unknown
+  permissions?: unknown
+  host_permissions?: unknown
+  options_ui?: { page?: unknown } | null
+  options_page?: unknown
+  action?: { default_popup?: unknown } | null
+  browser_action?: { default_popup?: unknown } | null
+  chrome_url_overrides?: { newtab?: unknown } | null
+  chrome_settings_overrides?: { startup_pages?: unknown } | null
+  update_url?: unknown
+}
+
+function str(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []
+}
+
+/** Reads the registry fields out of any manifest object (validated or raw; missing keys are fine). */
+export function manifestFields(input: unknown): ManifestFields {
+  const manifest = (input && typeof input === 'object' ? input : {}) as LooseManifest
+  const manifestVersion =
+    typeof manifest.manifest_version === 'number' ? manifest.manifest_version : 2
+  const permissions: string[] = []
+  const hostPermissions: string[] = []
+  for (const permission of strings(manifest.permissions)) {
+    // MV2 mixes host patterns into `permissions`; MV3 keeps them in `host_permissions`.
+    if (manifestVersion < 3 && isMatchPattern(permission)) hostPermissions.push(permission)
+    else permissions.push(permission)
+  }
+  hostPermissions.push(...strings(manifest.host_permissions))
+  const action = manifest.action ?? manifest.browser_action
+  const optionsPage = str(manifest.options_ui?.page) || str(manifest.options_page) || null
+  const newTabPage = str(manifest.chrome_url_overrides?.newtab).replace(/^\/+/, '')
+  return {
+    version: str(manifest.version),
+    manifestVersion,
+    name: str(manifest.name),
+    description: str(manifest.description),
+    permissions,
+    hostPermissions,
+    optionsPage: optionsPage ? optionsPage.replace(/^\/+/, '') : null,
+    popup: str(action?.default_popup) || null,
+    newTabPage: newTabPage || null,
+    startupPages: startupPagesOf(manifest),
+    updateUrl: str(manifest.update_url) || null
+  }
+}
+
+/** The manifest's `chrome_settings_overrides.startup_pages` as web addresses, or null for none. */
+function startupPagesOf(manifest: LooseManifest): string[] | null {
+  const raw = manifest.chrome_settings_overrides?.startup_pages
+  if (!Array.isArray(raw)) return null
+  const pages = sanitizeStartupPages(raw)
+  return pages.length > 0 ? pages : null
+}
+
+/**
+ * The enabled extension whose `chrome_settings_overrides.startup_pages` holds Settings › On
+ * startup, from the registry alone: the newest-installed of several (`resolveStartupOverride`),
+ * a tie to the first record. The one source both halves of the override read – the boot, which
+ * opens its windows before any extension loads (`ExtensionHost.startupPagesOverride`), and the
+ * Settings page's indicator once they have (`StartupPagesApi`) – so the two never name
+ * different extensions, whatever order the extensions loaded or reloaded in.
+ */
+export function startupOverrideOf(records: readonly ExtensionRecord[]): StartupOverride | null {
+  return resolveStartupOverride(
+    records.flatMap((record) =>
+      record.enabled && record.startupPages && record.startupPages.length > 0
+        ? [
+            {
+              extensionId: record.id,
+              name: record.name,
+              pages: record.startupPages,
+              installedAt: record.installedAt
+            }
+          ]
+        : []
+    )
+  )
+}
+
+/** The URL new tabs open with while `record` holds the override, or null when it cannot. */
+export function newTabOverrideUrl(record: ExtensionRecord): string | null {
+  if (!record.enabled || !record.newTabOverride || !record.newTabPage) return null
+  return `chrome-extension://${record.id}/${record.newTabPage}`
+}
+
+/**
+ * Turns the override on for `id` (and off for every other record: like Chrome, one page wins)
+ * or off. Enabling an extension that declares no new-tab page changes nothing. Returns the
+ * records that changed, so the host persists only when something did.
+ */
+export function setNewTabOverride(
+  records: readonly ExtensionRecord[],
+  id: string,
+  enabled: boolean
+): ExtensionRecord[] {
+  const target = records.find((r) => r.id === id)
+  if (!target || (enabled && !target.newTabPage)) return []
+  const changed: ExtensionRecord[] = []
+  for (const record of records) {
+    const wanted = enabled && record.id === id
+    if (!enabled && record.id !== id) continue
+    if (record.newTabOverride === wanted) continue
+    record.newTabOverride = wanted
+    changed.push(record)
+  }
+  return changed
+}
+
+export interface NewRecordOptions {
+  id: string
+  source: ExtensionSource
+  path: string
+  manifest: unknown
+  now: number
+  publisher?: CrxPublisher | null
+  /** Overrides `manifest.update_url` (store installs always update through their store). */
+  updateUrl?: string | null
+  enabled?: boolean
+  allowFileAccess?: boolean
+  allowPrivate?: boolean
+  allowUserScripts?: boolean
+}
+
+export function newRecord(options: NewRecordOptions): ExtensionRecord {
+  const fields = manifestFields(options.manifest)
+  return {
+    id: options.id,
+    source: options.source,
+    path: options.path,
+    version: fields.version,
+    publisher: options.publisher ?? null,
+    updateUrl: options.updateUrl !== undefined ? options.updateUrl : fields.updateUrl,
+    installedAt: options.now,
+    updatedAt: options.now,
+    enabled: options.enabled ?? true,
+    pinned: false,
+    toolbarPinned: false,
+    allowFileAccess: options.allowFileAccess ?? false,
+    allowPrivate: options.allowPrivate ?? false,
+    allowUserScripts: options.allowUserScripts ?? false,
+    manifestVersion: fields.manifestVersion,
+    name: fields.name,
+    description: fields.description,
+    permissions: fields.permissions,
+    hostPermissions: fields.hostPermissions,
+    optionsPage: fields.optionsPage,
+    popup: fields.popup,
+    newTabPage: fields.newTabPage,
+    newTabOverride: false,
+    startupPages: fields.startupPages,
+    pendingWarnings: null
+  }
+}
+
+/** Refreshes the manifest-derived fields of a record (an unpacked folder changed on disk, an update landed). */
+export function withManifest(
+  record: ExtensionRecord,
+  manifest: unknown,
+  overrides: Partial<ExtensionRecord> = {}
+): ExtensionRecord {
+  const fields = manifestFields(manifest)
+  return {
+    ...record,
+    ...fields,
+    // Store installs keep updating through their store even if the manifest says otherwise.
+    updateUrl:
+      record.source === 'chrome-web-store' || record.source === 'edge-add-ons'
+        ? record.updateUrl
+        : fields.updateUrl,
+    ...overrides
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence and migration
+// ---------------------------------------------------------------------------
+
+export interface MigrationHelpers {
+  /** Chrome's id for an unpacked folder: a hash of its path (what `loadExtension` will report). */
+  idForPath(path: string): string
+  /** The folder's `manifest.json`, parsed, or null when unreadable. */
+  readManifest(path: string): unknown | null
+}
+
+const SOURCES: ReadonlySet<string> = new Set([
+  'chrome-web-store',
+  'edge-add-ons',
+  'crx',
+  'zip',
+  'unpacked'
+])
+
+export function emptyRegistry(): ExtensionRegistry {
+  return { version: 2, extensions: [], lastUpdateCheck: null }
+}
+
+/**
+ * Turns whatever `extensions.json` holds into the current schema. Version 1 records
+ * (`{ path, enabled }`) become `unpacked` records with their fields read from the folder's
+ * manifest; version 2 records are sanitised so a hand-edited or truncated document cannot crash
+ * the host, and fields a future record type may add are dropped.
+ */
+export function migrateRegistry(
+  raw: unknown,
+  helpers: MigrationHelpers,
+  now: number
+): ExtensionRegistry {
+  if (!raw || typeof raw !== 'object') return emptyRegistry()
+  const doc = raw as { version?: unknown; extensions?: unknown; lastUpdateCheck?: unknown }
+  if (!Array.isArray(doc.extensions)) return emptyRegistry()
+  const registry = emptyRegistry()
+  if (doc.version === 1) {
+    for (const entry of doc.extensions as unknown[]) {
+      const legacy = entry as { path?: unknown; enabled?: unknown } | null
+      if (!legacy || typeof legacy.path !== 'string' || legacy.path.length === 0) continue
+      const path = legacy.path
+      const id = helpers.idForPath(path)
+      if (registry.extensions.some((r) => r.id === id)) continue
+      registry.extensions.push(
+        newRecord({
+          id,
+          source: 'unpacked',
+          path,
+          manifest: helpers.readManifest(path),
+          now,
+          enabled: legacy.enabled !== false,
+          // The first schema loaded every folder with file access; keep what those users had.
+          allowFileAccess: true
+        })
+      )
+    }
+    return registry
+  }
+  if (doc.version !== 2) return emptyRegistry()
+  if (typeof doc.lastUpdateCheck === 'number') registry.lastUpdateCheck = doc.lastUpdateCheck
+  for (const entry of doc.extensions as unknown[]) {
+    const record = sanitizeRecord(entry, now)
+    if (record && !registry.extensions.some((r) => r.id === record.id))
+      registry.extensions.push(record)
+  }
+  return registry
+}
+
+function sanitizeRecord(entry: unknown, now: number): ExtensionRecord | null {
+  if (!entry || typeof entry !== 'object') return null
+  const r = entry as Record<string, unknown>
+  if (typeof r.id !== 'string' || r.id.length === 0) return null
+  if (typeof r.path !== 'string' || r.path.length === 0) return null
+  const source =
+    typeof r.source === 'string' && SOURCES.has(r.source)
+      ? (r.source as ExtensionSource)
+      : 'unpacked'
+  const publisher =
+    r.publisher === 'chrome-web-store' ||
+    r.publisher === 'edge-add-ons' ||
+    r.publisher === 'unknown'
+      ? r.publisher
+      : null
+  const installedAt = typeof r.installedAt === 'number' ? r.installedAt : now
+  const record: ExtensionRecord = {
+    id: r.id,
+    source,
+    path: r.path,
+    version: str(r.version),
+    publisher,
+    updateUrl: str(r.updateUrl) || null,
+    installedAt,
+    updatedAt: typeof r.updatedAt === 'number' ? r.updatedAt : installedAt,
+    enabled: r.enabled !== false,
+    pinned: r.pinned === true,
+    toolbarPinned: r.toolbarPinned === true,
+    allowFileAccess: r.allowFileAccess === true,
+    allowPrivate: r.allowPrivate === true,
+    allowUserScripts: r.allowUserScripts === true,
+    manifestVersion: typeof r.manifestVersion === 'number' ? r.manifestVersion : 2,
+    name: str(r.name),
+    description: str(r.description),
+    permissions: strings(r.permissions),
+    hostPermissions: strings(r.hostPermissions),
+    optionsPage: str(r.optionsPage) || null,
+    popup: str(r.popup) || null,
+    newTabPage: str(r.newTabPage) || null,
+    newTabOverride: r.newTabOverride === true,
+    pendingWarnings: Array.isArray(r.pendingWarnings) ? strings(r.pendingWarnings) : null
+  }
+  // Absent in registries from before the field (backfilled from the manifest on load): the key
+  // is left out rather than written null, so such a record reads as it was persisted.
+  if (r.startupPages !== undefined) record.startupPages = sanitizeStartupPagesField(r.startupPages)
+  // A synced landing still waiting for the user's approval (ID-44) stays one across a restart;
+  // an enabled record cannot be waiting, whatever a hand-edited registry says.
+  if (r.pendingApproval === true && !record.enabled) record.pendingApproval = true
+  // The switches' clocks (ID-44): kept when they are times, left out otherwise, so a record from
+  // before the clocks keeps reading its switches as never clocked (0 to the merge).
+  const enabledAt = clock(r.enabledAt)
+  if (enabledAt !== undefined) record.enabledAt = enabledAt
+  const toolbarPinnedAt = clock(r.toolbarPinnedAt)
+  if (toolbarPinnedAt !== undefined) record.toolbarPinnedAt = toolbarPinnedAt
+  // The install time a synced landing publishes (ID-44, round 5): kept when it is a time or the
+  // 0 of "the record carried none", left out otherwise – an install made here publishes its own.
+  if (
+    typeof r.syncedInstalledAt === 'number' &&
+    Number.isFinite(r.syncedInstalledAt) &&
+    r.syncedInstalledAt >= 0
+  )
+    record.syncedInstalledAt = r.syncedInstalledAt
+  const staged = sanitizeStaged(r.staged, publisher)
+  return staged ? { ...record, staged } : record
+}
+
+function clock(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+function sanitizeStartupPagesField(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null
+  const pages = sanitizeStartupPages(value)
+  return pages.length > 0 ? pages : null
+}
+
+function sanitizeStaged(entry: unknown, publisher: CrxPublisher | null): StagedUpdate | null {
+  if (!entry || typeof entry !== 'object') return null
+  const s = entry as Record<string, unknown>
+  if (typeof s.version !== 'string' || s.version.length === 0) return null
+  if (typeof s.path !== 'string' || s.path.length === 0) return null
+  const fields = (s.fields && typeof s.fields === 'object' ? s.fields : {}) as Record<
+    string,
+    unknown
+  >
+  return {
+    version: s.version,
+    path: s.path,
+    publisher:
+      s.publisher === 'chrome-web-store' ||
+      s.publisher === 'edge-add-ons' ||
+      s.publisher === 'unknown'
+        ? s.publisher
+        : publisher,
+    fields: {
+      version: str(fields.version, s.version),
+      manifestVersion: typeof fields.manifestVersion === 'number' ? fields.manifestVersion : 2,
+      name: str(fields.name),
+      description: str(fields.description),
+      permissions: strings(fields.permissions),
+      hostPermissions: strings(fields.hostPermissions),
+      optionsPage: str(fields.optionsPage) || null,
+      popup: str(fields.popup) || null,
+      newTabPage: str(fields.newTabPage) || null,
+      startupPages: sanitizeStartupPagesField(fields.startupPages),
+      updateUrl: str(fields.updateUrl) || null
+    },
+    addedWarnings: strings(s.addedWarnings),
+    stagedAt: typeof s.stagedAt === 'number' ? s.stagedAt : 0
+  }
+}

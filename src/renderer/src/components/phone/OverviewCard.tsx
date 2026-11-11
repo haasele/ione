@@ -1,0 +1,310 @@
+import type { CSSProperties, JSX, RefObject } from 'react'
+import { useContext, useRef } from 'react'
+import { Moon, Plus, VenetianMask, X } from 'lucide-react'
+import type { Tab } from '@shared/types'
+import { useOnScreen } from '@renderer/hooks/useOnScreen'
+import { HINT_BUBBLE_ID } from '@renderer/lib/iph'
+import { closeTabLabel, tabCardLabel } from '@renderer/lib/overviewLabels'
+import { NO_GRID, OverviewWindowContext, useCardFilled } from '@renderer/lib/overviewWindow'
+import { PRIVATE_TAB_PLACEHOLDER, useTabMasked } from '@renderer/lib/privateLock'
+import { tabTitle } from '@renderer/lib/selectors'
+import { cn } from '@renderer/lib/utils'
+import { Favicon } from '../sidebar/Favicon'
+import { departStore } from './departureStore'
+import { TabPreview } from './TabPreview'
+import { liftStore, useCardLift, type CardLiftOptions } from './useCardLift'
+
+/** Corner radius of a tab card; the page morphs from the content radius to this. */
+export const CARD_RADIUS = 14
+/** The phone card's aspect (Chrome's), what a cell draws where the tablet's ratio is unset. */
+export const PHONE_CARD_ASPECT = '3 / 4'
+/**
+ * A cell's `aspect-ratio`: the tablet layer's ratio – the frame's, landscape on a landscape
+ * tablet, set on the layer's box as `--zen-overview-card-aspect` by `TabOverview` (v2 §9.36) –
+ * or the phone's where none is set. Every cell in the box draws it: a card, the New Tab card,
+ * a dissolving group's members (`Departures`).
+ */
+export const CARD_ASPECT = `var(--zen-overview-card-aspect, ${PHONE_CARD_ASPECT})`
+/**
+ * How far past the grid's edges a card counts as on screen, as a share of the grid's height
+ * (`useOnScreen` measures from the card's scroller): about a row of cards, so the pictures of
+ * the next row are read before it scrolls in and the rest of the grid's cards hold none
+ * (`lib/thumbnails.ts`). At 412 x 915 that is the rows in view plus one above and one below –
+ * 10 to 14 cards of a 200-tab session, 18 to 25 MB counted (the preview host's numbers).
+ */
+const CARD_LOOKAHEAD = '35% 0px'
+
+interface Props {
+  tab: Tab
+  active: boolean
+  /**
+   * The card's place among the pane's tabs, for what TalkBack says of it ("tab 2 of 7",
+   * `tabCardLabel`): 1-based, in the grid's order.
+   */
+  position: number
+  count: number
+  /** The hero stands in for this card while the page morphs into it. */
+  hidden: boolean
+  onPick: (tab: Tab) => void
+  /** The card's close button – absent, the card shows none. */
+  onClose?: (tab: Tab) => void
+  /** The card was swiped off the grid (it is out of sight already): close its tab. */
+  onSwipeClose?: (tab: Tab) => void
+  lift: Omit<CardLiftOptions, 'tab' | 'onSwipeClose'>
+  /**
+   * The grid is in its select-tabs mode (TAB-08): the card is a checkbox – a tap toggles it
+   * instead of opening the tab, the hold and the swipe are off (the owner turns `lift` off with
+   * it), and the close button gives way to the check, which stands in its place at the title
+   * row's trailing end (Chrome's position; v2 §9.6). `selected` is the `--v2-selected` fill over
+   * the card and the accent-filled box, nothing else: the ring is the active card's mark.
+   */
+  selection?: { selected: boolean; onToggle: (tab: Tab) => void }
+  /**
+   * The card is built from the first frame whatever the grid's window says (`lib/overviewWindow`):
+   * the hero's own card, which the page morphs into (the phone) or which stands in the layer
+   * that comes down whole (the tablet, §9.36), and the cards the mount's guess puts in view. An
+   * eager cell is not re-rendered by a fill.
+   */
+  eager?: boolean
+  /**
+   * The drag-to-group hint bubble stands on this card (TB-19, `useOverviewGroupsHint`): the cell
+   * pulses §9.23's halo under the bubble (`data-iph-anchor`, main.css) and the card names the
+   * bubble as its description while it stands (`aria-describedby`, the lead's (j) on #641).
+   */
+  hinted?: boolean
+}
+
+/**
+ * One tab in the overview grid: title row above the thumbnail. Tap to switch to it; hold to pick
+ * it up, swipe it sideways to close it (see `useCardLift`). While it is in the hand the slot
+ * shows a faint stand-in, and a card that another card is about to be dropped on tucks itself in
+ * a little. The outer box is the grid's cell, keyed by the tab id for the glide and the morph.
+ * A card holds its tab's picture only while its cell is on screen or a row from it: the grid
+ * is not virtualised, its pictures are.
+ *
+ * The CELL is always built – the frame at the card's aspect, keyed, sized, in the grid's flow
+ * – and under the grid's window (`OverviewWindowContext`, `lib/overviewWindow.ts`: the cells in
+ * view and a row's margin, the hero's, then the rest on scroll and in idle time) the card in it
+ * is either the card itself (`CardFace`) or a PLACEHOLDER: the card's frame in the surface tone
+ * at the card's elevation, no title row, favicon or picture, nothing for the accessibility tree
+ * (`aria-hidden`, no role, no name: TalkBack's "tab 2 of 30" is the cards', whose count is the
+ * pane's tabs whatever the window holds). The cell's own element never changes, so the FLIP
+ * tracker's set, the hero's measure and the exits' rects hold through the fill. The context is
+ * the grid's token: the store's word counts under the grid that owns the window, so a cell of a
+ * grid mounting while the last grid's window is still the store's (the shell swap) reads nothing
+ * of it. A card rendered outside a windowed grid (a test's, a preview's) is a card, as it always
+ * was.
+ *
+ * In the select-tabs mode the card is the checkbox for assistive technology (`role="checkbox"`,
+ * `aria-checked`), the box a presentational span inside it drawn by the shared
+ * `.zen-v2-checkbox` in its span form (§9.34, as the panels' rows do it) – TalkBack reads
+ * "checked" or "not checked" with the card's name; no input, no second copy of the state.
+ */
+export function OverviewCard(props: Props): JSX.Element {
+  const { tab, eager = false, hinted = false } = props
+  const cellRef = useRef<HTMLDivElement>(null)
+  const grid = useContext(OverviewWindowContext)
+  const filled = useCardFilled(tab.id, eager || grid === NO_GRID, grid)
+  return (
+    <div
+      ref={cellRef}
+      className="relative"
+      style={{ aspectRatio: CARD_ASPECT }}
+      data-tab-id={tab.id}
+      data-cell={tab.id}
+      data-iph-anchor={hinted || undefined}
+    >
+      {filled ? (
+        <CardFace {...props} cellRef={cellRef} />
+      ) : (
+        <div className="zen-overview-card-placeholder absolute inset-0" aria-hidden />
+      )}
+    </div>
+  )
+}
+
+/**
+ * The card in its cell: the button (or checkbox) with the title row and the picture, and the
+ * close laid beside it. Its hooks – the lift, the stand-in and the drop target, the departure,
+ * the picture's on-screen word, the private mask – are the card's alone: a placeholder cell
+ * runs none of them, which is what the window saves at the mount.
+ */
+function CardFace({
+  tab,
+  active,
+  position,
+  count,
+  hidden,
+  onPick,
+  onClose,
+  onSwipeClose,
+  lift,
+  selection,
+  hinted = false,
+  cellRef
+}: Props & { cellRef: RefObject<HTMLDivElement | null> }): JSX.Element {
+  const handlers = useCardLift({ tab, ...lift, onSwipeClose: (t) => onSwipeClose?.(t) })
+  const held = liftStore.use((s) => (s.tabId === tab.id ? s.phase : 'idle'))
+  const targeted = liftStore.use((s) => s.phase === 'dragging' && s.target === `card:${tab.id}`)
+  const departing = departStore.use((s) => s.hidden.has(tab.id))
+  const visible = useOnScreen(cellRef, CARD_LOOKAHEAD)
+  // A locked private tab's card is named the placeholder, as its title row reads (§9.19).
+  const masked = useTabMasked(tab)
+  const name = masked ? PRIVATE_TAB_PLACEHOLDER : tabTitle(tab)
+  const style: CSSProperties = {}
+  if (hidden || departing || held === 'dropping') style.opacity = 0
+  else if (held !== 'idle') style.opacity = 0.35
+  const selecting = selection !== undefined
+  const act = (): void => (selection ? selection.onToggle(tab) : onPick(tab))
+  return (
+    <>
+      <div
+        role={selecting ? 'checkbox' : 'button'}
+        aria-checked={selecting ? selection.selected : undefined}
+        tabIndex={0}
+        className={cn(
+          'zen-overview-card absolute inset-0 flex flex-col overflow-hidden',
+          targeted && 'zen-overview-card-target'
+        )}
+        data-active={active}
+        data-discarded={tab.discarded || undefined}
+        data-masked={masked || undefined}
+        data-selecting={selecting || undefined}
+        data-selected={(selecting && selection.selected) || undefined}
+        style={style}
+        aria-label={tabCardLabel(name, position, count, active, tab.discarded === true)}
+        aria-describedby={hinted ? HINT_BUBBLE_ID : undefined}
+        onPointerDown={handlers.onPointerDown}
+        onPointerMove={handlers.onPointerMove}
+        onPointerUp={handlers.onPointerUp}
+        onPointerCancel={handlers.onPointerCancel}
+        onContextMenu={(e) => e.preventDefault()}
+        onClick={() => {
+          if (!handlers.swallowsClick()) act()
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            act()
+          }
+        }}
+      >
+        <CardBody tab={tab} closable={selecting || onClose ? 'space' : false} visible={visible} />
+        {/*
+          The check (§9.6): the shared 20 box, laid over the title row's trailing 44 – the slot
+          the row keeps clear for the close, which the mode hides – on the card's own surface,
+          never over the picture; a direct child of the card so the primitive's
+          `[aria-checked='true'] > .zen-v2-checkbox` draws it filled.
+        */}
+        {selecting && <span className="zen-v2-checkbox zen-overview-card-check" aria-hidden />}
+      </div>
+      {/*
+        The close sits beside the card's button, not inside it: this WebView reads a focusable,
+        named node as one leaf and drops a button nested in it from the tree (A11Y-01, the device
+        driver's run 1), so a nested Close was never a TalkBack stop. It is laid over the header's
+        end, the 44 the body keeps clear for it, and looks the same as the ghost's drawn one.
+        While tabs are being selected the cards carry no close: the action row closes the picks.
+      */}
+      {onClose && !selecting && (
+        <button
+          type="button"
+          className="zen-toolbar-button zen-overview-card-close absolute right-0 top-0 h-8 w-8 rounded-[10px]"
+          style={style}
+          aria-label={closeTabLabel(name)}
+          onClick={(e) => {
+            e.stopPropagation()
+            onClose(tab)
+          }}
+        >
+          <X className="h-4 w-4" />
+        </button>
+      )}
+    </>
+  )
+}
+
+/**
+ * Title row and thumbnail – shared with the ghost of a card in the hand and a card on its way
+ * out, which show the close button (so the card looks the same) without it doing anything.
+ * `visible` is the grid's word on whether the card is on screen (a ghost always is). A locked
+ * private tab's row reads "Private tab" behind the mask in place of its favicon and title
+ * (`useTabMasked`, §9.19), as the pill does; its picture is masked by `TabPreview`.
+ */
+export function CardBody({
+  tab,
+  closable = true,
+  visible = true
+}: {
+  tab: Tab
+  /**
+   * `true` draws a close glyph that does nothing (a ghost, a departing card); `'space'` keeps the
+   * glyph's 44 clear for the real button `OverviewCard` lays over it; `false` gives the row to
+   * the title.
+   */
+  closable?: boolean | 'space'
+  visible?: boolean
+}): JSX.Element {
+  const masked = useTabMasked(tab)
+  return (
+    <>
+      {/*
+        The close is the phone's 44 icon button (§9.3, main.css's phone rule on
+        `.zen-toolbar-button`), flush with the card's edge so the whole box stays inside the
+        card's clip; the row is its 44 (`CARD_HEADER`, §9.21), drawn from
+        `--zen-overview-card-header` so it grows with the system font size (A11Y-05).
+      */}
+      <header className="zen-overview-card-header flex shrink-0 items-center gap-2 pl-3 pr-0">
+        <span className="zen-overview-card-favicon flex shrink-0">
+          {masked ? (
+            <VenetianMask className="h-4 w-4 opacity-60" strokeWidth={1.75} aria-hidden />
+          ) : (
+            <Favicon tab={tab} size={16} />
+          )}
+        </span>
+        <span className="zen-overview-card-title min-w-0 flex-1 truncate text-[13px] font-medium">
+          {masked ? PRIVATE_TAB_PLACEHOLDER : tabTitle(tab)}
+        </span>
+        {tab.discarded && (
+          // A sleeping page (CT-22): the moon the sidebar's row shows, at the deemphasised
+          // 69% with the title, 16 like the favicon and the close glyph beside it (§9.3); the
+          // card's own tap wakes the page, so the glyph is a mark.
+          <Moon
+            className="zen-overview-card-sleeping h-4 w-4 shrink-0"
+            aria-hidden
+            data-sleeping=""
+          />
+        )}
+        {closable === true && (
+          <span aria-hidden className="zen-toolbar-button h-8 w-8 rounded-[10px]">
+            <X className="h-4 w-4" />
+          </span>
+        )}
+        {closable === 'space' && (
+          <span aria-hidden className="zen-toolbar-button zen-overview-card-close-space h-8 w-8" />
+        )}
+      </header>
+      <div className="zen-overview-card-preview relative min-h-0 flex-1 overflow-hidden">
+        <TabPreview tab={tab} scale={0.8} visible={visible} />
+      </div>
+    </>
+  )
+}
+
+/**
+ * The New Tab card's face – the plus (the mask on the private pane) over its label – shared by
+ * the grid's card (`NewTabCard` in TabOverview, a `.zen-overview-new` button) and its exit: a
+ * query takes the card off the grid with the cards that do not match (§9.34), and the exit is
+ * the same face drawn where the card stood, leaving as they do (`Departures`).
+ */
+export function NewTabFace({ isPrivate }: { isPrivate: boolean }): JSX.Element {
+  return (
+    <>
+      {isPrivate ? (
+        <VenetianMask className="h-6 w-6" strokeWidth={1.75} />
+      ) : (
+        <Plus className="h-6 w-6" />
+      )}
+      <span className="text-[13px] font-medium">{isPrivate ? 'New Private Tab' : 'New Tab'}</span>
+    </>
+  )
+}

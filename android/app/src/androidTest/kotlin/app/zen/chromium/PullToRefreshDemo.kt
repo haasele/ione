@@ -1,0 +1,322 @@
+package app.zen.chromium
+
+import android.os.SystemClock
+import android.util.Log
+import android.view.MotionEvent
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import org.junit.Test
+import org.junit.runner.RunWith
+import java.io.FileInputStream
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * Shows pull-to-refresh on a device so the `android-ptr-demo` workflow can record it: a long page
+ * (Wikipedia's Damping article) at its top pulled a little and let go (the disc comes out and
+ * goes back), pulled past the threshold (the page reloads under a spinning disc), a retracting
+ * page caught by a second touch and pushed back up (the finger returns to the page), a fling on
+ * the address pill still switching tabs, a scroll inside the page and a drag down from mid-page
+ * neither of them pulling, the Look and Feel switch turning the pull off, and one more pull with
+ * the address bar docked at the top.
+ *
+ * The profile (`ptr-demo-state.json`) holds two tabs. The `theme` instrumentation argument
+ * (`light`, the default, or `dark`) picks the colour scheme. Screenshots land as
+ * `ptr-<theme>-*.png`; see [DemoHarness] for the plumbing.
+ */
+@RunWith(AndroidJUnit4::class)
+class PullToRefreshDemo : DemoHarness("ptr-demo-state.json", "ptr-$THEME", "ptr-demo") {
+    override val tag = "PullToRefreshDemo"
+
+    @Test
+    fun record() = runDemo()
+
+    override fun patchState(json: String): String =
+        json.replace("\"colorScheme\": \"light\"", "\"colorScheme\": \"$THEME\"")
+
+    /** Somewhere on the page, clear of both bar positions and of the article's first links. */
+    private val pageX get() = width * 0.5f
+    private val pageY get() = height * 0.4f
+
+    override fun warmUp() {
+        shell("cmd uimode night ${if (THEME == "dark") "yes" else "no"}")
+        SystemClock.sleep(2_500)
+        ensureForeground()
+        // The article comes over the network; give it time, then pay for the touch pipeline off
+        // camera with a scroll down and back up that no pull can come out of (it starts upwards).
+        SystemClock.sleep(10_000)
+        Finger().apply {
+            down(pageX, pageY)
+            moveBy(0f, -120 * density, 300)
+            moveBy(0f, 120 * density, 300)
+            up()
+        }
+        SystemClock.sleep(1_500)
+        toTop()
+        Log.i(tag, "warm-up done")
+    }
+
+    override fun demo() {
+        shot("01-top")
+
+        // 1. A little way and let go: the disc comes out under the frame's edge and goes back.
+        Finger().apply {
+            down(pageX, pageY)
+            moveBy(0f, BELOW * density, 800)
+            hold(700)
+            shot("02-pull-below-threshold")
+            up()
+        }
+        SystemClock.sleep(1_500)
+        shot("03-retracted")
+
+        // 2. Past the threshold: letting go reloads the page; the disc spins until it has loaded.
+        Finger().apply {
+            down(pageX, pageY)
+            moveBy(0f, PAST * density, 1_000)
+            hold(700)
+            shot("04-pull-past-threshold")
+            up()
+        }
+        SystemClock.sleep(600)
+        shot("05-refreshing")
+        SystemClock.sleep(7_000)
+        shot("06-reloaded")
+
+        // 3. Caught in flight: let go below the threshold and touch again while the page is still
+        //    springing home – the finger has it where it is – then push it back up: the pull is
+        //    undone and the rest of the drag is the page's, as any other scroll.
+        Finger().apply {
+            down(pageX, pageY)
+            moveBy(0f, BELOW * density, 500)
+            up()
+            hold(90)
+            down(pageX, pageY)
+            hold(700)
+            shot("07-caught")
+            moveBy(0f, -(BELOW + 40) * density, 500)
+            hold(400)
+            shot("08-reversed")
+            up()
+        }
+        SystemClock.sleep(1_500)
+        toTop()
+
+        // 4. The pill's horizontal fling is untouched: next tab, and back.
+        flingLeft()
+        SystemClock.sleep(3_500)
+        shot("09-pill-swipe-next-tab")
+        flingRight()
+        SystemClock.sleep(3_500)
+
+        // 5. Scrolling inside the page is a scroll; a drag down from mid-page scrolls back up
+        //    instead of pulling, because the page was not at its top when the finger landed.
+        Finger().apply {
+            down(pageX, pageY)
+            moveBy(0f, -260 * density, 500)
+            up()
+        }
+        SystemClock.sleep(1_200)
+        shot("10-scrolled-down")
+        Finger().apply {
+            down(pageX, pageY)
+            moveBy(0f, PAST * density, 900)
+            hold(600)
+            shot("11-drag-down-mid-page-no-pull")
+            up()
+        }
+        SystemClock.sleep(1_200)
+        toTop()
+
+        // 5b. A touchpad's two-finger swipe down at the top (Android 14's classified fake finger,
+        //     W6-D27): never a pull, as Chrome's refresh is the touchscreen's alone – the page
+        //     keeps the swipe and the disc never comes; a finger's pull right after still does.
+        touchpadSwipeIsNotAPull()
+
+        // 6. Settings → Look and Feel → Pull to refresh off: the same drag is the page's.
+        openLookAndFeel()
+        val row = revealSettingsRow(PULL_ROW) ?: error("no $PULL_ROW row in Look and Feel")
+        shot("12-settings-row")
+        Finger().tap(width - 62 * density, row.exactCenterY())
+        SystemClock.sleep(1_200)
+        shot("13-settings-row-off")
+        leaveSettingsTab()
+        Finger().apply {
+            down(pageX, pageY)
+            moveBy(0f, PAST * density, 900)
+            hold(600)
+            shot("14-toggle-off-no-pull")
+            up()
+        }
+        SystemClock.sleep(1_200)
+
+        // 7. Back on, and the address bar carried to the top: the disc still comes from the
+        //    frame's top edge, now under the bar.
+        openLookAndFeel()
+        val again = revealSettingsRow(PULL_ROW) ?: error("no $PULL_ROW row in Look and Feel")
+        Finger().tap(width - 62 * density, again.exactCenterY())
+        SystemClock.sleep(800)
+        // The bar position's picker (a hosted sheet since #134, no inline options): a finger on
+        // the row opens it – a Settings-page row, not a sheet's, so the tree's click stands in
+        // when it is not on screen – then a finger on its Top option, the rule's one injected
+        // touch for this flow, and the picker must close on it with the row reading the new
+        // value – the touch that fell through to the scrim (#192) closed it with the old one.
+        // The picker and the row's value are read off the chrome's document (the tree trails
+        // the screen here by seconds; see DemoHarness's Settings section).
+        revealSettingsRow(BAR_ROW) ?: error("no $BAR_ROW row in Look and Feel")
+        if (!touchSettingsRow(BAR_ROW)) clickSettingsRow(BAR_ROW)
+        if (!awaitSheet(BAR_ROW) || !awaitSettingsRow("Top")) error("no Top option for the bar position")
+        if (!touchSettingsRowExpecting("Top", "the picker closed with the row reading Top") { !sheetPresented(BAR_ROW) && settingsRowReads(BAR_ROW, "Top") } &&
+            !settingsRowReads(BAR_ROW, "Top") && !clickByLabel("Top")
+        ) error("no Top option for the bar position")
+        SystemClock.sleep(1_200)
+        leaveSettingsTab()
+        SystemClock.sleep(500)
+        shot("15-bar-top")
+        Finger().apply {
+            down(pageX, pageY)
+            moveBy(0f, PAST * density, 1_000)
+            hold(700)
+            shot("16-bar-top-pull-past-threshold")
+            up()
+        }
+        SystemClock.sleep(600)
+        shot("17-bar-top-refreshing")
+        SystemClock.sleep(5_000)
+        shot("18-bar-top-reloaded")
+    }
+
+    // --- moves -----------------------------------------------------------------------------------
+
+    /**
+     * The touchpad's swipe at the top against the finger's pull, on the same page: the swipe (the
+     * platform's fake finger, see [Touchpad]) dragged well past the pull's threshold must leave the
+     * page at home – its `translationY` is the pull's offset plus the bar's shift, both 0 at the
+     * top of a page at rest – while the finger's drag right after moves it. Both read on the
+     * main thread mid-hold; a failed claim fails the run. So that the first claim cannot hold for
+     * want of a swipe, the down is also read as the page's view receives it – through a touch
+     * listener the view's `dispatchTouchEvent` consults before its own `onTouchEvent` (the
+     * browser's window sets none; the custom tab sets its own on its own view,
+     * `CustomTabActivity.kt`), which must see what the gate reads: no button, the two-finger
+     * classification – and the dispatcher must have taken it. Skipped below Android 14, where
+     * the platform delivers no classified swipe (Chrome there treats the touchpad as a finger too).
+     */
+    private fun touchpadSwipeIsNotAPull() {
+        val touchpad = Touchpad()
+        if (!touchpad.supported) {
+            Log.i(tag, "touchpad scene skipped: no classified two-finger swipe before Android 14")
+            return
+        }
+        val view = activeTabView() ?: error("no view for the active tab")
+        val received = AtomicReference<String>()
+        onMain {
+            view.setOnTouchListener { _, e ->
+                if (e.actionMasked == MotionEvent.ACTION_DOWN && received.get() == null) {
+                    val touchpadSwipe = HistoryNavClassifier.isTouchpadSwipe(e.buttonState, e.classification)
+                    received.set(
+                        "source=${e.source} tool=${e.getToolType(0)} buttons=${e.buttonState} " +
+                            "classification=${e.classification} touchpad=$touchpadSwipe"
+                    )
+                }
+                false
+            }
+        }
+        val taken = touchpad.down(pageX, pageY)
+        touchpad.moveBy(0f, PAST * density, 900)
+        touchpad.hold(600)
+        val swipeOffset = onMain { view.translationY }
+        shot("11b-touchpad-swipe-no-pull")
+        touchpad.up()
+        SystemClock.sleep(1_200)
+        onMain { view.setOnTouchListener(null) }
+        val down = received.get()
+        Log.i(
+            tag,
+            "touchpad swipe: down taken=$taken, the view's down read [$down]; ${touchpad.moves} moves over " +
+                "${touchpad.movedMs} ms, ${touchpad.refused} refused; page offset ${swipeOffset}px mid-hold (must be 0)"
+        )
+        if (!taken) error("the dispatcher refused the touchpad's down: nothing to claim")
+        if (down == null) error("the page's view never received the touchpad's down")
+        if (!down.endsWith("touchpad=true")) error("the view's down did not read as the touchpad's swipe: $down")
+
+        val finger = Finger()
+        finger.down(pageX, pageY)
+        finger.moveBy(0f, BELOW * density, 800)
+        finger.hold(700)
+        val pullOffset = onMain { view.translationY }
+        shot("11c-finger-pull-after-touchpad")
+        finger.up()
+        SystemClock.sleep(1_500)
+        Log.i(tag, "finger pull: page offset ${pullOffset}px mid-hold (must be > 0)")
+
+        if (swipeOffset != 0f) error("the touchpad's swipe pulled the page ${swipeOffset}px: the pull armed on it")
+        if (pullOffset <= 0f) error("the finger's pull after the touchpad's swipe did not move the page")
+        toTop()
+    }
+
+    /** The host's view for the core's active tab. */
+    private fun activeTabView(): TabWebView? {
+        val tabId = activeCoreTab()?.optString("id")?.takeIf { it.isNotEmpty() } ?: return null
+        return onMain { (activity as? MainActivity)?.host?.tabs?.get(tabId) }
+    }
+
+    private fun <T> onMain(read: () -> T): T {
+        var out: T? = null
+        instrumentation.runOnMainSync { out = read() }
+        @Suppress("UNCHECKED_CAST")
+        return out as T
+    }
+
+    /**
+     * Make sure the page is at its top without pulling it: a short drag up first (a drag that
+     * begins upwards is never a pull, and it leaves the page off its top), then a long drag down
+     * that scrolls it back up – it began with the page off the top, so it is the page's alone.
+     */
+    private fun toTop() {
+        Finger().apply {
+            down(pageX, pageY)
+            moveBy(0f, -80 * density, 250)
+            up()
+        }
+        SystemClock.sleep(900)
+        Finger().apply {
+            down(pageX, pageY)
+            moveBy(0f, 500 * density, 300)
+            up()
+        }
+        SystemClock.sleep(1_200)
+    }
+
+    /**
+     * Settings from the menu sheet, then Look and Feel over the tab's landing (since #134 the
+     * Settings tab opens on its categories; the rows are in the section), through the harness's
+     * shared flow: the section proven by the chrome's document, not the tree (the nightly's run
+     * had the section on screen within a second of the touch and the tree without it for the
+     * 5 s it was given: "no Look and Feel row on the Settings landing").
+     */
+    private fun openLookAndFeel() {
+        if (!openSettingsSection(LOOK_SECTION)) error("the Look and Feel section never came up")
+        SystemClock.sleep(3_000)
+    }
+
+    /** Run a shell command with the instrumentation's shell permissions; returns its output. */
+    private fun shell(command: String): String {
+        val fd = ui.executeShellCommand(command)
+        return FileInputStream(fd.fileDescriptor).bufferedReader().use { it.readText() }.also { fd.close() }
+    }
+
+    companion object {
+        private const val MENU_LABEL = "Menu"
+        private const val PULL_ROW = "Pull to refresh"
+        /** The address bar's position row (Look and Feel); its picker offers Bottom and Top. */
+        private const val BAR_ROW = "Position on phones"
+        /**
+         * Finger travel in dp. The chrome's pull reaches its threshold at 120 CSS px of travel
+         * past the slop (`lib/pull.ts`); 70 stays clearly under it, 240 clearly over.
+         */
+        private const val BELOW = 70f
+        private const val PAST = 240f
+        private val THEME = InstrumentationRegistry.getArguments().getString("theme").let {
+            if (it == "dark") "dark" else "light"
+        }
+    }
+}

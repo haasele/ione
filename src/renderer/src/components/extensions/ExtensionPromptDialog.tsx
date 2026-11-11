@@ -1,0 +1,212 @@
+import type { JSX } from 'react'
+import { useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import type { ExtensionPromptRequest } from '@shared/types'
+import { useEscape } from '@renderer/hooks/useEscape'
+import { usePopover } from '@renderer/hooks/usePopover'
+import { useBackSurface } from '@renderer/lib/back'
+import { answerExtensionPrompt } from '@renderer/lib/extensions/popup'
+import { noWarningsLine, promptCopy } from '@renderer/lib/extensions/promptCopy'
+import { useViewport } from '@renderer/lib/formFactor'
+import { useFrameDialog } from '@renderer/lib/portals'
+import { uiStore } from '@renderer/lib/ui'
+import { BottomSheet, type BottomSheetHandle } from '../sheet/BottomSheet'
+import { ExtensionIcon } from './ExtensionIcon'
+import { V2Button, V2Row, V2TitleBlock } from './v2'
+import { WarningRow } from './WarningRow'
+
+/**
+ * Install, update and `permissions.request` prompts as a v2 dialog (§1–§3: the panel colour,
+ * radius 12, the dialog shadow; §9.23: a title block with the extension's icon, no bar and no
+ * X). Main asks, the renderer shows what it will be able to do as rows with a glyph per kind,
+ * and two buttons. One prompt at a time, oldest first; Escape, a press on the scrim, the system
+ * back and Cancel all answer no.
+ *
+ * Rendered inside TabDialogs' `FrameDialogHost` (lib/portals.tsx), which centres the dialog in
+ * the content frame over its §9.5 scrim – the frame alone dims; the sidebar and toolbar stay
+ * undimmed. While a prompt is queued the content frame counts as covered
+ * (`overlayCoversContent`): the page's view is hidden and the frame shows its capture, the way
+ * every chrome overlay does; the dialog draws no tint of its own. On a phone's finger the prompt
+ * is a bottom sheet, on the body with the other sheets (whose §9.24 stack is their mount order
+ * there), with the sheet's own scrim; a tablet's finger gets the dialog in the coarse pointer's
+ * sizes (§9.36 as the lead amended it on #750: a prompt on the tablet is a dialog, not a sheet –
+ * the split is the form factor's), its glyph at the title block's `--v2-icon`, 20 there and on
+ * a phone, 16 on the desktop (§9.23).
+ */
+export function ExtensionPromptDialog(): JSX.Element | null {
+  const prompt = uiStore.use((s) => s.extensionPrompts[0] ?? null)
+  const viewport = useViewport()
+  if (!prompt) return null
+  if (viewport.coarse && viewport.formFactor !== 'tablet') {
+    return createPortal(<SheetPrompt key={prompt.requestId} prompt={prompt} />, document.body)
+  }
+  return (
+    <PanelPrompt
+      key={prompt.requestId}
+      prompt={prompt}
+      glyph={viewport.formFactor === 'desktop' ? 16 : 20}
+    />
+  )
+}
+
+/** What the extension will be able to do: a row with a glyph per warning kind, or the one line saying there is nothing to warn of. */
+function PromptRows({
+  prompt,
+  onScroll
+}: {
+  prompt: ExtensionPromptRequest
+  onScroll?: (scrolled: boolean) => void
+}): JSX.Element {
+  return (
+    <div
+      className="zen-ext-dialog-body"
+      onScroll={onScroll && ((e) => onScroll(e.currentTarget.scrollTop > 0))}
+    >
+      {prompt.warnings.length > 0 && <p className="zen-v2-caption">It can:</p>}
+      <div className="zen-v2-rows">
+        {prompt.warnings.length === 0 ? (
+          <V2Row
+            label={<span className="zen-v2-deemphasized">{noWarningsLine(prompt.kind)}</span>}
+          />
+        ) : (
+          prompt.warnings.map((warning) => <WarningRow key={warning} warning={warning} />)
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** The two buttons (§9.11), Cancel then the accepting one; their row is the caller's. */
+function PromptButtons({
+  prompt,
+  onAnswer
+}: {
+  prompt: ExtensionPromptRequest
+  onAnswer: (accept: boolean) => void
+}): JSX.Element {
+  return (
+    <>
+      <V2Button onClick={() => onAnswer(false)}>Cancel</V2Button>
+      <V2Button variant="primary" data-accept onClick={() => onAnswer(true)}>
+        {promptCopy(prompt).accept}
+      </V2Button>
+    </>
+  )
+}
+
+/** The desktop dialog's body: the rows, then the buttons hugging and right-aligned under them. */
+function PromptBody({
+  prompt,
+  onAnswer,
+  onScroll
+}: {
+  prompt: ExtensionPromptRequest
+  onAnswer: (accept: boolean) => void
+  onScroll?: (scrolled: boolean) => void
+}): JSX.Element {
+  return (
+    <>
+      <PromptRows prompt={prompt} onScroll={onScroll} />
+      <div className="zen-ext-dialog-buttons">
+        <PromptButtons prompt={prompt} onAnswer={onAnswer} />
+      </div>
+    </>
+  )
+}
+
+/**
+ * The dialog (the desktop's, and the tablet's): its panel in flow in the frame dialog host, which
+ * centres it above its scrim, takes the pointer over the frame, makes the window chrome inert
+ * (§9.5) and closes the popover that is open when it appears; a press on the scrim answers no,
+ * and so does the tablet's system back – the dialog is the back registry's top surface while it
+ * shows (lib/back.ts), as the other two prompt dialogs are: a modal is outside the popover
+ * registry, so without a surface of its own the back fell through to the legacy chain and ran
+ * `tab.back` on the page behind it. Focus lands on the accepting button, as Firefox's install
+ * prompt has it; Tab wraps inside; nothing in the chrome opened it, so there is no control to
+ * return focus to (§9.22). A modal, not a popover: it is not in the layer's popover registry, so
+ * a resize re-centres rather than closes it and a popover opening later does not dismiss it.
+ * `glyph` is the title block's icon size, the form factor's `--v2-icon` (§9.23); the pair's
+ * height is the pointer's control token.
+ */
+function PanelPrompt({
+  prompt,
+  glyph
+}: {
+  prompt: ExtensionPromptRequest
+  glyph: number
+}): JSX.Element {
+  const answer = (accept: boolean): void => answerExtensionPrompt(prompt, accept)
+  const ref = useRef<HTMLDivElement>(null)
+  const [scrolled, setScrolled] = useState(false)
+  useFrameDialog({ onScrimPress: () => answer(false) })
+  useBackSurface({ name: 'extension-prompt', onCommit: () => answer(false) })
+  usePopover(ref, {
+    onClose: () => answer(false),
+    initial: (root) => root.querySelector<HTMLElement>('[data-accept]'),
+    returnTo: null
+  })
+  const copy = promptCopy(prompt)
+  return (
+    <div
+      ref={ref}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="zen-ext-dialog-title"
+      className="zen-v2 zen-v2-dialog zen-ext-dialog zen-animate-pop"
+    >
+      <V2TitleBlock
+        id="zen-ext-dialog-title"
+        title={copy.title}
+        description={copy.subtitle}
+        glyph={<ExtensionIcon icon={prompt.icon} size={glyph} box={glyph} />}
+        scrolled={scrolled}
+      />
+      <PromptBody prompt={prompt} onAnswer={answer} onScroll={setScrolled} />
+    </div>
+  )
+}
+
+/**
+ * On a phone the prompt is a sheet that opens on a title block (§9.23), as the chassis' other
+ * prompt sheets do – the block is the body's first content, since the sheet's `header` slot is
+ * its 48 bar header (§9.16) – with the footer splitting the width between the two buttons
+ * (§9.11, `.zen-sheet-footer`). The buttons go in the sheet's `footer` slot, outside its
+ * scroller: an extension asking for a dozen permissions (a password manager, a userscript
+ * manager) fills the sheet's first detent with rows, and buttons under the rows would sit below
+ * the fold until the user found them by scrolling – the footer stays in reach at every detent.
+ */
+function SheetPrompt({ prompt }: { prompt: ExtensionPromptRequest }): JSX.Element {
+  const sheet = useRef<BottomSheetHandle>(null)
+  const answered = useRef(false)
+  const answer = (accept: boolean): void => {
+    if (answered.current) return
+    answered.current = true
+    sheet.current?.dismiss(() => answerExtensionPrompt(prompt, accept))
+  }
+  // Escape answers no – and, over another sheet, closes this one only (§9.24).
+  useEscape(() => answer(false))
+  const copy = promptCopy(prompt)
+  // The phone's glyph size (§9.23: 20 on a phone, 16 on desktop).
+  const glyph = <ExtensionIcon icon={prompt.icon} size={20} box={20} />
+  return (
+    <BottomSheet
+      ref={sheet}
+      className="zen-ext-prompt-sheet"
+      handleLabel="Resize"
+      label={copy.title}
+      onDismissed={() => {
+        // Dragged or flung away without a choice: that is a no.
+        if (!answered.current) {
+          answered.current = true
+          answerExtensionPrompt(prompt, false)
+        }
+      }}
+      footer={<PromptButtons prompt={prompt} onAnswer={answer} />}
+    >
+      <div className="zen-v2 zen-ext-dialog">
+        <V2TitleBlock title={copy.title} description={copy.subtitle} glyph={glyph} />
+        <PromptRows prompt={prompt} />
+      </div>
+    </BottomSheet>
+  )
+}

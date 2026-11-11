@@ -1,0 +1,274 @@
+package app.zen.chromium
+
+import android.view.View
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import app.zen.chromium.ext.Extensions
+import app.zen.chromium.blocking.Blocking
+import app.zen.chromium.privacy.Privacy
+import org.json.JSONObject
+
+/**
+ * What a page WebView, and the services it reports into, need from whatever hosts it. The
+ * browser window's [Host] forwards everything to the chrome WebView, where the core runs; a
+ * custom tab ([CustomTabHost]) has no chrome and answers natively. Either way the page behaves
+ * identically: the same [TabWebView], the same downloads, permission prompts, file chooser,
+ * fullscreen and in-page predictive back.
+ */
+interface PageHost {
+    val activity: BrowserActivity
+    /** The page script injected into every document (empty: no script). */
+    val pageScript: String
+    val pageToken: String
+    /** The request engine every page's requests run through (`shouldInterceptRequest`). */
+    val blocking: Blocking
+    /** The page-controls policy pages are laid out by (desktop site, dark theme for sites, zoom); none by default. */
+    val pageRules: PageRules get() = PageRules.NONE
+    /** The same rules as the core sent them, handed to every page's document-start script. */
+    val pageRulesJson: JSONObject get() = JSONObject()
+    /**
+     * The per-site content settings the pages enforce before a document's request leaves (images,
+     * JavaScript, insecure content, the page-world guards; `src/shared/contentRules.ts`); none
+     * by default – a host without a core (a custom tab) allows everything, as the WebView does.
+     */
+    val contentRules: ContentRules get() = ContentRules.NONE
+    /** The same rules as the core sent them, handed to every page's document-start script. */
+    val contentRulesJson: JSONObject get() = JSONObject()
+    /**
+     * Whether the core can be asked which content settings govern a navigation (`resolveRules` →
+     * `view.rulesResolved`, [TabWebView.interceptNavigation]): once its rules service has pushed
+     * its first document. A host without a core (a custom tab) reads [contentRules] alone.
+     */
+    val contentRulesResolvable: Boolean get() = false
+    /**
+     * Whether the turn of the device takes a playing video fullscreen and back (MED-02, Chrome's
+     * rule for the phone alone – design language v2 §9.36): the one word both halves of the rule
+     * read. The page script's half hears it at document start (`window.__zenRotateToFullscreen`,
+     * `shared/rotateToFullscreen.ts`) and the host's half – the held screen handed to the device so
+     * the turn back turns it ([FullscreenRotation]) – reads it live. A tablet's window keeps its
+     * layout through a turn and its video goes fullscreen by the player's own control
+     * ([ScreenClass]); a custom tab turns nothing.
+     */
+    val rotateToFullscreen: Boolean get() = false
+    /** The page fonts every page WebView's `WebSettings` take (Settings › Appearance › Customize fonts, CT-25). */
+    val pageFonts: PageFonts get() = PageFonts.DEFAULT
+    /** The privacy policy the pages apply (cookies, signals, Safe Browsing's word ahead of the engine). */
+    val privacy: Privacy
+    val keys: Keys
+    val downloads: Downloads
+    val permissions: Permissions
+    /**
+     * The "<site> is using your microphone" card and its service while a page captures (NOT-13);
+     * the browser window's, fed by the core's per-tab fold – a custom tab has none.
+     */
+    val capture: CaptureNotifications? get() = null
+    /** Links that leave the web (`mailto:`, `intent://`, a site's own app). */
+    val externalProtocols: ExternalProtocols
+    /** HTTP sign-in and client-certificate requests. */
+    val security: Security
+    val snapshots: HistorySnapshots
+    /** The tab cards' pictures on disk ([Thumbnails]); a host without cards (a custom tab) keeps none. */
+    val thumbnails: Thumbnails? get() = null
+    /**
+     * The file-backed handoffs to the chrome ([BootHandoff]), whose favicon store the served new
+     * tab page's tile icons are answered from ([TabWebView.shouldInterceptRequest], NTP-35); a
+     * host without a chrome (a custom tab) serves no such page and has none.
+     */
+    val handoff: BootHandoff? get() = null
+    val tabs: TabHost
+    val fullscreenTab: TabWebView?
+    /** Whether the host is in its own fullscreen (Menu > Fullscreen: the bars hidden, no element fullscreen). */
+    val immersive: Boolean get() = false
+    /**
+     * The view drawn under the pages that a touch on a covered strip (a message card's, see
+     * [ContentCover]) is handed to: the browser window's chrome WebView. A custom tab has none.
+     */
+    val underlay: View? get() = null
+    /**
+     * Page-to-chrome Tab traversal for a hardware keyboard ([FocusHandoff], A11Y-09): the browser
+     * window wires every page view into it; a custom tab has no chrome to hand the keyboard to,
+     * so its page wraps within itself as WebView does.
+     */
+    val focusHandoff: FocusHandoff? get() = null
+    /** The colour scheme and scrim of the surrounding chrome, for what is drawn natively. */
+    val themeDark: Boolean
+    val themeScrim: Int
+    /**
+     * The chrome's accent for a native primary control (`--v2-accent`) and the ink on it
+     * (`--v2-on-accent`); the v2 draft's defaults until the chrome has sent its theme's.
+     */
+    val themeAccent: Int get() = androidx.core.content.ContextCompat.getColor(activity, if (themeDark) R.color.v2_accent_dark else R.color.v2_accent_light)
+    val themeOnAccent: Int get() = androidx.core.content.ContextCompat.getColor(activity, if (themeDark) R.color.v2_on_accent_dark else R.color.v2_on_accent_light)
+    /** Whether `window.open` popups become tabs of their own (false: they navigate the one page). */
+    val popupsAsTabs: Boolean get() = true
+    /**
+     * The Auth Tab's return (CCT-13), only on a custom tab another app opened for a sign-in
+     * result ([AuthTabVerifier]): a main-frame navigation it claims is the caller's redirect, not
+     * loaded but handed back. Read first in every navigation decision ([TabWebView]), so this
+     * default – one null – is the whole cost to the browser's tabs and the ordinary custom tab.
+     */
+    val authTab: AuthTab.Return? get() = null
+    /**
+     * Whether the pages' `alert` / `confirm` / `prompt` and their `beforeunload` question are
+     * Ione's own sheet ([PageDialogSheet], drawn natively over the page: PUI-27, PUI-28) rather
+     * than the WebView's own dialogs, which a host without a chrome (a custom tab) keeps.
+     */
+    val pageDialogs: Boolean get() = false
+    /**
+     * Whether a drag down from the top of a page may become a pull-to-refresh (the browser's
+     * Look and Feel setting; the chrome draws the disc, so a host without one leaves it off).
+     */
+    val pullToRefresh: Boolean get() = false
+    /**
+     * Whether a touchpad's two-finger swipe may become a history navigation (GN-23 / A11Y-14;
+     * Settings → Accessibility → "Swipe between pages using a touchpad", Chrome's
+     * `settings.a11y.touchpad_overscroll_history_navigation`, on by default). The finger's edge
+     * drag is not this switch's: Chrome's `OnOverscrolled` gates the touchpad's overscroll alone.
+     */
+    val touchpadSwipeToNavigate: Boolean get() = true
+    /**
+     * The extension runtime's Kotlin half, when the host runs one: the browser window does; a
+     * custom tab has no core to run the backgrounds against, so its pages get no content scripts.
+     */
+    val extensions: Extensions? get() = null
+    /**
+     * Whether the forms script in the pages reports fields and submits (the core's autofill; off
+     * when a system autofill service owns the pages). Sent with the flags to every new document.
+     */
+    val formsEnabled: Boolean get() = true
+    /** The autofill provider of the pages: `ione` takes the WebViews out of the system framework. */
+    val autofillProvider: String get() = SystemAutofill.PROVIDER_SYSTEM
+
+    /** Something happened to one page: `navigated`, `title`, `startLoading`, … (see [TabWebView]). */
+    fun viewEvent(tabId: String, name: String, payload: Any?)
+
+    /**
+     * A page's message on its way to the core, for a host that keeps part of it for itself: the
+     * browser window writes a share call's files to its cache and forwards their addresses
+     * (`Share.spillPageShare`, SH-14). The default forwards as is. Main thread, `then` once.
+     */
+    fun preparePageMessage(message: JSONObject, then: (JSONObject) -> Unit) = then(message)
+
+    /**
+     * `tab`'s renderer went (`onRenderProcessGone`). Every WebView of the app shares the one
+     * renderer, so the browser window classifies the exit once for every page on screen and
+     * remembers it across the chrome's rebuild ([RendererExits]); the answer is the `crashed`
+     * event's payload for this page – `{ reason, repeat }` – or null for an exit the page is
+     * not told of (it comes back on its own). A host without a chrome names the way it went.
+     */
+    fun rendererGone(tab: TabWebView, didCrash: Boolean, priorityAtExit: Int): JSONObject? =
+        json("reason" to if (didCrash) "crashed" else "killed")
+
+    /**
+     * `tab`'s main frame started a new document (`onPageStarted`): whatever the host had up for
+     * the document before – the picture-in-picture window showing its video – is over. Main
+     * thread, before the `startLoading` event. A host without a chrome has nothing up.
+     */
+    fun documentStarted(tab: TabWebView) {}
+
+    /**
+     * `tab`'s main frame got an HTTP error status for its document (`onReceivedHttpError`, a 404
+     * or a 5xx): the page still renders the server's body, this is the status alone. Main thread.
+     * Only a Trusted Web Activity's host has a use for it (CCT-20, the quality log); the browser
+     * window has none.
+     */
+    fun documentHttpError(tab: TabWebView, url: String, status: Int) {}
+
+    /**
+     * `tab`'s view is being torn down ([TabHost.destroy], [TabHost.dropAll]), before the
+     * fullscreen it may hold is exited: a picture-in-picture window showing it ends with it. A
+     * host without a chrome has no window.
+     */
+    fun tabRemoved(tab: TabWebView) {}
+
+    /**
+     * `tabId`'s view now fills the picture-in-picture window over the chrome ([TabHost.fillWindow]),
+     * or null: the one that did went back where the chrome has it. A host without a chrome has
+     * nothing under the view.
+     */
+    fun windowFillChanged(tabId: String?) {}
+
+    /**
+     * Hear the renderer behind `view` stop and start answering again
+     * (`WebViewRenderProcessClient`; the unresponsive-page prompt, ERR-16). A host without a
+     * chrome leaves the platform to it.
+     */
+    fun watchRenderer(view: WebView) {}
+
+    /**
+     * The state a fresh WebView rebuilds `tabId`'s back/forward list from changed: `hostState`
+     * as [NavigationState.hostStateOf] gives it, null when there is none to keep (a private tab,
+     * an empty list, one over the cap). Main thread, with every `historyChanged`; the browser
+     * window keeps the latest to answer the core's synchronous `view.navigationHostState` from
+     * the bridge thread, where the WebView cannot be asked. A custom tab has no core to answer.
+     */
+    fun navigationStateChanged(tabId: String, hostState: String?) {}
+
+    /**
+     * The view known as `viewId` (a popup's provisional id) is `tabId`'s from now on: whatever
+     * the window kept under the old id – the list its pushes filled, the state behind it – is not
+     * kept there any more; the view pushes both again under the new id right after.
+     */
+    fun viewBound(viewId: String, tabId: String) {}
+
+    /** Something happened outside any one page: a download, a permission request, a popup. */
+    fun hostEvent(name: String, payload: Any?)
+
+    /** Load progress of a page's main document, 0…100 (at most one report per 100 ms, and 100 always). */
+    fun progress(tabId: String, percent: Int) {}
+
+    /** A pull-to-refresh on a page moved on: `start`, `move`, `release` or `cancel` (see `lib/pull.ts`). */
+    fun pullEvent(tabId: String, phase: String, payload: JSONObject?) {}
+
+    /**
+     * The edge drag that goes back or forward in a page's history moved on (GN-04): `start`
+     * (`{ edge }`), `move` (`{ travel, time }`, CSS px), `release` or `cancel` (see `lib/historyNav.ts`).
+     */
+    fun historyNavEvent(tabId: String, phase: String, payload: JSONObject?) {}
+
+    /**
+     * Whether the system navigates with its three buttons rather than gestures: only then do the
+     * pages' edges belong to the app, and the history drag arms (`HistoryNavGesture`). A host
+     * that does not know says false, and no page arms it.
+     */
+    val threeButtonNavigation: Boolean get() = false
+
+    /**
+     * Ione's items for the floating toolbar over `text` selected in a page (`Menus.selectionToolbar`
+     * in the core): `reply` gets the JSON text of `[{ id, title }]` in order, or null for none. A
+     * host without a core (a custom tab) has none; the system's toolbar stands as it is.
+     */
+    fun selectionMenu(tabId: String, text: String, reply: (String?) -> Unit) = reply(null)
+
+    /** A page scrolled under the bar that hides on scroll: `start`, `move`, `end` or `show` (see `lib/barHide.ts`). */
+    fun barScroll(tabId: String, phase: String, payload: JSONObject?) {}
+
+    /** A physical key the shortcut table matched (`tabId` null: typed into the chrome). */
+    fun onKey(tabId: String?, input: JSONObject)
+
+    fun enterFullscreen(tab: TabWebView, view: View, callback: WebChromeClient.CustomViewCallback)
+    fun exitFullscreen(tab: TabWebView)
+    /**
+     * The page's `fullscreenchange` ([PageMessageRoute.Fullscreen]): a fullscreen element is
+     * there or gone, whether it shows a video at all (`video`), and the natural size of the
+     * video it shows (0 × 0 for none known), from the main document (`mainFrame`) or from one
+     * of its frames, whose embed's video the main document cannot see into. A host that turns
+     * the screen with a landscape video reads it (MED-01), and tells the way out of an element
+     * without one (MED-03); the default leaves it.
+     */
+    fun fullscreenVideo(tab: TabWebView, active: Boolean, video: Boolean, videoWidth: Int, videoHeight: Int, mainFrame: Boolean) {}
+    /**
+     * The page view was laid out at a new size (device px). The browser's host tells the chrome
+     * once the frame at that size is drawn (`view.sized`), for the chrome's return from a
+     * fullscreen to fade in on the page's landing (MED-01); a host without a chrome has no one
+     * to tell.
+     */
+    fun viewSized(tab: TabWebView, widthPx: Int, heightPx: Int) {}
+    /** Leave the host's own fullscreen (a back while [immersive]); a host without one has nothing to do. */
+    fun leaveImmersive() {}
+    fun openExternal(url: String)
+
+    /** A page's history or fullscreen state changed: whoever handles back re-decides its target. */
+    fun backChanged()
+    fun onPageTransitionEnded(transition: PageBackTransition)
+}

@@ -1,0 +1,57 @@
+import type { ExtensionRecord } from '@core/extensions/registry'
+
+/**
+ * The seam between the extension store (`extensionHost.ts`: downloads, files, the registry,
+ * updates) and the emulation layer that runs extensions on Android (`extensions*.ts` and the
+ * Kotlin `ext/Extensions.kt`, owned by the runtime). The store keeps the registry and calls these
+ * after every change it persisted; the runtime reads what it needs from the record, above all
+ * `record.path`, the versioned directory (`files/zen/extensions/<id>/<version>/`) whose
+ * `manifest.json` it loads. Every call may reject; the store records the message as the
+ * extension's load error and carries on.
+ */
+export interface ExtensionRuntimeHooks {
+  /**
+   * Start running an extension: after an install, at startup for every enabled record, and when
+   * the user enables one. Called again with the new record after an update landed (the old
+   * version was detached first).
+   */
+  attach(record: ExtensionRecord): Promise<void>
+  /** Stop running an extension: it was disabled, removed, or is about to be replaced by an update. */
+  detach(id: string): Promise<void>
+  /**
+   * A record changed while the extension stays attached: `pinned`, `allowFileAccess`,
+   * `allowPrivate` or the manifest-derived fields after a reload. The runtime re-reads what it configures from them.
+   */
+  reconfigure(record: ExtensionRecord): Promise<void>
+  /**
+   * The extensions the store is about to attach: at construction the enabled records, before
+   * the browser restores its windows, so a restored tab on an extension page is held rather
+   * than answered with nothing while the attach is still reading files; `[]` once the start is
+   * over, so a page held for an extension that did not come up fails. Nothing to do for a host
+   * whose pages cannot ask ahead of the runtime.
+   */
+  expect?(ids: string[]): void
+  /**
+   * Chrome's `ShouldDelayExtensionUpdate` for a running extension the store downloaded an
+   * update for: with a persistent background page, true while the page listens for
+   * `runtime.onUpdateAvailable` (the extension applies the update itself with
+   * `runtime.reload()`); otherwise true while the extension is busy (a page of its own open,
+   * its worker or event page running). A delayed update is staged on the record and applied
+   * once this turns false (`RuntimeStoreLink.idle`), at `runtime.reload()`, when the user asks
+   * for it, or at the next start. Without the hook nothing delays: updates land at once.
+   */
+  delaysUpdate?(id: string): boolean
+  /**
+   * An update was staged: `runtime.onUpdateAvailable` with the new version's manifest (Chrome's
+   * `details`, `version` among them) to the extension's contexts, its background woken for it
+   * when it registered a listener.
+   */
+  updateAvailable?(id: string, details: Record<string, unknown>): void
+}
+
+/** Before the runtime lands (or on hosts that only manage packages): installs are files and records. */
+export const noRuntimeHooks: ExtensionRuntimeHooks = {
+  attach: async () => undefined,
+  detach: async () => undefined,
+  reconfigure: async () => undefined
+}

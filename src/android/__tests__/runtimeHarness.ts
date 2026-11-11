@@ -1,0 +1,929 @@
+import type {
+  Container,
+  ExtensionControl,
+  ExtensionInfo,
+  SearchEngine,
+  SearchEngineControl,
+  Space,
+  Tab,
+  TabSection,
+  TopSite
+} from '@shared/types'
+import { DEFAULT_FONT_SETTINGS, type PageFontSettings } from '@shared/fonts'
+import { DEFAULT_AUTOFILL_SETTINGS } from '@shared/defaults'
+import { DEFAULT_PRELOAD_PAGES, DEFAULT_PRIVACY_SETTINGS } from '@shared/privacy'
+import { RuleEngine } from '@core/blocking/engine'
+import { moveTab as moveTabInModel, type Model } from '@core/model'
+import type { Browser } from '@core/browser'
+import type { SpeechHost, SpeechHostEvent, SpeechUtteranceOptions, StoreIO } from '@core/platform'
+import type { ReadAloudVoice } from '@shared/readAloud'
+import type { ZenWindow } from '@core/window'
+import { newRecord, type ExtensionRecord } from '@core/extensions/registry'
+import {
+  AndroidExtensionRuntime,
+  type ConfigureStats,
+  type RuntimeBridge
+} from '../extensionRuntime'
+
+// ---------------------------------------------------------------------------
+// A Kotlin side in memory: what ext/Extensions.kt answers, minus the WebViews
+// ---------------------------------------------------------------------------
+
+export interface Sent {
+  ep: string
+  message: Record<string, unknown>
+}
+
+/** One `identity.launchWebAuthFlow` sheet as the fake Kotlin holds it. */
+export interface FakeAuthSheet {
+  id: string
+  url: string
+  title: string
+  shown: boolean
+  closed: boolean
+}
+
+export class FakeKotlin implements RuntimeBridge {
+  isolatedWorlds = true
+  worldSlots = 16
+  /** The fake WebView has the navigation listener (`navigation` view events carry webNavigation). */
+  navigationListener = false
+  readonly calls: Array<{ method: string; args: Record<string, unknown> }> = []
+  /** The methods that came one way (`post`), in order; `calls` has them too. */
+  readonly posted: string[] = []
+  /** The messages that came over the reply hop (`deliver`), when the fake has one: `[ep, at]` each; `sent` has them too. */
+  readonly hopped: Array<{ ep: string; at: unknown }> = []
+  /** Set by `harness({ hop: true })`: the reply hop, taking every `ext.send` before `post`; absent as the real bridge's is without `__zenExtHop`. */
+  deliver?: (ep: string, message: string, at?: [number, number]) => boolean
+  /** Every message the runtime sent to an endpoint, decoded. */
+  readonly sent: Sent[] = []
+  readonly manifests = new Map<string, Record<string, unknown>>()
+  /** The manifest's text as the file holds it, when a test wants it other than the JSON of `manifests`. */
+  readonly manifestTexts = new Map<string, string>()
+  /** `_locales/<locale>/messages.json` texts per install path, as `ext.open` hands them over. */
+  readonly locales = new Map<string, Record<string, string>>()
+  readonly files = new Map<string, string>()
+  /**
+   * File sizes `ext.fileSizes` answers, by `<id>/<path>`, over a file's text in `files` when
+   * unset; a path in neither is left out of the answer (Kotlin sizes what is there). `null`
+   * makes the call fail, as a host without it would.
+   */
+  fileBytes: Map<string, number> | null = new Map()
+  /** Background pages Kotlin holds right now, by extension id. */
+  readonly backgrounds = new Set<string>()
+  /** The engine snapshot's build count `blocking.stats` answers; null for a host without the call. */
+  blockingBuilds: number | null = null
+  /** When set, `ext.exec` is rejected with the message it returns for the given arguments. */
+  failExec: ((args: Record<string, unknown>) => string | null) | null = null
+  /** When set, what `ext.exec` answers (the script's value) for the given arguments. */
+  execAnswer: ((args: Record<string, unknown>) => unknown) | null = null
+  /** What the fake platform's classifier answers `ext.i18n.detectLanguage` (Kotlin's shape). */
+  languageAnswer: (text: string) => unknown = () => ({ isReliable: false, languages: [] })
+  /** What the fake phone answers `ext.system.cpu` (Kotlin's reading: `Runtime`, `/proc` where readable). */
+  cpuAnswer: () => unknown = () => ({
+    numOfProcessors: 4,
+    archName: 'aarch64',
+    modelName: 'Qualcomm Technologies, Inc SM8550',
+    features: [],
+    usage: null
+  })
+  /** What the fake phone answers `ext.system.memory` (`ActivityManager.MemoryInfo`, bytes). */
+  memoryAnswer: () => unknown = () => ({
+    capacity: 8 * 1024 ** 3,
+    availableCapacity: 3 * 1024 ** 3
+  })
+  /** The keep-awake requests the fake window holds (`ext.power.keepAwake`): extension id → level. */
+  readonly keepAwake = new Map<string, string>()
+  /** The offscreen documents Kotlin holds right now (`ext.offscreen.*`): extension id → page URL. */
+  readonly offscreens = new Map<string, string>()
+  /** The cookie jars (`ext.cookies.*`), one per container, see `FakeJar`. */
+  readonly jars = new Map<string, FakeJar>()
+  /** Whether the fake WebView lists cookies with attributes (`GET_COOKIE_INFO`). */
+  detailedCookies = true
+  /** Whether the fake app may post notifications (`ext.notifications.allowed`). */
+  notificationsAllowed = true
+  /** The proxy override the fake WebView holds (`ext.proxy.set` / `clear`), null for the system's settings. */
+  proxyOverride: Record<string, unknown> | null = null
+  /** The optional host patterns Kotlin's CORS proxy was last told per extension (`ext.hosts`). */
+  readonly hosts = new Map<string, string[]>()
+  /** When set, the message the fake WebView refuses an override with. */
+  failProxy: string | null = null
+  /** The font layer the fake WebViews hold (`ext.fonts.apply`, the whole payload); undefined while none was ever applied. */
+  fontLayer: Record<string, unknown> | undefined = undefined
+  /** How often a layer was applied. */
+  fontApplies = 0
+  /** The privacy layer the fake WebViews hold (`ext.privacy.apply`, the whole payload); undefined while none was ever applied. */
+  privacyLayer: Record<string, unknown> | undefined = undefined
+  /** How often a privacy layer was applied. */
+  privacyApplies = 0
+  /** The fake phone's font configuration (`ext.fonts.list`): `fonts.xml`'s named families with their files' own names. */
+  fontNames: Array<{ id: string; name: string }> = [
+    { id: 'sans-serif', name: 'Roboto' },
+    { id: 'serif', name: 'Noto Serif' },
+    { id: 'monospace', name: 'Droid Sans Mono' },
+    { id: 'casual', name: 'Coming Soon' },
+    { id: 'cursive', name: 'Dancing Script' }
+  ]
+  /** The notifications Kotlin shows right now: `<extension id>/<notification id>` → what it was given. */
+  readonly notifications = new Map<string, Record<string, unknown>>()
+  /** The auth sheets Kotlin holds (`ext.auth.*`), by view id; `closed` ones stay for inspection. */
+  readonly authSheets = new Map<number, FakeAuthSheet>()
+  /** What `view.capture` answers: the encoded pixels, or null for a view that cannot be copied. */
+  capture: ((args: Record<string, unknown>) => Record<string, unknown> | null) | null = (args) => ({
+    data: 'AAAA',
+    mimeType: `image/${String(args.format)}`,
+    width: 2,
+    height: 2
+  })
+
+  jar(container = 'default'): FakeJar {
+    let jar = this.jars.get(container)
+    if (!jar) {
+      jar = new FakeJar()
+      this.jars.set(container, jar)
+    }
+    return jar
+  }
+
+  /**
+   * While set, `ext.configure` is answered only once this settles: a compile taking its time
+   * on Kotlin's io thread, for tests of what the runtime does with the calls that arrive
+   * meanwhile. The call is recorded when it is answered.
+   */
+  configureGate: Promise<void> | null = null
+
+  call<T = void>(method: string, args?: unknown): Promise<T> {
+    if (method === 'ext.exec' && this.failExec) {
+      const rejection = this.failExec((args ?? {}) as Record<string, unknown>)
+      if (rejection !== null) return Promise.reject(new Error(rejection))
+    }
+    if (method === 'ext.configure' && this.configureGate) {
+      return this.configureGate.then(
+        () => this.dispatch(method, (args ?? {}) as Record<string, unknown>) as T
+      )
+    }
+    const result = this.dispatch(method, (args ?? {}) as Record<string, unknown>) as T
+    return Promise.resolve(result)
+  }
+
+  send(method: string, args?: unknown): void {
+    this.dispatch(method, (args ?? {}) as Record<string, unknown>)
+  }
+
+  /** One way, as the real bridge's: dispatched, nothing answered. */
+  post(method: string, args?: unknown): void {
+    this.posted.push(method)
+    this.dispatch(method, (args ?? {}) as Record<string, unknown>)
+  }
+
+  calledWith(method: string): Record<string, unknown>[] {
+    return this.calls.filter((c) => c.method === method).map((c) => c.args)
+  }
+
+  /** Replies and events the runtime sent to one endpoint. */
+  to(ep: string): Record<string, unknown>[] {
+    return this.sent.filter((s) => s.ep === ep).map((s) => s.message)
+  }
+
+  private dispatch(method: string, args: Record<string, unknown>): unknown {
+    this.calls.push({ method, args })
+    switch (method) {
+      case 'ext.env':
+        return {
+          token: 'tok',
+          uiLanguage: 'en-US',
+          isolatedWorlds: this.isolatedWorlds,
+          worldSlots: this.isolatedWorlds ? this.worldSlots : 0,
+          navigationListener: this.navigationListener
+        }
+      case 'ext.open': {
+        const manifest = this.manifests.get(String(args.path))
+        if (!manifest) throw new Error(`no manifest under ${args.path}`)
+        return {
+          manifest: this.manifestTexts.get(String(args.path)) ?? JSON.stringify(manifest),
+          locales: this.locales.get(String(args.path)) ?? {}
+        }
+      }
+      case 'ext.configure': {
+        const units = args.units as Array<{ key: string }>
+        const stats: ConfigureStats = {
+          units: units.map((u) => ({ key: u.key, chars: 100, cached: false })),
+          ms: 1
+        }
+        return stats
+      }
+      case 'ext.detach':
+        this.backgrounds.delete(String(args.id))
+        this.offscreens.delete(String(args.id))
+        // Kotlin's `detachExtension` lets the extension's keep-awake request go with it.
+        this.keepAwake.delete(String(args.id))
+        return undefined
+      case 'ext.expect':
+        return undefined
+      case 'ext.background.start':
+        this.backgrounds.add(String(args.id))
+        return undefined
+      case 'ext.background.stop':
+        this.backgrounds.delete(String(args.id))
+        return undefined
+      case 'ext.send':
+        this.sent.push({
+          ep: String(args.ep),
+          message: JSON.parse(String(args.message)) as Record<string, unknown>
+        })
+        return undefined
+      case 'ext.readFile':
+        return this.files.get(`${args.id}/${args.path}`) ?? null
+      case 'ext.fileSizes': {
+        if (!this.fileBytes) throw new Error('Unknown method ext.fileSizes')
+        const sizes: Record<string, number> = {}
+        for (const path of args.files as string[]) {
+          const key = `${args.id}/${path}`
+          const bytes = this.fileBytes.get(key) ?? this.files.get(key)?.length
+          if (bytes !== undefined) sizes[path] = bytes
+        }
+        return { sizes }
+      }
+      case 'ext.i18n.detectLanguage':
+        return this.languageAnswer(String(args.text))
+      case 'ext.system.cpu':
+        return this.cpuAnswer()
+      case 'ext.system.memory':
+        return this.memoryAnswer()
+      case 'ext.power.keepAwake': {
+        const id = String(args.id)
+        if (args.level === null || args.level === undefined) this.keepAwake.delete(id)
+        else this.keepAwake.set(id, String(args.level))
+        return undefined
+      }
+      case 'ext.observeRequests':
+      case 'ext.observeRequestHeaders':
+      case 'ext.observeResponses':
+      case 'ext.popup.open':
+      case 'ext.popup.close':
+      case 'ext.contextMenuEvent':
+        return undefined
+      case 'ext.offscreen.open':
+        this.offscreens.set(String(args.id), String(args.url))
+        return undefined
+      case 'ext.offscreen.close':
+        this.offscreens.delete(String(args.id))
+        return undefined
+      case 'ext.auth.open':
+        this.authSheets.set(Number(args.viewId), {
+          id: String(args.id),
+          url: String(args.url),
+          title: String(args.title),
+          shown: false,
+          closed: false
+        })
+        return undefined
+      case 'ext.auth.show': {
+        const sheet = this.authSheets.get(Number(args.viewId))
+        if (sheet && !sheet.closed) sheet.shown = true
+        return undefined
+      }
+      case 'ext.auth.close': {
+        const sheet = this.authSheets.get(Number(args.viewId))
+        if (sheet) sheet.closed = true
+        return undefined
+      }
+      case 'ext.cookies.read': {
+        const jar = this.jar(String(args.container))
+        return {
+          cookies: this.detailedCookies
+            ? jar.setCookieLines(String(args.url))
+            : jar.pairs(String(args.url)),
+          detailed: this.detailedCookies
+        }
+      }
+      case 'ext.cookies.write':
+        return this.jar(String(args.container)).set(String(args.url), String(args.cookie))
+      case 'ext.exec':
+        return this.execAnswer ? this.execAnswer(args) : { ran: true }
+      case 'view.capture':
+        return this.capture ? this.capture(args) : null
+      case 'ext.notifications.show': {
+        const notification = args.notification as Record<string, unknown>
+        this.notifications.set(`${args.id}/${notification.notificationId}`, notification)
+        return undefined
+      }
+      case 'ext.notifications.hide':
+        this.notifications.delete(`${args.id}/${args.notificationId}`)
+        return undefined
+      case 'ext.notifications.forget':
+        for (const key of [...this.notifications.keys()])
+          if (key.startsWith(`${args.id}/`)) this.notifications.delete(key)
+        return undefined
+      case 'ext.proxy.set':
+        if (this.failProxy !== null) throw new Error(this.failProxy)
+        this.proxyOverride = args
+        return null
+      case 'ext.proxy.clear':
+        this.proxyOverride = null
+        return null
+      case 'ext.notifications.allowed':
+        return this.notificationsAllowed
+      case 'ext.fonts.apply':
+        this.fontLayer = args
+        this.fontApplies++
+        return null
+      case 'ext.fonts.list':
+        return this.fontNames.map((entry) => ({ ...entry }))
+      case 'ext.privacy.apply':
+        this.privacyLayer = args
+        this.privacyApplies++
+        return null
+      case 'ext.hosts':
+        this.hosts.set(String(args.id), (args.hosts as string[]) ?? [])
+        return undefined
+      case 'blocking.stats':
+        if (this.blockingBuilds === null) throw new Error(`no such bridge method ${method}`)
+        return {
+          sets: 1,
+          filters: 0,
+          rules: 1,
+          builds: this.blockingBuilds,
+          lastBuildMs: 1,
+          indexChars: 100
+        }
+      default:
+        throw new Error(`no such bridge method ${method}`)
+    }
+  }
+}
+
+/** A stored cookie of the fake jar (what the WebView remembers about one). */
+export interface FakeCookie {
+  name: string
+  value: string
+  /** With a leading dot: a domain cookie; without: host-only. */
+  domain: string
+  path: string
+  secure: boolean
+  httpOnly: boolean
+  expires: number | null
+  sameSite: string | null
+}
+
+/**
+ * A cookie jar with `CookieManager`'s two readings: `getCookie`'s `name=value` pairs and
+ * `getCookieInfo`'s `Set-Cookie` lines, both filtered by URL the way the WebView filters them
+ * (host match, path prefix, `Secure` over https only). `set` parses a `Set-Cookie` line; an
+ * expired one deletes.
+ */
+export class FakeJar {
+  readonly cookies: FakeCookie[] = []
+
+  set(url: string, line: string): boolean {
+    const u = new URL(url)
+    const host = u.hostname.toLowerCase()
+    const parts = line.split(';').map((p) => p.trim())
+    const first = parts.shift() ?? ''
+    const eq = first.indexOf('=')
+    const cookie: FakeCookie = {
+      name: eq === -1 ? '' : first.slice(0, eq),
+      value: eq === -1 ? first : first.slice(eq + 1),
+      domain: host,
+      path: defaultPathOf(u.pathname),
+      secure: false,
+      httpOnly: false,
+      expires: null,
+      sameSite: null
+    }
+    for (const part of parts) {
+      const at = part.indexOf('=')
+      const key = (at === -1 ? part : part.slice(0, at)).toLowerCase()
+      const value = at === -1 ? '' : part.slice(at + 1)
+      if (key === 'domain' && value) {
+        const domain = value.replace(/^\./, '').toLowerCase()
+        if (host !== domain && !host.endsWith(`.${domain}`)) return false
+        cookie.domain = `.${domain}`
+      } else if (key === 'path' && value.startsWith('/')) cookie.path = value
+      else if (key === 'secure') cookie.secure = true
+      else if (key === 'httponly') cookie.httpOnly = true
+      else if (key === 'expires') cookie.expires = Date.parse(value)
+      else if (key === 'max-age') cookie.expires = Date.now() + Number(value) * 1000
+      else if (key === 'samesite') cookie.sameSite = value
+    }
+    if (cookie.secure && u.protocol !== 'https:') return false
+    const index = this.cookies.findIndex(
+      (c) => c.name === cookie.name && c.domain === cookie.domain && c.path === cookie.path
+    )
+    if (index >= 0) this.cookies.splice(index, 1)
+    if (cookie.expires !== null && cookie.expires <= Date.now()) return true
+    this.cookies.push(cookie)
+    return true
+  }
+
+  matching(url: string): FakeCookie[] {
+    const u = new URL(url)
+    const host = u.hostname.toLowerCase()
+    const path = u.pathname || '/'
+    return this.cookies.filter((c) => {
+      const hostOk = c.domain.startsWith('.')
+        ? host === c.domain.slice(1) || host.endsWith(c.domain)
+        : host === c.domain
+      if (!hostOk) return false
+      if (c.secure && u.protocol !== 'https:') return false
+      return path === c.path || path.startsWith(c.path.endsWith('/') ? c.path : `${c.path}/`)
+    })
+  }
+
+  pairs(url: string): string[] {
+    return this.matching(url).map((c) => `${c.name}=${c.value}`)
+  }
+
+  setCookieLines(url: string): string[] {
+    return this.matching(url).map((c) => {
+      const parts = [`${c.name}=${c.value}`]
+      if (c.domain.startsWith('.')) parts.push(`Domain=${c.domain}`)
+      parts.push(`Path=${c.path}`)
+      if (c.expires !== null) parts.push(`Expires=${new Date(c.expires).toUTCString()}`)
+      if (c.secure) parts.push('Secure')
+      if (c.httpOnly) parts.push('HttpOnly')
+      if (c.sameSite) parts.push(`SameSite=${c.sameSite}`)
+      return parts.join('; ')
+    })
+  }
+}
+
+function defaultPathOf(pathname: string): string {
+  const last = pathname.lastIndexOf('/')
+  return last <= 0 ? '/' : pathname.slice(0, last)
+}
+
+// ---------------------------------------------------------------------------
+// A browser core in miniature: tabs, the state subscription, the one window
+// ---------------------------------------------------------------------------
+
+/**
+ * The device's speech engine as the platform presents it (`Platform.speech`, Kotlin's
+ * `ReadAloud.kt` in memory): what was spoken and stopped, and the events a test fires back.
+ */
+export class FakeSpeech implements SpeechHost {
+  readonly spoken: Array<{ utteranceId: string; text: string; options: SpeechUtteranceOptions }> =
+    []
+  stops = 0
+  voiceList: ReadAloudVoice[] = [
+    { id: 'en-us-x-tpf-local', name: 'English (United States)', lang: 'en-US', local: true },
+    { id: 'de-de-x-nfh-network', name: 'German (Germany)', lang: 'de-DE', local: false }
+  ]
+  private readonly listeners: Array<(utteranceId: string, event: SpeechHostEvent) => void> = []
+  private readonly voicesListeners: Array<() => void> = []
+
+  async voices(): Promise<ReadAloudVoice[]> {
+    return this.voiceList
+  }
+
+  onVoicesChanged(listener: () => void): void {
+    this.voicesListeners.push(listener)
+  }
+
+  speak(utteranceId: string, text: string, options: SpeechUtteranceOptions): void {
+    // As Kotlin's flush: the utterance the engine had is reported interrupted, after the new one is in.
+    const had = this.current
+    this.current = utteranceId
+    this.spoken.push({ utteranceId, text, options })
+    if (had !== null && had !== utteranceId)
+      this.fire(had, { type: 'error', message: 'interrupted' })
+  }
+
+  stop(): void {
+    this.stops += 1
+    const had = this.current
+    this.current = null
+    if (had !== null) this.fire(had, { type: 'error', message: 'interrupted' })
+  }
+
+  onEvent(listener: (utteranceId: string, event: SpeechHostEvent) => void): void {
+    this.listeners.push(listener)
+  }
+
+  /** The utterance the engine has (null once it ended, errored or was stopped). */
+  current: string | null = null
+
+  /** The engine reports on an utterance (`speech.event`). */
+  fire(utteranceId: string, event: SpeechHostEvent): void {
+    if (event.type === 'end' || event.type === 'error') {
+      if (this.current === utteranceId) this.current = null
+    }
+    for (const listener of [...this.listeners]) listener(utteranceId, event)
+  }
+
+  voicesChanged(): void {
+    for (const listener of [...this.voicesListeners]) listener()
+  }
+
+  /** The last utterance handed to the engine. */
+  last(): { utteranceId: string; text: string; options: SpeechUtteranceOptions } | undefined {
+    return this.spoken[this.spoken.length - 1]
+  }
+}
+
+export interface Harness {
+  kt: FakeKotlin
+  runtime: AndroidExtensionRuntime
+  /** The speech engine behind `chrome.tts` and read aloud; absent (a device without one) when the harness was asked so. */
+  speech: FakeSpeech | undefined
+  /** Read aloud's player as `chrome.tts` sees it: whether it plays, and how often it was paused for an extension. */
+  readAloud: { status: 'idle' | 'playing' | 'paused'; pauses: number }
+  files: Map<string, string>
+  tabs: Record<string, Tab>
+  /** The model's spaces (`tabs.move` orders a space's `tabIds`); none until a test adds one. */
+  spaces: Space[]
+  active: { id: string | null }
+  /** The core's request-blocking engine the declarativeNetRequest sink feeds (`browser.blocking.engine`). */
+  engine: RuleEngine
+  /** How often the runtime flushed the blocking store's index (`browser.blocking.store.whenSettled`). */
+  blockingFlushes: { count: number }
+  /** The user's containers in the model (`state.model.containers`); private is not one. */
+  containers: Container[]
+  /** Every `tabs.createTab` the runtime made, in order: the new tab's id and whether it was activated. */
+  created: Array<{ id: string; active: boolean }>
+  clock: { now: number }
+  timers: Array<{ fn: () => void; ms: number; at: number; cleared: boolean }>
+  /** Run every timer due at or before `clock.now`. */
+  tick: (ms: number) => void
+  notifyState: () => void
+  toasts: string[]
+  /** What `browser.extensions.list()` answers (the store's view: icons for the menus). */
+  infos: ExtensionInfo[]
+  /**
+   * The PDF viewer's documents (`browser.pdf.documentUrl`): a viewer tab's address
+   * (`zen://pdf?id=…`) → the URL of the PDF it shows, which the tab reads as to extensions.
+   */
+  pdfDocuments: Map<string, string>
+  /** The browser's most visited sites (`browser.history.topSites`, the new tab page's ranking), mutable: what `chrome.topSites.get` lists. */
+  topSites: TopSite[]
+  /** Turn the phone's screen to `angle` degrees (0, 90, 180, 270): `system.display.onDisplayChanged`. */
+  turnScreen: (angle: number) => void
+  /**
+   * What the runtime told the search model (`state.setExtensionSearch`), every call in order:
+   * the attached extensions' engines and the control of the default.
+   */
+  search: Array<{ engines: SearchEngine[]; control: SearchEngineControl | null }>
+  /** The user's page fonts (`state.settings.fonts`), mutable: a test changes a row and calls `notifyState`. */
+  fonts: PageFontSettings
+  /** The user's password setting (`state.settings.passwords`): the browser's value of `services.passwordSavingEnabled`. */
+  passwords: { offerToSave: boolean }
+  /** Every map the runtime published to `state.setExtensionControls`, in order (the whole map each time). */
+  controls: Array<Record<string, ExtensionControl>>
+  /** Write the debounced JSON documents out now and parse one of them. */
+  saved: (name: string) => Record<string, unknown>
+}
+
+export function makeTab(id: string, url: string, containerId = 'default'): Tab {
+  return {
+    id,
+    url,
+    title: url,
+    loading: false,
+    containerId
+  } as unknown as Tab
+}
+
+export function harness(
+  options: {
+    isolatedWorlds?: boolean
+    worldSlots?: number
+    files?: Map<string, string>
+    navigationListener?: boolean
+    /** A device without a speech engine: `Platform.speech` is left out. */
+    speech?: boolean
+    /** The runtime's `debug` (its default on): off, no reply carries the host trace's stamps. */
+    debug?: boolean
+    /** A host with the reply hop (`__zenExtHop`): `deliver` takes every message to an endpoint; `hopped` records them. */
+    hop?: boolean
+  } = {}
+): Harness {
+  const kt = new FakeKotlin()
+  if (options.hop) {
+    kt.deliver = (ep, message, at) => {
+      kt.hopped.push({ ep, at })
+      kt.sent.push({ ep, message: JSON.parse(message) as Record<string, unknown> })
+      return true
+    }
+  }
+  const speech = options.speech === false ? undefined : new FakeSpeech()
+  const readAloud: Harness['readAloud'] = { status: 'idle', pauses: 0 }
+  kt.isolatedWorlds = options.isolatedWorlds ?? true
+  kt.worldSlots = options.worldSlots ?? 16
+  kt.navigationListener = options.navigationListener ?? false
+  const files = options.files ?? new Map<string, string>()
+  const io: StoreIO = {
+    readSync: (name) => files.get(name) ?? null,
+    write: async (name, text) => {
+      files.set(name, text)
+    },
+    writeSync: (name, text) => {
+      files.set(name, text)
+    },
+    remove: async (name) => {
+      files.delete(name)
+    }
+  }
+  const tabs: Record<string, Tab> = { t1: makeTab('t1', 'https://example.com/') }
+  // The model's ordered lists, for `tabs.move`: a test that orders tabs puts a space here and
+  // names it in its tabs' `spaceId`; the real model's move runs over it.
+  const spaces: Space[] = []
+  const model = { tabs, spaces, essentialTabIds: [] as string[], localSpaces: {} }
+  const active = { id: 't1' as string | null }
+  const created: Harness['created'] = []
+  const listeners: Array<() => void> = []
+  const toasts: string[] = []
+  const infos: ExtensionInfo[] = []
+  const engine = new RuleEngine()
+  const containers: Container[] = []
+  const notifyState = (): void => listeners.forEach((fn) => fn())
+  const win = {
+    isPrivate: false,
+    host: {
+      contentSize: () => ({ width: 411, height: 800 }),
+      isFocused: () => true,
+      isFullScreen: () => false
+    }
+  } as unknown as ZenWindow
+  const pdfDocuments = new Map<string, string>()
+  const topSites: TopSite[] = []
+  const search: Harness['search'] = []
+  const fonts: PageFontSettings = { ...DEFAULT_FONT_SETTINGS }
+  const passwords = { offerToSave: true }
+  // The rest of what `chrome.privacy` reads the browser's own values from (`PrivacyUserSettings`), at the defaults.
+  const settings = {
+    fonts,
+    passwords,
+    autofill: { ...DEFAULT_AUTOFILL_SETTINGS },
+    privacy: structuredClone(DEFAULT_PRIVACY_SETTINGS),
+    searchSuggestions: true,
+    preloadPages: DEFAULT_PRELOAD_PAGES
+  }
+  const controls: Harness['controls'] = []
+  const browser = {
+    platform: { io, speech },
+    readAloud: {
+      uiState: () => (readAloud.status === 'idle' ? null : { status: readAloud.status }),
+      pause: () => {
+        if (readAloud.status !== 'playing') return
+        readAloud.status = 'paused'
+        readAloud.pauses += 1
+      }
+    },
+    state: {
+      model: { containers },
+      settings,
+      subscribe: (fn: () => void) => {
+        listeners.push(fn)
+        return () => undefined
+      },
+      commitVolatile: () => undefined,
+      setExtensionSearch: (engines: SearchEngine[], control: SearchEngineControl | null) => {
+        search.push({ engines, control })
+      },
+      setExtensionControls: (map: Record<string, ExtensionControl>) => {
+        controls.push(map)
+      }
+    },
+    toast: (message: string) => {
+      toasts.push(message)
+    },
+    extensions: { list: () => infos },
+    pdf: { documentUrl: (url: string) => pdfDocuments.get(url) ?? null },
+    history: { topSites: (n: number) => topSites.slice(0, Math.max(0, n)) },
+    tabs: {
+      tab: (id: string) => tabs[id],
+      activeTabFor: () => (active.id ? tabs[active.id] : undefined),
+      model,
+      isPrivate: (tab: Tab) => tab.containerId === 'private',
+      moveTab: (tabId: string, target: { section: TabSection; index: number }) => {
+        const tab = tabs[tabId]
+        if (tab) moveTabInModel(model as unknown as Model, tab, target, 12)
+        notifyState()
+      },
+      createTab: (opts: { url: string; active?: boolean }) => {
+        const id = `t${created.length + 2}`
+        tabs[id] = makeTab(id, opts.url)
+        const activate = opts.active !== false
+        if (activate) active.id = id
+        created.push({ id, active: activate })
+        notifyState()
+        return tabs[id]
+      },
+      activateTab: (id: string) => {
+        active.id = id
+        notifyState()
+      },
+      closeTab: (id: string) => {
+        delete tabs[id]
+        if (active.id === id) active.id = 't1'
+        notifyState()
+      }
+    }
+  } as unknown as Browser
+  const clock = { now: 1_700_000_000_000 }
+  const timers: Harness['timers'] = []
+  // A 412x915 CSS px phone at 2.625x (a Pixel's), upright; `turnScreen` rotates it.
+  const screen = {
+    width: 412,
+    height: 915,
+    availWidth: 412,
+    availHeight: 915,
+    scaleFactor: 2.625,
+    angle: 0
+  }
+  const screenListeners: Array<() => void> = []
+  const runtime = new AndroidExtensionRuntime(kt, browser, () => win, {
+    idleMs: 30_000,
+    debug: options.debug,
+    now: () => clock.now,
+    screen: () => ({ ...screen }),
+    onScreenChange: (listener) => {
+      screenListeners.push(listener)
+    },
+    setTimeout: (fn, ms) => {
+      timers.push({ fn, ms, at: clock.now + ms, cleared: false })
+      return timers.length - 1
+    },
+    clearTimeout: (handle) => {
+      const timer = timers[handle as number]
+      if (timer) timer.cleared = true
+    }
+  })
+  // As in the Browser constructor: `createExtensions` (this runtime) runs before the blocking
+  // service exists, so the engine is attached afterwards and must be read lazily. The store's
+  // settle (the index flushed to disk) is counted: a rule update's answer asks for it.
+  const blockingFlushes = { count: 0 }
+  ;(
+    browser as unknown as {
+      blocking: {
+        engine: RuleEngine
+        store: { whenSettled: () => Promise<void> }
+        reconcileOwners: () => string[]
+      }
+    }
+  ).blocking = {
+    engine,
+    store: {
+      whenSettled: async () => {
+        blockingFlushes.count++
+      }
+    },
+    // `runtime.start()` asks the service to drop stale dNR sets; the fake has none to drop.
+    reconcileOwners: () => []
+  }
+  const tick = (ms: number): void => {
+    clock.now += ms
+    for (;;) {
+      const due = timers
+        .filter((t) => !t.cleared && t.at <= clock.now)
+        .sort((a, b) => a.at - b.at)[0]
+      if (!due) return
+      due.cleared = true
+      due.fn()
+    }
+  }
+  return {
+    kt,
+    runtime,
+    speech,
+    readAloud,
+    files,
+    tabs,
+    spaces,
+    active,
+    engine,
+    blockingFlushes,
+    containers,
+    created,
+    clock,
+    timers,
+    tick,
+    notifyState,
+    toasts,
+    infos,
+    pdfDocuments,
+    topSites,
+    search,
+    fonts,
+    passwords,
+    controls,
+    turnScreen: (angle) => {
+      screen.angle = angle
+      const landscape = angle === 90 || angle === 270
+      screen.width = screen.availWidth = landscape ? 915 : 412
+      screen.height = screen.availHeight = landscape ? 412 : 915
+      for (const listener of screenListeners) listener()
+    },
+    saved: (name) => {
+      runtime.flushSync()
+      return JSON.parse(files.get(name) ?? '{}') as Record<string, unknown>
+    }
+  }
+}
+
+export const ID = 'abcdefghijklmnopabcdefghijklmnop'
+export const ID2 = 'ponmlkjihgfedcbaponmlkjihgfedcba'
+export const PATH = `/data/user/0/app.zen.chromium/files/zen/extensions/${ID}/1.0.0`
+
+export function manifest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    manifest_version: 3,
+    name: 'Runtime test',
+    version: '1.0.0',
+    permissions: ['storage', 'alarms', 'scripting', 'tabs'],
+    host_permissions: ['https://example.com/*'],
+    background: { service_worker: 'bg.js' },
+    content_scripts: [
+      { matches: ['https://example.com/*'], js: ['cs.js'], run_at: 'document_start' }
+    ],
+    action: { default_popup: 'popup.html' },
+    ...overrides
+  }
+}
+
+export function record(
+  h: Harness,
+  overrides: Partial<ExtensionRecord> = {},
+  m = manifest()
+): ExtensionRecord {
+  h.kt.manifests.set(overrides.path ?? PATH, m)
+  return {
+    ...newRecord({ id: ID, source: 'crx', path: PATH, manifest: m, now: h.clock.now }),
+    ...overrides
+  }
+}
+
+/** A frame or page says hello and becomes an endpoint. */
+export function hello(
+  h: Harness,
+  ep: string,
+  ctx: 'content' | 'background' | 'popup' | 'options' | 'sidePanel' | 'offscreen' | 'page',
+  extra: { tabId?: string | null; top?: boolean; url?: string } = {}
+): void {
+  const url =
+    extra.url ??
+    (ctx === 'content' ? 'https://example.com/' : `https://${ID}.ext.ione.invalid/bg.html`)
+  h.runtime.onMessage({
+    ep,
+    tabId: extra.tabId ?? (ctx === 'content' ? 't1' : null),
+    top: extra.top ?? true,
+    origin: new URL(url).origin,
+    message: { t: 'hello', ext: ID, ctx, url, world: ctx === 'content' }
+  })
+}
+
+export function message(h: Harness, ep: string, message: Record<string, unknown>): void {
+  h.runtime.onMessage({ ep, tabId: null, top: true, origin: '', message })
+}
+
+/** Let the runtime's pending promises run until `ready` holds (a bounded number of ticks). */
+export async function until(ready: () => boolean): Promise<void> {
+  for (let i = 0; i < 50; i++) {
+    if (ready()) return
+    await Promise.resolve()
+  }
+  throw new Error('the runtime did not get there')
+}
+
+let callSeq = 0
+
+/** The next `call` id; for tests that send a call and read its reply later. */
+export function nextCallId(): number {
+  return ++callSeq
+}
+
+/** A `chrome.<ns>.<method>(...args)` call from an endpoint; resolves with the reply. */
+export async function call(
+  h: Harness,
+  ep: string,
+  ns: string,
+  method: string,
+  args: unknown[]
+): Promise<Record<string, unknown>> {
+  const id = nextCallId()
+  message(h, ep, { t: 'call', id, ns, method, args })
+  for (let i = 0; i < 20; i++) {
+    await Promise.resolve()
+    const reply = h.kt.to(ep).find((m) => m.t === 'reply' && m.id === id)
+    if (reply) return reply
+  }
+  throw new Error(`no reply to ${ns}.${method}`)
+}
+
+export function events(h: Harness, ep: string, key: string): Record<string, unknown>[] {
+  // The event name follows the last dot: `storage.local.onChanged` is `onChanged` of the
+  // `storage.local` namespace, as the shim spells an area's own event.
+  const dot = key.lastIndexOf('.')
+  const ns = key.slice(0, dot)
+  const name = key.slice(dot + 1)
+  return h.kt.to(ep).filter((m) => m.t === 'event' && m.ns === ns && m.name === name)
+}
+
+/** The background comes up: hello, listeners, ready. */
+export function backgroundUp(h: Harness, ep: string, listeners: string[] = []): void {
+  hello(h, ep, 'background')
+  for (const event of listeners) message(h, ep, { t: 'listen', event, on: true })
+  message(h, ep, { t: 'ready' })
+}
+
+// ---------------------------------------------------------------------------

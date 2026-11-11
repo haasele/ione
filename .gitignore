@@ -1,14 +1,32 @@
+# Dependencies
 node_modules/
+backend/node_modules/
+
+# Build output
 out/
 dist/
-coverage/
-.vite/
+build/out/
+android/.gradle/
+android/app/build/
+android/build/
+backend/.convex/
+*.tsbuildinfo
+
+# Tool caches and logs
+.eslintcache
+.cache/
 *.log
-*.local
+npm-debug.log*
+yarn-error.log*
+
+# Local environment
+.env
+.env.*
+!.env.example
+android/local.properties
+
+# OS and editors
 .DS_Store
-*.sqlite
-*.sqlite-shm
-*.sqlite-wal
-test-results/
-playwright-report/
-blob-report/
+Thumbs.db
+.idea/
+.vscode/

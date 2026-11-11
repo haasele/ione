@@ -1,0 +1,6518 @@
+import type { ReactNode } from 'react'
+import { Check, CircleAlert, CreditCard, Fingerprint, MapPin } from 'lucide-react'
+import type { InternalPageSection } from '@shared/internalPages'
+import type {
+  AgentSkillStatus,
+  AppLinkState,
+  BookmarksBarMode,
+  ColorScheme,
+  ContainerColor,
+  ContainerIcon as ContainerIconName,
+  CrashRestoreMode,
+  DesktopSiteDefault,
+  DownloadSettings,
+  EnergySaverMode,
+  FormFactor,
+  GlanceTrigger,
+  GovernorActionKind,
+  GpuMode,
+  HomepageMode,
+  ImportSource,
+  InactiveTabsArchiveDays,
+  NewTabBackgroundKind,
+  NewTabPosition,
+  NewTabPreset,
+  NewTabSettings,
+  NewTabShortcutsMode,
+  PasswordsStatus,
+  PermissionRule,
+  PhoneBarPosition,
+  PinnedCloseBehavior,
+  Platform,
+  ResourceEnforcement,
+  ResourceProcessProfile,
+  ResourceSettings,
+  SearchEngine,
+  Settings,
+  ShortcutGroup,
+  ShortcutPreset,
+  Space,
+  Tab,
+  ThirdPartyPinnedBehavior,
+  UIState,
+  UrlbarBehavior,
+  WindowSyncMode,
+  WindowTransparency
+} from '@shared/types'
+import { DEFAULT_CONTAINER_ID, ENERGY_SAVER_LOW_BATTERY_PERCENT } from '@shared/types'
+import { defaultEnergySaverMode } from '@core/resources/energySaver'
+import {
+  CONTAINER_COLORS,
+  CONTAINER_ICONS,
+  INACTIVE_TAB_AUTO_CLOSE_DAYS,
+  INACTIVE_TABS_ARCHIVE_DAYS,
+  spaceLabel
+} from '@shared/defaults'
+import { DEFAULT_DOWNLOAD_SETTINGS, resolveDownloadSettings } from '@shared/downloads'
+import { toolbarDepartures, toolbarPinned, withToolbarPin } from '@shared/toolbarPins'
+import { themeName } from '@shared/theme'
+import {
+  DEFAULT_NEW_TAB_SETTINGS,
+  MAX_NEW_TAB_SHORTCUTS,
+  newTabPresetChoices,
+  newTabSections,
+  newTabShortcutsMode,
+  pickNewTabPreset,
+  setNewTabBackground,
+  setNewTabSection,
+  setNewTabShortcutsMode
+} from '@shared/newTab'
+import { formatZoom, zoomChoices, zoomKey } from '@shared/pageControls'
+import {
+  READ_ALOUD_RATES,
+  baseLanguage,
+  normalizeLanguageTag,
+  sanitizeReadAloudRate,
+  voiceForLanguage,
+  type ReadAloudHighlightMode,
+  type ReadAloudVoice,
+  type ReadAloudVoicesResult
+} from '@shared/readAloud'
+import { engineHost, isActiveSearchEngine } from '@shared/search'
+import {
+  SHORTCUT_GROUP_LABELS,
+  SHORTCUT_PRESETS,
+  SHORTCUT_PRESET_DESCRIPTIONS,
+  SHORTCUT_PRESET_LABELS,
+  bindingsEqual,
+  defaultShortcuts,
+  formatBinding,
+  shortcutHint
+} from '@shared/shortcuts'
+import { describeUpdateTarget, type UpdateChannel } from '@shared/updates'
+import { displayUrl, getDomain, inputToUrl, isWebPageUrl } from '@shared/url'
+import { isShortcutRecord } from '@shared/webApp'
+import { extensionHomepage, homepageAddress, homepageDisplay } from '@shared/homepage'
+import { languageName } from '@shared/languageNames'
+import { HELP_URL, ISSUES_URL } from '@shared/links'
+import { isProxyMode, type ProxyMode } from '@core/extensions/api/proxy'
+import {
+  APP_PROXY_COPY,
+  DEFAULT_APP_PROXY_SETTINGS,
+  profileLabel,
+  routeLabel,
+  sanitizeAppProxySettings,
+  targetLabel,
+  type AgentProxyGrant,
+  type AppProxySettings,
+  type ProxyProfile,
+  type ProxyRoute
+} from '@shared/appProxy'
+import { AgentProxyGrantForm, ProxyProfileForm, ProxyRouteForm } from './proxyForms'
+import { catalogueLanguageName } from '@renderer/lib/languageCatalogue'
+import { SPELLCHECK_LANGUAGES_MAX, type SpellcheckDictionaryStatus } from '@shared/spellcheck'
+import {
+  TOOLBAR_LAYOUTS,
+  TOOLBAR_LAYOUT_LABELS,
+  forcesRail,
+  hasTopToolbar
+} from '@shared/toolbarLayout'
+import type { TranslatePreferences } from '@shared/translate'
+import { cmd, run } from '@renderer/lib/api'
+import {
+  CLIPBOARD_CLEAR_OPTIONS,
+  NETWORK_NAMES,
+  addressRowSubtitle,
+  addressTitle,
+  androidProviderHint,
+  cardSubtitle,
+  cardTitle,
+  openAutofillEdit,
+  passkeySubtitle,
+  vaultGateCopy
+} from '@renderer/lib/autofill'
+import type { AutofillSettingsData, VaultGate } from '@renderer/lib/autofillSettings'
+import { requestDefaultBrowser } from '@renderer/lib/defaultBrowser'
+import { downloadLocationLabel } from '@renderer/lib/downloadText'
+import { versionLine } from '@renderer/lib/about'
+import { downloadsEngine } from '@renderer/lib/downloadsEngine'
+import {
+  NEW_TAB_LAYOUT_HINT,
+  NEW_TAB_PRESET_DESCRIPTIONS,
+  NEW_TAB_PRESET_LABELS,
+  newTabBackgroundValue
+} from '@renderer/lib/newTabSettings'
+import { openPage } from '@renderer/lib/pages'
+import { setPrivateLockOnLeave } from '@renderer/lib/privateLock'
+import { formatRate } from '@renderer/lib/readAloud'
+import { describePermissionRule, siteLabel } from '@renderer/lib/security'
+import { tabTitle } from '@renderer/lib/selectors'
+import { wordProblem, type DictionaryWords } from '@renderer/lib/spellcheckWords'
+import { openThemePicker, resetSpaceTheme } from '@renderer/lib/theme'
+import { agentReleaseWords } from '@renderer/lib/agentRelease'
+import { openOverlay, pushToast } from '@renderer/lib/ui'
+import { pairKey, pairLabel, warmRegistryModels } from '@renderer/lib/translate'
+import { formatBytes, relativeTime } from '@renderer/lib/utils'
+import { versionReport } from '@renderer/lib/versionReport'
+import { VaultPassphraseForm } from '../../autofill/PassphraseForm'
+import { ContainerIcon } from '../../ContainerIcon'
+import { openMagicStackCustomize } from '../../newtab/magicStackCustomize'
+import {
+  CLEAR_BROWSING_DATA_FORM,
+  clearDataGroups,
+  safetyCheckGroups,
+  siteSettingsGroups
+} from '../../siteControls/settingsRows'
+import {
+  APP_ICON_HINT,
+  PASSWORD_GRACE_OPTIONS,
+  PASSWORDS_COPY,
+  checkupLabel,
+  detail,
+  headline,
+  installLabel,
+  passwordsSavedLabel,
+  vaultProtectionLabel
+} from '../../overlays/settingsCopy'
+import { ModelPickList, PickList } from '../../translate/pickers'
+import { fontsGroups } from './fonts'
+import { startupGroup } from './startup'
+import type { FontsDraft } from './fontsDraft'
+import {
+  addLanguageRow,
+  addLanguageTargets,
+  preferredLanguagesGroups,
+  type AddLanguageList
+} from './languages'
+import {
+  AddRouteForm,
+  AppIconGrid,
+  CodeBlock,
+  CopyRow,
+  CssEditor,
+  EngineGlyph,
+  FaviconGlyph,
+  NewContainerForm,
+  ResourceMeter,
+  SearchEngineForm,
+  ShortcutForm,
+  UpdateStatusBlock,
+  UrlForm,
+  WordForm,
+  ZoomBlock
+} from './blocks'
+import { importGroups } from '../../import/importRows'
+import { AboutVersionBlock } from './AboutVersionBlock'
+import { CustomizeToolbarForm } from './CustomizeToolbarForm'
+import { extensionControlled } from './controlled'
+import { extensionsGroups } from './extensions'
+import { LayoutCards } from './LayoutCards'
+import {
+  choice,
+  onLayout,
+  type FieldRow,
+  type InlineAction,
+  type RowGroup,
+  type RowOption,
+  type SectionModel,
+  type SettingsRow
+} from './model'
+import { accountGroups } from './account'
+import { syncGroups } from './sync'
+import { PRIVACY_HUB_CARDS, PRIVACY_HUB_LINES, thirdPartyCookiesLine } from './privacyHub'
+import {
+  heldSwitch,
+  httpsOnlyGroups,
+  preloadGroups,
+  safeBrowsingGroups,
+  secureDnsGroups,
+  signalsGroups
+} from './protectionRows'
+import { ShortcutRow } from './ShortcutRow'
+import { siteDataGroups } from './siteDataRows'
+import { trackingGroups } from './tracking'
+
+/**
+ * The Settings sections as data: one builder per category turns the browser state into the
+ * groups and rows of `model.ts`. Every row the desktop overlay once drew with its own components
+ * is here in its v2 form – a menulist is a value row, a checkbox a switch row, a button an action
+ * row (with the desktop's `button` where Zen's about:preferences trails one), an input a field
+ * row, a list a group of item rows – reading the same settings and running the same commands, so
+ * nothing is reachable on one platform only. The phone draws the rows in its vocabulary (§10.4)
+ * and the desktop two-pane in its own (§10.5); the categories the phone never lists (Compact
+ * Mode, Resources, Sync, Keyboard Shortcuts, Default Browser) are builders all the same, so
+ * "Find in Settings" reaches their rows.
+ */
+
+export interface SectionContext {
+  state: UIState
+  /** The Settings tab the page lives in; its opener is the site an action may be about. */
+  tab: Tab
+  /**
+   * The host has a pointer that hovers (a mouse or trackpad): the rows that describe a mouse
+   * gesture – double-click, Alt + Click – keep it; a touch host reads its own gesture instead.
+   */
+  pointer: boolean
+  /**
+   * The chrome's layout: the phone shell has the phone bar (its position and its editor row) and
+   * no bookmarks bar; the desktop and tablet shells the other way round. A builder says which
+   * shells a row or group belongs to with `layouts`, and `buildSection` keeps the layout's own
+   * (`onLayout`), so a phone's row never reaches a desktop's page or its search (BUG-055).
+   * Absent, every row shows.
+   */
+  formFactor?: FormFactor
+  set(patch: Partial<Settings>): void
+  /** Move the page to another category (About › Check for updates lands on Updates). */
+  navigate(section: string): void
+  /**
+   * Bring one of the shown section's groups on screen, its heading at the column's top (the
+   * Privacy and security hub's cards, W7-6): the page takes the group as the address's landing
+   * (`zen://settings/privacy?group=<id>`, the `?row=` deep link's twin, `SettingsPage`) and
+   * scrolls it up before the paint, padding the column's end for a group near the section's
+   * end as it does for a deep link. Left out where no page stands behind the rows (a test).
+   */
+  reveal?(groupId: string): void
+  /** The navigation bar's editor sheet (Look and Feel › Navigation bar). */
+  openBarEditor(): void
+  /** Leave for `tabId` and open the Boost editor on it (Boosts › Boost the site you came from). */
+  boost(tabId: string): void
+  /**
+   * What Settings › Autofill reads of the vault – its lists while unlocked, its gate while
+   * locked – and does to it (`useAutofillSettings`); `idleAutofillSettings()` where there is no
+   * vault to read (a test, the landing's search).
+   */
+  autofill: AutofillSettingsData
+  /**
+   * The device has a screen lock (a PIN, a pattern, a biometric) for "Lock private tabs when
+   * you leave Ione" to be passed with – the phone host's word (`privateLockStore.screenLock`,
+   * told at boot and on each return). Without one the switch is disabled (§9.30) and says why.
+   */
+  screenLock: boolean
+  /**
+   * The speech engine's voices (`readAloud.voices`, `useReadAloudVoices`) for Accessibility ›
+   * Read aloud's voice rows; null while the list is on its way or where the host has no engine.
+   */
+  readAloudVoices: ReadAloudVoicesResult | null
+  /**
+   * The profile's custom spell-check dictionary (Settings › Languages › Spell check) and what
+   * moves it (`useDictionaryWords`); `idleDictionaryWords()` where there is none to read.
+   */
+  dictionary: DictionaryWords
+  /**
+   * What the import engine found on this computer (Settings › Import's pane names the browsers
+   * among them; `useImportSources`): `null` while it looks, left out where the pane is not
+   * drawn – the phone page, whose Import rows read files, and a test.
+   */
+  importSources?: ImportSource[] | null
+  /**
+   * The folder new downloads go to right now (`download.directory`, `useDownloadDirectory`),
+   * for Settings › Downloads › Location, which shows the path as Chrome's row does: null while
+   * the engine has not answered, left out where the row is not drawn (a test), and the row
+   * reads the setting meanwhile.
+   */
+  downloadDirectory?: string | null
+  /**
+   * The families installed on this computer (`useLocalFonts`), for Appearance › Customise
+   * fonts' family pickers on a host whose engine takes them: null while the list is on its way,
+   * left out where the rows are not drawn (a phone host, a test) – the pickers keep to the
+   * generic families meanwhile.
+   */
+  localFonts?: string[] | null
+  /**
+   * The Customise fonts group's draft (`useFontsDraft`): the ± rows' steps coalesced into one
+   * commit per quiet sequence, the preview following each step (the Android performance gate's
+   * ruling for #350). Left out where no page holds one (a test), the group commits at once.
+   */
+  fontsDraft?: FontsDraft
+}
+
+export function buildSection(section: InternalPageSection, ctx: SectionContext): SectionModel {
+  const builder = BUILDERS[section.id]
+  return { section, groups: builder ? onLayout(builder(ctx), ctx.formFactor) : [] }
+}
+
+/** Every listed section, built; what the landing's search filters. */
+export function buildSections(
+  sections: readonly InternalPageSection[],
+  ctx: SectionContext
+): SectionModel[] {
+  return sections.map((section) => buildSection(section, ctx))
+}
+
+type Builder = (ctx: SectionContext) => RowGroup[]
+
+const BUILDERS: Readonly<Record<string, Builder>> = {
+  look: lookSection,
+  compact: compactSection,
+  accessibility: accessibilitySection,
+  newtab: newTabSection,
+  tabs: tabsSection,
+  performance: performanceSection,
+  downloads: downloadsSection,
+  resources: resourcesSection,
+  privacy: privacySection,
+  search: searchSection,
+  autofill: autofillSection,
+  languages: languagesSection,
+  spaces: spaceRoutingSection,
+  containers: containersSection,
+  boosts: boostsSection,
+  mods: modsSection,
+  extensions: extensionsSection,
+  apps: appsSection,
+  agents: agentsSection,
+  passwords: passwordsSection,
+  security: securitySection,
+  account: accountSection,
+  sync: syncSection,
+  import: importGroups,
+  shortcuts: shortcutsSection,
+  'default-browser': defaultBrowserSection,
+  updates: updatesSection,
+  system: systemSection,
+  reset: resetSection,
+  about: aboutSection
+}
+
+function sorted<T>(map: Record<string, T>): Array<[string, T]> {
+  return Object.entries(map).sort(([a], [b]) => a.localeCompare(b))
+}
+
+/**
+ * A row that only lists something: shows what it is, and holds the rows that act on it. A row
+ * with one action names it as `action` too, the desktop's inline button (`ItemRow.action`).
+ */
+function item(
+  id: string,
+  label: string,
+  description: string | undefined,
+  rows: SettingsRow[],
+  extra: {
+    leading?: ReactNode
+    keywords?: readonly string[]
+    sheetDescription?: string
+    disabled?: boolean
+    action?: InlineAction
+    /** The row's several actions behind the desktop's ⋯, named by this label (`ItemRow.menu`). */
+    menu?: string
+  } = {}
+): SettingsRow {
+  return {
+    kind: 'item',
+    id,
+    label,
+    description,
+    keywords: extra.keywords,
+    leading: extra.leading,
+    disabled: extra.disabled,
+    action: extra.action,
+    menu: extra.menu,
+    sheet: {
+      title: label,
+      description: extra.sheetDescription ?? description,
+      groups: [{ id: `${id}-actions`, heading: null, rows }]
+    }
+  }
+}
+
+/**
+ * A whole number the desktop keeps in a 96 px field (§9.12): the row shows it, the sheet or the
+ * inline field edits it, and a value outside `min`…`max` (or no number) is refused with the one
+ * message; `unit` follows the value in the row's description ("10 min").
+ */
+function numberRow(
+  row: Omit<FieldRow, 'kind' | 'input' | 'value' | 'display' | 'onCommit'> & {
+    value: number
+    min: number
+    max: number
+    unit?: string
+    onCommit(value: number): void
+  }
+): FieldRow {
+  const { value, unit, onCommit, ...rest } = row
+  return {
+    ...rest,
+    kind: 'field',
+    input: 'number',
+    value: String(value),
+    display: unit ? `${value} ${unit}` : undefined,
+    onCommit: (text) => {
+      const n = Number(text.trim())
+      if (text.trim() === '' || !Number.isInteger(n) || n < row.min || n > row.max)
+        return `Enter a whole number from ${row.min} to ${row.max}`
+      if (n !== value) onCommit(n)
+      return undefined
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Look and Feel
+// ---------------------------------------------------------------------------
+
+/**
+ * Groups in the order the design lead set for the tab: identity (Appearance, App icon), then the
+ * chrome (URL bar, Pages), then page behaviour (Sites, Site exceptions), Glance last.
+ */
+function lookSection({
+  state,
+  set,
+  pointer,
+  formFactor,
+  openBarEditor,
+  tab,
+  localFonts,
+  fontsDraft
+}: SectionContext): RowGroup[] {
+  const s = state.settings
+  const caps = state.capabilities
+  const pc = s.pageControls
+  const patchControls = (patch: Partial<typeof pc>): void =>
+    set({ pageControls: { ...pc, ...patch } })
+  // The desktop's layout fixes the sidebar at the rail under Collapsed sidebar and Horizontal
+  // tabs (§9.37): there the expanded width is the layout's, not the setting's. The phone and
+  // the tablet have shells of their own, which the layout never reaches (nor does its row).
+  const railSet = (formFactor ?? 'desktop') === 'desktop' && forcesRail(s.toolbarLayout)
+  // What the Reset to default row has to undo: the pins that depart from the default bar (a
+  // folded Forward, a shown Home) and the downloads button's key.
+  const toolbarChanges =
+    toolbarDepartures(s.toolbarPins).length +
+    (resolveDownloadSettings(s).alwaysShowButton !== DEFAULT_DOWNLOAD_SETTINGS.alwaysShowButton
+      ? 1
+      : 0)
+  // The hover flyout is the Collapsed sidebar layout's alone: the one layout whose rail still
+  // carries the tab rows a flyout would show in full.
+  const hoverRail = (formFactor ?? 'desktop') === 'desktop' && s.toolbarLayout === 'collapsed'
+  // The theme row's space (settings-30): the theme is a space's, so the row names the active
+  // space's – and the space, where there is more than one to tell apart.
+  const activeSpace: Space | undefined =
+    state.spaces.find((space) => space.id === state.activeSpaceId) ?? state.spaces[0]
+  const themed = activeSpace?.theme !== null && activeSpace?.theme !== undefined
+  const themeLabel = themeName(activeSpace?.theme ?? null)
+  // The homepage rows (settings-32): the one setting the phone's Home group writes (`homepage`,
+  // synced), read as Chrome's `GetHomePage` reads its prefs – the phone's Off has no desktop
+  // reading, so it shows and opens as the new tab page here. An extension's homepage holds the
+  // rows as it holds the phone's (`RowBase.controlled`), the address it opens in the field.
+  const ownHomepage = s.homepage
+  const homepageControl = extensionControlled(state, 'homepage')
+  const heldHomepage = extensionHomepage(ownHomepage, homepageControl)
+  const homepage = heldHomepage ? { mode: 'url' as const, url: heldHomepage } : ownHomepage
+  const homepageControlled = heldHomepage ? homepageControl : undefined
+  const homeShown = toolbarPinned(s.toolbarPins, 'home')
+  const groups: RowGroup[] = [
+    {
+      id: 'appearance',
+      heading: 'Appearance',
+      rows: [
+        choice<ColorScheme>({
+          id: 'color-scheme',
+          label: 'Colour scheme',
+          value: s.colorScheme,
+          // Pages follow the scheme too (CT-23: the engine's theme source is this setting), so
+          // the row says so – the desktop's description, the phone picker's title block.
+          sheetDescription: 'Websites follow this too.',
+          options: [
+            { value: 'system', label: 'Follow system' },
+            { value: 'light', label: 'Light' },
+            { value: 'dark', label: 'Dark' }
+          ],
+          onChange: (v) => set({ colorScheme: v })
+        }),
+        // Chrome's Appearance › Theme row (settings-30): the theme's name, and "Reset to default"
+        // while the space has one – the theme picker's button by the same name, the one reset
+        // (`lib/theme.ts`, §9.1). At the default look the row is the door to the
+        // picker instead, as Chrome's row opens Customize Chrome (its Web Store is no part of
+        // Ione's; the row says nothing of a store): the picker hangs from the Change… button
+        // that opened it – end-aligned under it, §9.20 (#572's L8), a popover in the popover's
+        // chrome with the button its expanded anchor (`popover`; the lead's ruling on #572's
+        // notes 16–19) – not at the sidebar's seat the palette and the space menu open it at.
+        // A look picked in the hanging picker flips the row live, as Chrome's does, to Reset
+        // to default: the same button, the picker's anchor still while it hangs (`anchors`),
+        // the reset once it has gone. The theme is a space's, so the row reads the active
+        // space's and names it – "Ocean · Default space", the picker's own description under
+        // its title (#572's N5) – one space or many. The phone's Appearance keeps to its own
+        // rows; the tablet shares the desktop's two-pane page.
+        ...(activeSpace
+          ? [
+              {
+                kind: 'action',
+                id: 'theme',
+                label: 'Theme',
+                description: `${themeLabel} · ${spaceLabel(activeSpace)} Space`,
+                keywords: ['theme', 'accent', 'colour', 'color', 'gradient', 'preset', 'reset'],
+                layouts: ['desktop', 'tablet'],
+                button: themed ? 'Reset to default' : 'Change…',
+                popover: themed ? undefined : 'theme',
+                anchors: themed ? 'theme' : undefined,
+                onPress: (anchor) =>
+                  themed ? resetSpaceTheme(activeSpace.id) : openThemePicker(activeSpace.id, anchor)
+              } satisfies SettingsRow
+            ]
+          : []),
+        // Chrome's "Follow device colours" (settings-116; `browser.theme.follows_system_colors`,
+        // off by default on Windows): with it on, the controls' accent – the primary button,
+        // the on switch, the focus ring – takes the OS accent (Windows' DWM accent, macOS's
+        // Appearance pane) while the space has the default look; a themed space keeps its own.
+        // The row exists where the host has an accent to read (Windows, macOS; Linux has none
+        // through Electron and shows no row, as the Mica row shows only where Mica is), and is
+        // this device's alone – another machine's OS is another accent.
+        ...(typeof state.systemAccent === 'string'
+          ? [
+              {
+                kind: 'switch',
+                id: 'use-system-accent',
+                label: 'Use system accent colour',
+                description: themed
+                  ? 'Controls take the colour your system uses while the Space has the default look.'
+                  : 'Controls take the colour your system uses.',
+                keywords: ['accent', 'system colour', 'system color', 'follow device colours'],
+                layouts: ['desktop'],
+                checked: s.useSystemAccent,
+                onChange: (v) => set({ useSystemAccent: v })
+              } satisfies SettingsRow
+            ]
+          : []),
+        // One layout setting with four pictures (§9.37, §10.4's image radio cards): the desktop's
+        // alone – the phone and the tablet have shells of their own.
+        {
+          kind: 'custom',
+          id: 'toolbar-layout',
+          label: 'Layout',
+          keywords: [
+            'toolbar layout',
+            'browser layout',
+            'horizontal tabs',
+            'tab strip',
+            ...TOOLBAR_LAYOUTS.map((layout) => TOOLBAR_LAYOUT_LABELS[layout])
+          ],
+          layouts: ['desktop'],
+          render: () => (
+            <LayoutCards value={s.toolbarLayout} onChange={(v) => set({ toolbarLayout: v })} />
+          )
+        },
+        // The desktop bar's optional controls (settings-36; Chrome's toolbar customisation).
+        // "Show forward button" is the Customise toolbar dialog's Forward row by another name –
+        // one setting, `toolbarPins.forward` (`shared/toolbarPins.ts`) – and the dialog holds
+        // every control the bar can fold into the app menu; Reset puts the default bar back,
+        // the downloads button's own key (`downloads.alwaysShowButton`) included, since the
+        // dialog binds it as its Downloads row. The Reset row stands only while there is
+        // something to reset – never a disabled row on the first screen (§10.4 as amended for
+        // #297; the Downloads "Use the default folder" row is the precedent). The phone and the
+        // tablet keep their own bars.
+        {
+          kind: 'switch',
+          id: 'show-forward-button',
+          label: 'Show forward button',
+          keywords: ['toolbar', 'forward', 'navigation', 'customise toolbar'],
+          layouts: ['desktop'],
+          checked: toolbarPinned(s.toolbarPins, 'forward'),
+          onChange: (v) => set({ toolbarPins: withToolbarPin(s.toolbarPins, 'forward', v) })
+        },
+        // Chrome's "Show home button" (settings-32; `browser.show_home_button`, off by default)
+        // – the Home control's pin (`toolbarPins.home`, the Customise toolbar dialog's Home
+        // row), synced as Chrome's is – with its radio under it while on: "New Tab page" or a
+        // page of the user's (Chrome's `homepage_is_newtabpage`, `homepage`), the chassis's
+        // value row drawn as §9.14's two radios on the desktop (`radios: true` – W8-2's radio-
+        // list row, pr-584 R2 / N2: the options on the page's row chassis, the label the group's
+        // name for assistive technology alone, no `--v2-selected` band on the checked one; the
+        // lead's Q7 ruling on #572 – the menulist went), and the address as a §9.12 field
+        // stacked under the second option once a page is chosen – what was typed fixed up as
+        // Chrome's `FixupURL` does at the navigation (`example.com` →
+        // `https://example.com/`), a §9.12 line under the field for what is no web address. The
+        // setting is the phone's Home group's (`homepage`), so a page chosen here is the phone's
+        // Home page too.
+        {
+          kind: 'switch',
+          id: 'show-home-button',
+          label: 'Show home button',
+          keywords: ['toolbar', 'home', 'home page', 'homepage', 'customise toolbar'],
+          layouts: ['desktop'],
+          checked: homeShown,
+          onChange: (v) => set({ toolbarPins: withToolbarPin(s.toolbarPins, 'home', v) })
+        },
+        ...(homeShown
+          ? [
+              choice<'newtab' | 'url'>({
+                id: 'home-page',
+                label: 'Home page',
+                keywords: ['home', 'homepage', 'new tab page', 'custom web address'],
+                layouts: ['desktop'],
+                controlled: homepageControlled,
+                radios: true,
+                value: homepage.mode === 'url' ? 'url' : 'newtab',
+                sheetDescription: 'Where the Home button goes.',
+                options: [
+                  { value: 'newtab', label: 'New Tab page' },
+                  { value: 'url', label: 'Enter custom web address' }
+                ],
+                onChange: (mode) => set({ homepage: { ...ownHomepage, mode } })
+              }),
+              ...(homepage.mode === 'url'
+                ? [
+                    {
+                      kind: 'field',
+                      id: 'home-page-address',
+                      label: 'Address',
+                      keywords: ['home', 'homepage', 'url', 'web address'],
+                      layouts: ['desktop'],
+                      controlled: homepageControlled,
+                      value: homepageDisplay(homepage),
+                      display: homepageDisplay(homepage) || 'Not set',
+                      input: 'url',
+                      form: 'stacked',
+                      placeholder: 'Enter custom web address',
+                      onCommit: (value) => {
+                        const url = homepageAddress(value)
+                        if (!url) return 'Enter a web address, like example.com'
+                        set({ homepage: { mode: 'url', url } })
+                        return undefined
+                      }
+                    } satisfies SettingsRow
+                  ]
+                : [])
+            ]
+          : []),
+        {
+          kind: 'action',
+          id: 'customize-toolbar',
+          label: 'Customise toolbar',
+          description: 'Choose which controls show beside the address bar.',
+          keywords: [
+            'toolbar',
+            'customise toolbar',
+            'customize toolbar',
+            'pin',
+            'unpin',
+            'buttons',
+            'reader view',
+            'translate',
+            'bookmark',
+            'energy saver',
+            'media',
+            'downloads'
+          ],
+          layouts: ['desktop'],
+          button: 'Customise…',
+          form: {
+            title: 'Customise toolbar',
+            description: 'Choose the controls beside the address bar and how they show.',
+            body: 'list',
+            render: (close) => <CustomizeToolbarForm state={state} set={set} close={close} />
+          }
+        },
+        ...(toolbarChanges > 0
+          ? [
+              {
+                kind: 'action',
+                id: 'toolbar-reset',
+                label: 'Your toolbar',
+                description: `${toolbarChanges} ${toolbarChanges === 1 ? 'control differs' : 'controls differ'} from the default bar.`,
+                keywords: ['reset', 'defaults', 'toolbar'],
+                layouts: ['desktop'],
+                button: 'Reset to default',
+                onPress: () =>
+                  set({
+                    toolbarPins: {},
+                    downloads: { alwaysShowButton: DEFAULT_DOWNLOAD_SETTINGS.alwaysShowButton }
+                  })
+              } satisfies SettingsRow
+            ]
+          : []),
+        {
+          kind: 'switch',
+          id: 'tabs-right',
+          label: 'Tabs on the right',
+          checked: s.sidebarSide === 'right',
+          onChange: (v) => set({ sidebarSide: v ? 'right' : 'left' })
+        },
+        {
+          kind: 'switch',
+          id: 'sidebar-expanded',
+          label: 'Expanded sidebar',
+          // A dependent row (§10.4) while the layout fixes the rail: laid out at .4 with
+          // `aria-disabled`, showing the width the layout set – the rail, so unchecked – and
+          // saying what set it; live again under Only sidebar and Sidebar and top toolbar. A
+          // live switch stating what the layout overrides would be a lie the page tells, and a
+          // row that left would make the page jump under the layout card.
+          // The double-click is a mouse gesture: only a pointer host is told about it.
+          description: railSet
+            ? 'Set by the layout.'
+            : pointer
+              ? 'Show tab titles next to their icons. Double-click the sidebar edge to toggle.'
+              : 'Show tab titles next to their icons.',
+          checked: s.sidebarExpanded && !railSet,
+          disabled: railSet,
+          onChange: (v) => set({ sidebarExpanded: v })
+        },
+        {
+          kind: 'switch',
+          id: 'sidebar-expand-on-hover',
+          label: 'Expand on hover',
+          // The Collapsed sidebar layout's own row (tabs-03): the rail flies out over the page
+          // after a short dwell and folds back when the pointer leaves. Under the other three
+          // layouts there is no rail to fly out (or, under Horizontal tabs, no tab rows in it),
+          // so the row is a §10.4 dependent row of the layout card – .4, `aria-disabled`, still
+          // laid out, its description the way back to the layout that uses it.
+          description: hoverRail
+            ? 'Rest the pointer on the sidebar to show it in full until the pointer leaves.'
+            : 'Only in the Collapsed sidebar layout.',
+          keywords: ['flyout', 'hover', 'collapsed sidebar', 'rail'],
+          layouts: ['desktop'],
+          checked: s.sidebarExpandOnHover && hoverRail,
+          disabled: !hoverRail,
+          onChange: (v) => set({ sidebarExpandOnHover: v })
+        },
+        {
+          kind: 'switch',
+          id: 'borderless',
+          label: 'Remove browser padding',
+          description: 'Hide the rounded frame around web content.',
+          checked: s.borderless,
+          onChange: (v) => set({ borderless: v })
+        },
+        ...(caps.nativeWindowControls && state.platform === 'linux'
+          ? [
+              {
+                kind: 'switch',
+                id: 'native-window-controls',
+                label: 'Use system window controls',
+                description:
+                  'New windows get your desktop’s own frame and buttons. Compositors without server-side decorations (niri, Hyprland) show none; their own shortcuts manage the window.',
+                keywords: ['titlebar', 'title bar', 'window buttons', 'decorations', 'wayland', 'hyprland', 'niri', 'minimise', 'minimize', 'close'],
+                checked: s.nativeWindowControls,
+                onChange: (v: boolean) => set({ nativeWindowControls: v })
+              } satisfies SettingsRow
+            ]
+          : []),
+        // Edge's "Show mini menu when selecting text" (Settings › Appearance › Context menus;
+        // CT-39, `Settings.showSelectionMenu`, on by default – an absent value reads as on): the
+        // pill of chips – Copy, Search, Define, Translate, Read aloud – over a settled text
+        // selection. Desktop hosts with the popup surface alone (`capabilities.selectionMenu`),
+        // in the desktop and the tablet layouts – a desktop host at a tablet width still runs
+        // the menu; the phone's selection toolbar is the system's.
+        ...(caps.selectionMenu
+          ? [
+              {
+                kind: 'switch',
+                id: 'show-selection-menu',
+                label: 'Show the mini menu when text is selected',
+                keywords: [
+                  'mini menu',
+                  'selection',
+                  'select text',
+                  'selected text',
+                  'copy',
+                  'search',
+                  'define',
+                  'translate',
+                  'read aloud',
+                  'context menu'
+                ],
+                layouts: ['desktop', 'tablet'],
+                checked: s.showSelectionMenu !== false,
+                onChange: (v) => set({ showSelectionMenu: v })
+              } satisfies SettingsRow
+            ]
+          : [])
+      ]
+    }
+  ]
+  if (caps.windowMaterial) {
+    groups[0].rows.push({
+      kind: 'switch',
+      id: 'window-material',
+      label: 'Use Windows transparency effects',
+      description: 'Let the desktop show through the window frame (Mica). Applies to new windows.',
+      keywords: ['mica', 'acrylic', 'transparent'],
+      checked: s.windowMaterial === 'mica',
+      onChange: (v) => set({ windowMaterial: v ? 'mica' : 'none' })
+    })
+  }
+  if (caps.windowTransparency) {
+    // The compositor's own blur and dimming (Hyprland, niri, KWin on Wayland): the window is
+    // opened clear and the chrome lays its gradient over the desktop at the setting's alpha.
+    // The native see-through frame is made at creation, so the row says "new windows".
+    groups[0].rows.push(
+      choice<WindowTransparency>({
+        id: 'window-transparency',
+        label: 'Window transparency',
+        description: 'Let the compositor show what is behind the window. Applies to new windows.',
+        keywords: [
+          'transparent',
+          'translucent',
+          'opacity',
+          'blur',
+          'hyprland',
+          'niri',
+          'wayland',
+          'compositor'
+        ],
+        value: s.windowTransparency,
+        options: [
+          { value: 'off', label: 'Off' },
+          { value: 'translucent', label: 'Translucent' },
+          { value: 'transparent', label: 'Transparent' }
+        ],
+        onChange: (v) => set({ windowTransparency: v })
+      })
+    )
+  }
+  if (!caps.pageControls) {
+    // Chrome's Page zoom menulist and the per-site zooms, under Appearance where the host has no
+    // page-controls sheet (the desktop); a host with one keeps the zoom under Accessibility.
+    groups[0].rows.push(
+      choice({
+        id: 'page-zoom',
+        label: 'Page zoom',
+        description: 'Sites without a zoom of their own open at this size.',
+        keywords: ['zoom', 'default zoom', 'text size'],
+        value: zoomKey(pc.zoom),
+        options: zoomChoices(pc.zoom),
+        onChange: (v) => patchControls({ zoom: Number(v) / 100 })
+      })
+    )
+    groups.push({
+      id: 'site-zooms',
+      heading: 'Sites with their own zoom',
+      rows: sorted(pc.siteZooms).map(([domain, factor]) =>
+        item(`site-zoom:${domain}`, domain, formatZoom(factor), [
+          {
+            kind: 'action',
+            id: `site-zoom:${domain}:forget`,
+            label: 'Remove zoom',
+            description: 'The site opens at the page zoom again.',
+            button: 'Remove',
+            onPress: () => run('pageControls.forgetSite', { kind: 'zoom', domain })
+          }
+        ])
+      ),
+      empty: 'No sites yet. Zooming a page remembers the zoom for its site here.'
+    })
+  }
+  // Customise fonts (CT-25) follows Appearance and the zooms: what pages look like, before the
+  // chrome's own look.
+  groups.push(...fontsGroups({ state, set, localFonts, fontsDraft }))
+  groups.push({
+    id: 'app-icon',
+    heading: 'App icon',
+    description: APP_ICON_HINT[state.platform],
+    rows: [
+      {
+        kind: 'custom',
+        id: 'app-icon-treatment',
+        label: 'Treatment',
+        keywords: ['icon', 'launcher', 'home screen', 'colour', 'color', 'black', 'white', 'transparent'],
+        render: () => <AppIconGrid value={s.appIcon} onChange={(id) => set({ appIcon: id })} />
+      }
+    ]
+  })
+  // The bookmarks bar is the desktop and tablet shells' (App.tsx); the phone shell has none.
+  groups.push({
+    id: 'bookmarks',
+    heading: 'Bookmarks',
+    layouts: ['desktop', 'tablet'],
+    rows: [
+      choice<BookmarksBarMode>({
+        id: 'bookmarks-bar',
+        label: 'Show bookmarks bar',
+        keywords: ['toolbar', 'favourites'],
+        value: s.bookmarksBar,
+        sheetDescription:
+          'Always, only on the new tab page, or never. Compact mode hides it with the toolbar.',
+        options: [
+          { value: 'always', label: 'Always' },
+          { value: 'newtab', label: 'Only on new tab page' },
+          { value: 'never', label: 'Never' }
+        ],
+        onChange: (v) => set({ bookmarksBar: v })
+      }),
+      {
+        kind: 'action',
+        id: 'bookmarks-import',
+        label: 'Import bookmarks',
+        description: 'From a Netscape HTML file, which Chrome, Edge and Firefox all export.',
+        keywords: ['html', 'chrome', 'firefox', 'edge'],
+        button: 'Import…',
+        onPress: () => void run('bookmark.import', undefined)
+      },
+      {
+        kind: 'action',
+        id: 'bookmarks-export',
+        label: 'Export bookmarks',
+        description: 'To a Netscape HTML file other browsers can import.',
+        keywords: ['html', 'backup'],
+        button: 'Export…',
+        onPress: () => void run('bookmark.export', undefined)
+      }
+    ]
+  })
+  // The phone bar is the phone shell's alone: where it sits and which controls it carries are
+  // its rows (BUG-055 – the desktop drew "Position on phones" for a bar it does not have).
+  groups.push({
+    id: 'url-bar',
+    heading: 'Address bar',
+    rows: [
+      choice<UrlbarBehavior>({
+        id: 'urlbar-behaviour',
+        label: 'Floating behaviour',
+        value: s.urlbarBehavior,
+        options: [
+          { value: 'float-typing', label: 'Floating only when typing' },
+          { value: 'always-float', label: 'Always floating' },
+          { value: 'normal', label: 'Normal (attached to top)' }
+        ],
+        onChange: (v) => set({ urlbarBehavior: v })
+      }),
+      choice<PhoneBarPosition>({
+        id: 'phone-bar-position',
+        label: 'Position on phones',
+        keywords: ['address bar', 'bottom', 'top'],
+        layouts: ['phone'],
+        value: s.phoneBarPosition,
+        sheetDescription: 'Hold the address bar to carry it to the other edge.',
+        options: [
+          { value: 'bottom', label: 'Bottom' },
+          { value: 'top', label: 'Top' }
+        ],
+        onChange: (v) => set({ phoneBarPosition: v })
+      }),
+      {
+        kind: 'switch',
+        id: 'hide-toolbar-on-scroll',
+        label: 'Hide toolbar when scrolling',
+        description:
+          'On phones, the bar slides away as a page scrolls down and back as it scrolls up.',
+        keywords: ['address bar', 'scroll', 'hide', 'toolbar'],
+        layouts: ['phone'],
+        checked: s.hideToolbarOnScroll,
+        onChange: (v) => set({ hideToolbarOnScroll: v })
+      },
+      {
+        kind: 'action',
+        id: 'navigation-bar',
+        label: 'Navigation bar',
+        description: 'Choose the controls beside the address bar and their order.',
+        keywords: ['customise', 'toolbar items', 'buttons'],
+        layouts: ['phone'],
+        onPress: openBarEditor
+      }
+    ]
+  })
+  groups.push(homepageGroup(state, tab, set))
+  if (caps.pullToRefresh) {
+    groups.push({
+      id: 'pages',
+      heading: 'Pages',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'pull-to-refresh',
+          label: 'Pull to refresh',
+          description: 'Drag down from the top of a page to reload it.',
+          checked: s.pullToRefresh,
+          onChange: (v) => set({ pullToRefresh: v })
+        }
+      ]
+    })
+  }
+  // The desktop-site default is the page-controls host's; the dark theme for sites is any host
+  // that darkens pages (CT-18). Each exceptions list belongs to the row above it.
+  if (caps.pageControls || caps.darkenSites) {
+    const siteRows: SettingsRow[] = []
+    if (caps.pageControls)
+      siteRows.push(
+        choice<DesktopSiteDefault>({
+          id: 'desktop-site',
+          label: 'Desktop site',
+          keywords: ['mobile', 'layout', 'viewport'],
+          value: pc.desktopSite,
+          sheetDescription:
+            'Automatic asks sites for their desktop layout on large screens, or when a keyboard and mouse are attached.',
+          options: [
+            { value: 'auto', label: 'Automatic' },
+            { value: 'on', label: 'Always' },
+            { value: 'off', label: 'Never' }
+          ],
+          onChange: (v) => patchControls({ desktopSite: v })
+        })
+      )
+    if (caps.darkenSites)
+      siteRows.push({
+        kind: 'switch',
+        id: 'darken-sites',
+        label: 'Apply dark theme to sites',
+        // One sentence: the 13/20 description clamps at two lines (§9.2), and where the menu's
+        // per-site choice goes is the Site exceptions group's description below.
+        description: 'Sites without a dark theme get one while Ione is dark.',
+        keywords: ['dark mode', 'auto dark', 'darken', 'night'],
+        checked: pc.darkenSites,
+        onChange: (v) => patchControls({ darkenSites: v })
+      })
+    groups.push({ id: 'sites', heading: 'Sites', rows: siteRows })
+    const exceptions: SettingsRow[] = [
+      ...(caps.pageControls ? sorted(pc.desktopSites) : []).map(([domain, on]) =>
+        item(`desktop-site:${domain}`, domain, on ? 'Desktop site on' : 'Desktop site off', [
+          {
+            kind: 'action',
+            id: `desktop-site:${domain}:forget`,
+            label: 'Remove exception',
+            description: 'The site follows the Desktop site setting again.',
+            button: 'Remove',
+            onPress: () => run('pageControls.forgetSite', { kind: 'desktop', domain })
+          }
+        ])
+      ),
+      ...(caps.darkenSites ? sorted(pc.darkenSiteExceptions) : []).map(([domain, on]) =>
+        item(`darken:${domain}`, domain, on ? 'Dark theme on' : 'Dark theme off', [
+          {
+            kind: 'action',
+            id: `darken:${domain}:forget`,
+            label: 'Remove exception',
+            description: 'The site follows the dark theme setting again.',
+            button: 'Remove',
+            onPress: () => run('pageControls.forgetSite', { kind: 'darken', domain })
+          }
+        ])
+      )
+    ]
+    const creators = [
+      caps.pageControls && 'Desktop Site',
+      caps.darkenSites && 'Dark Theme for This Site'
+    ].filter((x): x is string => typeof x === 'string')
+    groups.push({
+      id: 'site-exceptions',
+      heading: 'Site exceptions',
+      description: `${creators.join(' and ')} in the menu ${creators.length > 1 ? 'remember' : 'remembers'} a site’s choice here.`,
+      rows: exceptions,
+      empty: 'No exceptions yet'
+    })
+  }
+  // Only a mouse drags tabs (a finger scrolls the strip): a touch host is not offered the row.
+  if (pointer) {
+    groups.push({
+      id: 'split-view',
+      heading: 'Split view',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'split-edge-zones',
+          label: 'Split view drag and drop',
+          description: 'Drag a tab to the edge of the page to open it in a split view.',
+          keywords: ['split screen', 'side by side', 'pane', 'drag', 'edge'],
+          checked: s.splitEdgeZones,
+          onChange: (v) => set({ splitEdgeZones: v })
+        }
+        // The left pane's link rule (split-13) is not a row here: it is each split's own, on the
+        // pane header's ⋯ menu – one home for the switch (v2 §9.35).
+      ]
+    })
+  }
+  groups.push({
+    id: 'glance',
+    heading: 'Glance',
+    rows: [
+      {
+        kind: 'switch',
+        id: 'glance-enabled',
+        label: 'Enable Glance',
+        description: 'Preview links on top of the current tab without leaving it.',
+        checked: s.glanceEnabled,
+        onChange: (v) => set({ glanceEnabled: v })
+      },
+      // The modifier-click trigger is a pointer's; a touch host opens Glance from the link's
+      // long-press menu (menus.ts, "Open Link in Glance"), so its row says that and picks nothing.
+      pointer
+        ? choice<GlanceTrigger>({
+            id: 'glance-trigger',
+            label: 'Trigger',
+            value: s.glanceTrigger,
+            disabled: !s.glanceEnabled,
+            options: [
+              { value: 'alt', label: 'Alt + Click' },
+              { value: 'ctrl', label: 'Ctrl + Click' },
+              { value: 'shift', label: 'Shift + Click' }
+            ],
+            onChange: (v) => set({ glanceTrigger: v })
+          })
+        : {
+            kind: 'info',
+            id: 'glance-trigger',
+            label: 'Trigger',
+            description: 'Hold a link and choose Open Link in Glance.',
+            keywords: ['long press', 'link menu'],
+            disabled: !s.glanceEnabled
+          }
+    ]
+  })
+  return groups
+}
+
+/**
+ * Settings › Look and Feel › Home (SET-36 / NTP-30; Chrome's and Edge's Homepage): what the
+ * phone's Home button opens – the navigation bar's optional item (TB-15) when the user adds it,
+ * the app menu's icon-row glyph otherwise (v2 §9.13: a button wherever it lives) – or that
+ * there is none. The value row's §9.13 picker sets the mode; a "Specific page" shows its
+ * address as a §9.12 field row (the one-field sheet, a web address required) and Use current
+ * page, which takes the address of the page Settings was opened from (the tab's opener). The
+ * rows are the phone shell's; the desktop reads the same setting through Appearance's Show
+ * home button rows (settings-32, `lookSection`), where Off has no reading and shows as the new
+ * tab page – Chrome has no Off. While an extension holds the homepage
+ * (`chrome_settings_overrides.homepage`, `UIState.extensionControls.homepage` with its page as
+ * the value) the rows are held (`RowBase.controlled`, §10.5's controlled-setting primitive):
+ * the picker at Specific page, the Address row showing the extension's page – what Home opens
+ * (`extensionHomepage`, the core's `effectiveHomepage`) – and Use current page with them, one
+ * run under one indicator. Off stays the user's, Home button and rows alike: Chrome's "Show
+ * home button" is no extension's to set, so an extension's page waits until the button is on.
+ */
+function homepageGroup(state: UIState, tab: Tab, set: SectionContext['set']): RowGroup {
+  const own = state.settings.homepage
+  const control = extensionControlled(state, 'homepage')
+  const held = extensionHomepage(own, control)
+  const homepage = held ? { mode: 'url' as const, url: held } : own
+  const controlled = held ? control : undefined
+  const address = homepageDisplay(homepage)
+  const opener = tab.openerTabId ? state.tabs[tab.openerTabId] : undefined
+  const current =
+    opener && homepageAddress(opener.url) && state.window.kind !== 'private' ? opener : null
+  const rows: SettingsRow[] = [
+    choice<HomepageMode>({
+      id: 'homepage',
+      label: 'Homepage',
+      keywords: ['home', 'home button', 'start page', 'new tab page'],
+      layouts: ['phone'],
+      controlled,
+      value: homepage.mode,
+      sheetDescription: 'Where the Home button goes.',
+      options: [
+        { value: 'off', label: 'Off', description: 'No Home button.' },
+        { value: 'newtab', label: 'New tab page' },
+        {
+          value: 'url',
+          label: 'Specific page',
+          description: address || 'Enter an address below, or use the current page.',
+          // The page's address once there is one (§9.2's exception); the invitation is prose.
+          address: address !== ''
+        }
+      ],
+      onChange: (mode) => set({ homepage: { ...own, mode } })
+    })
+  ]
+  if (homepage.mode === 'url') {
+    rows.push(
+      {
+        kind: 'field',
+        id: 'homepage-address',
+        label: 'Address',
+        keywords: ['homepage', 'url', 'web address'],
+        layouts: ['phone'],
+        controlled,
+        value: address,
+        display: address || 'Not set',
+        // The row's line is the address once set (§9.2's exception); "Not set" is prose.
+        address: address !== '',
+        input: 'url',
+        placeholder: 'example.com',
+        onCommit: (value) => {
+          const url = homepageAddress(value)
+          if (!url) return 'Enter a web address, like example.com'
+          set({ homepage: { mode: 'url', url } })
+          return undefined
+        }
+      },
+      {
+        kind: 'action',
+        id: 'homepage-use-current',
+        label: 'Use current page',
+        description: current
+          ? displayUrl(current.url).replace(/\/$/, '')
+          : 'Open a page, then come back to Settings from it.',
+        // The page's address while there is a page (§9.2's exception); the hint is prose.
+        address: current !== null,
+        keywords: ['homepage'],
+        layouts: ['phone'],
+        controlled,
+        disabled: current === null,
+        onPress: () => {
+          const url = current ? homepageAddress(current.url) : null
+          if (url) set({ homepage: { mode: 'url', url } })
+        }
+      }
+    )
+  }
+  return {
+    id: 'home',
+    heading: 'Home',
+    layouts: ['phone'],
+    rows
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Compact Mode (the desktop and tablet shells; the phone shell has no bars to hide)
+// ---------------------------------------------------------------------------
+
+/**
+ * Zen's compact mode: the mode itself, then which bars it hides. Hiding neither would hide
+ * nothing, so turning one off turns the other on, as Zen's preferences do.
+ */
+function compactSection({ state, set }: SectionContext): RowGroup[] {
+  const s = state.settings
+  const cm = s.compactMode
+  const chord = shortcutHint(state.shortcuts ?? [], 'compact.toggle', state.platform)
+  return [
+    {
+      id: 'compact',
+      heading: 'Compact mode',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'compact-enabled',
+          label: 'Enable compact mode',
+          description: `${chord ? `${chord}. ` : ''}Hidden bars reappear when you hover the window edge.`,
+          keywords: ['hide', 'sidebar', 'toolbar', 'fullscreen'],
+          checked: cm.enabled,
+          onChange: (v) => set({ compactMode: { ...cm, enabled: v } })
+        },
+        {
+          kind: 'switch',
+          id: 'compact-hide-sidebar',
+          label: 'Hide sidebar',
+          checked: cm.hideSidebar,
+          onChange: (v) =>
+            set({ compactMode: { ...cm, hideSidebar: v, hideToolbar: v ? cm.hideToolbar : true } })
+        },
+        {
+          kind: 'switch',
+          id: 'compact-hide-toolbar',
+          label: 'Hide top toolbar',
+          // A dependent row (§10.4): live only where the layout draws a top toolbar row of its
+          // own – the Only sidebar and Collapsed sidebar layouts keep the navigation in the
+          // sidebar, so there is nothing for the switch to hide.
+          description:
+            'Not in the Only sidebar or Collapsed sidebar layouts, which have no top toolbar to hide.',
+          checked: cm.hideToolbar,
+          disabled: !hasTopToolbar(s.toolbarLayout),
+          onChange: (v) =>
+            set({ compactMode: { ...cm, hideToolbar: v, hideSidebar: v ? cm.hideSidebar : true } })
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Accessibility (page zoom, from #78)
+// ---------------------------------------------------------------------------
+
+/**
+ * Settings › Accessibility: the page zoom groups on a host with page controls (the phone), and
+ * Read aloud's groups on a host with a speech engine (`readAloudGroups`, both platforms) – the
+ * category shows where either is true.
+ */
+function accessibilitySection(ctx: SectionContext): RowGroup[] {
+  const groups: RowGroup[] = []
+  if (ctx.state.capabilities.pageControls) groups.push(...pageZoomGroups(ctx))
+  if (ctx.state.capabilities.readAloud) groups.push(...readAloudGroups(ctx))
+  if (ctx.state.capabilities.caretBrowsing) groups.push(caretBrowsingGroup(ctx))
+  // Last, where Chrome Android's Accessibility page ends with it.
+  if (ctx.state.platform === 'android') groups.push(touchpadSwipeGroup(ctx))
+  return groups
+}
+
+/**
+ * The touchpad swipe's switch (GN-23 / A11Y-14), Android's alone: Chrome Android's Settings ›
+ * Accessibility ends with "Swipe between pages using a touchpad" (`accessibility_preferences.xml`
+ * `touchpad_overscroll_history_navigation`; the strings are `browser_ui_strings.grd`'s), shown on
+ * every layout – phone, tablet and a desktop-windowed DeX session, which is where the touchpad
+ * is. Gated by the platform, not `layouts`: `classifyViewport` gives an Android session with a
+ * hovering pointer the desktop layout, and a layout pin would hide the row from the very
+ * device that has a touchpad. The desktop has no touchpad swipe and never sees the row. The
+ * host reads the switch at each swipe's down (`boot.ts` `syncTouchpadSwipeToNavigate`).
+ */
+function touchpadSwipeGroup({ state, set }: SectionContext): RowGroup {
+  return {
+    id: 'touchpad',
+    heading: 'Touchpad',
+    rows: [
+      {
+        kind: 'switch',
+        id: 'touchpad-swipe-navigate',
+        label: 'Swipe between pages using a touchpad',
+        description: 'Navigate back and forth by swiping with two fingers on the touchpad.',
+        keywords: ['trackpad', 'two fingers', 'back', 'forward', 'history', 'gesture'],
+        checked: state.settings.touchpadSwipeToNavigate !== false,
+        onChange: (v) => set({ touchpadSwipeToNavigate: v })
+      }
+    ]
+  }
+}
+
+/**
+ * Caret browsing (CT-34) on a host whose engine has the switch (the desktop): the state F7
+ * toggles, as a row too – Chrome keeps it in Settings › Accessibility – and whether F7 asks
+ * first, the setting the dialog's "Don't ask again" clears, so it can be turned back on.
+ */
+function caretBrowsingGroup({ state, set }: SectionContext): RowGroup {
+  const s = state.settings
+  return {
+    id: 'caret-browsing',
+    heading: 'Keyboard',
+    rows: [
+      {
+        kind: 'switch',
+        id: 'caret-browsing',
+        label: 'Caret browsing',
+        description:
+          "Move through a page's text with the arrow keys and select it with Shift. F7 turns it on and off.",
+        checked: s.caretBrowsing === true,
+        onChange: (v) => set({ caretBrowsing: v })
+      },
+      {
+        kind: 'switch',
+        id: 'caret-browsing-confirm',
+        label: 'Ask before turning on caret browsing',
+        description: 'F7 asks "Turn on caret browsing?" first.',
+        checked: s.caretBrowsingConfirm !== false,
+        onChange: (v) => set({ caretBrowsingConfirm: v })
+      }
+    ]
+  }
+}
+
+function pageZoomGroups({ state, set }: SectionContext): RowGroup[] {
+  const pc = state.settings.pageControls
+  const patch = (p: Partial<typeof pc>): void => set({ pageControls: { ...pc, ...p } })
+  const fontScale = state.pageEnvironment.fontScale || 1
+  const scale = pc.zoomIncludesOsFontSize ? fontScale : 1
+  const fontHint =
+    fontScale === 1
+      ? 'Follow the font size chosen in the system settings; it is at 100% now.'
+      : `The system font size is ${formatZoom(fontScale)}; with it, pages open at ${formatZoom(pc.zoom * scale)}.`
+  return [
+    {
+      id: 'zoom',
+      heading: 'Page zoom',
+      rows: [
+        {
+          kind: 'custom',
+          id: 'default-zoom',
+          label: 'Default zoom',
+          description: 'Sites without a zoom of their own open at this size.',
+          keywords: ['text size', 'magnify', formatZoom(pc.zoom)],
+          render: () => (
+            <ZoomBlock
+              value={pc.zoom}
+              previewFactor={pc.zoom * scale}
+              onChange={(factor) => patch({ zoom: factor })}
+            />
+          )
+        },
+        {
+          kind: 'switch',
+          id: 'zoom-os-font',
+          label: 'Include system font size',
+          description: fontHint,
+          checked: pc.zoomIncludesOsFontSize,
+          onChange: (v) => patch({ zoomIncludesOsFontSize: v })
+        },
+        {
+          kind: 'switch',
+          id: 'force-zoom',
+          label: 'Force enable zoom',
+          description: 'Pinch to zoom on every page, even where a site turns it off.',
+          checked: pc.forceZoom,
+          onChange: (v) => patch({ forceZoom: v })
+        }
+      ]
+    },
+    {
+      id: 'site-zooms',
+      heading: 'Sites with their own zoom',
+      description: 'Zoom In and Zoom Out in the menu remember a site’s zoom here.',
+      rows: sorted(pc.siteZooms).map(([domain, factor]) =>
+        item(`zoom:${domain}`, domain, formatZoom(factor), [
+          {
+            kind: 'action',
+            id: `zoom:${domain}:forget`,
+            label: 'Remove zoom',
+            description: 'The site opens at the default zoom again.',
+            button: 'Remove',
+            onPress: () => run('pageControls.forgetSite', { kind: 'zoom', domain })
+          }
+        ])
+      ),
+      empty: 'No sites yet'
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Read aloud (Accessibility)
+// ---------------------------------------------------------------------------
+
+/**
+ * The highlight modes (`readAloud.setHighlight`) in the picker's order – the default first –
+ * with their labels, Edge's "Text highlighting" words.
+ */
+const READ_ALOUD_HIGHLIGHT_OPTIONS: ReadonlyArray<{
+  value: ReadAloudHighlightMode
+  label: string
+}> = [
+  { value: 'both', label: 'Sentence and word' },
+  { value: 'sentence', label: 'Sentence' },
+  { value: 'word', label: 'Word' },
+  { value: 'off', label: 'Off' }
+]
+
+/**
+ * The languages Settings › Read aloud offers a voice for: the languages Ione reads in
+ * (Languages › preferred, the first of them the model's own UI language), then any the player
+ * already chose a voice for, in that order and once each; English where nothing names one.
+ */
+export function readAloudLanguages(state: UIState): string[] {
+  const out: string[] = []
+  const add = (tag: string): void => {
+    const clean = normalizeLanguageTag(tag)
+    if (clean && !out.includes(clean)) out.push(clean)
+  }
+  for (const lang of state.translate.preferences.preferred) add(lang)
+  for (const lang of Object.keys(state.settings.readAloud.voiceByLanguage)) add(lang)
+  if (out.length === 0) add('en')
+  return out
+}
+
+/**
+ * Settings › Accessibility › Read aloud (CT-12, CT-13; Chrome for Android keeps Listen to this
+ * page under Accessibility), on hosts with a speech engine – one builder for the phone page and
+ * the desktop panel: the speed the player starts at (the model's ladder, `readAloud.setRate`),
+ * the highlight the page draws while it reads (`readAloud.setHighlight`), then a Voices group
+ * with one value row per language (`readAloudLanguages`) – the engine's voices for it, the
+ * language's current voice (the user's choice, else the engine's default for it) as the value –
+ * writing `readAloud.setVoice` for that language. The player's speed chip and voice picker
+ * write the same settings, so a change here reaches a session under way from its next sentence.
+ * Before the voice list arrives the group holds one line saying so; an engine without a voice
+ * for a language says that in the row.
+ */
+export function readAloudGroups({
+  state,
+  readAloudVoices
+}: Pick<SectionContext, 'state' | 'readAloudVoices'>): RowGroup[] {
+  const prefs = state.settings.readAloud
+  const rate = String(sanitizeReadAloudRate(prefs.rate))
+  const rates = READ_ALOUD_RATES.map((r) => String(r))
+  if (!rates.includes(rate)) rates.push(rate)
+  const voices = readAloudVoices?.voices ?? null
+  const voiceRows: SettingsRow[] = []
+  if (voices !== null && voices.length > 0) {
+    for (const lang of readAloudLanguages(state)) {
+      const base = baseLanguage(lang)
+      const own = voices.filter((v) => baseLanguage(v.lang) === base)
+      const label = languageName(lang)
+      if (own.length === 0) {
+        voiceRows.push({
+          kind: 'info',
+          id: `read-aloud-voice:${lang}`,
+          label,
+          description: 'No voice for this language on this device',
+          keywords: ['voice', 'read aloud']
+        })
+        continue
+      }
+      const current = voiceForLanguage(voices, lang, prefs.voiceByLanguage) ?? own[0]!.id
+      voiceRows.push(
+        choice<string>({
+          id: `read-aloud-voice:${lang}`,
+          label,
+          keywords: ['voice', 'read aloud', 'listen'],
+          sheetDescription: `The voices on this device for ${label}. Read aloud speaks ${label} pages with the one chosen here.`,
+          value: current,
+          options: own.map((voice) => ({
+            value: voice.id,
+            label: voice.name,
+            description: voiceOptionDescription(voice, lang)
+          })),
+          onChange: (voiceId) => run('readAloud.setVoice', { voiceId, lang })
+        })
+      )
+    }
+  }
+  return [
+    {
+      id: 'read-aloud',
+      heading: 'Read aloud',
+      description:
+        'Listen to This Page reads a page sentence by sentence; the player’s own controls change these too.',
+      rows: [
+        choice<string>({
+          id: 'read-aloud-rate',
+          label: 'Speed',
+          keywords: ['rate', 'read aloud', 'listen', 'speech'],
+          value: rate,
+          options: rates.map((value) => ({ value, label: formatRate(Number(value)) })),
+          onChange: (value) => run('readAloud.setRate', { rate: Number(value) })
+        }),
+        choice<ReadAloudHighlightMode>({
+          id: 'read-aloud-highlight',
+          label: 'Highlight while reading',
+          keywords: ['read aloud', 'listen', 'highlight'],
+          value: prefs.highlight,
+          sheetDescription: 'The page marks what is being read: the sentence, the word, or both.',
+          options: READ_ALOUD_HIGHLIGHT_OPTIONS,
+          onChange: (mode) => run('readAloud.setHighlight', { mode })
+        })
+      ]
+    },
+    {
+      id: 'read-aloud-voices',
+      heading: 'Voices',
+      description:
+        'One voice per language, from the voices on this device. Listen picks the language’s voice as it reads.',
+      rows:
+        voices === null
+          ? [{ kind: 'info', id: 'read-aloud-voices-loading', label: 'Looking for voices…' }]
+          : voiceRows,
+      empty: 'No voices on this device'
+    }
+  ]
+}
+
+/**
+ * A voice's second line in the picker: its own language where it is a regional variant of the
+ * row's (`English (United Kingdom)` under English), where it runs, and its quality when the
+ * engine says.
+ */
+function voiceOptionDescription(voice: ReadAloudVoice, lang: string): string {
+  const parts: string[] = []
+  const own = normalizeLanguageTag(voice.lang)
+  if (own && own !== normalizeLanguageTag(lang)) parts.push(languageName(voice.lang))
+  parts.push(voice.local ? 'On this device' : 'Needs a network')
+  if (voice.quality === 'high') parts.push('High quality')
+  else if (voice.quality === 'low') parts.push('Low quality')
+  return parts.join(' · ')
+}
+
+// ---------------------------------------------------------------------------
+// New Tab
+// ---------------------------------------------------------------------------
+
+/**
+ * Settings › New Tab, on a host that renders `zen://newtab` (`newTabPage`; the desktop overlay's
+ * section row for row, `NewTabSection.tsx`): the page on or off, the layout (the preset the
+ * phone's sheet picks too), the shortcuts source, the background and the greeting – rows that
+ * write the one model's sections through the same toggles as the phone's sheet – then the
+ * shortcut tiles as item rows – each with its address, its place in the grid and a confirmed
+ * removal – and an Add shortcut form. The image background is offered only where the host can
+ * pick a file; choosing it there opens the host's picker.
+ */
+function newTabSection({ state, set }: SectionContext): RowGroup[] {
+  const prefs = state.settings.newTab
+  const write = (next: NewTabSettings): void => set({ newTab: next })
+  const { image, canPick, accent } = state.newTabBackground
+  const activeSpace = state.spaces.find((s) => s.id === state.activeSpaceId)
+  const backgroundOptions: Array<{ value: NewTabBackgroundKind; label: string }> = [
+    { value: 'space', label: 'Space gradient' },
+    { value: 'solid', label: 'Solid colour' }
+  ]
+  if (canPick) backgroundOptions.push({ value: 'image', label: 'Image from file' })
+  const background = newTabBackgroundValue(prefs, image)
+  const shortcuts = state.newTabShortcuts
+  const full = shortcuts.length >= MAX_NEW_TAB_SHORTCUTS
+  return [
+    {
+      id: 'newtab',
+      heading: 'New tab page',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'newtab-enabled',
+          label: 'Open the new tab page',
+          description: 'Off, a new tab shows only the address bar.',
+          checked: prefs.enabled,
+          onChange: (v) => write({ ...prefs, enabled: v })
+        },
+        choice<NewTabPreset>({
+          id: 'newtab-layout',
+          label: 'Layout',
+          keywords: ['preset', 'focused', 'inspirational', 'custom'],
+          value: prefs.preset,
+          options: newTabPresetChoices(prefs).map((value) => ({
+            value,
+            label: NEW_TAB_PRESET_LABELS[value],
+            description: NEW_TAB_PRESET_DESCRIPTIONS[value]
+          })),
+          sheetDescription: NEW_TAB_LAYOUT_HINT,
+          onChange: (v) => write(pickNewTabPreset(prefs, v))
+        }),
+        {
+          // The phone's cards under the shortcuts (NTP-16, Chrome's Magic Stack – "Cards" to the
+          // user): a level beside Layout and Shortcuts, the second door to the one Show list the
+          // page's gear sheet opens (§9.29's two doors, one setting) – the very sheet, over this
+          // page, not a copy of its rows. The hidden set is this device's, so the row is the
+          // phone layout's alone; the desktop has no stack and its page keeps its rows.
+          kind: 'action',
+          id: 'newtab-cards',
+          label: 'Cards',
+          description: 'Choose which cards show under the shortcuts',
+          keywords: [
+            'continue where you left off',
+            'recently closed',
+            'downloads',
+            'bookmarks',
+            'default browser'
+          ],
+          layouts: ['phone'],
+          leaves: 'chevron',
+          onPress: openMagicStackCustomize
+        },
+        choice<NewTabShortcutsMode>({
+          id: 'newtab-shortcuts',
+          label: 'Shortcuts',
+          value: newTabShortcutsMode(prefs),
+          options: [
+            { value: 'most-visited', label: 'Most visited' },
+            { value: 'my-shortcuts', label: 'My shortcuts' },
+            { value: 'hidden', label: 'Hide' }
+          ],
+          sheetDescription:
+            'Your shortcuts take the first tiles; the most visited sites fill the rest.',
+          onChange: (v) => write(setNewTabShortcutsMode(prefs, v))
+        }),
+        choice<NewTabBackgroundKind>({
+          id: 'newtab-background',
+          label: 'Background',
+          keywords: ['image', 'gradient', 'colour', 'color', 'wallpaper'],
+          value: background,
+          options: backgroundOptions,
+          sheetDescription:
+            background === 'image' && image
+              ? 'Your image is stored on this device only.'
+              : undefined,
+          onChange: (v) => {
+            // Picking the file sets the background once a file was chosen; a cancelled picker
+            // keeps the current choice.
+            if (v === 'image' && !image) void run('newtab.pickBackgroundImage', undefined)
+            else write(setNewTabBackground(prefs, v))
+          }
+        }),
+        // The image rows exist where a file can be picked; each depends on an image being set.
+        ...(canPick
+          ? [
+              // The picture's colour as the space's accent (NTP-14): Chrome recolours the browser
+              // from the image on its own; here it is the user's switch, under the background it
+              // reads from. On, this space takes the picture's colour the moment it is flipped
+              // (§9.23) and follows each new picture; off, the colours stay. It rests at .4
+              // without a picture, and until the picture's colour is read.
+              {
+                kind: 'switch',
+                id: 'newtab-image-colour',
+                label: "Use the picture's colour",
+                description:
+                  'This Space takes the colour your picture is mostly of, and follows a new one.',
+                keywords: ['theme', 'accent', 'colour', 'color', 'wallpaper'],
+                checked: activeSpace?.theme?.fromImage === true,
+                disabled: !image || !accent,
+                onChange: (v) => run('newtab.useImageColor', { on: v })
+              } satisfies SettingsRow,
+              {
+                kind: 'action',
+                id: 'newtab-change-image',
+                label: 'Change background image',
+                description: 'Pick another file; the current image is replaced.',
+                keywords: ['wallpaper', 'photo'],
+                button: 'Change…',
+                disabled: !image,
+                onPress: () => run('newtab.pickBackgroundImage', undefined)
+              } satisfies SettingsRow,
+              {
+                kind: 'action',
+                id: 'newtab-remove-image',
+                label: 'Remove background image',
+                button: 'Remove',
+                disabled: !image,
+                onPress: () => run('newtab.clearBackgroundImage', undefined)
+              } satisfies SettingsRow
+            ]
+          : []),
+        // Chrome's "Reset to default" for the theme (NTP-12): the background alone, back to the
+        // space gradient with the picked image let go. One row's reset asks nothing (§10.5).
+        {
+          kind: 'action',
+          id: 'newtab-reset-background',
+          label: 'Reset background to default',
+          description: 'The Space gradient; an image kept on this device is removed.',
+          keywords: ['restore', 'theme', 'wallpaper'],
+          button: 'Reset',
+          disabled: background === DEFAULT_NEW_TAB_SETTINGS.background && !image,
+          onPress: () => run('newtab.resetBackground', undefined)
+        },
+        {
+          kind: 'switch',
+          id: 'newtab-greeting',
+          label: 'Show a greeting',
+          description: 'A line above the search box that follows the hour.',
+          checked: newTabSections(prefs).greeting,
+          onChange: (v) => write(setNewTabSection(prefs, 'greeting', v))
+        }
+      ]
+    },
+    {
+      id: 'newtab-shortcuts',
+      heading: 'My shortcuts',
+      description: 'The sites on every new tab: the first tiles, ahead of the most visited.',
+      rows: shortcuts.map((shortcut, i) => {
+        const move = (dir: -1 | 1): void => {
+          const ids = shortcuts.map((x) => x.id)
+          ;[ids[i], ids[i + dir]] = [ids[i + dir], ids[i]]
+          run('newtab.reorderShortcuts', { ids })
+        }
+        return item(`shortcut:${shortcut.id}`, shortcut.title || shortcut.url, shortcut.url, [
+          {
+            kind: 'field',
+            id: `shortcut:${shortcut.id}:title`,
+            label: 'Name',
+            value: shortcut.title,
+            input: 'text',
+            placeholder: 'Name',
+            onCommit: (v) => {
+              run('newtab.updateShortcut', { id: shortcut.id, title: v.trim(), url: shortcut.url })
+              return undefined
+            }
+          },
+          {
+            kind: 'field',
+            id: `shortcut:${shortcut.id}:url`,
+            label: 'Address',
+            value: shortcut.url,
+            input: 'text',
+            placeholder: 'example.com',
+            onCommit: (v) => {
+              if (!inputToUrl(v.trim())) return 'Enter a web address.'
+              run('newtab.updateShortcut', {
+                id: shortcut.id,
+                title: shortcut.title,
+                url: v.trim()
+              })
+              return undefined
+            }
+          },
+          {
+            kind: 'action',
+            id: `shortcut:${shortcut.id}:up`,
+            label: 'Move up',
+            button: 'Up',
+            disabled: i === 0,
+            onPress: () => move(-1)
+          },
+          {
+            kind: 'action',
+            id: `shortcut:${shortcut.id}:down`,
+            label: 'Move down',
+            button: 'Down',
+            disabled: i === shortcuts.length - 1,
+            onPress: () => move(1)
+          },
+          {
+            kind: 'action',
+            id: `shortcut:${shortcut.id}:remove`,
+            label: 'Remove shortcut',
+            button: 'Remove…',
+            destructive: true,
+            confirm: {
+              title: `Remove ${shortcut.title || shortcut.url}?`,
+              description: 'The tile leaves the grid; the site itself is not affected.',
+              action: 'Remove'
+            },
+            onPress: () => run('newtab.removeShortcut', { id: shortcut.id })
+          }
+        ])
+      }),
+      empty: 'No shortcuts yet. Add the sites you want on every new tab.'
+    },
+    {
+      id: 'newtab-add',
+      heading: null,
+      rows: [
+        {
+          kind: 'action',
+          id: 'newtab-add-shortcut',
+          label: 'Add shortcut',
+          description: full ? `The grid holds ${MAX_NEW_TAB_SHORTCUTS} shortcuts.` : undefined,
+          disabled: full,
+          keywords: ['tile', 'site'],
+          button: 'Add…',
+          form: {
+            title: 'Add shortcut',
+            render: (close) => (
+              <ShortcutForm
+                onSubmit={(title, url) => void run('newtab.addShortcut', { title, url })}
+                close={close}
+              />
+            )
+          }
+        }
+      ]
+    },
+    {
+      id: 'newtab-reset',
+      heading: null,
+      rows: [
+        // The whole page (NTP-22): a bulk reset, so the row's §9.23 confirmation stands before
+        // it – Cancel | Reset in the danger ink, no primary, Enter inert (§9.22). Whether a new
+        // tab opens the page at all (the first switch) is not the page's content and stays.
+        {
+          kind: 'action',
+          id: 'newtab-reset',
+          label: 'Reset new tab page',
+          description:
+            'Layout, shortcuts, background and greeting return to their defaults; removed sites come back.',
+          keywords: ['restore', 'defaults'],
+          button: 'Reset…',
+          destructive: true,
+          confirm: {
+            title: 'Reset the new tab page?',
+            description:
+              'Your shortcuts and a background image kept on this device are removed; the layout, background and greeting return to their defaults.',
+            action: 'Reset'
+          },
+          onPress: () => run('newtab.reset', undefined)
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Tab Management
+// ---------------------------------------------------------------------------
+
+function tabsSection({ state, set }: SectionContext): RowGroup[] {
+  const s = state.settings
+  const windows = state.capabilities.windows
+  // #129's session rows follow the desktop panel: a crash offer and a "Close N tabs?" question
+  // are a windowed host's (Android's runs end by the process going, its pages just come back).
+  const sessionRows: SettingsRow[] = windows
+    ? [
+        choice<CrashRestoreMode>({
+          id: 'crash-restore',
+          label: 'Restore pages after a crash',
+          description: 'What happens to the open pages when Ione did not shut down correctly.',
+          value: s.crashRestore,
+          options: [
+            { value: 'ask', label: 'Ask first' },
+            { value: 'always', label: 'Restore them' },
+            { value: 'never', label: 'Start fresh' }
+          ],
+          onChange: (v) => set({ crashRestore: v })
+        }),
+        {
+          kind: 'switch',
+          id: 'warn-close-window',
+          label: 'Confirm before closing multiple tabs',
+          description: 'Also asks before quitting with more than one tab open.',
+          checked: s.warnOnCloseWindow,
+          onChange: (v) => set({ warnOnCloseWindow: v })
+        }
+      ]
+    : []
+  // No switch for the phone's Close all tabs: it asks nothing, and one toast undoes the lot (the
+  // Lead's A3/S1 ruling).
+  // The startup on a host without windows: the phone's boot knows two – the last session back,
+  // or one fresh tab – so its row stays the switch it was (`startup.mode` underneath: on is
+  // "Continue where you left off", off "Open the New Tab page"; a synced `pages` reads as on,
+  // the boot it gets there). The windowed hosts have Settings › On startup (`startupGroup`).
+  const startupRows: SettingsRow[] = windows
+    ? []
+    : [
+        {
+          kind: 'switch',
+          id: 'restore-session',
+          label: 'Restore previous session on startup',
+          checked: s.startup.mode !== 'newTab',
+          onChange: (v) => set({ startup: { ...s.startup, mode: v ? 'continue' : 'newTab' } })
+        }
+      ]
+  const groups: RowGroup[] = [
+    {
+      id: 'tabs',
+      heading: 'Tabs',
+      rows: [
+        choice<NewTabPosition>({
+          id: 'new-tab-position',
+          label: 'Open new tabs',
+          value: s.newTabPosition,
+          options: [
+            { value: 'end', label: 'At the end of the list' },
+            { value: 'after-current', label: 'Below the current tab' }
+          ],
+          onChange: (v) => set({ newTabPosition: v })
+        }),
+        {
+          kind: 'switch',
+          id: 'tab-separator',
+          label: 'Show separator between pinned and regular tabs',
+          checked: s.showTabSeparator,
+          onChange: (v) => set({ showTabSeparator: v })
+        },
+        {
+          kind: 'switch',
+          id: 'ctrl-tab-section',
+          label: 'Ctrl+Tab stays within Essentials or regular tabs',
+          checked: s.ctrlTabCyclesWithinSection,
+          onChange: (v) => set({ ctrlTabCyclesWithinSection: v })
+        },
+        ...startupRows,
+        ...sessionRows
+      ]
+    }
+  ]
+  if (windows) groups.push(startupGroup({ state, set }))
+  if (state.capabilities.windows) {
+    groups.push({
+      id: 'window-sync',
+      heading: 'Window sync',
+      rows: [
+        choice<WindowSyncMode>({
+          id: 'window-sync',
+          label: 'Tabs across windows',
+          value: s.windowSync,
+          sheetDescription:
+            'Ione mirrors your Spaces and tabs in every window. Choose pinned only to keep unpinned tabs per window.',
+          options: [
+            { value: 'all', label: 'Sync all tabs' },
+            { value: 'pinned', label: 'Sync only pinned tabs in Spaces' },
+            { value: 'off', label: 'Off – windows are independent' }
+          ],
+          onChange: (v) => set({ windowSync: v })
+        }),
+        {
+          kind: 'action',
+          id: 'blank-window',
+          label: 'Open a blank window',
+          description:
+            'Ctrl+Shift+N opens a window without Spaces, pinned tabs or Essentials. Its tabs are temporary.',
+          button: 'Open',
+          onPress: () => run('window.newUnsynced', undefined)
+        }
+      ]
+    })
+  }
+  groups.push(
+    {
+      id: 'pinned',
+      heading: 'Pinned tabs and Essentials',
+      rows: [
+        choice<PinnedCloseBehavior>({
+          id: 'pinned-close',
+          label: 'When closing a pinned tab',
+          value: s.pinnedCloseBehavior,
+          options: [
+            { value: 'reset-unload-switch', label: 'Reset, unload and switch to next' },
+            { value: 'reset-unload', label: 'Reset and unload' },
+            { value: 'reset', label: 'Reset to pinned URL' },
+            { value: 'unload', label: 'Unload' },
+            { value: 'unload-switch', label: 'Unload and switch to next' },
+            { value: 'switch', label: 'Switch to next tab' },
+            { value: 'close', label: 'Close the tab' }
+          ],
+          onChange: (v) => set({ pinnedCloseBehavior: v })
+        }),
+        {
+          kind: 'switch',
+          id: 'pinned-reset-startup',
+          label: 'Restore pinned tabs to their pinned URL on startup',
+          checked: s.pinnedResetOnStartup,
+          onChange: (v) => set({ pinnedResetOnStartup: v })
+        },
+        choice<ThirdPartyPinnedBehavior>({
+          id: 'third-party-pinned',
+          label: 'Third-party links on pinned and essential tabs',
+          value: s.thirdPartyOnPinned,
+          options: [
+            { value: 'new-tab', label: 'Open in their own tab' },
+            { value: 'glance', label: 'Open in Glance' },
+            { value: 'same-tab', label: 'Open in the same tab' }
+          ],
+          onChange: (v) => set({ thirdPartyOnPinned: v })
+        }),
+        {
+          kind: 'switch',
+          id: 'container-essentials',
+          label: 'Container-specific Essentials',
+          description: 'Each container gets its own set of Essentials.',
+          checked: s.containerSpecificEssentials,
+          onChange: (v) => set({ containerSpecificEssentials: v })
+        },
+        {
+          kind: 'field',
+          id: 'essentials-max',
+          label: 'Maximum number of Essentials',
+          value: String(s.essentialsMax),
+          input: 'number',
+          min: 1,
+          max: 24,
+          onCommit: (value) => {
+            const n = Number(value)
+            if (!Number.isInteger(n) || n < 1 || n > 24) return 'Enter a number from 1 to 24'
+            set({ essentialsMax: n })
+            return undefined
+          }
+        }
+      ]
+    },
+    // The same three keys twice over: Chrome's Memory Saver rows under Performance on the
+    // desktop and tablet shells (W8-2, `performanceSection`), Edge's sleeping tabs here on the
+    // phone (CT-22).
+    ...sleepingTabsGroups(s, set)
+  )
+  if (state.capabilities.inactiveTabs) groups.push(...inactiveTabsGroups(s, set))
+  return groups
+}
+
+/**
+ * The site "Add current site" puts on the never-unload list: the registrable domain (eTLD+1) of
+ * the page Settings was opened from – the tab's opener, as Use current page reads it – which is
+ * what the core's unload pass matches an entry against (`neverUnloaded` in
+ * `core/memoryPressure.ts`: the page's host with `www.` aside, or its registrable domain, equals
+ * the entry), so `mail.google.com` goes on as `google.com` and every page of the site
+ * stays loaded. `listed` names the domain when it is on the list already – the row is laid out
+ * at .4 and says so rather than adding a twin. No site for a chrome page (Settings opened from
+ * the menu of a blank tab or from History), an extension page, or a private window, whose sites
+ * are nothing to remember.
+ */
+function currentUnloadSite(
+  state: UIState,
+  tab: Tab
+): { domain: string | null; listed: string | null } {
+  const opener = tab.openerTabId ? state.tabs[tab.openerTabId] : undefined
+  if (!opener || state.window.kind === 'private' || !isWebPageUrl(opener.url))
+    return { domain: null, listed: null }
+  const domain = getDomain(opener.url)
+  if (!domain) return { domain: null, listed: null }
+  const listed = state.settings.unloadExcludedDomains.some((d) => d.toLowerCase() === domain)
+  return listed ? { domain: null, listed: domain } : { domain, listed: null }
+}
+
+/**
+ * Edge's ladder for "Put inactive tabs to sleep after" (Settings › System and performance), in
+ * minutes: 30 seconds to 12 hours. The engine stores the timeout in minutes down to a half.
+ */
+const SLEEP_TIMEOUTS: readonly number[] = [0.5, 1, 5, 15, 30, 60, 120, 180, 360, 720]
+
+/** "30 seconds", "5 minutes", "1 hour", "12 hours": the ladder's labels, and any stored value's. */
+export function sleepTimeoutLabel(minutes: number): string {
+  if (minutes < 1) return `${Math.round(minutes * 60)} seconds`
+  if (minutes < 60) return minutes === 1 ? '1 minute' : `${minutes} minutes`
+  const hours = minutes / 60
+  const shown = Number.isInteger(hours) ? String(hours) : hours.toFixed(1).replace(/\.0$/, '')
+  return hours === 1 ? '1 hour' : `${shown} hours`
+}
+
+/**
+ * Sleeping tabs on a phone (CT-22), in Edge's words: the switch ("Save resources with sleeping
+ * tabs"), the timeout as a choice on Edge's ladder – a stored value off it (an older profile's
+ * 20 minutes) is listed in its place rather than shown as nothing – and the never-sleep sites
+ * as a managed list ("No sites yet" while it is empty, §9.17), each with Remove, and an Add sheet
+ * in a group of its own taking a site (a URL is cut down to its host). Every dependent row reads
+ * at .4 while the switch is off (§10.4). A sleeping tab fades
+ * in the tab overview and wakes when it is opened; memory pressure puts pages to sleep ahead of
+ * the timeout whatever the switch says. The phone shell's groups: the desktop and tablet shells
+ * bind the same keys through Zen's "Tab unloading" rows in `tabsSection`.
+ */
+function sleepingTabsGroups(s: Settings, set: (patch: Partial<Settings>) => void): RowGroup[] {
+  const off = !s.unloadEnabled
+  const keywords = ['sleeping tabs', 'memory saver', 'discard', 'unload', 'inactive', 'battery']
+  const ladder = SLEEP_TIMEOUTS.includes(s.unloadTimeoutMinutes)
+    ? SLEEP_TIMEOUTS
+    : [...SLEEP_TIMEOUTS, s.unloadTimeoutMinutes].sort((a, b) => a - b)
+  const sites = [...s.unloadExcludedDomains].sort((a, b) => a.localeCompare(b))
+  const addSite = (raw: string): void => {
+    const host = raw
+      .trim()
+      .toLowerCase()
+      .replace(/^https?:\/\//, '')
+      .replace(/^www\./, '')
+      .split('/')[0]
+      .split(':')[0]
+    if (!host || s.unloadExcludedDomains.includes(host)) return
+    set({ unloadExcludedDomains: [...s.unloadExcludedDomains, host] })
+  }
+  return [
+    {
+      id: 'sleeping-tabs',
+      heading: 'Sleeping tabs',
+      layouts: ['phone'],
+      description:
+        'Tabs you have not looked at for a while go to sleep to save memory and battery. A sleeping tab fades in the tab overview and wakes when you open it.',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'unload-enabled',
+          label: 'Save resources with sleeping tabs',
+          keywords,
+          checked: s.unloadEnabled,
+          onChange: (v) => set({ unloadEnabled: v })
+        },
+        choice({
+          id: 'unload-after',
+          label: 'Put inactive tabs to sleep after',
+          keywords,
+          value: String(s.unloadTimeoutMinutes),
+          disabled: off,
+          options: ladder.map((minutes) => ({
+            value: String(minutes),
+            label: sleepTimeoutLabel(minutes)
+          })),
+          onChange: (v) => set({ unloadTimeoutMinutes: Number(v) })
+        })
+      ]
+    },
+    {
+      id: 'never-sleep',
+      heading: 'Never put these sites to sleep',
+      layouts: ['phone'],
+      description:
+        'Pages on these sites stay awake in the background – a chat, a player, a document you come back to.',
+      rows: sites.map((domain) =>
+        item(
+          `never-sleep:${domain}`,
+          domain,
+          undefined,
+          [
+            {
+              kind: 'action',
+              id: `never-sleep:${domain}:remove`,
+              label: 'Remove',
+              description: 'Pages on the site go to sleep like any other.',
+              onPress: () =>
+                set({
+                  unloadExcludedDomains: s.unloadExcludedDomains.filter((d) => d !== domain)
+                })
+            }
+          ],
+          { keywords, disabled: off }
+        )
+      ),
+      // The list's own empty state (§9.17): one plain row where its sites would be, so the Add
+      // action below is a group of its own, as the spell-check languages' is.
+      empty: 'No sites yet'
+    },
+    {
+      id: 'never-sleep-add',
+      heading: null,
+      layouts: ['phone'],
+      rows: [
+        {
+          kind: 'action',
+          id: 'never-sleep-add',
+          label: 'Add a site',
+          keywords,
+          disabled: off,
+          form: {
+            title: 'Never put this site to sleep',
+            render: (close) => (
+              <UrlForm
+                id="never-sleep-site"
+                label="Site"
+                placeholder="mail.example.com"
+                action="Add"
+                onSubmit={addSite}
+                close={close}
+              />
+            )
+          }
+        }
+      ]
+    }
+  ]
+}
+
+/**
+ * Chrome's Memory Saver tiers (`chrome/browser/performance_manager/policies/
+ * memory_saver_mode_policy.cc`, `GetTimeBeforeDiscard`): a hidden tab is discarded once it has
+ * been inactive for the tier's time – kConservative 6 h, kMedium 4 h (Chrome's default),
+ * kAggressive 2 h – written here to `unloadTimeoutMinutes`, the timer the desktop governor's
+ * discard-after rule and the phone's sleeping-tabs pass both read. Labels and descriptions are
+ * Chrome's (`settings_strings.grdp`), the hours added after them so the row says what it sets.
+ */
+export const MEMORY_SAVER_TIERS: ReadonlyArray<{
+  minutes: number
+  label: string
+  description: string
+}> = [
+  {
+    minutes: 360,
+    label: 'Moderate',
+    description:
+      'Get moderate memory savings. Your tabs become inactive after a longer period of time – 6 hours.'
+  },
+  {
+    minutes: 240,
+    label: 'Balanced (recommended)',
+    description:
+      'Get balanced memory savings. Your tabs become inactive after an optimal period of time – 4 hours.'
+  },
+  {
+    minutes: 120,
+    label: 'Maximum',
+    description:
+      'Get maximum memory savings. Your tabs become inactive after a shorter period of time – 2 hours.'
+  }
+]
+
+/**
+ * The tier radio's options for a stored timeout: Chrome's three, longest first, and a stored
+ * value off them – an existing profile's shipped 20 minutes (a fresh desktop profile starts on
+ * Balanced, `freshPerformanceDefaults`), a timer set in the field this row replaced, the phone
+ * ladder's 30 seconds – listed in its place among them (the phone ladder's rule for an
+ * off-ladder value), so the row never shows a choice the browser is not making and never
+ * rewrites a timer the user did not touch: the migration is the affordance (pr-584 §D (3)).
+ */
+export function memorySaverTierOptions(minutes: number): RowOption[] {
+  const tiers: RowOption[] = MEMORY_SAVER_TIERS.map((tier) => ({
+    value: String(tier.minutes),
+    label: tier.label,
+    description: tier.description
+  }))
+  if (MEMORY_SAVER_TIERS.some((tier) => tier.minutes === minutes)) return tiers
+  const custom: RowOption = {
+    value: String(minutes),
+    label: `Custom – ${sleepTimeoutLabel(minutes)}`,
+    description: 'The timer set before these options; kept until you pick one of them.'
+  }
+  const at = MEMORY_SAVER_TIERS.findIndex((tier) => tier.minutes < minutes)
+  return at === -1 ? [...tiers, custom] : [...tiers.slice(0, at), custom, ...tiers.slice(at)]
+}
+
+/**
+ * Energy Saver's two conditions, Chrome's rows in Chrome's order (`battery_page.html.ts`:
+ * kEnabledBelowThreshold, then kEnabledOnBattery). The threshold row's description is the
+ * host's: where the battery level cannot be read (`batteryPercent` null – Windows without a
+ * native module, a computer without a battery) it says so, since the mode would wait for ever.
+ */
+export function energySaverOptions(
+  platform: Platform,
+  batteryPercent: number | null
+): Array<RowOption & { value: EnergySaverMode }> {
+  const unreadable =
+    batteryPercent === null
+      ? platform === 'win32'
+        ? 'Ione cannot read the battery level on Windows yet, so this option waits until it can.'
+        : 'No battery level to read on this computer, so this option waits until there is one.'
+      : undefined
+  return [
+    {
+      value: 'low-battery',
+      label: `Turn on only when your battery is at ${ENERGY_SAVER_LOW_BATTERY_PERCENT}% or lower`,
+      description: unreadable
+    },
+    { value: 'on-battery', label: 'Turn on when your computer is unplugged' }
+  ]
+}
+
+/** Cut a typed site down to its host, as the phone's never-sleep Add sheet does. */
+function siteHost(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .split('/')[0]
+    .split(':')[0]
+}
+
+/**
+ * Chrome's Performance page (chrome://settings/performance; W8-2, settings-69 / -26 / -29) on
+ * the desktop and tablet shells – the phone keeps Edge's sleeping tabs under Tab Management
+ * (CT-22) and never lists this section. Three groups in Chrome's order:
+ *
+ * - Memory Saver: Zen's tab unloading under Chrome's name and its ONE switch (`unloadEnabled`;
+ *   the Resources page's twin switch went, that page links here – one owner, §9.1), Chrome's
+ *   sentence as the description, and its tiers as a radio (`MEMORY_SAVER_TIERS` onto
+ *   `unloadTimeoutMinutes`, a stored value off them listed in place) – a dependent row at .4
+ *   while the switch is off (§10.4).
+ * - Always keep these sites active: `unloadExcludedDomains`, the governor's exceptions (a host,
+ *   a subdomain or a registrable domain matches, `isExcluded`), as §10.5 item rows each with
+ *   the trailing 32 Remove in plain ink, "No sites yet" while empty (§9.17), an Add form (a
+ *   URL cut to its host, the phone sheet's rule) and Chrome's Add current site.
+ * - Energy Saver: `energySaver` as switch + Chrome's two conditions as a radio, and its effect
+ *   – the budget factor the governor applies while the mode is on (`resources.batteryFactor`,
+ *   the row moved here from Resources › Budgets; one setting, one place). The group goes on a
+ *   computer without a battery, as Chrome's Battery Saver section does (pr-584 L5):
+ *   `performance_page_index.ts` hides `<settings-battery-page>` on `showBatterySettings_`, the
+ *   handler's `getDeviceHasBattery` / `device-has-battery-changed` off
+ *   `BatterySaverModeManager::DeviceHasBattery` – a `BatteryStateSampler` count above zero.
+ *   Ione's host reads it itself (`ResourceSnapshot.system.hasBattery`: Linux's sysfs, macOS's
+ *   pmset); the group is hidden on `false` alone and stays where the host cannot tell (null –
+ *   Windows without a native module, the tablet). Chrome's `has_battery_` starts false and is
+ *   never set on Linux (no `BatteryLevelProvider` there: `_has_battery_provider_impl = is_win ||
+ *   is_mac`), so Chrome on Linux never shows the section; Ione shows it on a Linux laptop. The
+ *   mode's rule and the leaf's are unchanged: a computer never on battery never turns it on.
+ *   The group is the desktop's alone (`layouts: ['desktop']`): the tablet's Performance page is
+ *   Memory Saver's – its host's governor is the no-op stub and Chrome Android has no Energy
+ *   Saver (pr-584, Android's condition).
+ */
+function performanceSection({ state, tab, set }: SectionContext): RowGroup[] {
+  const s = state.settings
+  const r = s.resources
+  const snap = state.resources
+  const off = !s.unloadEnabled
+  const memoryKeywords = [
+    'memory saver',
+    'sleeping tabs',
+    'unload',
+    'discard',
+    'inactive',
+    'tab unloading'
+  ]
+  const siteKeywords = ['never unload', 'keep active', 'exceptions', 'sleeping tabs', 'sites']
+  const energyKeywords = [
+    'energy saver',
+    'battery saver',
+    'battery',
+    'power',
+    'unplugged',
+    'budgets'
+  ]
+  const sites = [...s.unloadExcludedDomains].sort((a, b) => a.localeCompare(b))
+  const currentSite = currentUnloadSite(state, tab)
+  const addSite = (raw: string): void => {
+    const host = siteHost(raw)
+    if (!host || s.unloadExcludedDomains.includes(host)) return
+    set({ unloadExcludedDomains: [...s.unloadExcludedDomains, host] })
+  }
+  const saverOff = s.energySaver === 'off'
+  // The condition the switch lands on, and the off row shows in waiting: the host's fresh-
+  // profile default (`defaultEnergySaverMode` – the 20 % threshold where the level reads,
+  // unplugged on Windows), as Chrome's toggle lands on kEnabledBelowThreshold.
+  const saverDefault = defaultEnergySaverMode(state.platform)
+  const energySaver: RowGroup = {
+    id: 'energy-saver',
+    heading: 'Energy Saver',
+    // The desktop's alone (pr-584, Android's condition): the tablet is the Android host, whose
+    // governor is the no-op stub – the mode would run nowhere – and Chrome Android has no
+    // Energy Saver; the tablet's Performance page is Memory Saver's. The host's no-battery gate
+    // below (`noBattery`) is the desktop's other reading of the same rule.
+    layouts: ['desktop'],
+    rows: [
+      {
+        kind: 'switch',
+        id: 'energy-saver',
+        label: 'Energy Saver',
+        // Chrome's shape ("conserves battery power by limiting background activity and visual
+        // effects") with what Ione limits, in the user's words – what a background tab feels,
+        // not the governor's budgets that do it (pr-584 N3).
+        description:
+          'Ione conserves battery power by limiting background activity – background tabs are slowed and unloaded sooner while it is on.',
+        keywords: energyKeywords,
+        checked: !saverOff,
+        onChange: (v) => set({ energySaver: v ? saverDefault : 'off' })
+      },
+      {
+        ...choice<EnergySaverMode>({
+          id: 'energy-saver-mode',
+          label: 'Energy Saver options',
+          keywords: energyKeywords,
+          // Off, the row shows the condition the switch lands on, unchecked-in-waiting.
+          value: saverOff ? saverDefault : s.energySaver,
+          disabled: saverOff,
+          options: energySaverOptions(state.platform, snap.system.batteryPercent),
+          onChange: (v) => set({ energySaver: v })
+        }),
+        radios: true
+      },
+      // Nothing live in the row (the re-read's NEW 3, as the lead ruled): no "is on now" and no
+      // battery reading under the label – Chrome's Performance page carries no state sentence,
+      // the leaf and its bubble say it – so the row stays its one line of 40 whatever the mode
+      // does, and the page does not shift when it flips.
+      choice({
+        id: 'energy-saver-factor',
+        label: 'While Energy Saver is on, shrink the budgets to',
+        keywords: [...energyKeywords, 'shrink', 'factor'],
+        value: String(Math.round(r.batteryFactor * 100)),
+        disabled: saverOff,
+        options: [
+          { value: '100', label: '100% (no change)' },
+          { value: '85', label: '85%' },
+          { value: '70', label: '70%' },
+          { value: '50', label: '50%' },
+          { value: '25', label: '25%' }
+        ],
+        onChange: (v) => set({ resources: { ...r, batteryFactor: Number(v) / 100 } })
+      })
+    ]
+  }
+  // A computer the host knows to have no battery: nothing to save, no group (Chrome's
+  // `showBatterySettings_`); unknown shows.
+  const noBattery = snap.system.hasBattery === false
+  return [
+    {
+      id: 'memory-saver',
+      heading: 'Memory Saver',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'memory-saver',
+          label: 'Memory Saver',
+          // Chrome's three sentences (`IDS_SETTINGS_PERFORMANCE_MEMORY_SAVER_MODE_SETTING_
+          // DESCRIPTION`) run 214 characters and the row's description holds two lines of 13
+          // (§10.4) – about 190 at the 664 column, where Chrome's clamped mid-sentence (pr-584
+          // N1); the same three facts in two sentences, with room to spare at narrower columns.
+          description:
+            'Ione frees up memory from inactive tabs so active tabs and other apps have more resources. Inactive tabs become active again when you go back to them.',
+          keywords: memoryKeywords,
+          checked: s.unloadEnabled,
+          onChange: (v) => set({ unloadEnabled: v })
+        },
+        {
+          ...choice({
+            id: 'memory-saver-tier',
+            label: 'Memory Saver options',
+            keywords: memoryKeywords,
+            value: String(s.unloadTimeoutMinutes),
+            disabled: off,
+            options: memorySaverTierOptions(s.unloadTimeoutMinutes),
+            onChange: (v) => set({ unloadTimeoutMinutes: Number(v) })
+          }),
+          radios: true
+        }
+      ]
+    },
+    {
+      id: 'keep-active',
+      heading: 'Always keep these sites active',
+      description: 'Sites you add will always stay active and memory won’t be freed up from them.',
+      // Each site an item row whose one action is Remove: the mouse's trailing 32 button, a plain
+      // secondary running at once with no dialog (§10.5) – a preference removed is plain ink
+      // (§10.4), the danger ink being for what destroys the user's data (§10.5), and the site is
+      // one the user adds again in a press, as the permission rows' Forget is (pr-584 R1); the
+      // finger's sheet (the tablet) holds the same action as its row, as those rows do. With
+      // Memory Saver off the list is one dependent of the switch: this group – heading,
+      // sentence, item rows or the empty line – and the Add rows' group below dim as one at .4,
+      // `aria-disabled` on each (§9.30's one register; the re-read's NEW 2 as the lead ruled).
+      disabled: off,
+      rows: sites.map((domain) => {
+        const remove = (): void =>
+          set({ unloadExcludedDomains: s.unloadExcludedDomains.filter((d) => d !== domain) })
+        return item(
+          `keep-active:${domain}`,
+          domain,
+          undefined,
+          [
+            {
+              kind: 'action',
+              id: `keep-active:${domain}:remove`,
+              label: 'Remove',
+              description: 'Pages on the site are unloaded like any other.',
+              button: 'Remove',
+              onPress: remove
+            }
+          ],
+          {
+            keywords: siteKeywords,
+            disabled: off,
+            action: { label: 'Remove', onPress: remove }
+          }
+        )
+      }),
+      empty: 'No sites yet'
+    },
+    {
+      id: 'keep-active-add',
+      heading: null,
+      // The Add rows continue the list above: the same dependent, dimmed with it.
+      disabled: off,
+      rows: [
+        {
+          kind: 'action',
+          id: 'keep-active-add',
+          label: 'Add a site',
+          description: 'Every page of the site stays loaded.',
+          keywords: siteKeywords,
+          disabled: off,
+          button: 'Add…',
+          form: {
+            title: 'Always keep this site active',
+            render: (close) => (
+              <UrlForm
+                id="keep-active-site"
+                label="Site"
+                placeholder="mail.example.com"
+                action="Add"
+                onSubmit={addSite}
+                close={close}
+              />
+            )
+          }
+        },
+        // Chrome's "Add current site": the site Settings was opened from, one press; laid out at
+        // .4 with its reason when there is no site to add (§10.4).
+        {
+          kind: 'action',
+          id: 'keep-active-current',
+          label: 'Add current site',
+          description: currentSite.listed
+            ? `${currentSite.listed} is already on the list.`
+            : currentSite.domain
+              ? `${currentSite.domain} – every page of the site stays loaded.`
+              : 'Open a page, then come back to Settings from it.',
+          keywords: [...siteKeywords, 'current site', 'this site'],
+          disabled: off || currentSite.domain === null,
+          button: 'Add',
+          onPress: () => {
+            const domain = currentSite.domain
+            if (domain && !s.unloadExcludedDomains.includes(domain))
+              set({ unloadExcludedDomains: [...s.unloadExcludedDomains, domain] })
+          }
+        }
+      ]
+    },
+    {
+      // The tab hover card's memory line (settings-29, W8-10; Chrome's "Show tab memory usage",
+      // `browser.hovercard.memory_usage_enabled` – off by default, Chrome 152's effective default
+      // after `MigrateHoverCardMemoryPref`). Chrome seats the switch in
+      // Appearance under "Tab hover preview card" and its Performance page only links there;
+      // the matrix seats the row here, with Chrome's words under Chrome's heading in §9.20's
+      // name for the card. The desktop's alone, as the card is (the tablet chrome mounts none).
+      id: 'hover-card',
+      heading: 'Tab hover card',
+      layouts: ['desktop'],
+      rows: [
+        {
+          kind: 'switch',
+          id: 'hover-card-memory',
+          label: 'Show tab memory usage',
+          description:
+            'The card that appears when you rest the pointer on a tab says how much memory its page is using.',
+          keywords: ['hover card', 'tab hover', 'preview card', 'memory usage', 'memory'],
+          checked: s.hoverCardMemoryUsage,
+          onChange: (v) => set({ hoverCardMemoryUsage: v })
+        }
+      ]
+    },
+    ...(noBattery ? [] : [energySaver])
+  ]
+}
+
+/** "Never", "After 7 days inactive": the threshold's labels, Chrome's own words. */
+export function archiveDaysLabel(days: InactiveTabsArchiveDays): string {
+  return days === 0 ? 'Never' : `After ${days} days inactive`
+}
+
+/**
+ * The auto-close switch's description, its period read off the core's constant in months the
+ * way Chrome's `getAutoDeleteTimeDeltaMonths` counts them (days / 30): "Inactive tabs are closed
+ * after 3 months".
+ */
+export function autoCloseDescription(days: number = INACTIVE_TAB_AUTO_CLOSE_DAYS): string {
+  const months = Math.max(1, Math.round(days / 30))
+  return `Inactive tabs are closed after ${months === 1 ? '1 month' : `${months} months`}`
+}
+
+/**
+ * Inactive tabs on a phone (TAB-20, SET-34; Chrome's "Move to inactive section"): a tab the user
+ * has not opened for the threshold leaves the grid for the switcher's Inactive tabs list, and –
+ * with the switch on – is closed for good after `INACTIVE_TAB_AUTO_CLOSE_DAYS` there (Chrome
+ * 152's 90 days, worded in months by {@link autoCloseDescription}). The
+ * value row's options are Chrome's four in Chrome's words, the current one as the row's
+ * description (§10.4); the switch reads at .4 while the threshold is Never (§10.4), as Chrome
+ * greys it, and its description names the period. A group of its own after Sleeping tabs, the
+ * two being different things – a sleeping tab keeps its place in the grid – which the heading's
+ * description says. Phone only, where the archive lives (`capabilities.inactiveTabs`).
+ */
+function inactiveTabsGroups(s: Settings, set: (patch: Partial<Settings>) => void): RowGroup[] {
+  const never = s.inactiveTabsArchiveDays === 0
+  const keywords = ['inactive tabs', 'archive', 'move to inactive', 'unused tabs', 'auto close']
+  return [
+    {
+      id: 'inactive-tabs',
+      heading: 'Inactive tabs',
+      layouts: ['phone'],
+      description:
+        "Tabs you haven't used for a while move out of the grid into Inactive tabs, where you can bring them back or close them. Sleeping tabs stay in the grid and only free memory.",
+      rows: [
+        choice({
+          id: 'inactive-tabs-after',
+          label: 'Move to inactive',
+          keywords,
+          value: String(s.inactiveTabsArchiveDays),
+          options: INACTIVE_TABS_ARCHIVE_DAYS.map((days) => ({
+            value: String(days),
+            label: archiveDaysLabel(days)
+          })),
+          onChange: (v) =>
+            set({
+              inactiveTabsArchiveDays:
+                INACTIVE_TABS_ARCHIVE_DAYS.find((days) => String(days) === v) ?? 21
+            })
+        }),
+        {
+          kind: 'switch',
+          id: 'inactive-tabs-auto-close',
+          label: 'Automatically close inactive tabs',
+          description: autoCloseDescription(),
+          keywords,
+          checked: s.inactiveTabsAutoClose,
+          disabled: never,
+          onChange: (v) => set({ inactiveTabsAutoClose: v })
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Downloads
+// ---------------------------------------------------------------------------
+
+/**
+ * Settings › Downloads (#161's desktop section row for row, on the engine's `Settings.downloads`;
+ * Chrome's `chrome://settings/downloads` rows in Chrome's words): **Location** – the folder new
+ * downloads go to, by its path (`download.directory`, HB-20), with Change… through the host's
+ * own picker (`download.chooseDirectory`, then `settings.update`) – **Use the default folder**,
+ * a plain action row that is there only while a folder has been picked (§10.4 as amended for
+ * #297: a one-tap way back to the default is worth a row once the user has left it; a row most
+ * users could never tap is not, so it is never a disabled row on the first screen; Chrome has
+ * no such row, Firefox's radio is the default itself) –
+ * **Ask where to save each file** (the interface's label: Chrome's desktop string runs on
+ * "before downloading", which wraps the phone's 320 px label column to a second line against
+ * §9.2's one-line rule; Chrome's own phone label is the short "Ask where to save files", and the
+ * long form stays a search keyword), the file types that open by themselves once they are on
+ * disk, and the completion notification (Android's downloader posts it, the
+ * desktop shell its own). No switch for the danger warnings: Chrome has none (Safe Browsing
+ * governs them), so neither does this page. The downloads bubble and the toolbar button are
+ * the desktop chrome's – a single-window host shows its downloads panel as a transfer starts
+ * (`Browser.onDownloadStarted`) – so their switches show where the chrome has windows.
+ */
+function downloadsSection({ state, set, downloadDirectory }: SectionContext): RowGroup[] {
+  const d = resolveDownloadSettings(state.settings)
+  const patch = (p: Partial<DownloadSettings>): void => set({ downloads: p })
+  const types = d.autoOpenTypes.map((t) => `.${t}`).join(', ')
+  const saving: SettingsRow[] = [
+    {
+      kind: 'action',
+      id: 'download-directory',
+      label: 'Location',
+      // The engine's resolved folder (a desktop path as it is); until it answers, the setting
+      // – Android keeps a picked folder as a document-tree URI, read as its relative path – or
+      // the system folder by name.
+      description: downloadLocationLabel(downloadDirectory, d.directory),
+      // A path while there is a folder to name (§9.2's exception: one line, its start
+      // shortened, the folder's own name readable); the system folder's line is prose.
+      address: Boolean(downloadDirectory || d.directory),
+      keywords: ['folder', 'directory', 'save files to', 'downloads folder', 'path'],
+      button: 'Change…',
+      onPress: () => {
+        // A dismissed picker keeps the folder as it is.
+        void downloadsEngine.chooseDirectory().then((dir) => {
+          if (dir !== null) patch({ directory: dir })
+        })
+      }
+    }
+  ]
+  if (d.directory !== null) {
+    // The way back to the system folder, under the Location it undoes: a row only while there
+    // is a picked folder to leave (§10.4), never a disabled one while the default is in force.
+    saving.push({
+      kind: 'action',
+      id: 'download-directory-default',
+      label: 'Use the default folder',
+      keywords: ['reset', 'system folder'],
+      button: 'Use default',
+      onPress: () => patch({ directory: null })
+    })
+  }
+  if (state.platform !== 'android') {
+    // A desktop OS has a file manager to show the folder in; Android's picked folder is a
+    // document tree with no such window.
+    saving.push({
+      kind: 'action',
+      id: 'download-open-folder',
+      label: 'Open the downloads folder',
+      keywords: ['reveal', 'file manager', 'explorer', 'finder'],
+      leaves: 'external',
+      onPress: () => downloadsEngine.openFolder()
+    })
+  }
+  saving.push({
+    kind: 'switch',
+    id: 'ask-where-to-save',
+    label: 'Ask where to save each file',
+    keywords: ['before downloading', 'always ask', 'prompt', 'save as', 'choose'],
+    checked: d.askWhereToSave,
+    onChange: (v) => set({ askWhereToSave: v })
+  })
+  if (d.autoOpenTypes.length > 0) {
+    saving.push({
+      kind: 'action',
+      id: 'download-auto-open',
+      label: 'Open certain file types automatically',
+      description: types,
+      keywords: ['auto open', 'always open'],
+      button: 'Stop…',
+      confirm: {
+        title: 'Stop opening these files automatically?',
+        description: `Files of these types are saved without opening: ${types}.`,
+        action: 'Stop'
+      },
+      onPress: () => patch({ autoOpenTypes: [] })
+    })
+  }
+  const groups: RowGroup[] = [{ id: 'saving', heading: 'Saving', rows: saving }]
+  if (state.capabilities.windows) {
+    groups.push({
+      id: 'downloads-panel',
+      heading: 'Downloads panel',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'download-open-on-complete',
+          label: 'Show the downloads when a download finishes',
+          description:
+            'The bubble opens by itself once the last download in progress is done and leaves again after five seconds.',
+          checked: d.openPanelOnComplete,
+          onChange: (v) => patch({ openPanelOnComplete: v })
+        },
+        {
+          kind: 'switch',
+          id: 'download-open-on-start',
+          label: 'Show the downloads when a download starts',
+          description: 'Off, the toolbar button animates instead.',
+          checked: d.openPanelOnStart,
+          onChange: (v) => patch({ openPanelOnStart: v })
+        },
+        {
+          kind: 'switch',
+          id: 'download-always-show-button',
+          label: 'Always show the downloads button',
+          description: 'Keep the button in the toolbar when nothing is downloading.',
+          checked: d.alwaysShowButton,
+          onChange: (v) => patch({ alwaysShowButton: v })
+        }
+      ]
+    })
+  }
+  groups.push({
+    id: 'download-notifications',
+    heading: 'Notifications',
+    rows: [
+      {
+        kind: 'switch',
+        id: 'download-notify',
+        label: 'Notify when a download finishes',
+        description: 'A system notification once the file is saved; opening it shows the file.',
+        checked: d.notifyOnComplete,
+        onChange: (v) => patch({ notifyOnComplete: v })
+      }
+    ]
+  })
+  return groups
+}
+
+// ---------------------------------------------------------------------------
+// Resources (the resource governor; hosts with the `resourceGovernor` capability)
+// ---------------------------------------------------------------------------
+
+const GOVERNOR_ACTION_LABELS: Record<GovernorActionKind, string> = {
+  purge: 'Purged memory of',
+  throttle: 'Throttled CPU of',
+  unthrottle: 'Unthrottled',
+  freeze: 'Froze',
+  thaw: 'Woke',
+  discard: 'Unloaded',
+  reload: 'Reloaded',
+  'pause-media': 'Paused media in',
+  defer: 'Deferred loading'
+}
+
+function fmtMb(mb: number): string {
+  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`
+  return `${Math.round(mb).toLocaleString('en-US')} MB`
+}
+
+function ago(at: number): string {
+  const s = Math.max(0, Math.round((Date.now() - at) / 1000))
+  if (s < 5) return 'just now'
+  if (s < 60) return `${s}s ago`
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m} min ago`
+  return `${Math.round(m / 60)} h ago`
+}
+
+function concurrencyFor(r: ResourceSettings, cores: number): string {
+  if (!cores) return '?'
+  if (!r.enabled || r.cpuPercent >= 100) return String(cores)
+  return String(Math.max(1, Math.min(cores, Math.round((cores * r.cpuPercent) / 100))))
+}
+
+const percent = (v: number): string => `${v}%`
+
+/**
+ * The resource governor (the desktop overlay's Resources section, row for row): live usage as
+ * meters with the two actions, the biggest pages as items that can be unloaded, then the
+ * governor's switch and enforcement, the budgets (the two shares as slider rows), sleeping and
+ * unloading, what it never touches, the process profile that needs a relaunch, and its log.
+ */
+function resourcesSection({ state, set, navigate }: SectionContext): RowGroup[] {
+  const r = state.settings.resources
+  const snap = state.resources
+  const setR = (patch: Partial<ResourceSettings>): void => set({ resources: { ...r, ...patch } })
+  const setP = (patch: Partial<ResourceProcessProfile>): void =>
+    set({ resources: { ...r, process: { ...r.process, ...patch } } })
+  const totalMb = snap.system.totalMemoryMb
+  const percentBudget = totalMb ? Math.round((totalMb * r.memoryPercent) / 100) : 0
+  const notes: string[] = []
+  if (snap.system.energySaver)
+    notes.push(
+      `Energy Saver is on – budgets are tightened to ${Math.round(r.batteryFactor * 100)}%.`
+    )
+  if (snap.system.idle) notes.push('System idle – hidden pages are frozen.')
+  const livePages = snap.tabs.filter((u) => {
+    const tab = state.tabs[u.tabId]
+    return tab !== undefined && !tab.discarded
+  })
+  const groups: RowGroup[] = [
+    {
+      id: 'usage',
+      heading: 'Live usage',
+      description:
+        'The resource governor keeps every Chromium process of this browser under the budgets you set. Hidden pages are purged, CPU-throttled, frozen and finally unloaded – cheapest first – and background loads queue up instead of all starting at once.',
+      rows: [
+        {
+          kind: 'custom',
+          id: 'usage-meters',
+          label: 'Memory, CPU and GPU memory',
+          keywords: ['usage', 'live', 'gauge', 'battery', 'idle'],
+          render: () => (
+            <div className="zen-settings-meters">
+              <ResourceMeter
+                label="Memory"
+                gauge={snap.memory}
+                fallbackMax={totalMb}
+                format={fmtMb}
+                note={`${snap.loadedTabs} live · ${snap.frozenTabs} frozen · ${snap.throttledTabs} throttled · ${snap.queuedLoads} waiting to load · ${fmtMb(snap.overheadMb)} browser, GPU and network overhead`}
+              />
+              <ResourceMeter
+                label="CPU"
+                gauge={snap.cpu}
+                fallbackMax={100}
+                format={(v) => `${Math.round(v)}%`}
+                note={`Share of all ${snap.system.cpuCount || '?'} cores; pages see ${concurrencyFor(r, snap.system.cpuCount)} of them.`}
+              />
+              <ResourceMeter
+                label="GPU memory"
+                gauge={snap.gpu}
+                fallbackMax={0}
+                format={fmtMb}
+                note={r.gpuMode === 'off' ? 'Hardware acceleration is off.' : undefined}
+              />
+              {notes.map((note) => (
+                <span key={note} className="zen-settings-description zen-settings-description-full">
+                  {note}
+                </span>
+              ))}
+            </div>
+          )
+        },
+        {
+          kind: 'action',
+          id: 'resources-trim',
+          label: 'Free up memory now',
+          description: 'Purges and unloads what the governor can spare.',
+          keywords: ['trim', 'purge', 'memory'],
+          button: 'Free up',
+          onPress: () => run('resources.trim', undefined)
+        },
+        {
+          kind: 'action',
+          id: 'resources-snapshot',
+          label: 'Refresh the sample',
+          description: snap.sampledAt
+            ? `Sampled ${ago(snap.sampledAt)}.`
+            : 'Waiting for the first sample…',
+          button: 'Refresh',
+          onPress: () => run('resources.snapshot', undefined)
+        }
+      ]
+    },
+    {
+      id: 'biggest',
+      heading: 'Biggest pages',
+      rows: livePages.slice(0, 8).map((u) => {
+        const tab = state.tabs[u.tabId]
+        const states: string[] = []
+        if (tab.frozen) states.push('frozen')
+        if (tab.cpuThrottle > 1) states.push(`CPU ×${tab.cpuThrottle}`)
+        return item(
+          `page:${u.tabId}`,
+          tabTitle(tab),
+          `${fmtMb(u.memoryMb)} · ${u.cpuPercent.toFixed(1)}% CPU · ${u.processes} process${u.processes === 1 ? '' : 'es'}${states.length ? ` · ${states.join(' · ')}` : ''}`,
+          [
+            {
+              kind: 'action',
+              id: `page:${u.tabId}:unload`,
+              label: 'Unload',
+              description: 'The tab stays; the page reloads when you return to it.',
+              button: 'Unload',
+              onPress: () => run('tab.unload', { tabId: u.tabId })
+            }
+          ]
+        )
+      }),
+      empty: 'No pages are loaded'
+    },
+    {
+      id: 'governor',
+      heading: 'Resource governor',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'governor-enabled',
+          label: 'Keep the browser within budgets',
+          description: 'Turning this off also drops the startup switches below after a relaunch.',
+          checked: r.enabled,
+          onChange: (v) => setR({ enabled: v })
+        },
+        choice<ResourceEnforcement>({
+          id: 'governor-enforcement',
+          label: 'Enforcement',
+          value: r.enforcement,
+          sheetDescription:
+            'Balanced only touches hidden pages. Strict may also purge and throttle visible panes. Extreme may throttle and, as a last resort, reload the page you are looking at.',
+          options: [
+            { value: 'balanced', label: 'Balanced – hidden pages only' },
+            { value: 'strict', label: 'Strict – visible panes too' },
+            { value: 'extreme', label: 'Extreme – even the active page' }
+          ],
+          onChange: (v) => setR({ enforcement: v })
+        })
+      ]
+    },
+    {
+      id: 'budgets',
+      heading: 'Budgets',
+      rows: [
+        numberRow({
+          id: 'memory-mb',
+          label: 'Memory budget',
+          description:
+            r.memoryMb > 0
+              ? 'Every Chromium process together. Set to 0 to use a share of installed RAM instead.'
+              : `Using ${r.memoryPercent}% of installed RAM${totalMb ? ` = ${fmtMb(percentBudget)}` : ''}.`,
+          keywords: ['ram'],
+          value: r.memoryMb,
+          min: 0,
+          max: 1_048_576,
+          unit: 'MB',
+          onCommit: (v) => setR({ memoryMb: v })
+        }),
+        {
+          kind: 'slider',
+          id: 'memory-percent',
+          label: 'Share of installed RAM',
+          description: 'Used when the memory budget above is 0.',
+          value: r.memoryPercent,
+          min: 5,
+          max: 100,
+          step: 5,
+          format: percent,
+          disabled: r.memoryMb > 0,
+          onChange: (v) => setR({ memoryPercent: v })
+        },
+        {
+          kind: 'slider',
+          id: 'cpu-percent',
+          label: 'CPU budget',
+          description:
+            'Share of the whole machine. Pages are also told they have proportionally fewer cores. 100% = no limit.',
+          keywords: ['hardwareConcurrency', 'cores'],
+          value: r.cpuPercent,
+          min: 5,
+          max: 100,
+          step: 5,
+          format: percent,
+          onChange: (v) => setR({ cpuPercent: v })
+        },
+        numberRow({
+          id: 'gpu-memory-mb',
+          label: 'GPU memory budget',
+          description: '0 = no limit. Also caps Chromium’s GPU tile memory after a relaunch.',
+          value: r.gpuMemoryMb,
+          min: 0,
+          max: 65_536,
+          unit: 'MB',
+          onCommit: (v) => setR({ gpuMemoryMb: v })
+        })
+      ]
+    },
+    {
+      id: 'sleeping',
+      heading: 'Sleeping and unloading',
+      rows: [
+        // Memory Saver's switch, its tiers, the sites kept active and Energy Saver's battery
+        // factor are Performance's rows (W8-2): one owner, and this page points at it (§9.1)
+        // where its twin switch and its "excluded domains" fact stood.
+        {
+          kind: 'action',
+          id: 'resources-performance',
+          label: 'Memory Saver and Energy Saver',
+          description:
+            'Unloading inactive tabs, the sites always kept active and how far Energy Saver shrinks these budgets are set under Performance.',
+          keywords: ['unload', 'sleeping tabs', 'memory saver', 'battery', 'energy saver'],
+          leaves: 'chevron',
+          onPress: () => navigate('performance')
+        },
+        numberRow({
+          id: 'freeze-after',
+          label: 'Freeze hidden pages after',
+          description:
+            'A frozen page keeps its state but runs no script or timers, like Chrome’s tab freezing. 0 freezes as soon as a page is hidden.',
+          value: r.freezeAfterMinutes,
+          min: 0,
+          max: 1440,
+          unit: 'min',
+          onCommit: (v) => setR({ freezeAfterMinutes: v })
+        }),
+        numberRow({
+          id: 'idle-freeze',
+          label: 'Freeze everything when idle for',
+          description:
+            'No input anywhere on the system. 0 = off. Extreme enforcement freezes visible pages as well.',
+          value: r.idleFreezeMinutes,
+          min: 0,
+          max: 1440,
+          unit: 'min',
+          onCommit: (v) => setR({ idleFreezeMinutes: v })
+        }),
+        numberRow({
+          id: 'max-loaded',
+          label: 'Maximum live pages',
+          description:
+            'Hard cap on pages kept in memory; the oldest hidden page is unloaded to make room. 0 = unlimited.',
+          value: r.maxLoadedTabs,
+          min: 0,
+          max: 500,
+          onCommit: (v) => setR({ maxLoadedTabs: v })
+        }),
+        numberRow({
+          id: 'max-loads',
+          label: 'Background loads at once',
+          description:
+            'Further background tabs wait in a queue instead of starting more renderers.',
+          value: r.maxConcurrentLoads,
+          min: 1,
+          max: 16,
+          onCommit: (v) => setR({ maxConcurrentLoads: v })
+        })
+      ]
+    },
+    {
+      id: 'protect',
+      heading: 'Never touch',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'protect-audible',
+          label: 'Pages playing audio',
+          checked: r.protectAudible,
+          onChange: (v) => setR({ protectAudible: v })
+        },
+        {
+          kind: 'switch',
+          id: 'protect-pinned',
+          label: 'Pinned tabs',
+          checked: r.protectPinned,
+          onChange: (v) => setR({ protectPinned: v })
+        },
+        {
+          kind: 'switch',
+          id: 'protect-essentials',
+          label: 'Essentials',
+          checked: r.protectEssentials,
+          onChange: (v) => setR({ protectEssentials: v })
+        }
+      ]
+    },
+    {
+      id: 'process',
+      heading: 'Process profile',
+      description: 'These switches take effect when the browser starts.',
+      rows: [
+        ...(snap.restartRequired
+          ? [
+              {
+                kind: 'action',
+                id: 'resources-relaunch',
+                label: 'Relaunch to apply',
+                description: 'The process profile changed since the browser started.',
+                button: 'Relaunch',
+                onPress: () => run('resources.relaunch', undefined)
+              } satisfies SettingsRow
+            ]
+          : []),
+        choice<GpuMode>({
+          id: 'gpu-mode',
+          label: 'GPU',
+          value: r.gpuMode,
+          sheetDescription:
+            'Low keeps compositing on the GPU but rasterises, decodes video and draws canvases on the CPU. Off disables hardware acceleration.',
+          keywords: ['hardware acceleration'],
+          options: [
+            { value: 'auto', label: 'Automatic' },
+            { value: 'low', label: 'Low GPU usage' },
+            { value: 'off', label: 'Off – software rendering' }
+          ],
+          onChange: (v) => setR({ gpuMode: v })
+        }),
+        numberRow({
+          id: 'renderer-limit',
+          label: 'Renderer process limit',
+          description:
+            'Chromium reuses processes across sites once the limit is reached. 0 = Chromium’s default.',
+          value: r.process.rendererProcessLimit,
+          min: 0,
+          max: 64,
+          onCommit: (v) => setP({ rendererProcessLimit: v })
+        }),
+        numberRow({
+          id: 'renderer-heap',
+          label: 'JavaScript heap cap per page',
+          description:
+            'A page that grows past its V8 heap cap is unloaded instead of bloating. 0 = default.',
+          value: r.process.rendererHeapMb,
+          min: 0,
+          max: 16384,
+          unit: 'MB',
+          onCommit: (v) => setP({ rendererHeapMb: v })
+        }),
+        {
+          kind: 'switch',
+          id: 'low-end-device',
+          label: 'Low-end device mode',
+          description:
+            'Chromium sizes every cache and tile budget as if this were a low-memory device.',
+          checked: r.process.lowEndDeviceMode,
+          onChange: (v) => setP({ lowEndDeviceMode: v })
+        },
+        {
+          kind: 'switch',
+          id: 'no-spare-renderer',
+          label: 'No spare renderer process',
+          description:
+            'Chromium otherwise keeps a warm, empty renderer waiting for the next navigation.',
+          checked: r.process.disableSpareRenderer,
+          onChange: (v) => setP({ disableSpareRenderer: v })
+        },
+        {
+          kind: 'switch',
+          id: 'no-bfcache',
+          label: 'Drop the back/forward cache',
+          description: 'Chromium otherwise keeps up to six previous documents alive per tab.',
+          checked: r.process.disableBackForwardCache,
+          onChange: (v) => setP({ disableBackForwardCache: v })
+        },
+        numberRow({
+          id: 'raster-threads',
+          label: 'Raster threads per page',
+          description: '0 = Chromium’s default.',
+          value: r.process.rasterThreads,
+          min: 0,
+          max: 8,
+          onCommit: (v) => setP({ rasterThreads: v })
+        }),
+        {
+          kind: 'switch',
+          id: 'v8-size',
+          label: 'V8: favour memory over speed',
+          description: 'Smaller heaps, slightly slower script.',
+          checked: r.process.v8OptimizeForSize,
+          onChange: (v) => setP({ v8OptimizeForSize: v })
+        }
+      ]
+    },
+    {
+      id: 'log',
+      heading: 'Recent actions',
+      rows: snap.recentActions.slice(0, 15).map((a, i) => ({
+        kind: 'info',
+        id: `action:${a.at}:${i}`,
+        label: `${GOVERNOR_ACTION_LABELS[a.kind]} ${a.title || 'a tab'}`,
+        description: `${ago(a.at)} – ${a.reason}`
+      })),
+      empty: 'Nothing yet – the governor has not had to act'
+    }
+  ]
+  return groups
+}
+
+// ---------------------------------------------------------------------------
+// Privacy and Security (ad and tracker blocking, the site-controls program's Safety check, Clear
+// browsing data and Site settings blocks, the protection groups of `protectionRows.tsx`; the
+// remembered per-site answers are Security's)
+// ---------------------------------------------------------------------------
+
+/**
+ * The hub at the top of the section (settings-12; Chrome's card list, `privacyHub.ts`): one
+ * §10.4 action row per card in Chrome's order – Delete browsing data…, Third-party cookies,
+ * Safe Browsing, Site settings, Safety check – the leading glyph, the title, one line under it.
+ * A card brings its program's first group on screen (`ctx.reveal`, the section's `?group=`
+ * landing) and trails the chevron that says so (Q5 of the #553 lead check: the four landings
+ * keep it); Delete browsing data… opens the PS-13 dialog the Delete browsing data row opens, with
+ * §9.1's ellipsis on its name and no chevron (F1). No heading: the cards stand under the
+ * section's title as Chrome's do. The desktop and tablet shells' (`layouts`): the phone's
+ * Privacy page keeps its plain list.
+ */
+function privacyHubGroups(ctx: SectionContext): RowGroup[] {
+  const { state, reveal } = ctx
+  const cookies = thirdPartyCookiesLine(
+    state.siteData.default,
+    state.settings.privacy.thirdPartyCookies,
+    state.capabilities.windows
+  )
+  const lines: Record<string, string> = {
+    'hub-clear-data': PRIVACY_HUB_LINES.clearData,
+    'hub-cookies': cookies,
+    'hub-security': PRIVACY_HUB_LINES.security,
+    'hub-site-settings': PRIVACY_HUB_LINES.siteSettings,
+    'hub-safety-check': PRIVACY_HUB_LINES.safetyCheck
+  }
+  return [
+    {
+      id: 'privacy-hub',
+      heading: null,
+      layouts: ['desktop', 'tablet'],
+      rows: PRIVACY_HUB_CARDS.map((card): SettingsRow => {
+        const Glyph = card.glyph
+        const group = card.group
+        return {
+          kind: 'action',
+          id: card.id,
+          label: card.label,
+          description: lines[card.id],
+          leading: <Glyph className="zen-settings-glyph" aria-hidden="true" />,
+          // The dialog's card keeps its pre-M124 name as a search alias (W8-7): a hand that
+          // types "clear browsing data" still finds it.
+          ...(group === null
+            ? { form: CLEAR_BROWSING_DATA_FORM, keywords: ['clear'] }
+            : { leaves: 'chevron', onPress: () => reveal?.(group) })
+        }
+      })
+    }
+  ]
+}
+
+/**
+ * Groups in the hub cards' order (the #553 lead check's Q6 ruling, built in W8-8: the pane's
+ * groups take the cards' order, so the page and its hub read alike) – the cards
+ * (`privacyHubGroups`), then Delete browsing data, Cookies and site data, Safe Browsing, Site
+ * settings, Safety check – each program's groups self-contained: the site-controls program's
+ * (`siteControls/settingsRows`) at the delete-browsing-data, site-settings and safety-check
+ * positions, the site-data program's (`siteDataRows.tsx`, which carries the third-party cookie
+ * setting and its related sites from `protectionRows.tsx`) at the cookies position, the
+ * protection program's at the safe-browsing position. A group no card names follows the card
+ * it is kin to, as Chrome's page holds them (the #650 lead check): the request engine's
+ * Tracking prevention (`tracking.tsx`) and Privacy signals after Cookies – Chrome's
+ * cookies-and-ad-privacy stretch – and HTTPS-only with Secure DNS after Safe Browsing – both
+ * rows of Chrome's Security page. Preload pages (PS-43) is Chrome's Performance › Speed row and
+ * its seat is another slice's question, so it stays after Safety check for now; the private-tab
+ * lock (INC-05) is last, Chrome's seat for it. The phone's plain list – no cards – reads in the
+ * same order. The remembered per-site answers are Security's (`securitySection`).
+ */
+function privacySection(ctx: SectionContext): RowGroup[] {
+  const { state, set } = ctx
+  return [
+    ...privacyHubGroups(ctx),
+    ...clearDataGroups(ctx),
+    ...siteDataGroups(ctx),
+    ...trackingGroups(ctx),
+    ...signalsGroups(state, set),
+    ...safeBrowsingGroups(state, set),
+    ...httpsOnlyGroups(state, set),
+    ...secureDnsGroups(state, set),
+    ...siteSettingsGroups(ctx),
+    ...safetyCheckGroups(ctx),
+    ...preloadGroups(state, set),
+    ...privateLockGroups(ctx)
+  ]
+}
+
+/** The lock row's label, description and the description that says why it is disabled. */
+export const PRIVATE_LOCK_ROW = {
+  label: 'Lock private tabs when you leave Ione',
+  // One line each at 13 px beside the switch, a full stop like the page's other descriptions.
+  description: 'Use your screen lock to see them again.',
+  noScreenLock: 'Needs a screen lock on this device.'
+} as const
+
+/**
+ * "Lock private tabs when you leave Ione" (INC-05 / SET-17; Chrome's "Lock Incognito tabs when
+ * you leave Chrome", at its place in Privacy and security after Do Not Track): a §10.4 switch
+ * row, off by default as Chrome's. Device-local, as Chrome's is – the lock is this device's
+ * screen lock, and another device has its own – so it is `state.privateLockOnLeave`
+ * (`BrowserState.privateDevice`, the `newTabDevice` shape), never a synced setting. The change
+ * is confirmed by the device first, on or off (`setPrivateLockOnLeave`: the system's prompt,
+ * else turning the lock off would be the way past it); without a screen lock the row is
+ * disabled at .4 and its description says a screen lock is needed (§9.30). Phone-host-only,
+ * as the Tabs section's startup switch is (`startupRows`): a desktop private window has no lock.
+ */
+function privateLockGroups({ state, screenLock }: SectionContext): RowGroup[] {
+  if (state.capabilities.windows || !state.capabilities.privateTabs) return []
+  return [
+    {
+      id: 'private-lock',
+      heading: 'Private tabs',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'private-lock-on-leave',
+          label: PRIVATE_LOCK_ROW.label,
+          description: screenLock ? PRIVATE_LOCK_ROW.description : PRIVATE_LOCK_ROW.noScreenLock,
+          keywords: ['incognito', 'lock', 'biometric', 'fingerprint', 'screen lock', 'pin'],
+          checked: state.privateLockOnLeave,
+          disabled: !screenLock,
+          onChange: (enabled) => void setPrivateLockOnLeave(enabled)
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+/**
+ * Chrome for Android's Search settings: the engine picker lists the shipped engines, then an
+ * "Added" heading with the ones added by hand and a "Recently visited" heading with the engines
+ * pages offered through OpenSearch (OMN-27), each with its favicon and, for the user's own, the
+ * host it searches; the user's engines are listed under the picker with Make default and
+ * Remove, and a form adds one by name and `%s` template.
+ */
+function searchSection({ state, set }: SectionContext): RowGroup[] {
+  const s = state.settings
+  // An extension's engine (`chrome_settings_overrides`) is not the user's to pick or remove; it
+  // is the default only through the extension, which the URL bar follows (`defaultSearchEngineOf`).
+  const engines = state.searchEngines.filter((e) => e.source !== 'extension')
+  // While an extension holds the default (`search_provider.is_default`, the host's
+  // `search.defaultEngine` control), the picker is held at its engine – listed for the held row
+  // to show, as Chrome's disabled menu shows the extension's engine – and the user's pick waits
+  // under it (§10.5: the row reads "Controlled by <name>", Disable hands the pick back).
+  const engineControl = extensionControlled(state, 'search.defaultEngine')
+  const heldEngine =
+    typeof engineControl?.value === 'string'
+      ? state.searchEngines.find((e) => e.id === engineControl.value)
+      : undefined
+  // `chrome.privacy.services.searchSuggestEnabled` holds the suggestions switch (Chrome marks
+  // its "Autocomplete searches and URLs" toggle).
+  const suggestControl = extensionControlled(state, 'search.suggestions')
+  const own = engines.filter((e) => e.source === 'custom' || e.source === 'discovered')
+  // A deactivated engine (settings-43) is offered nowhere – not as the default, not by shortcut
+  // – and every layout lists it under Inactive (SET-10: the phone's page and the tablet's pane
+  // as the desktop's, since #710 gave them the row's sheet); the default engine reads active
+  // whatever a peer's list says.
+  const isActive = (e: SearchEngine): boolean =>
+    isActiveSearchEngine(e) || e.id === s.searchEngineId
+  const active = engines.filter(isActive)
+  const inactiveOwn = own.filter((e) => !isActive(e))
+  const glyph = (e: SearchEngine): ReactNode => <EngineGlyph engine={e} />
+  /**
+   * The picker's heading for the user's engines; the shipped ones (no `source`) sit above any
+   * heading, and only the user's own name the host they search under the label.
+   */
+  const pickerGroup = (e: SearchEngine): string | undefined =>
+    e.source === 'custom' ? 'Added' : e.source === 'discovered' ? 'Recently visited' : undefined
+  return [
+    {
+      id: 'search',
+      heading: 'Search',
+      rows: [
+        choice({
+          id: 'search-engine',
+          label: 'Default search engine',
+          controlled: engineControl,
+          value: heldEngine?.id ?? s.searchEngineId,
+          options: [...(heldEngine ? [heldEngine] : []), ...active].map((e) => {
+            // An added or discovered engine's line is its host: an address (§9.2's exception).
+            const host = pickerGroup(e) ? (engineHost(e) ?? undefined) : undefined
+            return {
+              value: e.id,
+              label: e.name,
+              description: host,
+              address: host !== undefined,
+              leading: glyph(e),
+              group: pickerGroup(e)
+            }
+          }),
+          onChange: (v) => set({ searchEngineId: v })
+        }),
+        // The EEA's choice screen again (W6-2; Chrome's chrome://search-engine-choice can be
+        // reopened from its Search engine settings): on a device in the EEA, or one that
+        // answered the screen once (a record) wherever it is now. Every shell draws the screen
+        // – the desktop's and tablet's `SearchChoiceScreen`, the phone's
+        // `PhoneSearchChoiceScreen` (OMN-26) – so the row stands on every layout.
+        ...(state.searchChoice?.eea || s.searchChoice !== null
+          ? [
+              {
+                kind: 'action',
+                id: 'search-choice-again',
+                label: 'Choose your search engine again',
+                description:
+                  'Shows the search engines again, in a random order, to set the default.',
+                keywords: ['choice', 'default', 'eea', 'dma'],
+                button: 'Choose…',
+                onPress: () => run('searchChoice.askAgain', undefined)
+              } satisfies SettingsRow
+            ]
+          : []),
+        {
+          kind: 'switch',
+          id: 'search-suggestions',
+          label: 'Show search suggestions',
+          description: 'Sends what you type to the search engine as you type.',
+          controlled: suggestControl,
+          checked: heldSwitch(suggestControl, s.searchSuggestions),
+          onChange: (v) => set({ searchSuggestions: v })
+        },
+        // Suggestion privacy (omnibox-45): the local sources each behind their own switch, as
+        // Edge's; private windows show neither whatever these say.
+        {
+          kind: 'switch',
+          id: 'history-suggestions',
+          label: 'Show history suggestions',
+          description: 'Pages you visited, and completing an address you typed before.',
+          checked: s.historySuggestions !== false,
+          onChange: (v) => set({ historySuggestions: v })
+        },
+        {
+          kind: 'switch',
+          id: 'bookmark-suggestions',
+          label: 'Show bookmark suggestions',
+          description: 'Bookmarks whose title or address matches what you type.',
+          checked: s.bookmarkSuggestions !== false,
+          onChange: (v) => set({ bookmarkSuggestions: v })
+        },
+        // The desktop URL bar shows the whole URL at rest (§10.1); the phone pill shows hosts
+        // only, so the row is the desktop and tablet shells'.
+        {
+          kind: 'switch',
+          id: 'full-urls',
+          label: 'Always show full URLs',
+          description: 'Keep the scheme and www. in the address bar instead of hiding them.',
+          keywords: ['scheme', 'https', 'www', 'address bar'],
+          layouts: ['desktop', 'tablet'],
+          checked: Boolean(s.showFullUrls),
+          onChange: (v) => set({ showFullUrls: v })
+        },
+        {
+          kind: 'info',
+          id: 'search-keywords',
+          label: 'Engine keywords',
+          description: `Type a keyword, then a space: ${active.map((e) => e.keyword).join(' · ')}`
+        }
+      ]
+    },
+    {
+      id: 'search-engines',
+      heading: 'Added search engines',
+      description:
+        'Engines you added, and engines from sites you visited that offer one. Sites in private tabs are never listed.',
+      rows: own.filter(isActive).map((e) => searchEngineItem(e, state, set, glyph(e))),
+      empty: 'No search engines added yet'
+    },
+    // The engines taken out of the omnibox (settings-43; Chrome's Inactive shortcuts): kept
+    // with their shortcut, answering to nothing until activated. No empty state (§9.17): the
+    // group comes with the first engine deactivated and goes with the last activated, on every
+    // layout – the phone's page and the tablet's pane list it under the same heading as the
+    // desktop, and the row's sheet or dialog offers Activate (SET-10's tail).
+    ...(inactiveOwn.length > 0
+      ? [
+          {
+            id: 'inactive-search-engines',
+            heading: 'Inactive',
+            description: 'Engines kept but not offered in the address bar until you activate them.',
+            rows: inactiveOwn.map((e) => searchEngineItem(e, state, set, glyph(e)))
+          } satisfies RowGroup
+        ]
+      : []),
+    {
+      id: 'add-search-engine',
+      heading: null,
+      rows: [
+        {
+          kind: 'action',
+          id: 'add-search-engine',
+          label: 'Add search engine',
+          keywords: ['custom', 'opensearch', '%s'],
+          button: 'Add…',
+          form: {
+            title: 'Add search engine',
+            description: 'Put %s in the URL where the search terms go.',
+            // The form's shortcut goes to the command as the engine's `keyword` (W5-4): a typed
+            // word – checked against every engine of the profile (`engines`, no `engineId`) as
+            // the Edit form's is, and refused by the core with the same line – is the engine's;
+            // left empty, the engine derives one from the name (`customSearchEngine`).
+            render: (close) => (
+              <SearchEngineForm
+                action="Add"
+                engines={state.searchEngines}
+                onSubmit={({ name, url, shortcut }) =>
+                  cmd('search.addEngine', { name, url, keyword: shortcut })
+                }
+                close={close}
+              />
+            )
+          }
+        }
+      ]
+    }
+  ]
+}
+
+/**
+ * One of the user's engines under Added or Inactive (omnibox-09, settings-43; Chrome's Site
+ * search rows): the row's second line carries the engine's standing – the default, a visited
+ * site's – its shortcut (Chrome's Shortcut column) and the host it searches; its sheet offers
+ * Make default (an active engine; the default's is held), Edit – the Add form pre-filled with a
+ * Shortcut field – Deactivate or Activate (the default engine stays active), and Remove, on
+ * every layout as Chrome 152's row menu offers them on every custom engine (SET-10; the phone's
+ * sheet and the tablet's dialog got the rows with #710's Edit and this tail's Activate /
+ * Deactivate). Under the Inactive heading the row does not say "Inactive" again – the heading
+ * says it, as Added's rows do not say "Added" (§9.17) – and carries its source instead.
+ */
+function searchEngineItem(
+  e: SearchEngine,
+  state: UIState,
+  set: SectionContext['set'],
+  leading: ReactNode
+): SettingsRow {
+  const s = state.settings
+  const isDefault = e.id === s.searchEngineId
+  const inactive = !isDefault && !isActiveSearchEngine(e)
+  const standing = isDefault
+    ? 'Default search engine'
+    : e.source === 'discovered'
+      ? 'Recently visited'
+      : null
+  const rows: SettingsRow[] = []
+  if (!inactive)
+    rows.push({
+      kind: 'action',
+      id: `search-engine:${e.id}:default`,
+      label: 'Make default',
+      description: `Searches from the address bar use ${e.name}.`,
+      disabled: isDefault,
+      onPress: () => set({ searchEngineId: e.id })
+    })
+  rows.push(
+    {
+      kind: 'action',
+      id: `search-engine:${e.id}:edit`,
+      label: 'Edit',
+      description: 'The name, the shortcut and the URL the terms go into.',
+      button: 'Edit…',
+      form: {
+        title: 'Edit search engine',
+        description: 'Put %s in the URL where the search terms go.',
+        // The Add form (`SearchEngineForm`, the chassis's one Add / Edit form) pre-filled from
+        // the engine, Save as its verb; the shortcut is checked by the shared keyword rule
+        // against the profile's other engines (`engineId` excepts the engine's own word) and
+        // goes to the command as the engine's `keyword`, `@` or not – the core normalises it.
+        // On the phone the form is the second sheet over the engine's (§9.24), on the tablet the
+        // second dialog over the engine's, as Add's is over the page on each; the save keeps the
+        // engine's id, so the default stays.
+        render: (close) => (
+          <SearchEngineForm
+            initial={{ name: e.name, url: e.searchUrl, shortcut: e.keyword }}
+            action="Save"
+            engines={state.searchEngines}
+            engineId={e.id}
+            onSubmit={({ name, url, shortcut }) =>
+              cmd('search.updateEngine', { id: e.id, name, searchUrl: url, keyword: shortcut })
+            }
+            close={close}
+          />
+        )
+      }
+    },
+    inactive
+      ? {
+          kind: 'action',
+          id: `search-engine:${e.id}:activate`,
+          label: 'Activate',
+          description: `${e.keyword} works in the address bar again.`,
+          onPress: () => run('search.setEngineActive', { id: e.id, active: true })
+        }
+      : {
+          kind: 'action',
+          id: `search-engine:${e.id}:deactivate`,
+          label: 'Deactivate',
+          description: isDefault
+            ? 'The default search engine stays active.'
+            : `Keeps ${e.name} in the list but out of the address bar until you activate it.`,
+          disabled: isDefault,
+          onPress: () => run('search.setEngineActive', { id: e.id, active: false })
+        },
+    {
+      kind: 'action',
+      id: `search-engine:${e.id}:remove`,
+      label: 'Remove',
+      description:
+        e.source === 'discovered' ? 'The site offers it again on your next visit.' : undefined,
+      destructive: true,
+      confirm: {
+        title: `Remove ${e.name}?`,
+        description: isDefault ? 'The address bar goes back to the default engine.' : undefined,
+        action: 'Remove'
+      },
+      onPress: () => run('search.removeEngine', { id: e.id })
+    }
+  )
+  return item(
+    `search-engine:${e.id}`,
+    e.name,
+    [standing, e.keyword, isDefault ? null : (engineHost(e) ?? e.searchUrl)]
+      .filter((part): part is string => Boolean(part))
+      .join(' · '),
+    rows,
+    { leading, keywords: [e.keyword, engineHost(e) ?? '', inactive ? 'inactive' : ''] }
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Autofill (services-password-fill, #145)
+// ---------------------------------------------------------------------------
+
+/**
+ * Settings > Autofill on the phone: the rows of the desktop `AutofillSection` in the page's
+ * form – the password switches and the clipboard choice, then, while the vault is locked, its
+ * gate (§9.30: Unlock as an action row that is busy while the device checks, the passphrase form
+ * at the gutter once the vault asks for one), else the vault's addresses, payment methods and
+ * passkeys as item rows with their sheets and the editors behind them. The lists and the gate
+ * come in through `ctx.autofill` (`useAutofillSettings`), fetched while this section is shown.
+ */
+function autofillSection({ state, set, autofill }: SectionContext): RowGroup[] {
+  const s = state.settings.passwords
+  const android = state.platform === 'android'
+  const system = state.autofill.systemAutofill
+  const ione = s.androidProvider === 'ione'
+  // `chrome.privacy.services.passwordSavingEnabled` holds the offer-to-save switch here and in
+  // the Passwords category alike (Chrome marks its "Offer to save passwords" toggle).
+  const offerControl = extensionControlled(state, 'passwords.offerToSave')
+  const groups: RowGroup[] = [
+    {
+      id: 'autofill-passwords',
+      heading: 'Passwords',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'autofill-offer-to-save',
+          label: 'Offer to save passwords',
+          description: 'Ask to save or update a login after you sign in on a site.',
+          keywords: ['save passwords', 'login', 'update'],
+          controlled: offerControl,
+          checked: heldSwitch(offerControl, s.offerToSave),
+          onChange: (v) => set({ passwords: { ...s, offerToSave: v } })
+        },
+        {
+          kind: 'switch',
+          id: 'autofill-auto-sign-in',
+          label: 'Sign in automatically',
+          description:
+            'Fill the one saved login of a site as soon as its form is focused, without the picker.',
+          keywords: ['auto sign-in', 'fill'],
+          checked: s.autoSignIn,
+          onChange: (v) => set({ passwords: { ...s, autoSignIn: v } })
+        },
+        // The Android host alone has a system autofill service that could own the pages instead.
+        ...(android
+          ? [
+              {
+                kind: 'switch',
+                id: 'autofill-android-provider',
+                label: 'Use Ione to fill passwords in pages',
+                description: androidProviderHint(system, ione),
+                keywords: ['autofill service', 'provider', 'system', 'google'],
+                checked: !system?.enabled || ione,
+                disabled: !system?.enabled,
+                onChange: (v) =>
+                  set({ passwords: { ...s, androidProvider: v ? 'ione' : 'system' } })
+              } satisfies SettingsRow
+            ]
+          : []),
+        choice({
+          id: 'autofill-clipboard-clear',
+          label: 'Clear copied passwords',
+          keywords: ['clipboard', 'card number', 'copy'],
+          value: String(s.clipboardClearSeconds),
+          options: CLIPBOARD_CLEAR_OPTIONS,
+          sheetDescription:
+            'Remove a copied password or card number from the clipboard again after this long.',
+          onChange: (v) => set({ passwords: { ...s, clipboardClearSeconds: Number(v) } })
+        })
+      ]
+    }
+  ]
+  if (state.passwords.locked) return [...groups, vaultGateGroup(state.passwords, autofill.gate)]
+  return [
+    ...groups,
+    ...addressGroups(state, set, autofill),
+    ...cardGroups(state, set, autofill),
+    passkeysGroup(autofill)
+  ]
+}
+
+/**
+ * The vault gate (§9.27 on desktop; here the group's heading names it, §10.3): idle, one Unlock
+ * action row – busy while the device checks (§9.30), not pressable while the vault is unreadable
+ * (`status.error`, which the description then says); once the vault asks for its passphrase, or
+ * for a new one where the device cannot verify the user, the shared passphrase form at the
+ * gutter (`VaultPassphraseForm`), whose Cancel returns to the idle gate.
+ */
+function vaultGateGroup(status: PasswordsStatus, gate: VaultGate): RowGroup {
+  const { title, description } = vaultGateCopy(gate.step, status, gate.error)
+  const keywords = ['vault', 'locked', 'unlock', 'passphrase']
+  return {
+    id: 'autofill-vault',
+    heading: title,
+    description,
+    rows:
+      gate.step === 'idle'
+        ? [
+            {
+              kind: 'action',
+              id: 'autofill-unlock',
+              label: 'Unlock',
+              keywords,
+              busy: gate.busy,
+              disabled: status.error !== null,
+              button: 'Unlock',
+              onPress: () => gate.unlock()
+            }
+          ]
+        : [
+            {
+              kind: 'custom',
+              id: 'autofill-vault-passphrase',
+              label: title,
+              keywords,
+              render: () => <VaultPassphraseForm gate={gate} />
+            }
+          ]
+  }
+}
+
+/**
+ * A vault list as groups (§10.3): the heading with its switch, the entries as item rows under
+ * it (one 20 px glyph column, labels at 48 – §10.4) with the §9.17 empty line once the list has
+ * arrived, and the add action last; the two tails carry no heading, so the three read as one.
+ */
+function vaultListGroups(
+  id: string,
+  head: Omit<RowGroup, 'id'>,
+  entries: SettingsRow[] | null,
+  empty: string,
+  add: SettingsRow | null
+): RowGroup[] {
+  const groups: RowGroup[] = [{ id, ...head }]
+  groups.push({
+    id: `${id}-list`,
+    heading: null,
+    rows: entries ?? [],
+    empty: entries ? empty : undefined
+  })
+  if (add) groups.push({ id: `${id}-add`, heading: null, rows: [add] })
+  return groups
+}
+
+function addressGroups(
+  state: UIState,
+  set: SectionContext['set'],
+  { addresses }: AutofillSettingsData
+): RowGroup[] {
+  const a = state.settings.autofill
+  // `chrome.privacy.services.autofillAddressEnabled` (Chrome marks its "Save and fill addresses").
+  const control = extensionControlled(state, 'autofill.addresses')
+  return vaultListGroups(
+    'autofill-addresses',
+    {
+      heading: 'Addresses',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'autofill-save-addresses',
+          label: 'Save and fill addresses',
+          description:
+            'Offer to save addresses typed into forms, and fill them back into checkouts and sign-ups.',
+          controlled: control,
+          checked: heldSwitch(control, a.addresses),
+          onChange: (v) => set({ autofill: { ...a, addresses: v } })
+        }
+      ]
+    },
+    addresses?.map((address) =>
+      item(
+        `autofill-address:${address.id}`,
+        addressTitle(address),
+        addressRowSubtitle(address),
+        [
+          {
+            kind: 'action',
+            id: `autofill-address:${address.id}:edit`,
+            label: 'Edit address',
+            closesSheet: true,
+            onPress: () => openAutofillEdit({ kind: 'address', id: address.id })
+          },
+          {
+            kind: 'action',
+            id: `autofill-address:${address.id}:delete`,
+            label: 'Delete address',
+            destructive: true,
+            confirm: {
+              title: `Delete ${addressTitle(address)}?`,
+              description: 'Ione stops filling it into forms.',
+              action: 'Delete'
+            },
+            onPress: () => run('autofill.removeAddress', { id: address.id })
+          }
+        ],
+        {
+          leading: <MapPin className="zen-settings-glyph" aria-hidden="true" />,
+          keywords: [address.organization, address.locality, address.country].filter(Boolean)
+        }
+      )
+    ) ?? null,
+    'No addresses saved yet',
+    {
+      kind: 'action',
+      id: 'autofill-add-address',
+      label: 'Add address',
+      keywords: ['new address'],
+      onPress: () => openAutofillEdit({ kind: 'address', id: null })
+    }
+  )
+}
+
+function cardGroups(
+  state: UIState,
+  set: SectionContext['set'],
+  { cards, copying, copyCard }: AutofillSettingsData
+): RowGroup[] {
+  const a = state.settings.autofill
+  // `chrome.privacy.services.autofillCreditCardEnabled` (Chrome marks its "Save and fill
+  // payment methods").
+  const control = extensionControlled(state, 'autofill.cards')
+  return vaultListGroups(
+    'autofill-cards',
+    {
+      heading: 'Payment methods',
+      description: 'Card numbers stay in the vault; security codes are never saved.',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'autofill-save-cards',
+          label: 'Save and fill payment methods',
+          description:
+            'Offer to save cards typed into checkouts, and fill them back after you verify it is you.',
+          keywords: ['credit card', 'debit card'],
+          controlled: control,
+          checked: heldSwitch(control, a.cards),
+          onChange: (v) => set({ autofill: { ...a, cards: v } })
+        }
+      ]
+    },
+    cards?.map((card) =>
+      item(
+        `autofill-card:${card.id}`,
+        cardTitle(card),
+        cardSubtitle(card),
+        [
+          {
+            kind: 'action',
+            id: `autofill-card:${card.id}:copy`,
+            label: 'Copy card number',
+            description: 'Unlocks with your passphrase where the vault asks for it.',
+            busy: copying === card.id,
+            onPress: () => copyCard(card)
+          },
+          {
+            kind: 'action',
+            id: `autofill-card:${card.id}:edit`,
+            label: 'Edit card',
+            closesSheet: true,
+            onPress: () => openAutofillEdit({ kind: 'card', id: card.id })
+          },
+          {
+            kind: 'action',
+            id: `autofill-card:${card.id}:delete`,
+            label: 'Delete card',
+            destructive: true,
+            confirm: {
+              title: `Delete ${cardTitle(card)}?`,
+              description: 'Ione stops filling it into checkouts.',
+              action: 'Delete'
+            },
+            onPress: () => run('autofill.removeCard', { id: card.id })
+          }
+        ],
+        {
+          leading: <CreditCard className="zen-settings-glyph" aria-hidden="true" />,
+          keywords: [NETWORK_NAMES[card.network], card.last4, card.name].filter(Boolean)
+        }
+      )
+    ) ?? null,
+    'No cards saved yet',
+    {
+      kind: 'action',
+      id: 'autofill-add-card',
+      label: 'Add card',
+      keywords: ['new card', 'credit card', 'debit card'],
+      onPress: () => openAutofillEdit({ kind: 'card', id: null })
+    }
+  )
+}
+
+function passkeysGroup({ passkeys }: AutofillSettingsData): RowGroup {
+  return {
+    id: 'autofill-passkeys',
+    heading: 'Passkeys',
+    description:
+      "Passkeys created in Ione. The keys themselves stay with your device's authenticator (Windows Hello, Touch ID, Google Password Manager); this is where they exist and when they were last used.",
+    rows:
+      passkeys?.map((passkey) =>
+        item(
+          `autofill-passkey:${passkey.id}`,
+          passkey.userDisplayName || passkey.userName,
+          passkeySubtitle(passkey),
+          [
+            {
+              kind: 'action',
+              id: `autofill-passkey:${passkey.id}:forget`,
+              label: "Forget this passkey's record",
+              description: 'The passkey itself stays with the authenticator that holds it.',
+              destructive: true,
+              confirm: {
+                title: `Forget the passkey for ${passkey.rpName || passkey.rpId}?`,
+                description:
+                  'Only the record goes; the key itself stays with the authenticator that holds it.',
+                action: 'Forget'
+              },
+              onPress: () => run('autofill.removePasskey', { id: passkey.id })
+            }
+          ],
+          {
+            leading: <Fingerprint className="zen-settings-glyph" aria-hidden="true" />,
+            keywords: [passkey.rpId, passkey.rpName, passkey.userName].filter(Boolean)
+          }
+        )
+      ) ?? [],
+    empty: passkeys ? 'No passkeys yet' : undefined
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Languages (page translation, #106)
+// ---------------------------------------------------------------------------
+
+/**
+ * Settings › Languages: the preferred languages first (CT-41, `languages.tsx`: `Settings.
+ * languages` in order with a ⋯ menu per row and Add language – the list translate's "languages
+ * you read" is derived from), then the desktop pane (`LanguagesSection.tsx`) row for row:
+ * whether Ione offers to translate, the always and never lists, the sites never offered, and
+ * the models on the device with their size and a confirmed removal. What the desktop adds
+ * through a menulist is an action row here (§9.13: no menulist on a phone settings page)
+ * opening a sheet of the languages or models left to pick. The lists read the core's translate
+ * state and write through its commands, so both platforms keep one set of rules.
+ */
+function languagesSection({ state, dictionary, set: setSettings }: SectionContext): RowGroup[] {
+  const t = state.translate
+  const prefs = t.preferences
+  // The "Download a model" sheet lists the registry's pairs, which the core is asked for: asked
+  // here, so the list is at hand by the time the sheet – which measures itself as it mounts –
+  // opens (once; nothing happens after the first answer).
+  warmRegistryModels()
+  const set = (patch: Partial<TranslatePreferences>): void => run('translate.setPreferences', patch)
+  const rule = (language: string, value: 'always' | 'never' | 'ask'): void =>
+    run('translate.setLanguageRule', { language, rule: value })
+
+  /**
+   * The languages in `codes` as item rows (§10.4: one object, one row in every list on the
+   * page), each opening the one Remove row `remove` describes – the row's one action, so on a
+   * mouse it is #322's inline Remove as well (§10.5: the count picks the form). A preference
+   * removed is plain ink and asks no confirmation.
+   */
+  const languageRows = (
+    prefix: string,
+    codes: readonly string[],
+    remove: (code: string) => { description: string; onPress: () => void }
+  ): SettingsRow[] =>
+    codes.map((code) => {
+      const { description, onPress } = remove(code)
+      const name = catalogueLanguageName(code) ?? languageName(code)
+      return item(
+        `${prefix}:${code}`,
+        name,
+        undefined,
+        [
+          {
+            kind: 'action',
+            id: `${prefix}:${code}:ask`,
+            label: 'Remove',
+            description,
+            button: 'Remove',
+            onPress
+          }
+        ],
+        { keywords: [code], action: { label: 'Remove', onPress } }
+      )
+    })
+
+  /**
+   * The Add language row of a translate list, in a group of its own after it; none when nothing
+   * is left. The same row as the preferred list's (`addLanguageRow`): the phone's find-and-pick
+   * page with the list in its address, the desktop's filtered dialog (§10.2).
+   */
+  const targets = addLanguageTargets({ state, set: setSettings })
+  const addGroup = (id: Exclude<AddLanguageList, 'preferred'>, title: string): RowGroup[] => {
+    if (targets[id].choices.length === 0) return []
+    return [
+      {
+        id: `${id}-add`,
+        heading: null,
+        rows: [addLanguageRow(`languages-${id}-add`, id, targets[id], { keywords: [title] })]
+      }
+    ]
+  }
+
+  const installedBytes = t.installed.reduce((sum, m) => sum + m.bytes, 0)
+  const modelRows: SettingsRow[] = [
+    ...t.installed.map((m) => {
+      const pair = pairLabel(m.from, m.to)
+      return item(`languages-model:${pairKey(m)}`, pair, formatBytes(m.bytes), [
+        {
+          kind: 'action',
+          id: `languages-model:${pairKey(m)}:remove`,
+          label: 'Remove model',
+          description: 'It is downloaded again the next time these languages are translated.',
+          destructive: true,
+          button: 'Remove…',
+          confirm: {
+            title: `Remove the ${pair} model?`,
+            description: `${formatBytes(m.bytes)} is freed; the model is downloaded again the next time a page in these languages is translated.`,
+            action: 'Remove'
+          },
+          onPress: () => run('translate.removeModel', { from: m.from, to: m.to })
+        }
+      ])
+    }),
+    ...t.downloading.map((m): SettingsRow => ({
+      kind: 'info',
+      id: `languages-model:${pairKey(m)}`,
+      label: pairLabel(m.from, m.to),
+      description: 'Downloading…'
+    }))
+  ]
+  if (t.installed.length > 0) {
+    modelRows.push({
+      kind: 'info',
+      id: 'languages-models-total',
+      label: `${formatBytes(installedBytes)} on this device`,
+      keywords: ['storage', 'space']
+    })
+  }
+
+  return [
+    ...preferredLanguagesGroups({ state, set: setSettings }),
+    {
+      id: 'translation',
+      heading: 'Translation',
+      description:
+        'Pages in other languages are translated on this device, with models Ione downloads the first time a language pair is used. Pages in your preferred languages are shown as they are. Nothing leaves the device.',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'languages-offer',
+          label: 'Offer to translate pages in other languages',
+          keywords: ['automatic', 'translation bar', 'auto offer'],
+          checked: prefs.autoOffer,
+          onChange: (autoOffer) => set({ autoOffer })
+        }
+      ]
+    },
+    {
+      id: 'always',
+      heading: 'Always translate',
+      description: 'Pages in these languages are translated as soon as they load, without asking.',
+      rows: languageRows('languages-always', prefs.alwaysTranslate, (code) => ({
+        description: 'Ione asks before translating pages in this language again.',
+        onPress: () => rule(code, 'ask')
+      })),
+      empty: 'No languages yet'
+    },
+    ...addGroup('always', 'Always translate'),
+    {
+      id: 'never',
+      heading: 'Never translate',
+      description: 'Ione never offers to translate pages in these languages.',
+      rows: languageRows('languages-never', prefs.neverTranslate, (code) => ({
+        description: 'Ione offers to translate pages in this language again.',
+        onPress: () => rule(code, 'ask')
+      })),
+      empty: 'No languages yet'
+    },
+    ...addGroup('never', 'Never translate'),
+    {
+      id: 'sites',
+      heading: 'Sites never translated',
+      description:
+        'Ione does not offer to translate these sites. Add one from the translation bar’s options while you are on the site.',
+      rows: prefs.neverTranslateSites.map((site) => {
+        const forget = (): void =>
+          set({ neverTranslateSites: prefs.neverTranslateSites.filter((s) => s !== site) })
+        return item(
+          `languages-site:${site}`,
+          site,
+          undefined,
+          [
+            {
+              kind: 'action',
+              id: `languages-site:${site}:forget`,
+              label: 'Remove',
+              description: 'Ione offers to translate this site again.',
+              button: 'Remove',
+              onPress: forget
+            }
+          ],
+          { action: { label: 'Remove', onPress: forget } }
+        )
+      }),
+      empty: 'No sites yet'
+    },
+    {
+      id: 'models',
+      heading: 'Translation models',
+      description: `Downloaded the first time a language pair is translated and kept on this device. Mozilla’s Firefox Translations models (${t.modelLicense}); list from ${t.registryDate}.`,
+      rows: modelRows,
+      empty: 'No models on this device yet'
+    },
+    {
+      id: 'models-add',
+      heading: null,
+      rows: [
+        {
+          kind: 'action',
+          id: 'languages-model-download',
+          label: 'Download a model',
+          description: 'Fetch a language pair ahead of time, for pages read offline.',
+          keywords: ['offline', 'language pair'],
+          button: 'Download…',
+          form: {
+            title: 'Download a model',
+            render: (close) => (
+              <ModelPickList onDevice={[...t.installed, ...t.downloading]} close={close} />
+            )
+          }
+        }
+      ]
+    },
+    ...spellcheckGroups(state, dictionary)
+  ]
+}
+
+/** What a language's dictionary is doing, as its row's description; nothing while it is ready. */
+function dictionaryDetail(status: SpellcheckDictionaryStatus): string | undefined {
+  if (status === 'downloading') return 'Downloading dictionary…'
+  if (status === 'failed') return 'Dictionary download failed'
+  return undefined
+}
+
+/**
+ * Settings › Languages › Spell check on a phone, the desktop pane's `SpellcheckGroups` row for
+ * row (CT-07, CT-19). Android's WebView has no spellchecker of the browser's own – the system
+ * spell checker service chosen next to the keyboards checks its text fields – so on that host
+ * the group states the limit and leads to the keyboard settings (`spellcheck.openKeyboardSettings`).
+ * A host with a checker of its own gets the switch, the languages checked in as item rows – the
+ * dictionary's state as the description, Remove inside – and an Add sheet of the host's other
+ * dictionaries up to Chrome's five; with the switch off the list is the dependent group at .4
+ * (§10.4). A host whose checker follows the OS's languages shows where they are chosen instead.
+ * The custom dictionary (Chrome's "Customize spell check": the words the checker never marks,
+ * each with Remove inside, and the Add a new word form) follows on the desktop and tablet
+ * shells, whose host checks spelling itself; no phone host does.
+ */
+function spellcheckGroups(state: UIState, dictionary: DictionaryWords): RowGroup[] {
+  const status = state.spellcheck
+  const settings = state.settings.spellcheck
+  const keywords = ['spelling', 'spell check', 'dictionary', 'misspelt', 'autocorrect']
+  if (!status.available) {
+    return [
+      {
+        id: 'spellcheck',
+        heading: 'Spell check',
+        description:
+          'Text fields are checked by the spell checker of the keyboard in use. Its languages, and whether it marks or corrects words as you type, are chosen with the keyboard in the system settings.',
+        rows: [
+          {
+            kind: 'action',
+            id: 'spellcheck-keyboard',
+            label: 'Keyboard settings',
+            description: 'Open the system’s keyboard and spell checker settings.',
+            keywords,
+            leaves: 'external',
+            onPress: () => run('spellcheck.openKeyboardSettings', undefined)
+          }
+        ]
+      }
+    ]
+  }
+  const checked = status.languages.filter((l) => l.enabled)
+  const remaining = status.languages.filter((l) => !l.enabled)
+  const off = !settings.enabled
+  const groups: RowGroup[] = [
+    {
+      id: 'spellcheck',
+      heading: 'Spell check',
+      description:
+        'Misspelt words in text fields are underlined as you type; their menu offers corrections and Add to Dictionary.',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'spellcheck-enabled',
+          label: 'Check the spelling of text fields',
+          keywords,
+          checked: settings.enabled,
+          onChange: (enabled) => run('spellcheck.setEnabled', { enabled })
+        }
+      ]
+    }
+  ]
+  if (status.systemLanguages) {
+    groups.push({
+      id: 'spellcheck-languages',
+      heading: 'Languages',
+      rows: [
+        {
+          kind: 'info',
+          id: 'spellcheck-system-languages',
+          label: 'Languages follow the system',
+          description:
+            'The system’s spell checker checks in the languages chosen for it in the system settings; a text field’s menu switches between them.',
+          keywords
+        }
+      ]
+    })
+    return groups
+  }
+  groups.push({
+    id: 'spellcheck-languages',
+    heading: 'Languages',
+    description: `Text fields are checked in up to ${SPELLCHECK_LANGUAGES_MAX} languages at a time. A dictionary is downloaded the first time a language is checked in and kept on this device.`,
+    rows: checked.map((language) =>
+      item(
+        `spellcheck-language:${language.code}`,
+        language.name,
+        dictionaryDetail(language.status),
+        [
+          {
+            kind: 'action',
+            id: `spellcheck-language:${language.code}:remove`,
+            label: 'Remove',
+            description: 'Text fields are no longer checked in this language.',
+            button: 'Remove',
+            onPress: () => run('spellcheck.setLanguage', { code: language.code, on: false })
+          }
+        ],
+        { keywords: [language.code, ...keywords], disabled: off }
+      )
+    ),
+    empty: 'No languages yet'
+  })
+  if (checked.length >= SPELLCHECK_LANGUAGES_MAX) {
+    groups.push({
+      id: 'spellcheck-add',
+      heading: null,
+      rows: [
+        {
+          kind: 'info',
+          id: 'spellcheck-limit',
+          label: `Up to ${SPELLCHECK_LANGUAGES_MAX} languages can be checked at a time`,
+          description: 'Remove one to add another.',
+          disabled: off
+        }
+      ]
+    })
+  } else if (remaining.length > 0) {
+    const options = remaining.map((l) => ({ value: l.code, label: l.name }))
+    groups.push({
+      id: 'spellcheck-add',
+      heading: null,
+      rows: [
+        {
+          kind: 'action',
+          id: 'spellcheck-add',
+          label: 'Add language',
+          keywords,
+          disabled: off,
+          button: 'Add…',
+          form: {
+            // One copy for the page's three Add rows (the #350 review's nit 3): the group says
+            // what the list is for, the sheet's description what the pick does.
+            title: 'Add language',
+            description: 'Text you type is checked in this language too.',
+            render: (close) => (
+              <PickList
+                label="Add language"
+                options={options}
+                onPick={(code) => run('spellcheck.setLanguage', { code, on: true })}
+                close={close}
+              />
+            )
+          }
+        }
+      ]
+    })
+  }
+  groups.push(...customDictionaryGroups(dictionary, off, keywords))
+  return groups
+}
+
+/**
+ * Chrome's "Customize spell check" as two groups: the words the checker never marks – added
+ * here or with a text field's Add to Dictionary – each an item whose sheet holds Remove, and
+ * the Add a new word action with its §9.12 form (`WordForm`). Nothing is drawn while the words
+ * have not arrived; both groups follow the spell check switch as its dependent (§10.4).
+ */
+function customDictionaryGroups(
+  dictionary: DictionaryWords,
+  off: boolean,
+  keywords: readonly string[]
+): RowGroup[] {
+  const words = dictionary.words
+  const layouts: FormFactor[] = ['desktop', 'tablet']
+  return [
+    {
+      id: 'spellcheck-dictionary',
+      heading: 'Custom dictionary',
+      description:
+        'Words the checker never marks. Add to Dictionary in a text field’s menu puts a word here too.',
+      layouts,
+      rows: (words ?? []).map((word) =>
+        item(
+          `spellcheck-word:${word}`,
+          word,
+          undefined,
+          [
+            {
+              kind: 'action',
+              id: `spellcheck-word:${word}:remove`,
+              label: 'Remove',
+              description: 'The checker marks this word again.',
+              button: 'Remove',
+              onPress: () => dictionary.remove(word)
+            }
+          ],
+          { keywords: ['custom dictionary', 'word', ...keywords], disabled: off }
+        )
+      ),
+      empty: words === null ? undefined : 'No words yet'
+    },
+    {
+      id: 'spellcheck-add-word',
+      heading: null,
+      layouts,
+      rows: [
+        {
+          kind: 'action',
+          id: 'spellcheck-add-word',
+          label: 'Add a new word',
+          description: 'One word the checker never marks.',
+          keywords: ['custom dictionary', 'customize spell check', ...keywords],
+          disabled: off,
+          button: 'Add…',
+          form: {
+            title: 'Add a new word',
+            render: (close) => (
+              <WordForm
+                problem={(word) => wordProblem(word, words)}
+                onAdd={dictionary.add}
+                close={close}
+              />
+            )
+          }
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Space Routing
+// ---------------------------------------------------------------------------
+
+function spaceRoutingSection({ state, set }: SectionContext): RowGroup[] {
+  const routing = state.settings.spaceRouting
+  const remove = (domain: string): void => {
+    const next = { ...routing }
+    delete next[domain]
+    set({ spaceRouting: next })
+  }
+  return [
+    {
+      id: 'routes',
+      heading: 'Routes',
+      description:
+        'Space Routing opens links from the listed domains in a specific Space, wherever you click them.',
+      rows: sorted(routing).map(([domain, spaceId]) => {
+        const space = state.spaces.find((sp) => sp.id === spaceId)
+        return item(
+          `route:${domain}`,
+          domain,
+          space ? spaceLabel(space) : 'Space no longer exists',
+          [
+            {
+              kind: 'action',
+              id: `route:${domain}:remove`,
+              label: 'Remove route',
+              button: 'Remove',
+              onPress: () => remove(domain)
+            }
+          ]
+        )
+      }),
+      empty: 'No routes yet'
+    },
+    {
+      id: 'add-route',
+      heading: null,
+      rows: [
+        {
+          kind: 'action',
+          id: 'add-route',
+          label: 'Add route',
+          button: 'Add…',
+          keywords: ['domain', 'space'],
+          disabled: state.spaces.length === 0,
+          form: {
+            title: 'Add route',
+            description: 'Links to the domain open in the Space you pick.',
+            render: (close) => (
+              <AddRouteForm
+                spaces={state.spaces}
+                onAdd={(domain, spaceId) =>
+                  set({ spaceRouting: { ...routing, [domain]: spaceId } })
+                }
+                close={close}
+              />
+            )
+          }
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Containers
+// ---------------------------------------------------------------------------
+
+function containersSection({ state }: SectionContext): RowGroup[] {
+  const containers = state.containers
+  return [
+    {
+      id: 'containers',
+      heading: 'Containers',
+      description:
+        'Containers keep cookies and site data separate, so you can stay signed in to several accounts on the same site. Assign a container to a Space to isolate it.',
+      rows: containers.map((c, i) => {
+        const editable = c.id !== DEFAULT_CONTAINER_ID
+        const rows: SettingsRow[] = editable
+          ? [
+              choice<ContainerColor>({
+                id: `container:${c.id}:colour`,
+                label: 'Colour',
+                value: c.color,
+                options: (Object.keys(CONTAINER_COLORS) as ContainerColor[]).map((k) => ({
+                  value: k,
+                  label: k.charAt(0).toUpperCase() + k.slice(1)
+                })),
+                onChange: (v) => run('container.update', { id: c.id, patch: { color: v } })
+              }),
+              choice<ContainerIconName>({
+                id: `container:${c.id}:icon`,
+                label: 'Icon',
+                value: c.icon,
+                options: CONTAINER_ICONS.map((k) => ({
+                  value: k,
+                  label: k.charAt(0).toUpperCase() + k.slice(1)
+                })),
+                onChange: (v) => run('container.update', { id: c.id, patch: { icon: v } })
+              }),
+              {
+                kind: 'action',
+                id: `container:${c.id}:up`,
+                label: 'Move up',
+                button: 'Up',
+                disabled: i <= 1,
+                onPress: () => run('container.reorder', { id: c.id, index: i - 1 })
+              },
+              {
+                kind: 'action',
+                id: `container:${c.id}:down`,
+                label: 'Move down',
+                button: 'Down',
+                disabled: i >= containers.length - 1,
+                onPress: () => run('container.reorder', { id: c.id, index: i + 1 })
+              },
+              {
+                kind: 'action',
+                id: `container:${c.id}:delete`,
+                label: 'Delete container',
+                // A container's removal deletes site data: the Delete family's verb (W8-11, the
+                // design lead's ruling).
+                description: 'Its cookies and site data are deleted.',
+                button: 'Delete…',
+                destructive: true,
+                confirm: {
+                  title: `Delete ${c.name}?`,
+                  description:
+                    'Tabs in this container lose their sign-ins; its site data is deleted.',
+                  action: 'Delete'
+                },
+                onPress: () => run('container.delete', { id: c.id })
+              }
+            ]
+          : []
+        return item(
+          `container:${c.id}`,
+          c.name,
+          editable ? undefined : 'Tabs without a container',
+          rows,
+          { leading: <ContainerIcon container={c} size={20} />, keywords: [c.color, c.icon] }
+        )
+      })
+    },
+    {
+      id: 'new-container',
+      heading: null,
+      rows: [
+        {
+          kind: 'action',
+          id: 'new-container',
+          label: 'New container',
+          keywords: ['create', 'colour', 'icon'],
+          button: 'New…',
+          form: {
+            title: 'New container',
+            render: (close) => (
+              <NewContainerForm
+                onCreate={(name, color, icon) => run('container.create', { name, color, icon })}
+                close={close}
+              />
+            )
+          }
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Boosts
+// ---------------------------------------------------------------------------
+
+function boostsSection({ state, tab, boost }: SectionContext): RowGroup[] {
+  const opener = tab.openerTabId ? state.tabs[tab.openerTabId] : undefined
+  const site =
+    opener && /^https?:/.test(opener.url) && state.window.kind !== 'private' ? opener : null
+  return [
+    {
+      id: 'boosts',
+      heading: 'Active Boosts',
+      description:
+        'Boosts change how a website looks: tint its colours, swap fonts, zap elements away or force dark mode. They apply to every page of the site and stay until you remove them.',
+      rows: state.boosts.map((b) => {
+        const parts = [
+          b.tint && 'tint',
+          b.font && 'font',
+          b.fontSize !== 100 && `${b.fontSize}% text`,
+          b.darkMode && 'dark mode',
+          b.zapped.length > 0 && `${b.zapped.length} zapped`,
+          b.css.trim() && 'custom CSS'
+        ].filter((p): p is string => typeof p === 'string')
+        return item(
+          `boost:${b.domain}`,
+          b.domain,
+          `${parts.join(' · ') || 'Nothing configured'} · ${relativeTime(b.updatedAt)}`,
+          [
+            {
+              kind: 'switch',
+              id: `boost:${b.domain}:enabled`,
+              label: 'Enabled',
+              checked: b.enabled,
+              onChange: (v) => run('boost.update', { domain: b.domain, patch: { enabled: v } })
+            },
+            {
+              kind: 'action',
+              id: `boost:${b.domain}:remove`,
+              label: 'Remove Boost',
+              button: 'Remove…',
+              destructive: true,
+              confirm: {
+                title: `Remove the Boost for ${b.domain}?`,
+                description: 'The site shows as its author made it again.',
+                action: 'Remove'
+              },
+              onPress: () => run('boost.remove', { domain: b.domain })
+            }
+          ],
+          {
+            leading: b.tint ? (
+              <span
+                className="zen-settings-tint"
+                style={{ background: b.tint }}
+                aria-hidden="true"
+              />
+            ) : undefined,
+            keywords: parts
+          }
+        )
+      }),
+      empty: 'No Boosts yet'
+    },
+    {
+      id: 'boost-current',
+      heading: null,
+      rows: [
+        {
+          kind: 'action',
+          id: 'boost-current',
+          label: site
+            ? `Boost ${new URL(site.url).hostname.replace(/^www\./, '')}`
+            : 'Boost a site',
+          description: site
+            ? 'Opens the Boost editor on the site you came from.'
+            : 'Open a site and tap the sparkle in the address bar.',
+          button: 'Boost…',
+          disabled: !site,
+          onPress: () => site && boost(site.id)
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Mods
+// ---------------------------------------------------------------------------
+
+/**
+ * The hint under a Mod's CSS field (the lead's line, ID-43): a Mod syncs as its CSS text, so a
+ * `data:` picture rides inside it while a `file:` or other host-local `url()` names a file only
+ * this device holds – the other devices resolve a web address alone.
+ */
+export const MOD_PICTURE_HINT =
+  'A picture stored on this device stays on it; other devices need a web address.'
+
+function modsSection({ state }: SectionContext): RowGroup[] {
+  return [
+    {
+      id: 'mods',
+      heading: 'Mods',
+      description:
+        'Custom CSS for the browser chrome, like Zen’s Mods and userChrome.css. Style hooks: .zen-tab, .zen-essential, .zen-panel, .zen-content-frame, .zen-toolbar-button, [data-active].',
+      rows: state.mods.map((mod) =>
+        item(
+          `mod:${mod.id}`,
+          mod.name,
+          mod.source ?? `${mod.css.length.toLocaleString()} characters`,
+          [
+            {
+              kind: 'switch',
+              id: `mod:${mod.id}:enabled`,
+              label: 'Enabled',
+              checked: mod.enabled,
+              onChange: (v) => run('mod.update', { id: mod.id, patch: { enabled: v } })
+            },
+            {
+              kind: 'field',
+              id: `mod:${mod.id}:name`,
+              label: 'Name',
+              value: mod.name,
+              input: 'text',
+              onCommit: (name) => {
+                const trimmed = name.trim()
+                if (!trimmed) return 'Enter a name'
+                if (trimmed !== mod.name)
+                  run('mod.update', { id: mod.id, patch: { name: trimmed } })
+                return undefined
+              }
+            },
+            {
+              kind: 'custom',
+              id: `mod:${mod.id}:css`,
+              label: 'CSS',
+              render: () => (
+                <CssEditor
+                  value={mod.css}
+                  onCommit={(css) => run('mod.update', { id: mod.id, patch: { css } })}
+                  hint={MOD_PICTURE_HINT}
+                />
+              )
+            },
+            {
+              kind: 'action',
+              id: `mod:${mod.id}:remove`,
+              label: 'Remove Mod',
+              button: 'Remove…',
+              destructive: true,
+              confirm: {
+                title: `Remove ${mod.name}?`,
+                description: 'Its CSS stops applying to the browser.',
+                action: 'Remove'
+              },
+              onPress: () => run('mod.remove', { id: mod.id })
+            }
+          ],
+          { keywords: ['css', 'style'] }
+        )
+      ),
+      empty: 'No Mods installed'
+    },
+    {
+      id: 'add-mod',
+      heading: 'Add a Mod',
+      rows: [
+        {
+          kind: 'action',
+          id: 'new-mod',
+          label: 'New Mod',
+          description: 'Starts an empty stylesheet you edit here.',
+          button: 'New',
+          onPress: () => run('mod.add', { name: 'New Mod', css: '/* your CSS */\n' })
+        },
+        {
+          kind: 'action',
+          id: 'import-mod-url',
+          label: 'Import from URL',
+          button: 'Import…',
+          form: {
+            title: 'Import a Mod from a URL',
+            render: (close) => (
+              <UrlForm
+                id="mod-url"
+                label="Stylesheet URL"
+                placeholder="https://example.com/mod.css"
+                action="Import"
+                onSubmit={(url) => run('mod.importUrl', { url })}
+                close={close}
+              />
+            )
+          }
+        },
+        {
+          kind: 'action',
+          id: 'import-mod-file',
+          label: 'Import from file',
+          button: 'Import…',
+          onPress: () => run('mod.importFile', undefined)
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Extensions
+// ---------------------------------------------------------------------------
+
+function extensionsSection(ctx: SectionContext): RowGroup[] {
+  return extensionsGroups(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Apps
+// ---------------------------------------------------------------------------
+
+/**
+ * Settings › Apps (shortcuts-menus-138; Edge's Apps › Manage apps, Chrome's chrome://apps): the
+ * web apps installed on this computer and the shortcuts made to pages (`state.webApps`, the
+ * launchers the host pinned; a shortcut's record is `kind` `shortcut`), under the one heading
+ * "Apps and shortcuts" – as chrome://apps lists both – one item row each by name, its icon
+ * where the host kept one. Under an app's name the site it opens at; under a shortcut's what
+ * its launcher does, "Shortcut · opens as a tab" or "Shortcut · opens in a window" by the
+ * record's `openAsWindow` (absent is a window, the host's rule), since the description's first
+ * clause is true of apps alone and the heading would otherwise call a shortcut an installed app
+ * (the Design Lead's ruling on #767). The row's ⋯ (§10.5: a row of actions and nothing to set,
+ * so no dialog opens to hold them) holds Open, which launches the app as its launcher does
+ * (`webapp.launch`: the app's open window forward, else a window of its own – a tab for a
+ * shortcut made to open one), and Uninstall in the danger ink (`webapp.uninstall`: the
+ * launcher and the record go, the app's windows close; Uninstall is Chrome's verb for a
+ * shortcut too). A row's action runs at once (§10.5) – except that closing a window the user
+ * has in front of them is the one thing here that costs something, so WHILE A WINDOW OF THE APP
+ * IS OPEN (`windows`, the snapshot's count) Uninstall asks first with §9.23's notice:
+ * "Uninstall <app>? Its open window closes." (or "Its open windows close."), Cancel | Uninstall
+ * as two secondaries with the verb in the plain ink, since nothing of the user's data goes (the
+ * #435 lead check, ruling 5); with no window open, no prompt. Installing is a page's own act –
+ * the app menu's Save and Share › Install <app>… or Create Shortcut… on the site – which the
+ * empty state and the description name, since nothing here adds one.
+ */
+function appsSection({ state }: SectionContext): RowGroup[] {
+  const apps = [...state.webApps].sort((a, b) => a.name.localeCompare(b.name))
+  return [
+    {
+      id: 'apps',
+      heading: 'Apps and shortcuts',
+      description:
+        "Sites installed as apps open in a window of their own; a shortcut opens its page as a tab or in a window, as you chose when you made it. To add one, open the site and pick Install… or Create Shortcut… from the app menu's Save and Share.",
+      rows: apps.map((app) =>
+        item(
+          `app:${app.id}`,
+          app.name,
+          isShortcutRecord(app)
+            ? `Shortcut · opens ${app.openAsWindow === false ? 'as a tab' : 'in a window'}`
+            : appSite(app.startUrl),
+          [
+            {
+              kind: 'action',
+              id: `app:${app.id}:open`,
+              label: 'Open',
+              button: 'Open',
+              onPress: () => run('webapp.launch', { appId: app.id })
+            },
+            {
+              kind: 'action',
+              id: `app:${app.id}:uninstall`,
+              label: 'Uninstall',
+              button: 'Uninstall',
+              destructive: true,
+              confirm:
+                app.windows > 0
+                  ? {
+                      title: `Uninstall ${app.name}?`,
+                      description:
+                        app.windows === 1 ? 'Its open window closes.' : 'Its open windows close.',
+                      action: 'Uninstall',
+                      verbTone: 'plain'
+                    }
+                  : undefined,
+              onPress: () => run('webapp.uninstall', { appId: app.id })
+            }
+          ],
+          {
+            leading: <FaviconGlyph src={app.icon} />,
+            keywords: [appSite(app.startUrl), 'web app', 'uninstall'],
+            menu: `Options for ${app.name}`
+          }
+        )
+      ),
+      empty: 'No apps installed'
+    }
+  ]
+}
+
+/**
+ * The site an app opens at, as its row's second line and every row's search keyword: the host
+ * alone, no scheme. A shortcut's second line says what its launcher does instead.
+ */
+function appSite(startUrl: string): string {
+  try {
+    return new URL(startUrl).host
+  } catch {
+    return startUrl
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Account and Sync
+// ---------------------------------------------------------------------------
+
+function accountSection(ctx: SectionContext): RowGroup[] {
+  return accountGroups(ctx)
+}
+
+function syncSection(ctx: SectionContext): RowGroup[] {
+  return syncGroups(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// AI Agents
+// ---------------------------------------------------------------------------
+
+function agentsSection({ state, set }: SectionContext): RowGroup[] {
+  const a = state.settings.agents
+  const server = state.agentServer
+  const setAgents = (patch: Partial<typeof a>): void => set({ agents: { ...a, ...patch } })
+  const groups: RowGroup[] = [
+    {
+      id: 'server',
+      heading: 'Server',
+      description:
+        'Let any AI agent drive this browser through a built-in Model Context Protocol server. Agents open their own tabs, read pages and click and type in them; each one gets a coloured cursor and tab badge.',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'mcp-enabled',
+          label: 'Enable the MCP server',
+          description:
+            server.error ??
+            (server.running && server.url ? `Running at ${server.url}` : 'The server is off.'),
+          keywords: ['mcp', 'model context protocol'],
+          checked: a.enabled,
+          onChange: (v) => setAgents({ enabled: v })
+        },
+        {
+          kind: 'field',
+          id: 'mcp-port',
+          label: 'Port',
+          description: undefined,
+          value: String(a.port),
+          input: 'number',
+          min: 1024,
+          max: 65535,
+          onCommit: (value) => {
+            const port = Number(value)
+            if (!Number.isInteger(port) || port < 1024 || port > 65535)
+              return 'Enter a port from 1024 to 65535'
+            setAgents({ port })
+            return undefined
+          }
+        },
+        {
+          kind: 'switch',
+          id: 'mcp-lan',
+          label: 'Allow devices on the local network',
+          description:
+            'Off by default. Lets an agent on another device drive this browser over Wi-Fi.',
+          checked: a.lan,
+          onChange: (v) => setAgents({ lan: v })
+        }
+      ]
+    }
+  ]
+  if (a.enabled && server.running && server.url) {
+    const url = server.url
+    const httpConfig = JSON.stringify({ mcpServers: { ione: { url } } }, null, 2)
+    const stdioConfig = JSON.stringify(
+      { mcpServers: { ione: { command: 'ione', args: ['--mcp'] } } },
+      null,
+      2
+    )
+    groups.push({
+      id: 'connect',
+      heading: 'Connect an agent',
+      description:
+        'Put the token in an Authorization: Bearer header, or append ?token=… to the URL.' +
+        (server.lanUrls.length
+          ? ` On the local network: ${server.lanUrls.join(', ')} – only share the token with devices you trust.`
+          : ''),
+      rows: [
+        {
+          kind: 'custom',
+          id: 'mcp-endpoint',
+          label: 'Streamable HTTP endpoint',
+          keywords: [url],
+          render: () => <CopyRow label="Streamable HTTP endpoint" value={url} />
+        },
+        {
+          kind: 'custom',
+          id: 'mcp-token',
+          label: 'Connection token',
+          description: 'Skips the approval prompt.',
+          render: () => <CopyRow label="Connection token" value={server.token} secret />
+        },
+        {
+          kind: 'custom',
+          id: 'mcp-config',
+          label: 'mcp.json (URL)',
+          keywords: ['config', 'streamable http'],
+          render: () => <CodeBlock label="mcp.json (URL)" value={httpConfig} />
+        },
+        {
+          kind: 'custom',
+          id: 'mcp-config-stdio',
+          label: 'mcp.json (command)',
+          description: 'For clients that start the server themselves over stdio.',
+          keywords: ['config', 'stdio', 'command'],
+          render: () => <CodeBlock label="mcp.json (command)" value={stdioConfig} />
+        },
+        {
+          kind: 'action',
+          id: 'mcp-regenerate',
+          label: 'Regenerate token',
+          description: 'Agents using the old token must reconnect.',
+          button: 'Regenerate…',
+          destructive: true,
+          confirm: {
+            title: 'Regenerate the connection token?',
+            description: 'Every agent that connects with the current token is cut off.',
+            action: 'Regenerate'
+          },
+          onPress: () => run('agent.regenerateToken', undefined)
+        }
+      ]
+    })
+  }
+  if (state.capabilities.agentSkills) groups.push(agentSkillGroup(state.agentSkills))
+  groups.push(
+    {
+      id: 'behaviour',
+      heading: 'Behaviour',
+      rows: [
+        choice({
+          id: 'agent-default-mode',
+          label: 'Default mode for new agents',
+          value: a.defaultMode,
+          sheetDescription:
+            'Foreground brings the agent’s tab in front of you before each action; background keeps you on your own tab.',
+          options: [
+            { value: 'foreground', label: 'Foreground (watch it work)' },
+            { value: 'background', label: 'Background (out of your way)' }
+          ],
+          onChange: (v) => setAgents({ defaultMode: v })
+        }),
+        {
+          kind: 'switch',
+          id: 'agent-cursor',
+          label: 'Show the agent’s cursor',
+          description: 'Draw a labelled cursor in the pages an agent drives.',
+          checked: a.showCursor,
+          onChange: (v) => setAgents({ showCursor: v })
+        },
+        {
+          kind: 'switch',
+          id: 'agent-approve',
+          label: 'Ask before a new agent connects',
+          description:
+            'When off, any agent that reaches the server may control the browser. The connection token always skips the prompt.',
+          checked: a.approveNewAgents,
+          onChange: (v) => setAgents({ approveNewAgents: v })
+        },
+        {
+          kind: 'switch',
+          id: 'agent-scripts',
+          label: 'Allow agents to run JavaScript in pages',
+          description:
+            'Off by default. Lets an agent run arbitrary script in the pages it drives, including sites you are signed in to.',
+          checked: a.allowScripts,
+          onChange: (v) => setAgents({ allowScripts: v })
+        }
+      ]
+    },
+    {
+      id: 'connected',
+      heading: 'Connected agents',
+      rows: state.agents.map((agent) =>
+        item(
+          `agent:${agent.id}`,
+          agent.name,
+          `${agent.pending ? 'Awaiting approval · ' : ''}${agent.transport === 'stdio' ? 'stdio' : 'HTTP'} · ${agent.groupIds.length} group${agent.groupIds.length === 1 ? '' : 's'} · ${agent.tabIds.length} tab${agent.tabIds.length === 1 ? '' : 's'} · ${agent.calls} action${agent.calls === 1 ? '' : 's'} · active ${relativeTime(agent.lastActiveAt)}`,
+          [
+            choice({
+              id: `agent:${agent.id}:mode`,
+              label: 'Mode',
+              value: agent.mode,
+              options: [
+                { value: 'foreground', label: 'Foreground' },
+                { value: 'background', label: 'Background' }
+              ],
+              onChange: (mode) => run('agent.setMode', { id: agent.id, mode })
+            }),
+            {
+              kind: 'action',
+              id: `agent:${agent.id}:disconnect`,
+              label: 'Disconnect',
+              description: 'Releases the tabs it opened.',
+              button: 'Disconnect…',
+              destructive: true,
+              confirm: { title: `Disconnect ${agent.name}?`, action: 'Disconnect' },
+              onPress: () => run('agent.disconnect', { id: agent.id })
+            }
+          ],
+          {
+            leading: (
+              <span
+                className="zen-settings-agent-dot"
+                style={{ background: agent.color }}
+                aria-hidden="true"
+              />
+            )
+          }
+        )
+      ),
+      empty: a.enabled
+        ? 'No agents connected – point an MCP client at the endpoint above'
+        : 'Turn the server on to let agents connect'
+    }
+  )
+  if (state.awayAgents.length > 0) {
+    groups.push({
+      id: 'away',
+      heading: 'Disconnected agents',
+      rows: state.awayAgents.map((agent) => {
+        const words = agentReleaseWords(agent.name, agent.groupIds.length, agent.tabIds.length)
+        return item(
+          `away:${agent.claimId}`,
+          agent.name,
+          `${agent.groupIds.length} group${agent.groupIds.length === 1 ? '' : 's'} · ${agent.tabIds.length} tab${agent.tabIds.length === 1 ? '' : 's'} · last seen ${relativeTime(agent.lastSeenAt)}`,
+          [
+            {
+              kind: 'action',
+              id: `away:${agent.claimId}:release`,
+              label: 'Release',
+              description: 'Keeps its tabs open for you; the agent cannot resume them.',
+              button: 'Release…',
+              confirm: {
+                title: words.title,
+                description: words.detail,
+                action: 'Release',
+                verbTone: 'plain'
+              },
+              onPress: () => run('agent.release', { claimId: agent.claimId })
+            }
+          ],
+          {
+            leading: (
+              <span
+                className="zen-settings-agent-dot"
+                style={{ background: agent.color }}
+                aria-hidden="true"
+              />
+            )
+          }
+        )
+      })
+    })
+  }
+  if (a.approvedNames.length > 0) {
+    groups.push({
+      id: 'remembered',
+      heading: 'Remembered agents',
+      rows: a.approvedNames.map((name) =>
+        item(`approved:${name}`, name, 'Allowed to connect without asking', [
+          {
+            kind: 'action',
+            id: `approved:${name}:forget`,
+            label: 'Forget',
+            description: 'It is asked about the next time it connects.',
+            button: 'Forget',
+            onPress: () => run('agent.forget', { name })
+          }
+        ])
+      )
+    })
+  }
+  return groups
+}
+
+/**
+ * Settings › AI Agents › Agent skill (desktop hosts, `capabilities.agentSkills`): the
+ * `ione-browser` Agent Skill – the file that teaches a coding agent to drive this browser
+ * politely – installed into each notable agent's global skills folder from a switch per
+ * agent, or all at once; a status row above them. Every notable tool is listed even when its
+ * folder is not on this machine yet, so a switch can pre-install. Detection still drives the
+ * status line's "found" wording. The rows say "agent", never the developer's "harness" (the
+ * #460 gate). The status row's error state trails §10.4's 16 status glyph in the danger ink
+ * through the row's one `tone`; its neutral states stay bare. A failure that is one agent's –
+ * the same sentence as that row's `note` – is said once, by the row it is about, while any
+ * agent has the skill: the status row keeps its count in the danger tone with the glyph (the
+ * lead's tidy from the #460 r3 delta read); the line carries the sentence itself when the
+ * operation failed as a whole (its record could not be saved – a sentence no row carries) or
+ * when no agent has the skill. An agent's row wears the ink of its sentence's kind, not of its
+ * place (the lead's #468 delta read): a failure takes the danger ink wherever it is said, a
+ * caution – an edited copy left in place, a copy Ione did not install – the warn ink; no
+ * row trails a glyph (§9.33: the glyph marks the row whose whole point is the status). Remove
+ * everywhere asks nothing and wears no danger ink (§10.5 as amended on #450): the files are
+ * Ione's copies, an edited one is spared by the installer's own rule, and Install brings them
+ * back in one click. No modal: the group is the nudge.
+ */
+function agentSkillGroup(skills: AgentSkillStatus): RowGroup {
+  const listed = skills.targets
+  const detected = listed.filter((t) => t.detected)
+  const installed = listed.filter((t) => t.installed)
+  const foundInstalled = detected.filter((t) => t.installed)
+  const allInstalled = listed.length > 0 && installed.length === listed.length
+  const count =
+    installed.length === 0
+      ? detected.length === 0
+        ? 'No coding agent found on this computer'
+        : 'Not installed'
+      : detected.length === 0
+        ? `Installed · version ${installed[0]?.installedVersion ?? skills.version}`
+        : `Installed for ${foundInstalled.length} of ${detected.length} agents found · version ${foundInstalled[0]?.installedVersion ?? installed[0]?.installedVersion ?? skills.version}`
+  const rowSaysWhy =
+    skills.error !== null && installed.length > 0 && listed.some((t) => t.note === skills.error)
+  const status = skills.error && !rowSaysWhy ? skills.error : count
+  const allIds = listed.map((t) => t.id)
+  const rows: SettingsRow[] = [
+    {
+      kind: 'info',
+      id: 'skill-status',
+      label: 'ione-browser skill',
+      description: status,
+      tone: skills.error ? 'danger' : undefined,
+      trailing: skills.error ? (
+        <CircleAlert className="zen-settings-trailing-glyph" aria-hidden="true" />
+      ) : undefined,
+      keywords: ['skill', 'claude code', 'cursor', 'codex', 'opencode', 'gemini cli', 'copilot']
+    },
+    ...listed.map((t): SettingsRow => ({
+      kind: 'switch',
+      id: `skill:${t.id}`,
+      label: t.label,
+      description: t.note ?? t.dir,
+      // The skill's directory is a path (§9.2's exception); a note in its place is prose.
+      address: t.note === null,
+      tone: t.note ? (isSkillFailure(t.note) ? 'danger' : 'warn') : undefined,
+      keywords: ['skill', t.dir],
+      checked: t.installed,
+      onChange: (v) => run(v ? 'agent.installSkill' : 'agent.uninstallSkill', { targets: [t.id] })
+    })),
+    allInstalled
+      ? {
+          kind: 'action',
+          id: 'skill-all',
+          label: 'Remove everywhere',
+          description: 'Takes Ione’s copy out of each folder above; a copy you edited stays.',
+          button: 'Remove',
+          onPress: () => run('agent.uninstallSkill', { targets: allIds })
+        }
+      : {
+          kind: 'action',
+          id: 'skill-all',
+          label: 'Install for every agent found',
+          description:
+            listed.length === 0
+              ? 'Install Claude Code, Cursor, Codex, Gemini CLI, GitHub Copilot or OpenCode first, then check again.'
+              : 'Writes the skill into each folder above and keeps it current when Ione updates.',
+          button: listed.length === 0 ? 'Check again' : 'Install',
+          onPress: () =>
+            listed.length === 0
+              ? run('agent.refreshSkill', undefined)
+              : run('agent.installSkill', { targets: allIds })
+        }
+  ]
+  return {
+    id: 'skill',
+    heading: 'Agent skill',
+    description:
+      'A skill file that teaches coding agents to drive this browser beside you: their own tab group, nothing touched that is not theirs. Ione keeps a copy in each agent’s skills folder.',
+    rows
+  }
+}
+
+/**
+ * Whether an agent's skill `note` reports a failure – the installer's `Could not <operation>: …`
+ * sentence (`failedAt` in `src/main/agent/skills.ts`, the same sentence the status line carries
+ * as `error`) – rather than a caution (an edited copy left in place, a copy Ione did not
+ * install). The renderer cannot import the installer, so the sentence's opener is the contract.
+ */
+function isSkillFailure(note: string): boolean {
+  return note.startsWith('Could not ')
+}
+
+// ---------------------------------------------------------------------------
+// Passwords (the desktop panel's Settings › Passwords and the manager's own settings view, as
+// phone rows: the ways into the manager, the two preferences, the vault's protection and lock,
+// import and export. The manager is an overlay over the Settings tab as over any page; the rows
+// about a vault operation land on the manager's view that does it, behind its re-authentication)
+// ---------------------------------------------------------------------------
+
+function passwordsSection({ state, tab, set }: SectionContext): RowGroup[] {
+  const status = state.passwords
+  const s = state.settings.passwords
+  const patch = (p: Partial<typeof s>): void => set({ passwords: { ...s, ...p } })
+  const open = (view: 'logins' | 'checkup' | 'settings'): void =>
+    void openOverlay('passwords', tab.id, null, null, view)
+  const unlocked = !status.locked && !status.error
+  // `chrome.privacy.services.passwordSavingEnabled`: the same hold as Autofill's twin row.
+  const offerControl = extensionControlled(state, 'passwords.offerToSave')
+  return [
+    {
+      id: 'passwords-manager',
+      heading: 'Password manager',
+      rows: [
+        {
+          kind: 'action',
+          id: 'passwords-manage',
+          label: PASSWORDS_COPY.manage,
+          description: passwordsSavedLabel(status),
+          keywords: ['saved passwords', 'logins', 'vault', 'generator'],
+          leaves: 'chevron',
+          onPress: () => open('logins')
+        },
+        {
+          kind: 'action',
+          id: 'passwords-checkup',
+          label: PASSWORDS_COPY.checkup,
+          description: checkupLabel(status.checkup),
+          keywords: ['checkup', 'compromised', 'breach', 'reused', 'weak', 'leaked'],
+          leaves: 'chevron',
+          onPress: () => open('checkup')
+        }
+      ]
+    },
+    {
+      id: 'passwords-saving',
+      heading: 'Saving',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'passwords-offer-to-save',
+          label: PASSWORDS_COPY.offerToSave.label,
+          description: PASSWORDS_COPY.offerToSave.description,
+          controlled: offerControl,
+          checked: heldSwitch(offerControl, s.offerToSave),
+          onChange: (v) => patch({ offerToSave: v })
+        }
+      ]
+    },
+    {
+      id: 'passwords-security',
+      heading: 'Security',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'passwords-leak-detection',
+          label: PASSWORDS_COPY.leakDetection.label,
+          description: PASSWORDS_COPY.leakDetection.description,
+          keywords: ['leak', 'breach', 'compromised', 'data breach', 'exposed', 'pwned'],
+          checked: s.leakDetection,
+          onChange: (v) => patch({ leakDetection: v })
+        },
+        choice({
+          id: 'passwords-reauth-grace',
+          label: PASSWORDS_COPY.grace.label,
+          sheetDescription: PASSWORDS_COPY.grace.description,
+          keywords: ['re-authentication', 'grace period', 'verify', 'reveal', 'copy'],
+          value: String(s.reauthGraceSeconds),
+          options: PASSWORD_GRACE_OPTIONS,
+          onChange: (v) => patch({ reauthGraceSeconds: Number(v) })
+        }),
+        {
+          kind: 'action',
+          id: 'passwords-protection',
+          label: PASSWORDS_COPY.protection.label,
+          description: vaultProtectionLabel(status),
+          keywords: ['passphrase', 'keychain', 'keystore', 'biometrics', 'fingerprint'],
+          leaves: 'chevron',
+          onPress: () => open('settings')
+        },
+        {
+          kind: 'action',
+          id: 'passwords-lock',
+          label: PASSWORDS_COPY.lock.label,
+          description: unlocked ? PASSWORDS_COPY.lock.description : PASSWORDS_COPY.lock.locked,
+          keywords: ['lock now', 'forget'],
+          // Nothing to lock: laid out at 40%, not pressable (§10.4), rather than a row that vanishes.
+          button: 'Lock now',
+          disabled: !unlocked,
+          onPress: () => run('passwords.lock', undefined)
+        }
+      ]
+    },
+    {
+      id: 'passwords-transfer',
+      heading: 'Import and export',
+      rows: [
+        {
+          kind: 'action',
+          id: 'passwords-import',
+          label: PASSWORDS_COPY.importCsv.label,
+          description: PASSWORDS_COPY.importCsv.description,
+          keywords: ['csv', 'chrome', 'firefox', 'bitwarden', 'lastpass', 'keepass'],
+          leaves: 'chevron',
+          onPress: () => open('settings')
+        },
+        {
+          kind: 'action',
+          id: 'passwords-export',
+          label: PASSWORDS_COPY.exportCsv.label,
+          description: PASSWORDS_COPY.exportCsv.description,
+          keywords: ['csv', 'backup'],
+          leaves: 'chevron',
+          onPress: () => open('settings')
+        }
+      ]
+    }
+  ]
+}
+
+// Security (the answers Ione remembered per site, and this session's sign-ins)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every per-site answer Ione remembered – a site allowed to open pop-up windows on its own, a
+ * scheme it may hand to another app, the camera, location, storage and file permissions – as an
+ * item row, the site over what it may or may not do, whose sheet (a Forget button on the desktop)
+ * takes the answer back; Forget all after them once there is more than one; then the sign-ins and
+ * certificate choices kept for this session. Ungated: every host keeps these answers.
+ */
+function securitySection({ state }: SectionContext): RowGroup[] {
+  const rules = [...state.permissionRules].sort(
+    (a, b) => a.origin.localeCompare(b.origin) || a.permission.localeCompare(b.permission)
+  )
+  return [
+    {
+      id: 'security-permissions',
+      heading: 'Site permissions',
+      description:
+        'Answers you gave sites asking to open pop-ups, to hand links to another app, or to use the camera, location and more.',
+      rows: [
+        ...rules.map(permissionRuleRow),
+        ...(rules.length > 1
+          ? [
+              {
+                kind: 'action',
+                id: 'security-forget-all',
+                label: 'Forget all site permissions',
+                description: 'Every site asks again the next time it needs something.',
+                button: 'Forget all…',
+                destructive: true,
+                confirm: {
+                  title: 'Forget all site permissions?',
+                  description: 'Every site asks again the next time it needs something.',
+                  action: 'Forget all'
+                },
+                onPress: () => run('permissions.reset', undefined)
+              } satisfies SettingsRow
+            ]
+          : [])
+      ],
+      empty: 'No site permissions remembered yet'
+    },
+    // Chrome's Notifications row (SET-26): the phone's system screen for this app's notifications,
+    // where each channel – downloads, sites, updates, private tabs – is turned on or off.
+    {
+      id: 'security-notifications',
+      heading: 'Notifications',
+      description:
+        'Ione’s own notifications – downloads, sites, updates, private tabs – are turned on and off in the system settings.',
+      layouts: ['phone'],
+      rows: [
+        {
+          kind: 'action',
+          id: 'notification-settings',
+          label: 'Notification settings',
+          description: 'Which of Ione’s notifications show, and how.',
+          keywords: ['notifications', 'alerts', 'channels', 'system settings', 'sound', 'badge'],
+          leaves: 'external',
+          onPress: () => run('app.openNotificationSettings', undefined)
+        }
+      ]
+    },
+    {
+      id: 'security-session',
+      heading: 'This session',
+      rows: [
+        {
+          kind: 'action',
+          id: 'security-forget-session',
+          label: 'Forget sign-ins and certificates',
+          description: 'Remembered until Ione quits, in memory only',
+          keywords: ['password', 'http authentication', 'client certificate', 'log in'],
+          button: 'Forget',
+          onPress: () => run('security.forgetSession', undefined)
+        }
+      ]
+    }
+  ]
+}
+
+/** One remembered answer: the site over what it may or may not do; its sheet forgets it. */
+function permissionRuleRow(rule: PermissionRule): SettingsRow {
+  const id = `security-rule:${rule.origin}:${rule.permission}`
+  const kind = rule.permission.split(':')[0]
+  const keywords =
+    kind === 'popups'
+      ? ['pop-ups', 'popups', 'blocked', 'exception']
+      : kind === 'openExternal'
+        ? ['external apps', 'other apps', 'protocol', 'scheme', 'link']
+        : ['permission']
+  return item(
+    id,
+    siteLabel(rule.origin),
+    describePermissionRule(rule),
+    [
+      {
+        kind: 'action',
+        id: `${id}:forget`,
+        label: 'Forget this answer',
+        description: 'The site asks again the next time it needs it.',
+        button: 'Forget',
+        onPress: () =>
+          run('permissions.forget', { origin: rule.origin, permission: rule.permission })
+      }
+    ],
+    { keywords }
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard Shortcuts (the desktop and tablet shells)
+// ---------------------------------------------------------------------------
+
+const SHORTCUT_GROUP_ORDER: readonly ShortcutGroup[] = [
+  'zen-compact-mode',
+  'zen-workspace',
+  'zen-split-view',
+  'zen-other',
+  'windowAndTabManagement',
+  'navigation',
+  'searchAndFind',
+  'pageOperations',
+  'historyAndBookmarks',
+  'mediaAndDisplay',
+  'devTools'
+]
+
+/**
+ * Zen's keyboard shortcut manager: the preset and the count of rows changed from it, then every
+ * shortcut in Zen's groups, each a row of its own (`ShortcutRow.tsx`) whose button records a
+ * new chord. "Find in Settings" filters them – by label or by chord – so the manager's own
+ * filter field is gone.
+ */
+function shortcutsSection({ state }: SectionContext): RowGroup[] {
+  const preset = state.settings.shortcutPreset
+  const defaults = new Map(
+    defaultShortcuts(state.platform, preset).map((s) => [s.id, s.binding] as const)
+  )
+  const changed = state.shortcuts.filter((s) => {
+    const base = defaults.get(s.id)
+    return base !== undefined && !bindingsEqual(base, s.binding)
+  }).length
+  const groups: RowGroup[] = [
+    {
+      id: 'preset',
+      heading: 'Preset',
+      description: 'Click a shortcut, then press the new keys. Backspace clears it, Esc cancels.',
+      rows: [
+        choice<ShortcutPreset>({
+          id: 'shortcut-preset',
+          label: 'Shortcut set',
+          value: preset,
+          sheetDescription: SHORTCUT_PRESET_DESCRIPTIONS[preset],
+          options: SHORTCUT_PRESETS.map((p) => ({ value: p, label: SHORTCUT_PRESET_LABELS[p] })),
+          onChange: (next) => run('settings.update', { shortcutPreset: next })
+        }),
+        {
+          kind: 'action',
+          id: 'shortcuts-reset',
+          label: 'Your changes',
+          description:
+            changed === 0
+              ? 'Every shortcut is the preset’s.'
+              : `${changed} ${changed === 1 ? 'shortcut differs' : 'shortcuts differ'} from the preset.`,
+          keywords: ['reset', 'defaults'],
+          button: 'Reset to preset',
+          disabled: changed === 0,
+          onPress: () => run('shortcuts.reset', undefined)
+        }
+      ]
+    }
+  ]
+  for (const group of SHORTCUT_GROUP_ORDER) {
+    const items = state.shortcuts.filter((s) => s.group === group && !s.hidden)
+    if (items.length === 0) continue
+    groups.push({
+      id: `shortcuts-${group}`,
+      heading: SHORTCUT_GROUP_LABELS[group],
+      rows: items.map((s) => ({
+        kind: 'custom',
+        id: `shortcut:${s.id}`,
+        label: s.label,
+        keywords: [
+          formatBinding(s.binding, state.platform),
+          ...(s.unsupported ? ['unsupported'] : [])
+        ],
+        layouts: s.layouts,
+        bare: true,
+        render: () => (
+          <ShortcutRow shortcut={s} shortcuts={state.shortcuts} platform={state.platform} />
+        )
+      }))
+    })
+  }
+  return groups
+}
+
+// ---------------------------------------------------------------------------
+// Default Browser (the desktop OSes; Android keeps its one row under About)
+// ---------------------------------------------------------------------------
+
+/**
+ * Which browser the OS hands web links to, and the request to make it Ione: a status row
+ * while the OS is asked, the ✓ once Ione holds the role, the Set as default button otherwise
+ * (§9.29's one name for the act, the strip's and the prompt's word; Chrome's row says Make
+ * default, kept as a search alias) – on Windows with the note that it opens Windows Settings,
+ * where the user presses Set default (Windows' own button, its label kept). `state.defaultBrowser`
+ * is what the core's DefaultBrowserService refreshes at start, on window focus and when the OS
+ * answers.
+ */
+function defaultBrowserSection({ state }: SectionContext): RowGroup[] {
+  const isDefault = state.defaultBrowser.isDefault
+  const row: SettingsRow =
+    isDefault === true
+      ? {
+          kind: 'info',
+          id: 'default-browser',
+          label: 'Ione is your default browser',
+          description: 'Links from other apps open here.',
+          keywords: ['default browser', 'links'],
+          trailing: (
+            <Check
+              className="zen-settings-trailing-glyph zen-settings-ok"
+              aria-label="Ione is the default browser"
+            />
+          )
+        }
+      : isDefault === false
+        ? {
+            kind: 'action',
+            id: 'default-browser',
+            label: 'Ione is not your default browser',
+            description:
+              state.platform === 'win32'
+                ? 'Set as default opens Windows Settings, where you press Set default.'
+                : 'Open links from other apps in Ione.',
+            keywords: ['default browser', 'links', 'set as default', 'make default'],
+            button: 'Set as default',
+            onPress: () => void requestDefaultBrowser('settings')
+          }
+        : {
+            kind: 'info',
+            id: 'default-browser',
+            label: 'Checking which browser opens your links',
+            keywords: ['default browser', 'links']
+          }
+  return [{ id: 'default-browser', heading: 'Default browser', rows: [row] }]
+}
+
+// ---------------------------------------------------------------------------
+// Updates
+// ---------------------------------------------------------------------------
+
+function updatesSection({ state, set }: SectionContext): RowGroup[] {
+  const u = state.updates
+  const prefs = state.settings.updates
+  const inPlace = u.mode === 'in-place'
+  const canDownload = u.mode !== 'manual' && Boolean(u.release?.asset) && !u.signerMismatch
+  const busy = u.phase === 'checking' || u.phase === 'downloading'
+  const release = u.release
+  const primary: SettingsRow =
+    u.phase === 'downloading'
+      ? {
+          kind: 'action',
+          id: 'update-cancel',
+          label: 'Cancel download',
+          button: 'Cancel',
+          onPress: () => run('updates.cancel', undefined)
+        }
+      : u.phase === 'ready'
+        ? {
+            kind: 'action',
+            id: 'update-install',
+            label: inPlace ? 'Restart to update' : 'Install the update',
+            button: inPlace ? 'Restart' : 'Install',
+            onPress: () => run('updates.install', undefined)
+          }
+        : u.phase === 'available' && canDownload
+          ? {
+              kind: 'action',
+              id: 'update-download',
+              label: `Download ${release?.version ?? ''}`.trim(),
+              description: release?.asset
+                ? `${release.asset.name} (${formatBytes(release.asset.size)})`
+                : undefined,
+              button: 'Download',
+              onPress: () => run('updates.download', undefined)
+            }
+          : {
+              kind: 'action',
+              id: 'update-check',
+              label: 'Check for updates',
+              button: 'Check now',
+              busy,
+              onPress: () => run('updates.check', undefined)
+            }
+  const statusRows: SettingsRow[] = [
+    {
+      kind: 'custom',
+      id: 'update-status',
+      label: headline(u),
+      description: detail(u),
+      keywords: ['version', u.currentVersion],
+      render: () => (
+        <UpdateStatusBlock
+          headline={headline(u)}
+          detail={detail(u)}
+          progress={u.phase === 'downloading' && u.progress ? u.progress.percent : null}
+        />
+      )
+    },
+    primary
+  ]
+  if (release) {
+    statusRows.push({
+      kind: 'action',
+      id: 'release-notes',
+      label: 'Release notes',
+      description: `${release.tag}${release.prerelease ? ' · pre-release' : ''}`,
+      leaves: 'external',
+      onPress: () => run('updates.openRelease', undefined)
+    })
+  }
+  const groups: RowGroup[] = [
+    { id: 'status', heading: null, rows: statusRows },
+    {
+      id: 'automatic',
+      heading: 'Automatic updates',
+      rows: [
+        {
+          kind: 'switch',
+          id: 'auto-check',
+          label: 'Check for updates automatically',
+          description:
+            'On startup and every six hours. Nothing is installed without you seeing it here first.',
+          checked: prefs.autoCheck,
+          onChange: (v) => set({ updates: { ...prefs, autoCheck: v } })
+        },
+        ...(inPlace
+          ? [
+              {
+                kind: 'switch',
+                id: 'auto-download',
+                label: 'Download updates in the background',
+                description:
+                  'Fetch a new version as soon as it is found; it installs when you restart Ione.',
+                checked: prefs.autoDownload,
+                disabled: !prefs.autoCheck,
+                onChange: (v: boolean) => set({ updates: { ...prefs, autoDownload: v } })
+              } satisfies SettingsRow
+            ]
+          : []),
+        choice<UpdateChannel>({
+          id: 'release-channel',
+          label: 'Release channel',
+          value: prefs.channel,
+          sheetDescription:
+            u.channel === 'beta' && prefs.channel !== 'beta'
+              ? 'Pre-release builds follow the beta channel until a final release replaces them.'
+              : 'Beta receives pre-releases (x.y.z-beta.n) as well as final releases.',
+          options: [
+            { value: 'stable', label: 'Stable' },
+            { value: 'beta', label: 'Beta (pre-releases)' }
+          ],
+          onChange: (v) => set({ updates: { ...prefs, channel: v } })
+        })
+      ]
+    },
+    {
+      id: 'applied',
+      heading: 'How updates are applied',
+      rows: [
+        {
+          kind: 'info',
+          id: 'install-kind',
+          label: installLabel(u),
+          description: `${describeUpdateTarget(u.target)} ${u.target.os}${u.target.arch !== 'universal' ? ` · ${u.target.arch}` : ''}`
+        },
+        {
+          kind: 'info',
+          id: 'verification',
+          label: 'Verification',
+          description:
+            u.signature === 'verified'
+              ? 'Release manifests are signed; this build checks the signature before trusting a release, then verifies every download against its SHA-256.'
+              : 'Every download is verified against the SHA-256 the release publishes.',
+          trailing:
+            u.signature === 'verified' ? (
+              <Check
+                className="zen-settings-trailing-glyph zen-settings-ok"
+                aria-label="Verified"
+              />
+            ) : undefined
+        }
+      ]
+    }
+  ]
+  return groups
+}
+
+// ---------------------------------------------------------------------------
+// System
+// ---------------------------------------------------------------------------
+
+/**
+ * Settings › System (Chrome's chrome://settings/system): the words of its one row. The label is
+ * Chrome's (`IDS_SETTINGS_SYSTEM_PROXY_SETTINGS_LABEL`). At rest the description says whose proxy
+ * settings Ione follows – the computer's, which is what the row opens. While an extension holds
+ * `chrome.proxy` the description is the value alone – the configuration's mode in Chrome's words
+ * (the API's `Mode`: fixed servers, a PAC script, automatic detection, a direct connection, the
+ * system's), one sentence for each of the five – as the §10.5 indicator row after it already
+ * names the holder: "Controlled by <name>" with Disable. When the host cannot open the panel (a
+ * Linux desktop Chrome's table does not know, or whose settings tool is not on the PATH) the
+ * renderer says so in one sentence.
+ */
+export const PROXY_SETTINGS_COPY = {
+  row: "Open your computer's proxy settings",
+  resting: "Ione uses your computer's proxy settings.",
+  modes: {
+    fixed_servers: 'Using fixed servers.',
+    pac_script: 'Using a PAC script.',
+    auto_detect: 'Using automatic detection.',
+    direct: 'Using a direct connection.',
+    system: "Using the system's proxy settings."
+  } as const satisfies Readonly<Record<ProxyMode, string>>,
+  unsupported: "Ione could not open your computer's proxy settings."
+} as const
+
+/**
+ * The held row's description: the configuration's mode alone, the map total over the API's five.
+ * The host always publishes the mode as the control's value (`ProxyApi.publishControls` in
+ * `main/platform/extensionApi/proxy.ts`), so a value that is not one of the five is unreachable
+ * through it; the resting sentence stands in for one all the same, so the row never loses its
+ * description.
+ */
+export function proxyHeldDescription(control: { value?: unknown }): string {
+  return isProxyMode(control.value)
+    ? PROXY_SETTINGS_COPY.modes[control.value]
+    : PROXY_SETTINGS_COPY.resting
+}
+
+/**
+ * System (Chrome's System, the category before Reset settings): in-app proxies, per-domain
+ * routing, agent grants, and the OS panel as a secondary door. While an extension holds
+ * `chrome.proxy` the default-connection row is held (`RowBase.controlled`, §10.5). Chrome's
+ * other System rows (background apps, graphics acceleration) are not here. Desktop OSes only
+ * (`internalPages.ts`): Android's proxy is the network's.
+ */
+function systemSection({ state, set }: SectionContext): RowGroup[] {
+  const control = extensionControlled(state, 'proxy')
+  const proxy = sanitizeAppProxySettings(state.settings.proxy ?? DEFAULT_APP_PROXY_SETTINGS)
+  const put = (next: AppProxySettings): void => set({ proxy: next })
+  const defaultOptions = [
+    { value: 'system', label: 'System proxy', description: PROXY_SETTINGS_COPY.resting },
+    { value: 'direct', label: 'Direct connection', description: 'Do not use a proxy.' },
+    ...proxy.profiles.map((profile) => ({
+      value: profile.id,
+      label: profileLabel(profile),
+      description:
+        profile.kind === 'pac' ? profile.pacUrl || 'PAC script' : `${profile.host}:${profile.port}`
+    }))
+  ]
+  return [
+    {
+      id: 'connection',
+      heading: 'Connection',
+      description: APP_PROXY_COPY.defaultDescription,
+      rows: [
+        choice({
+          id: 'proxy-default',
+          label: APP_PROXY_COPY.default,
+          description: control
+            ? proxyHeldDescription(control)
+            : targetLabel(proxy, proxy.defaultTarget),
+          keywords: ['proxy', 'network', 'pac', 'default', 'socks'],
+          value: proxy.defaultTarget,
+          options: defaultOptions,
+          controlled: control,
+          onChange: (value) => put({ ...proxy, defaultTarget: value })
+        })
+      ]
+    },
+    {
+      id: 'proxies',
+      heading: APP_PROXY_COPY.proxies,
+      rows: [
+        ...proxy.profiles.map((profile) => proxyProfileItem(profile, proxy, put)),
+        {
+          kind: 'action',
+          id: 'add-proxy',
+          label: APP_PROXY_COPY.addProxy,
+          keywords: ['proxy', 'socks', 'http', 'pac', 'add'],
+          button: 'Add…',
+          form: {
+            title: APP_PROXY_COPY.addProxy,
+            render: (close) => (
+              <ProxyProfileForm
+                onSubmit={(profile) => put({ ...proxy, profiles: [...proxy.profiles, profile] })}
+                close={close}
+              />
+            )
+          }
+        }
+      ],
+      empty: proxy.profiles.length === 0 ? APP_PROXY_COPY.proxiesEmpty : undefined
+    },
+    {
+      id: 'proxy-routes',
+      heading: APP_PROXY_COPY.routes,
+      description: APP_PROXY_COPY.routesDescription,
+      rows: [
+        ...proxy.routes.map((route) => proxyRouteItem(route, proxy, put)),
+        {
+          kind: 'action',
+          id: 'add-proxy-route',
+          label: APP_PROXY_COPY.addRoute,
+          keywords: ['proxy', 'route', 'domain', 'host', 'bypass'],
+          button: 'Add…',
+          form: {
+            title: APP_PROXY_COPY.addRoute,
+            render: (close) => (
+              <ProxyRouteForm
+                settings={proxy}
+                onSubmit={(route) => put({ ...proxy, routes: [...proxy.routes, route] })}
+                close={close}
+              />
+            )
+          }
+        }
+      ],
+      empty: proxy.routes.length === 0 ? APP_PROXY_COPY.routesEmpty : undefined
+    },
+    {
+      id: 'proxy-agents',
+      heading: APP_PROXY_COPY.agents,
+      description: APP_PROXY_COPY.agentsDescription,
+      rows: [
+        choice({
+          id: 'proxy-agent-default',
+          label: APP_PROXY_COPY.agentDefault,
+          keywords: ['proxy', 'agent', 'mcp', 'permission'],
+          value: grantStar(proxy)?.mode ?? 'follow',
+          options: [
+            {
+              value: 'follow',
+              label: APP_PROXY_COPY.followTab,
+              description: APP_PROXY_COPY.followTabDescription
+            },
+            {
+              value: 'allow',
+              label: APP_PROXY_COPY.allowListed,
+              description: APP_PROXY_COPY.allowListedDescription
+            },
+            {
+              value: 'direct',
+              label: APP_PROXY_COPY.alwaysDirect,
+              description: APP_PROXY_COPY.alwaysDirectDescription
+            }
+          ],
+          onChange: (mode) => put(upsertStarGrant(proxy, mode))
+        }),
+        ...proxy.agentGrants
+          .filter((grant) => grant.agentName !== '*')
+          .map((grant) => agentGrantItem(grant, proxy, put)),
+        {
+          kind: 'action',
+          id: 'add-proxy-grant',
+          label: APP_PROXY_COPY.addGrant,
+          keywords: ['proxy', 'agent', 'mcp', 'allow'],
+          button: 'Add…',
+          form: {
+            title: APP_PROXY_COPY.addGrant,
+            render: (close) => (
+              <AgentProxyGrantForm
+                settings={proxy}
+                onSubmit={(grant) =>
+                  put({
+                    ...proxy,
+                    agentGrants: [
+                      ...proxy.agentGrants.filter(
+                        (existing) =>
+                          existing.agentName.toLowerCase() !== grant.agentName.toLowerCase()
+                      ),
+                      grant
+                    ]
+                  })
+                }
+                close={close}
+              />
+            )
+          }
+        }
+      ]
+    },
+    {
+      id: 'system',
+      heading: APP_PROXY_COPY.computer,
+      rows: [
+        {
+          kind: 'action',
+          id: 'proxy-settings',
+          label: APP_PROXY_COPY.openSystem,
+          description: APP_PROXY_COPY.openSystemDescription,
+          keywords: ['proxy', 'network', 'pac', 'system', 'computer', "computer's proxy settings"],
+          leaves: 'external',
+          onPress: () => void openProxySettings()
+        }
+      ]
+    }
+  ]
+}
+
+function grantStar(proxy: AppProxySettings): AgentProxyGrant | undefined {
+  return proxy.agentGrants.find((grant) => grant.agentName === '*')
+}
+
+function upsertStarGrant(proxy: AppProxySettings, mode: AgentProxyGrant['mode']): AppProxySettings {
+  const rest = proxy.agentGrants.filter((grant) => grant.agentName !== '*')
+  if (mode === 'follow') return { ...proxy, agentGrants: rest }
+  return {
+    ...proxy,
+    agentGrants: [{ agentName: '*', mode, proxyIds: grantStar(proxy)?.proxyIds ?? [] }, ...rest]
+  }
+}
+
+function proxyProfileItem(
+  profile: ProxyProfile,
+  proxy: AppProxySettings,
+  put: (next: AppProxySettings) => void
+): SettingsRow {
+  return item(
+    `proxy:${profile.id}`,
+    profileLabel(profile),
+    profile.kind === 'pac'
+      ? profile.pacUrl || 'PAC script'
+      : `${profile.kind} · ${profile.host}:${profile.port}`,
+    [
+      {
+        kind: 'action',
+        id: `proxy:${profile.id}:edit`,
+        label: 'Edit',
+        button: 'Edit…',
+        form: {
+          title: 'Edit proxy',
+          render: (close) => (
+            <ProxyProfileForm
+              initial={profile}
+              onSubmit={(next) =>
+                put({
+                  ...proxy,
+                  profiles: proxy.profiles.map((each) => (each.id === profile.id ? next : each))
+                })
+              }
+              close={close}
+            />
+          )
+        }
+      },
+      {
+        kind: 'action',
+        id: `proxy:${profile.id}:remove`,
+        label: 'Remove',
+        destructive: true,
+        confirm: { title: 'Remove this proxy?', action: 'Remove' },
+        onPress: () =>
+          put({
+            ...proxy,
+            profiles: proxy.profiles.filter((each) => each.id !== profile.id),
+            defaultTarget: proxy.defaultTarget === profile.id ? 'system' : proxy.defaultTarget,
+            routes: proxy.routes.map((route) =>
+              route.target === profile.id ? { ...route, target: 'direct' } : route
+            ),
+            agentGrants: proxy.agentGrants.map((grant) => ({
+              ...grant,
+              proxyIds: grant.proxyIds.filter((id) => id !== profile.id)
+            }))
+          })
+      }
+    ],
+    {
+      keywords: ['proxy', profile.host, profile.kind],
+      menu: `Options for ${profileLabel(profile)}`
+    }
+  )
+}
+
+function proxyRouteItem(
+  route: ProxyRoute,
+  proxy: AppProxySettings,
+  put: (next: AppProxySettings) => void
+): SettingsRow {
+  return item(
+    `proxy-route:${route.id}`,
+    routeLabel(route),
+    `${route.enabled ? '' : 'Off · '}${targetLabel(proxy, route.target)}`,
+    [
+      {
+        kind: 'switch',
+        id: `proxy-route:${route.id}:enabled`,
+        label: 'On',
+        checked: route.enabled,
+        onChange: (enabled) =>
+          put({
+            ...proxy,
+            routes: proxy.routes.map((each) => (each.id === route.id ? { ...each, enabled } : each))
+          })
+      },
+      {
+        kind: 'action',
+        id: `proxy-route:${route.id}:edit`,
+        label: 'Edit',
+        button: 'Edit…',
+        form: {
+          title: 'Edit routing rule',
+          render: (close) => (
+            <ProxyRouteForm
+              settings={proxy}
+              initial={route}
+              onSubmit={(next) =>
+                put({
+                  ...proxy,
+                  routes: proxy.routes.map((each) => (each.id === route.id ? next : each))
+                })
+              }
+              close={close}
+            />
+          )
+        }
+      },
+      {
+        kind: 'action',
+        id: `proxy-route:${route.id}:remove`,
+        label: 'Remove',
+        destructive: true,
+        onPress: () =>
+          put({ ...proxy, routes: proxy.routes.filter((each) => each.id !== route.id) })
+      }
+    ],
+    { keywords: ['route', route.pattern] }
+  )
+}
+
+function agentGrantItem(
+  grant: AgentProxyGrant,
+  proxy: AppProxySettings,
+  put: (next: AppProxySettings) => void
+): SettingsRow {
+  const modeLabel =
+    grant.mode === 'direct'
+      ? APP_PROXY_COPY.alwaysDirect
+      : grant.mode === 'allow'
+        ? APP_PROXY_COPY.allowListed
+        : APP_PROXY_COPY.followTab
+  return item(`proxy-grant:${grant.agentName}`, grant.agentName, modeLabel, [
+    {
+      kind: 'action',
+      id: `proxy-grant:${grant.agentName}:edit`,
+      label: 'Edit',
+      button: 'Edit…',
+      form: {
+        title: 'Edit agent rule',
+        render: (close) => (
+          <AgentProxyGrantForm
+            settings={proxy}
+            initial={grant}
+            onSubmit={(next) =>
+              put({
+                ...proxy,
+                agentGrants: proxy.agentGrants.map((each) =>
+                  each.agentName === grant.agentName ? next : each
+                )
+              })
+            }
+            close={close}
+          />
+        )
+      }
+    },
+    {
+      kind: 'action',
+      id: `proxy-grant:${grant.agentName}:remove`,
+      label: 'Remove',
+      destructive: true,
+      onPress: () =>
+        put({
+          ...proxy,
+          agentGrants: proxy.agentGrants.filter((each) => each.agentName !== grant.agentName)
+        })
+    }
+  ])
+}
+
+/** The door: the host opens the OS panel, and says when it could not. */
+async function openProxySettings(): Promise<void> {
+  const result = await cmd('system.openProxySettings', undefined).catch(
+    () => 'unsupported' as const
+  )
+  if (result === 'unsupported') pushToast(PROXY_SETTINGS_COPY.unsupported, 'info')
+}
+
+// ---------------------------------------------------------------------------
+// Reset Settings
+// ---------------------------------------------------------------------------
+
+/**
+ * Chrome's Reset settings dialog (settings-70): the confirmation the row opens, Chrome's
+ * sentence word for word – its serial commas kept, as a verbatim line keeps its own punctuation
+ * (the #553 lead check) – with two clauses of the house's in Chrome's register: the home page
+ * (Chrome's resetter puts it back and its sentence does not say so) and the site permissions
+ * (the root's ruling on #553: Chrome's `ResetContentSettings`, ours through the call Clear
+ * browsing data's "Site settings" makes).
+ */
+export const RESET_SETTINGS_COPY = {
+  row: 'Restore settings to their original defaults',
+  title: 'Reset settings?',
+  body: 'This will reset your startup page, home page, new tab page, search engine, pinned tabs, and site permissions. It will also disable all extensions and clear temporary data like cookies. Your bookmarks, history, and saved passwords will not be cleared.',
+  action: 'Reset settings'
+} as const
+
+/**
+ * Reset Settings (settings-70; Chrome's `chrome://settings/reset`, the foot of its list): the
+ * one row, "Restore settings to their original defaults", label alone as Chrome's is – the
+ * sentence that says what resets is the confirmation's, read before anything runs, not a
+ * description that repeats it under the label – whose §9.23 confirmation carries Chrome's
+ * sentence: Cancel and "Reset settings" in the danger ink, no primary, Enter from the held
+ * container inert (§9.22): a bulk act that disables the extensions and clears the cookies –
+ * and whose act is the core's `settings.reset` (`core/settingsReset.ts`), which does what the
+ * sentence says and nothing else, then says "Settings reset" in one toast. The group carries
+ * no heading: the row stands under the category's 22 title as the Privacy and security hub's
+ * cards do – both panes one form (the #553 lead check's F2 / Q3) – the category's name being
+ * the nav's and the title's. The desktop trails its 32 px "Reset…" button on the 40 px control
+ * row (§10.5), the tablet's portrait page presses the row. The category is the desktop and
+ * tablet shells' (`internalPages.ts`).
+ */
+function resetSection(): RowGroup[] {
+  return [
+    {
+      id: 'reset',
+      heading: null,
+      rows: [
+        {
+          kind: 'action',
+          id: 'reset-settings',
+          label: RESET_SETTINGS_COPY.row,
+          keywords: [
+            'reset',
+            'restore',
+            'defaults',
+            'original',
+            'factory',
+            'home page',
+            'site permissions',
+            'extensions',
+            'cookies'
+          ],
+          button: 'Reset…',
+          destructive: true,
+          confirm: {
+            title: RESET_SETTINGS_COPY.title,
+            description: RESET_SETTINGS_COPY.body,
+            action: RESET_SETTINGS_COPY.action
+          },
+          onPress: () => run('settings.reset', undefined)
+        }
+      ]
+    }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// About
+// ---------------------------------------------------------------------------
+
+/**
+ * The Open by default row's second line: the state of the system's switch as the host read it
+ * (a fact of the switch, not a promise of what comes – with no default role most links still go
+ * elsewhere), or the screen's own offer when the host has no reading.
+ */
+function appLinksDescription(state: AppLinkState | undefined): string {
+  switch (state) {
+    case 'allowed':
+      return 'Ione is set to open web links from other apps.'
+    case 'disallowed':
+      return 'Ione is set not to open web links from other apps.'
+    default:
+      return 'Choose which links open in Ione.'
+  }
+}
+
+/**
+ * About (settings-73, shortcuts-menus-164; Chrome's chrome://settings/help): the version block
+ * – wordmark, version with its channel, engine, copyright – then the update row in one of two
+ * states: "Check for updates" (or "Update to <version>") leading to the Updates page, or, once
+ * an update is downloaded (`phase: 'ready'`), "Relaunch to update" with the relaunch on the row
+ * itself, as Chrome's About turns into a Relaunch button. "Get help" and "Report an issue" go
+ * where the app menu's Help submenu goes (`shared/links.ts`); "Open-source licences" opens the
+ * `zen://licences` page tab. On a touch layout the version block copies its report on a hold
+ * (SET-54); Android adds the Default browser, Open by default and What's new rows, and the Legal
+ * group's Privacy notice and Terms (SET-55) follow on every layout with page tabs.
+ */
+function aboutSection({ state, navigate, formFactor }: SectionContext): RowGroup[] {
+  const engineHost = state.platform === 'android' ? 'Android System WebView' : 'Electron'
+  const update = state.updates
+  const newer = update.phase === 'available' || update.phase === 'ready' ? update.release : null
+  const rows: SettingsRow[] = [
+    {
+      kind: 'custom',
+      id: 'version',
+      label: 'Ione',
+      description: versionLine(state.version, update.target),
+      keywords: ['version', state.version, 'channel', 'copyright', 'licence', engineHost],
+      render: () => (
+        <AboutVersionBlock version={state.version} target={update.target} engineHost={engineHost} />
+      ),
+      // A touch layout copies the version line on a hold (SET-54; Chrome for Android's About);
+      // the desktop's block is text to select.
+      ...(formFactor !== 'desktop'
+        ? {
+            copy: {
+              text: versionReport(
+                state.version,
+                engineHost,
+                typeof navigator === 'undefined' ? '' : navigator.userAgent
+              ),
+              confirmation: 'Version copied'
+            }
+          }
+        : {})
+    }
+  ]
+  if (state.capabilities.updates) {
+    rows.push(
+      update.phase === 'ready'
+        ? {
+            kind: 'action',
+            id: 'relaunch-to-update',
+            label: 'Relaunch to update',
+            description: `${newer?.version ?? 'The update'} is downloaded and installs when Ione relaunches.`,
+            button: 'Relaunch',
+            onPress: () => run('updates.install', undefined)
+          }
+        : {
+            kind: 'action',
+            id: 'check-updates',
+            label: newer ? `Update to ${newer.version}` : 'Check for updates',
+            leaves: 'chevron',
+            onPress: () => {
+              navigate('updates')
+              if (!newer) run('updates.check', undefined)
+            }
+          }
+    )
+  }
+  rows.push(
+    {
+      kind: 'action',
+      id: 'get-help',
+      label: 'Get help',
+      description: 'Ione’s guide on GitHub.',
+      leaves: 'external',
+      onPress: () => run('app.openExternal', { url: HELP_URL })
+    },
+    {
+      kind: 'action',
+      id: 'report-issue',
+      label: 'Report an issue',
+      description: 'Tell the project what went wrong, on GitHub.',
+      leaves: 'external',
+      onPress: () => run('app.openExternal', { url: ISSUES_URL })
+    }
+  )
+  // The browser role has a category of its own on the desktop OSes (Default Browser, the
+  // desktop's content); Android keeps the one row here.
+  if (state.capabilities.defaultBrowser && state.platform === 'android') {
+    rows.push(
+      state.defaultBrowser.isDefault
+        ? {
+            kind: 'info',
+            id: 'default-browser',
+            label: 'Default browser',
+            description: 'Ione is your default browser.',
+            trailing: (
+              <Check
+                className="zen-settings-trailing-glyph zen-settings-ok"
+                aria-label="Ione is the default browser"
+              />
+            )
+          }
+        : {
+            kind: 'action',
+            id: 'default-browser',
+            label: 'Set as default browser',
+            description: 'Open links from other apps in Ione.',
+            onPress: () => run('defaultBrowser.request', { source: 'settings' })
+          }
+    )
+    // Open by default (DEF-06; Chrome's row of the same name): the system's screen for which
+    // links open in Ione, its state as the host read it – the link-handling switch on Android
+    // 12+ – on the row; the tap leaves for the screen.
+    if (state.capabilities.appLinkSettings) {
+      rows.push({
+        kind: 'action',
+        id: 'open-by-default',
+        label: 'Open by default',
+        description: appLinksDescription(state.defaultBrowser.appLinks),
+        leaves: 'external',
+        keywords: ['open by default', 'links', 'supported links', 'app links'],
+        onPress: () => run('app.openAppLinkSettings', undefined)
+      })
+    }
+  }
+  // What's new (SET-54; Chrome's What's new): the running version's highlights, a chrome page
+  // (`zen://whats-new`) on every layout with page tabs.
+  if (state.capabilities.pageTabs) {
+    rows.push({
+      kind: 'action',
+      id: 'whats-new',
+      label: 'What’s new',
+      description: `The highlights of Ione ${state.version}.`,
+      leaves: 'chevron',
+      keywords: ["what's new", 'release notes', 'highlights', 'changes'],
+      onPress: () => openPage('whats-new')
+    })
+  }
+  rows.push(
+    {
+      kind: 'info',
+      id: 'engine',
+      label: 'Engine',
+      description:
+        'Blink and V8 – the same engine as Chrome. The chrome reimplements Zen Browser 1.22: Spaces, Essentials, Glance, Split View, compact mode, window sync, Boosts, Live Folders, Reader View, Mods and cross-device sync.'
+    },
+    {
+      kind: 'action',
+      id: 'upstream',
+      label: 'Upstream project',
+      description: 'zen-browser.app – this port is not affiliated with the Zen team.',
+      leaves: 'external',
+      onPress: () => run('app.openExternal', { url: 'https://zen-browser.app' })
+    },
+    {
+      kind: 'action',
+      id: 'licences',
+      label: 'Open-source licences',
+      description: 'The software Ione is built with, and the licence each part comes under.',
+      keywords: ['credits', 'licenses', 'open source', 'third party'],
+      leaves: 'chevron',
+      onPress: () => openPage('licences')
+    }
+  )
+  const groups: RowGroup[] = [{ id: 'about', heading: 'About', rows }]
+  // Legal (SET-55; Chrome's Legal information): the Privacy notice and the Terms, chrome pages
+  // (`zen://privacy-notice`, `zen://terms`) on every layout with page tabs.
+  if (state.capabilities.pageTabs) {
+    groups.push({
+      id: 'legal',
+      heading: 'Legal',
+      rows: [
+        {
+          kind: 'action',
+          id: 'privacy-notice',
+          label: 'Privacy notice',
+          description: 'What Ione keeps on this device and what leaves it.',
+          leaves: 'chevron',
+          keywords: ['privacy notice', 'legal', 'data'],
+          onPress: () => openPage('privacy-notice')
+        },
+        {
+          kind: 'action',
+          id: 'terms',
+          label: 'Terms',
+          description: 'The terms Ione is provided under.',
+          leaves: 'chevron',
+          keywords: ['terms', 'legal', 'licence', 'license'],
+          onPress: () => openPage('terms')
+        }
+      ]
+    })
+  }
+  return groups
+}

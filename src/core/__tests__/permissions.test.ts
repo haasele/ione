@@ -1,0 +1,1232 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { PermissionPromptHost, StoreIO } from '../platform'
+import type { PermissionPrompt, PermissionPromptAnswer } from '../../shared/types'
+import {
+  MAX_NOTICES,
+  PermissionService,
+  coarseVisitTime,
+  decisionKey,
+  displayOrigin,
+  permissionPromptCopy,
+  permissionSite,
+  qualifiedPermission,
+  sameSiteEmbedding,
+  schemeOf,
+  type PermissionChange,
+  type PermissionRequestDetails
+} from '../permissions'
+
+function fakeIo(initial: string | null = null): StoreIO & { writes: string[] } {
+  const io = {
+    writes: [] as string[],
+    readSync: () => initial,
+    write: async (_name: string, text: string) => {
+      io.writes.push(text)
+    },
+    writeSync: (_name: string, text: string) => {
+      io.writes.push(text)
+    }
+  }
+  return io
+}
+
+type Answer = PermissionPromptAnswer | boolean
+
+/** The chrome's side of a prompt: records what was asked and answers as told (true = Allow). */
+function prompts(
+  answer: Answer | ((request: PermissionPrompt) => Answer)
+): PermissionPromptHost & { asked: PermissionPrompt[] } {
+  const host = {
+    asked: [] as PermissionPrompt[],
+    show: async (request: PermissionPrompt): Promise<PermissionPromptAnswer | null> => {
+      host.asked.push(request)
+      const a = typeof answer === 'function' ? answer(request) : answer
+      return a === true ? 'allow' : a === false ? 'block' : a
+    },
+    cancel: () => undefined
+  }
+  return host
+}
+
+const PAGE = 'https://example.com/page'
+
+describe('PermissionService: what is asked', () => {
+  it('no longer hands out file system, storage access, window management or idle detection', async () => {
+    const d = prompts(false)
+    const p = new PermissionService(fakeIo(), d)
+    for (const permission of [
+      'fileSystem',
+      'storage-access',
+      'top-level-storage-access',
+      'window-management',
+      'idle-detection'
+    ]) {
+      expect(p.check(permission, 'https://example.com')).toBe(false)
+      expect(await p.decide(permission, PAGE)).toBe(false)
+    }
+    expect(d.asked.length).toBe(5)
+  })
+
+  it('still grants the harmless set without a prompt and denies the exotic set', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    expect(await p.decide('fullscreen', PAGE)).toBe(true)
+    expect(await p.decide('pointerLock', PAGE)).toBe(true)
+    expect(await p.decide('usb', PAGE)).toBe(false)
+    // Screen sharing has no prompt of its own: the picker (MW-19) is where the user decides.
+    expect(await p.decide('display-capture', PAGE)).toBe(true)
+    expect(await p.decide('xr', PAGE)).toBe(false)
+    expect(await p.decide('local-fonts', PAGE)).toBe(false)
+    expect(d.asked).toEqual([])
+  })
+
+  it('remembers the answer per origin and permission', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    expect(await p.decide('idle-detection', PAGE)).toBe(true)
+    expect(await p.decide('idle-detection', 'https://example.com/other')).toBe(true)
+    expect(d.asked.length).toBe(1)
+    expect(p.check('idle-detection', 'https://example.com')).toBe(true)
+    expect(p.check('idle-detection', 'https://other.example')).toBe(false)
+    expect(await p.decide('window-management', PAGE)).toBe(true)
+    expect(d.asked.length).toBe(2)
+  })
+
+  it('collapses concurrent requests for the same key into one prompt', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    const [a, b] = await Promise.all([p.decide('camera', PAGE), p.decide('camera', PAGE)])
+    expect(a).toBe(true)
+    expect(b).toBe(true)
+    expect(d.asked.length).toBe(1)
+  })
+
+  it('never asks for pop-ups: they are a stored allow or nothing', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    expect(await p.decide('popups', PAGE)).toBe(false)
+    expect(d.asked).toEqual([])
+    p.remember('popups', PAGE, 'allow')
+    expect(await p.decide('popups', PAGE)).toBe(true)
+    expect(p.stored('popups', 'https://example.com/')).toBe('allow')
+    p.forget('popups', PAGE)
+    expect(p.stored('popups', PAGE)).toBeNull()
+  })
+
+  it('refuses opaque and unparsable origins whatever a site would be asked about', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    expect(await p.decide('camera', 'not a url')).toBe(false)
+    expect(await p.decide('camera', 'data:text/html,hi')).toBe(false)
+    expect(await p.decide('geolocation', 'zen://settings')).toBe(false)
+    expect(await p.decide('media', 'chrome-error://chromewebdata/')).toBe(false)
+    expect(p.check('notifications', 'about:blank')).toBe(false)
+    expect(d.asked).toEqual([])
+    p.remember('popups', 'about:blank', 'allow')
+    p.set('geolocation', 'zen://settings', 'allow')
+    expect(p.rules()).toEqual([])
+    expect(p.stored('popups', 'about:blank')).toBeNull()
+  })
+
+  it('grants pages without a site what the catalogue grants without a prompt', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    for (const url of ['zen://settings', 'chrome-error://chromewebdata/', 'about:blank']) {
+      expect(await p.decide('fullscreen', url)).toBe(true)
+      expect(p.check('pointerLock', url)).toBe(true)
+      expect(p.resolve('keyboardLock', url)).toBe('allow')
+      expect(p.check('screen-wake-lock', url)).toBe(true)
+      expect(await p.decide('usb', url)).toBe(false)
+    }
+    // Not a URL at all: nothing, as before.
+    expect(await p.decide('fullscreen', 'not a url')).toBe(false)
+    expect(p.check('fullscreen', '')).toBe(false)
+    // The user's default for the permission still rules such pages.
+    p.chooseDefault('fullscreen', 'deny')
+    expect(await p.decide('fullscreen', 'zen://settings')).toBe(false)
+    expect(d.asked).toEqual([])
+  })
+})
+
+/*
+ * Web MIDI (MW-36 / PS-54). Chrome keeps one MIDI setting, `midi-sysex`, ask by default
+ * (`content_settings_registry.cc:209-217`), and since `kBlockMidiByDefault` (on by default,
+ * `blink/common/features.cc:108-109`) every `requestMIDIAccess()` asks for it, `sysex` or not
+ * (`midi_access_initializer.cc:48-52`): the request reaches the desktop as Electron's `midiSysex`
+ * (`content_converter.cc:162-163`) and the phone as the WebView's `RESOURCE_MIDI_SYSEX`
+ * (`aw_permission_manager.cc:373-378`), which `Permissions.kt` relays as `permission.request`
+ * with the permission name, the URL and the tab. Both shapes meet the same prompt here.
+ */
+describe('PermissionService: Web MIDI including SysEx (MW-36 / PS-54)', () => {
+  const SITE = 'https://synth.example'
+  /** Electron's request, as `permissionRequestDetails` shapes it for a main-frame page. */
+  const DESKTOP: PermissionRequestDetails = { tabId: 'tab_d' }
+  /** The phone's `permission.request` for a WebView resource: no media types, no embedder. */
+  const PHONE: PermissionRequestDetails = { tabId: 'tab_a', mediaTypes: undefined }
+
+  it('asks in Chrome’s words, offers no "Allow once", and grants system-exclusive access on Allow', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    expect(p.check('midiSysex', SITE)).toBe(false)
+    expect(await p.decide('midiSysex', `${SITE}/play`, DESKTOP)).toBe(true)
+    expect(d.asked).toHaveLength(1)
+    // Chrome's `IDS_MIDI_SYSEX_PERMISSION_FRAGMENT` ("Control and reprogram your MIDI devices",
+    // `permissions_strings.grdp:148-150`) after the prompt's "Allow <site> to …"; no one-time
+    // grant, as Chrome's chip carries none (`permission_request.cc:319-320`). The engine's
+    // `midiSysex` is the one MIDI row (`ALIASES`), so the prompt and the store name `midi`.
+    expect(d.asked[0]).toMatchObject({
+      tabId: 'tab_d',
+      origin: SITE,
+      permission: 'midi',
+      message: 'Allow synth.example to control and reprogram your MIDI devices?',
+      detail: 'Your choice is remembered for this site.',
+      allowLabel: 'Allow',
+      blockLabel: 'Block',
+      allowOnce: false
+    })
+    // Remembered: the engine's status check says yes and the next request asks nothing.
+    expect(p.check('midiSysex', SITE)).toBe(true)
+    expect(await p.decide('midiSysex', `${SITE}/other`, DESKTOP)).toBe(true)
+    expect(d.asked).toHaveLength(1)
+    expect(p.get('midi', SITE)).toBe('allow')
+    expect(p.listForOrigin(SITE)).toEqual([{ permission: 'midi', decision: 'allow' }])
+    expect(p.rules()).toMatchObject([{ origin: SITE, permission: 'midi', decision: 'allow' }])
+  })
+
+  it('remembers a Block for the site, and the site is refused without a second question', async () => {
+    const d = prompts(false)
+    const p = new PermissionService(fakeIo(), d)
+    expect(await p.decide('midiSysex', SITE, DESKTOP)).toBe(false)
+    expect(await p.decide('midiSysex', SITE, DESKTOP)).toBe(false)
+    expect(d.asked).toHaveLength(1)
+    expect(p.get('midi', SITE)).toBe('deny')
+    // The site-information sheet's reset: asked again.
+    p.resetOrigin(SITE)
+    expect(p.resolve('midiSysex', SITE)).toBe('ask')
+  })
+
+  it('meets the phone’s request shape with the same prompt, and keeps a private tab’s answer out of the store', async () => {
+    const io = fakeIo()
+    const d = prompts(true)
+    const p = new PermissionService(io, d)
+    expect(await p.decide('midiSysex', SITE, PHONE)).toBe(true)
+    expect(d.asked[0]).toMatchObject({
+      tabId: 'tab_a',
+      permission: 'midi',
+      message: 'Allow synth.example to control and reprogram your MIDI devices?'
+    })
+    p.flushSync()
+    expect(io.writes).toHaveLength(1)
+    expect(JSON.parse(io.writes[0]).decisions).toEqual({ [`${SITE}|midi`]: 'allow' })
+    // A private tab's Allow lasts its session and is never written (Chrome's Incognito rule).
+    const other = 'https://sequencer.example'
+    expect(
+      await p.decide('midiSysex', other, { tabId: 'tab_p', privateContainerId: 'private' })
+    ).toBe(true)
+    expect(d.asked).toHaveLength(2)
+    expect(p.get('midi', other)).toBeUndefined()
+    expect(p.resolve('midiSysex', other, { privateContainerId: 'private' })).toBe('allow')
+    p.forgetContainer('private')
+    expect(p.resolve('midiSysex', other, { privateContainerId: 'private' })).toBe('ask')
+    p.flushSync()
+    expect(io.writes).toHaveLength(1)
+  })
+
+  it('a default of Block in Settings refuses every site without a prompt; Ask brings the question back', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    // Settings speaks of the row; the engine's name reads the row's default through the alias.
+    p.chooseDefault('midi', 'deny')
+    expect(p.effectiveDefault('midiSysex')).toBe('deny')
+    expect(await p.decide('midiSysex', SITE, DESKTOP)).toBe(false)
+    expect(await p.decide('midiSysex', SITE, PHONE)).toBe(false)
+    expect(d.asked).toEqual([])
+    expect(p.rules()).toEqual([])
+    p.chooseDefault('midiSysex', 'ask')
+    expect(await p.decide('midiSysex', SITE, DESKTOP)).toBe(true)
+    expect(d.asked).toHaveLength(1)
+  })
+
+  it('is one row with the plain `midi` request: one answer, one set of words, one line in the site’s list', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    // The row's answer (the site card's toggle, Settings › Sites) covers the engine's request …
+    p.set('midi', SITE, 'allow')
+    expect(p.check('midiSysex', SITE)).toBe(true)
+    expect(await p.decide('midiSysex', SITE, DESKTOP)).toBe(true)
+    expect(d.asked).toEqual([])
+    expect(p.listForOrigin(SITE)).toEqual([{ permission: 'midi', decision: 'allow' }])
+    // … and Electron's plain `midi` (sent only with `kBlockMidiByDefault` off) reads the same
+    // answer and asks with the same words.
+    expect(p.check('midi', SITE)).toBe(true)
+    expect(permissionPromptCopy('midi', SITE).message).toBe(
+      'Allow synth.example to control and reprogram your MIDI devices?'
+    )
+    expect(permissionPromptCopy('midiSysex', SITE)).toEqual(permissionPromptCopy('midi', SITE))
+    // A Block of the row refuses both names; forgetting the row forgets both.
+    p.set('midi', SITE, 'deny')
+    expect(p.resolve('midiSysex', SITE)).toBe('deny')
+    expect(p.resolve('midi', SITE)).toBe('deny')
+    p.forget('midiSysex', SITE)
+    expect(p.resolve('midi', SITE)).toBe('ask')
+    expect(p.listForOrigin(SITE)).toEqual([])
+  })
+})
+
+describe('PermissionService: local files', () => {
+  const FILE_PAGE = 'file:///home/me/pages/index.html'
+
+  it('enters fullscreen and locks the pointer from a local file, as Chrome allows', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    expect(await p.decide('fullscreen', FILE_PAGE)).toBe(true)
+    expect(await p.decide('pointerLock', FILE_PAGE)).toBe(true)
+    expect(await p.decide('keyboardLock', FILE_PAGE)).toBe(true)
+    expect(await p.decide('clipboard-sanitized-write', FILE_PAGE)).toBe(true)
+    // The engine's check handler asks with the origin URL Chromium gives a file: page.
+    expect(p.check('fullscreen', 'file:///')).toBe(true)
+    expect(await p.decide('usb', FILE_PAGE)).toBe(false)
+    expect(d.asked).toEqual([])
+    p.chooseDefault('fullscreen', 'deny')
+    expect(await p.decide('fullscreen', FILE_PAGE)).toBe(false)
+  })
+
+  it('asks a local file about prompted types and remembers the answer for every local file', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    expect(await p.decide('geolocation', FILE_PAGE)).toBe(true)
+    expect(d.asked.length).toBe(1)
+    expect(d.asked[0].origin).toBe('file://')
+    expect(d.asked[0].message).toBe('Allow file:/// to know your location?')
+    expect(p.check('geolocation', 'file:///')).toBe(true)
+    expect(p.stored('geolocation', 'file:///tmp/other.html')).toBe('allow')
+    expect(p.rules()).toEqual([
+      {
+        origin: 'file://',
+        permission: 'geolocation',
+        decision: 'allow',
+        lastVisitedAt: coarseVisitTime(Date.now())
+      }
+    ])
+    expect(p.listForOrigin(FILE_PAGE)).toEqual([{ permission: 'geolocation', decision: 'allow' }])
+    expect(p.listForPermission('geolocation')).toEqual([{ origin: 'file://', decision: 'allow' }])
+    p.resetOrigin('file://')
+    expect(p.listForOrigin(FILE_PAGE)).toEqual([])
+    expect(await p.decide('geolocation', FILE_PAGE)).toBe(true)
+    expect(d.asked.length).toBe(2)
+  })
+
+  it('keeps an "Allow once" while the tab stays on local files', async () => {
+    const d = prompts('allow-once')
+    const p = new PermissionService(fakeIo(), d)
+    expect(await p.decide('camera', FILE_PAGE, { tabId: 't1', mediaTypes: ['video'] })).toBe(true)
+    expect(p.check('camera', 'file:///', { tabId: 't1' })).toBe(true)
+    p.onTabNavigated('t1', 'file:///home/me/pages/next.html')
+    expect(p.check('camera', 'file:///', { tabId: 't1' })).toBe(true)
+    p.onTabNavigated('t1', 'https://example.com/')
+    expect(p.check('camera', 'file:///', { tabId: 't1' })).toBe(false)
+    expect(p.rules()).toEqual([])
+  })
+})
+
+describe('permissionSite', () => {
+  it('is the origin of a web page, one site for local files and nothing for the rest', () => {
+    expect(permissionSite('https://example.com/a?b')).toBe('https://example.com')
+    expect(permissionSite('http://localhost:8080/x')).toBe('http://localhost:8080')
+    expect(permissionSite('file:///home/me/a.html')).toBe('file://')
+    expect(permissionSite('file:///')).toBe('file://')
+    expect(permissionSite('file://')).toBe('file://')
+    expect(permissionSite('zen://settings')).toBeNull()
+    expect(permissionSite('chrome-error://chromewebdata/')).toBeNull()
+    expect(permissionSite('data:text/html,hi')).toBeNull()
+    expect(permissionSite('about:blank')).toBeNull()
+    expect(permissionSite('')).toBeNull()
+    expect(permissionSite('not a url')).toBeNull()
+  })
+
+  it('names the local-file site the way Chrome does', () => {
+    expect(displayOrigin('file://')).toBe('file:///')
+    expect(displayOrigin('https://example.com')).toBe('example.com')
+    expect(displayOrigin('http://example.com')).toBe('http://example.com')
+  })
+})
+
+describe('PermissionService: external applications', () => {
+  it('keeps one answer per scheme and forgets a refusal', async () => {
+    let answer = false
+    const d = prompts(() => answer)
+    const p = new PermissionService(fakeIo(), d)
+    const zoom = { externalUrl: 'zoommtg://zoom.us/join?confno=1' }
+    expect(await p.decide('openExternal', PAGE, zoom)).toBe(false)
+    // Cancelling is not remembered: the site may ask again.
+    expect(await p.decide('openExternal', PAGE, zoom)).toBe(false)
+    expect(d.asked.length).toBe(2)
+    answer = true
+    expect(await p.decide('openExternal', PAGE, zoom)).toBe(true)
+    expect(await p.decide('openExternal', PAGE, zoom)).toBe(true)
+    expect(d.asked.length).toBe(3)
+    // A different scheme from the same site is a new question.
+    expect(await p.decide('openExternal', PAGE, { externalUrl: 'mailto:a@b.c' })).toBe(true)
+    expect(d.asked.length).toBe(4)
+    // A per-site external-application allow is stamped like any other ask-default grant (PS-41).
+    const lastVisitedAt = coarseVisitTime(Date.now())
+    expect(p.rules()).toEqual([
+      {
+        origin: 'https://example.com',
+        permission: 'openExternal:mailto',
+        decision: 'allow',
+        lastVisitedAt
+      },
+      {
+        origin: 'https://example.com',
+        permission: 'openExternal:zoommtg',
+        decision: 'allow',
+        lastVisitedAt
+      }
+    ])
+  })
+
+  it('names the scheme in the prompt and keys the answer on it', () => {
+    const scheme = permissionPromptCopy('openExternal', 'https://example.com', {
+      externalUrl: 'zoommtg://zoom.us/join'
+    })
+    expect(scheme.message).toBe('Allow example.com to open zoommtg: links in another app?')
+    expect(scheme.okLabel).toBe('Open')
+    expect(scheme.detail).toContain('Ione')
+    expect(scheme.detail).toContain('zoommtg://zoom.us/join')
+    expect(scheme.detail).toContain('remembered for zoommtg: links on this site')
+    const bare = permissionPromptCopy('openExternal', 'https://example.com')
+    expect(bare.message).toBe('Allow example.com to open another app?')
+    expect(bare.detail).toContain('remembered for this site')
+    expect(qualifiedPermission('openExternal', { externalUrl: 'ZoomMtg://x' })).toBe(
+      'openExternal:zoommtg'
+    )
+    expect(qualifiedPermission('openExternal', { externalUrl: 'no scheme' })).toBe('openExternal')
+  })
+})
+
+describe('PermissionService: qualified keys and prompt copy', () => {
+  it('qualifies storage access by the embedding site', () => {
+    expect(
+      qualifiedPermission('storage-access', { embedderUrl: 'https://news.example/article' })
+    ).toBe('storage-access:https://news.example')
+    expect(qualifiedPermission('storage-access', {})).toBe('storage-access')
+    expect(decisionKey('https://tracker.example', 'camera')).toBe('https://tracker.example|camera')
+    expect(schemeOf('MAILTO:x@y.z')).toBe('mailto')
+    expect(schemeOf('no scheme')).toBe('')
+  })
+
+  it('keeps storage access grants apart per embedder', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    const inNews = { embedderUrl: 'https://news.example/' }
+    const inShop = { embedderUrl: 'https://shop.example/' }
+    expect(await p.decide('storage-access', 'https://social.example/embed', inNews)).toBe(true)
+    expect(await p.decide('storage-access', 'https://social.example/embed', inNews)).toBe(true)
+    expect(d.asked.length).toBe(1)
+    expect(await p.decide('storage-access', 'https://social.example/embed', inShop)).toBe(true)
+    expect(d.asked.length).toBe(2)
+    expect(d.asked[0].message).toBe(
+      'Allow social.example to use cookies and site data it has stored while you are on news.example?'
+    )
+    expect(p.check('storage-access', 'https://social.example', inNews)).toBe(true)
+    expect(
+      p.check('storage-access', 'https://social.example', { embedderUrl: 'https://x.example' })
+    ).toBe(false)
+  })
+
+  // Google's reCAPTCHA anchor frame (www.google.com) on a google.com page calls
+  // `document.requestStorageAccess` before it answers its widget: Chrome resolves the same-site
+  // call on the spot, and a prompt left pending here stalled the widget until its timeout (W5-P1).
+  it('grants a frame of the embedding site storage access without a question', async () => {
+    const d = prompts(false)
+    const p = new PermissionService(fakeIo(), d)
+    const anchor = 'https://www.google.com/recaptcha/api2/anchor?ar=1&k=abc'
+    const onGoogle = { embedderUrl: 'https://www.google.com/recaptcha/api2/demo' }
+    expect(await p.decide('storage-access', anchor, onGoogle)).toBe(true)
+    expect(await p.decide('storage-access', anchor, { ...onGoogle, userGesture: false })).toBe(true)
+    // Another host of the same site is the same site (accounts.google.com in www.google.com).
+    expect(
+      await p.decide('storage-access', 'https://accounts.google.com/x', {
+        embedderUrl: 'https://www.google.com/'
+      })
+    ).toBe(true)
+    expect(p.check('storage-access', 'https://www.google.com', onGoogle)).toBe(true)
+    expect(d.asked).toEqual([])
+    // Nothing is remembered: the store has no answer to write.
+    expect(p.listForOrigin('https://www.google.com')).toEqual([])
+    // A stored block stands aside too: the same-site rule is the web platform's, not a setting.
+    p.set('storage-access:https://www.google.com', 'https://www.google.com', 'deny')
+    p.setDefault('storage-access', 'deny')
+    expect(await p.decide('storage-access', anchor, onGoogle)).toBe(true)
+    expect(p.check('storage-access', 'https://www.google.com', onGoogle)).toBe(true)
+    // Another scheme is another site; without an embedder there is nothing to compare.
+    expect(sameSiteEmbedding('http://www.google.com/a', onGoogle)).toBe(false)
+    expect(sameSiteEmbedding(anchor, {})).toBe(false)
+    expect(sameSiteEmbedding(anchor, { embedderUrl: 'https://news.example/' })).toBe(false)
+    expect(sameSiteEmbedding('not a url', onGoogle)).toBe(false)
+  })
+
+  it('refuses a cross-site storage access request without a gesture quietly', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    const inNews = { embedderUrl: 'https://news.example/' }
+    const quiet = { ...inNews, userGesture: false }
+    expect(await p.decide('storage-access', 'https://social.example/embed', quiet)).toBe(false)
+    expect(
+      await p.decide('top-level-storage-access', 'https://social.example/embed', {
+        userGesture: false
+      })
+    ).toBe(false)
+    expect(d.asked).toEqual([])
+    // The refusal is not remembered: the same frame asks again with a gesture and is asked about.
+    expect(p.listForOrigin('https://social.example')).toEqual([])
+    expect(
+      await p.decide('storage-access', 'https://social.example/embed', {
+        ...inNews,
+        userGesture: true
+      })
+    ).toBe(true)
+    expect(d.asked.length).toBe(1)
+    // A host that cannot tell leaves the gesture out, and the prompt stands as before.
+    expect(await p.decide('storage-access', 'https://social.example/embed', inNews)).toBe(true)
+    // A stored answer is read before the gesture rule: no prompt, and no refusal either.
+    expect(await p.decide('storage-access', 'https://social.example/embed', quiet)).toBe(true)
+    expect(d.asked.length).toBe(1)
+  })
+
+  it('describes file system access by file and direction', () => {
+    const write = permissionPromptCopy('fileSystem', 'https://editor.example', {
+      filePath: '/home/me/notes/todo.txt',
+      isDirectory: false,
+      fileAccessType: 'writable'
+    })
+    expect(write.message).toBe('Allow editor.example to save changes to "todo.txt"?')
+    expect(write.okLabel).toBe('Save changes')
+    const read = permissionPromptCopy('fileSystem', 'https://editor.example', {
+      filePath: 'C:\\Users\\me\\Projects\\',
+      isDirectory: true,
+      fileAccessType: 'readable'
+    })
+    expect(read.message).toBe('Allow editor.example to view the files in "Projects"?')
+    expect(read.okLabel).toBe('View files')
+  })
+
+  it('keeps a folder view answer apart from the file editing answer', () => {
+    expect(qualifiedPermission('fileSystem', { fileAccessType: 'readable' })).toBe(
+      'fileSystem:read'
+    )
+    expect(qualifiedPermission('fileSystem', { fileAccessType: 'writable' })).toBe('fileSystem')
+    expect(qualifiedPermission('fileSystem')).toBe('fileSystem')
+  })
+
+  it('has labels for the newly prompted permissions', () => {
+    expect(permissionPromptCopy('window-management', 'https://a.example').message).toBe(
+      'Allow a.example to manage windows on all your displays?'
+    )
+    expect(permissionPromptCopy('idle-detection', 'https://a.example').message).toBe(
+      'Allow a.example to know when you are actively using this device?'
+    )
+    expect(permissionPromptCopy('top-level-storage-access', 'https://a.example').message).toContain(
+      'embedded in it'
+    )
+    expect(permissionPromptCopy('something-new', 'http://a.example').message).toBe(
+      'Allow http://a.example to use "something-new"?'
+    )
+  })
+
+  it('asks about a second download in the words the lead settled (PS-71)', () => {
+    const copy = permissionPromptCopy('automatic-downloads', 'https://files.example')
+    expect(copy.message).toBe('Allow files.example to download multiple files?')
+    expect(copy.detail).toBe(
+      'The page started another download on its own. Your choice is remembered for this site.'
+    )
+    expect(copy.okLabel).toBe('Allow')
+    expect(copy.cancelLabel).toBe('Block')
+  })
+})
+
+describe('PermissionService: File System Access status checks', () => {
+  const ORIGIN = 'https://editor.example/'
+  const file = (
+    fileAccessType: 'readable' | 'writable',
+    extra: PermissionRequestDetails = {}
+  ): PermissionRequestDetails => ({
+    filePath: '/home/me/notes.txt',
+    isDirectory: false,
+    fileAccessType,
+    ...extra
+  })
+  const folder = (fileAccessType: 'readable' | 'writable'): PermissionRequestDetails => ({
+    filePath: '/home/me/notes',
+    isDirectory: true,
+    fileAccessType
+  })
+
+  it('grants reading a picked file, and reading a folder unless the site was refused', async () => {
+    const d = prompts(false)
+    const p = new PermissionService(fakeIo(), d)
+    expect(p.check('fileSystem', ORIGIN, file('readable'))).toBe(true)
+    expect(p.check('fileSystem', ORIGIN, folder('readable'))).toBe(true)
+    // The folder picker's prompt (request path) is refused: folders of this site stay unreadable.
+    expect(await p.decide('fileSystem', ORIGIN, folder('readable'))).toBe(false)
+    expect(p.check('fileSystem', ORIGIN, folder('readable'))).toBe(false)
+    expect(p.check('fileSystem', ORIGIN, file('readable'))).toBe(true)
+    expect(p.stored('fileSystem', ORIGIN, file('writable'))).toBeNull()
+    expect(p.rules()).toEqual([
+      { origin: 'https://editor.example', permission: 'fileSystem:read', decision: 'deny' }
+    ])
+  })
+
+  it('refuses a write it cannot ask about, and asks once the page has been interacted with', async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    expect(p.check('fileSystem', ORIGIN, file('writable'))).toBe(false)
+    expect(d.asked).toEqual([])
+    expect(p.check('fileSystem', ORIGIN, file('writable', { pageActivated: true }))).toBe(false)
+    expect(p.check('fileSystem', ORIGIN, file('writable', { pageActivated: true }))).toBe(false)
+    await Promise.resolve()
+    expect(d.asked.length).toBe(1)
+    expect(d.asked[0].message).toBe('Allow editor.example to save changes to "notes.txt"?')
+    await new Promise((r) => setTimeout(r, 0))
+    // The user said yes: the page's next attempt, on any file it is handed, goes through.
+    expect(p.check('fileSystem', ORIGIN, file('writable'))).toBe(true)
+    expect(p.check('fileSystem', ORIGIN, folder('writable'))).toBe(true)
+    expect(p.stored('fileSystem', ORIGIN, file('writable'))).toBe('allow')
+    expect(
+      p.check('fileSystem', 'https://other.example', file('writable', { pageActivated: true }))
+    ).toBe(false)
+  })
+
+  it('lets a file chosen in a save dialog be written for the session, that file only', () => {
+    const d = prompts(false)
+    const p = new PermissionService(fakeIo(), d)
+    const saved = file('writable', { pickedForSaving: true })
+    expect(p.check('fileSystem', ORIGIN, saved)).toBe(true)
+    // Later writes to it (the file is no longer empty) still pass without a question.
+    expect(p.check('fileSystem', ORIGIN, file('writable'))).toBe(true)
+    expect(
+      p.check('fileSystem', ORIGIN, { ...file('writable'), filePath: '/home/me/other.txt' })
+    ).toBe(false)
+    expect(p.check('fileSystem', 'https://other.example', file('writable'))).toBe(false)
+    expect(d.asked).toEqual([])
+    expect(p.rules()).toEqual([])
+    p.resetOrigin(ORIGIN)
+    expect(p.check('fileSystem', ORIGIN, file('writable'))).toBe(false)
+  })
+
+  it('honours a refusal over everything, and forgets session grants with the site', async () => {
+    const d = prompts(false)
+    const p = new PermissionService(fakeIo(), d)
+    expect(await p.decide('fileSystem', ORIGIN, file('writable'))).toBe(false)
+    expect(p.check('fileSystem', ORIGIN, file('writable', { pickedForSaving: true }))).toBe(false)
+    expect(p.check('fileSystem', ORIGIN, file('writable', { pageActivated: true }))).toBe(false)
+    expect(p.check('fileSystem', ORIGIN, file('readable'))).toBe(true)
+    expect(d.asked.length).toBe(1)
+    p.resetOrigin(ORIGIN, 'fileSystem')
+    expect(p.check('fileSystem', ORIGIN, file('writable', { pickedForSaving: true }))).toBe(true)
+    p.reset()
+    expect(p.check('fileSystem', ORIGIN, file('writable'))).toBe(false)
+  })
+})
+
+describe('PermissionService: persistence and rules', () => {
+  it('loads stored decisions and lists them as rules', () => {
+    const io = fakeIo(
+      JSON.stringify({
+        version: 1,
+        decisions: {
+          'https://b.example|popups': 'allow',
+          'https://a.example|camera': 'deny'
+        }
+      })
+    )
+    const p = new PermissionService(io, prompts(true))
+    expect(p.check('camera', 'https://a.example')).toBe(false)
+    expect(p.stored('popups', 'https://b.example/x')).toBe('allow')
+    expect(p.rules()).toEqual([
+      { origin: 'https://a.example', permission: 'camera', decision: 'deny' },
+      { origin: 'https://b.example', permission: 'popups', decision: 'allow' }
+    ])
+    p.forgetRule('https://a.example', 'camera')
+    expect(p.rules().length).toBe(1)
+    p.reset()
+    expect(p.rules()).toEqual([])
+  })
+
+  it('tells listeners which decision changed', async () => {
+    const p = new PermissionService(fakeIo(), prompts(true))
+    const changes: PermissionChange[] = []
+    const off = p.subscribe((c) => changes.push(c))
+    p.remember('popups', PAGE, 'allow')
+    await p.decide('camera', PAGE)
+    await p.decide('openExternal', PAGE, { externalUrl: 'tel:+15550100' })
+    p.forget('popups', PAGE)
+    p.forget('popups', PAGE)
+    expect(changes).toEqual([
+      { permission: 'popups', origin: 'https://example.com' },
+      { permission: 'camera', origin: 'https://example.com' },
+      { permission: 'openExternal:tel', origin: 'https://example.com' },
+      { permission: 'popups', origin: 'https://example.com' }
+    ])
+    off()
+    p.reset()
+    expect(changes).toHaveLength(4)
+  })
+
+  it('keeps a permission default out of the site rules but lets it answer for a site', () => {
+    const p = new PermissionService(fakeIo(), prompts(true))
+    p.setDefault('ads', 'allow')
+    expect(p.rules()).toEqual([])
+    expect(p.stored('ads', PAGE)).toBe('allow')
+    p.remember('ads', PAGE, 'deny')
+    expect(p.stored('ads', PAGE)).toBe('deny')
+    expect(p.rules()).toEqual([
+      { origin: 'https://example.com', permission: 'ads', decision: 'deny' }
+    ])
+  })
+})
+
+describe('PermissionService: first-use notices (the automatic picture-in-picture toast, MW-28)', () => {
+  const PIP = 'auto-picture-in-picture'
+
+  it('remembers a site told once, per site, in the store the answers share, and holds it across a restart', () => {
+    const { permissions, io } = service()
+    expect(permissions.noticed(PIP, 'https://video.example/watch')).toBe(false)
+    permissions.markNoticed(PIP, 'https://video.example/watch')
+    expect(permissions.noticed(PIP, 'https://video.example/watch')).toBe(true)
+    // Per site: another page of the site is told; another site and another permission are not.
+    expect(permissions.noticed(PIP, 'https://video.example/other?x=1')).toBe(true)
+    expect(permissions.noticed(PIP, 'https://clips.example/1')).toBe(false)
+    expect(permissions.noticed('camera', 'https://video.example/watch')).toBe(false)
+    // Not a rule: the site card and Settings list only decisions.
+    expect(permissions.rules()).toEqual([])
+    expect(permissions.listForOrigin('https://video.example')).toEqual([])
+    permissions.flushSync()
+    const doc = JSON.parse(io.files.get('permissions.json')!)
+    expect(doc).toEqual({ version: 1, decisions: {}, noticed: [`https://video.example|${PIP}`] })
+    // The restart: the memory holds.
+    const again = new PermissionService(io, prompts(true))
+    expect(again.noticed(PIP, 'https://video.example/watch')).toBe(true)
+    expect(again.noticed(PIP, 'https://clips.example/1')).toBe(false)
+  })
+
+  it('remembers nothing for a page without a site, and writes nothing twice for a site told', () => {
+    const { permissions, io } = service()
+    permissions.markNoticed(PIP, 'zen://newtab')
+    permissions.markNoticed(PIP, 'not a url')
+    expect(permissions.noticed(PIP, 'zen://newtab')).toBe(false)
+    permissions.flushSync()
+    expect(io.files.has('permissions.json')).toBe(false)
+    permissions.markNoticed(PIP, 'https://video.example/watch')
+    permissions.flushSync()
+    const written = io.files.get('permissions.json')
+    permissions.markNoticed(PIP, 'https://video.example/again')
+    permissions.flushSync()
+    expect(io.files.get('permissions.json')).toBe(written)
+  })
+
+  it('forgets a notice with the site’s reset, one permission or all, and with every reset of the store', () => {
+    const { permissions } = service()
+    permissions.markNoticed(PIP, 'https://video.example/watch')
+    permissions.markNoticed(PIP, 'https://clips.example/1')
+    permissions.resetOrigin('https://video.example/watch', PIP)
+    expect(permissions.noticed(PIP, 'https://video.example/watch')).toBe(false)
+    expect(permissions.noticed(PIP, 'https://clips.example/1')).toBe(true)
+    permissions.markNoticed(PIP, 'https://video.example/watch')
+    permissions.resetOrigin('https://video.example/watch', 'camera')
+    expect(permissions.noticed(PIP, 'https://video.example/watch')).toBe(true)
+    permissions.resetOrigin('https://video.example/watch')
+    expect(permissions.noticed(PIP, 'https://video.example/watch')).toBe(false)
+    permissions.resetSites()
+    expect(permissions.noticed(PIP, 'https://clips.example/1')).toBe(false)
+    permissions.markNoticed(PIP, 'https://clips.example/1')
+    permissions.reset()
+    expect(permissions.noticed(PIP, 'https://clips.example/1')).toBe(false)
+  })
+
+  it('keeps the file bounded: the oldest notices go first past the cap, on write and on read', () => {
+    const { permissions, io } = service()
+    for (let i = 0; i < MAX_NOTICES + 5; i++) permissions.markNoticed(PIP, `https://s${i}.example/`)
+    expect(permissions.noticed(PIP, 'https://s0.example/')).toBe(false)
+    expect(permissions.noticed(PIP, 'https://s4.example/')).toBe(false)
+    expect(permissions.noticed(PIP, 'https://s5.example/')).toBe(true)
+    expect(permissions.noticed(PIP, `https://s${MAX_NOTICES + 4}.example/`)).toBe(true)
+    permissions.flushSync()
+    expect(JSON.parse(io.files.get('permissions.json')!).noticed).toHaveLength(MAX_NOTICES)
+    // A file with too many (or with junk among them) is read to the cap, the newest kept.
+    const many = Array.from({ length: MAX_NOTICES + 10 }, (_, i) => `https://t${i}.example|${PIP}`)
+    const p = new PermissionService(
+      fakeIo(JSON.stringify({ version: 1, decisions: {}, noticed: [...many, 7, 'no-bar'] })),
+      prompts(true)
+    )
+    expect(p.noticed(PIP, 'https://t0.example/')).toBe(false)
+    expect(p.noticed(PIP, 'https://t9.example/')).toBe(false)
+    expect(p.noticed(PIP, 'https://t10.example/')).toBe(true)
+    expect(p.noticed(PIP, `https://t${MAX_NOTICES + 9}.example/`)).toBe(true)
+  })
+
+  it('reads a file from before the notices as it always did', () => {
+    const p = new PermissionService(
+      fakeIo(JSON.stringify({ version: 1, decisions: { 'https://a.example|camera': 'deny' } })),
+      prompts(true)
+    )
+    expect(p.noticed(PIP, 'https://a.example/')).toBe(false)
+    expect(p.check('camera', 'https://a.example')).toBe(false)
+  })
+})
+
+function memoryIo(): StoreIO & { files: Map<string, string> } {
+  const files = new Map<string, string>()
+  return {
+    files,
+    readSync: (name) => files.get(name) ?? null,
+    write: async (name, text) => {
+      files.set(name, text)
+    },
+    writeSync: (name, text) => {
+      files.set(name, text)
+    }
+  }
+}
+
+function service(answer = true): {
+  permissions: PermissionService
+  io: ReturnType<typeof memoryIo>
+  prompts: string[]
+} {
+  const io = memoryIo()
+  const prompts: string[] = []
+  const host: PermissionPromptHost = {
+    show: async (request) => {
+      prompts.push(request.message)
+      return answer ? 'allow' : 'block'
+    },
+    cancel: () => undefined
+  }
+  return { permissions: new PermissionService(io, host), io, prompts }
+}
+
+describe('PermissionService content settings', () => {
+  it('stores per-origin decisions without prompting, keyed origin|permission', async () => {
+    const { permissions, io, prompts } = service()
+    const changes: PermissionChange[] = []
+    permissions.subscribe((c) => changes.push(c))
+
+    permissions.set('ads', 'https://news.example/some/page', 'allow')
+    expect(permissions.get('ads', 'https://news.example/')).toBe('allow')
+    expect(permissions.get('ads', 'https://other.example/')).toBeUndefined()
+    expect(permissions.check('ads', 'https://news.example/')).toBe(true)
+    expect(permissions.check('ads', 'https://other.example/')).toBe(false)
+    expect(prompts).toEqual([])
+    expect(changes).toEqual([{ permission: 'ads', origin: 'https://news.example' }])
+
+    // Unchanged values do not write or notify; null forgets.
+    permissions.set('ads', 'https://news.example', 'allow')
+    expect(changes).toHaveLength(1)
+    permissions.set('ads', 'not a url', 'allow')
+    permissions.set('ads', 'about:blank', 'allow')
+    expect(permissions.listForPermission('ads')).toEqual([
+      { origin: 'https://news.example', decision: 'allow' }
+    ])
+    permissions.set('ads', 'https://news.example', null)
+    expect(permissions.get('ads', 'https://news.example')).toBeUndefined()
+    expect(changes).toHaveLength(2)
+
+    // The document on disk carries the same keys the site-information sheet reads.
+    permissions.set('ads', 'https://a.example', 'allow')
+    permissions.set('geolocation', 'https://a.example', 'deny')
+    await (permissions as unknown as { store: { flush(): Promise<void> } }).store.flush()
+    expect(JSON.parse(io.files.get('permissions.json') ?? '{}')).toEqual({
+      version: 1,
+      decisions: { 'https://a.example|ads': 'allow', 'https://a.example|geolocation': 'deny' }
+    })
+    expect(permissions.listForOrigin('https://a.example')).toEqual([
+      { permission: 'ads', decision: 'allow' },
+      { permission: 'geolocation', decision: 'deny' }
+    ])
+  })
+
+  it('keeps a default per permission that origins without a decision inherit', async () => {
+    const { permissions, prompts } = service(false)
+    const changes: PermissionChange[] = []
+    permissions.subscribe((c) => changes.push(c))
+    expect(permissions.defaultFor('ads')).toBeUndefined()
+
+    permissions.setDefault('ads', 'allow')
+    expect(permissions.defaultFor('ads')).toBe('allow')
+    expect(permissions.check('ads', 'https://any.example/')).toBe(true)
+    expect(await permissions.decide('ads', 'https://any.example/')).toBe(true)
+    expect(prompts).toEqual([])
+    expect(changes).toEqual([{ permission: 'ads', origin: null }])
+
+    // A per-origin decision beats the default; the default never shows up as an origin.
+    permissions.set('ads', 'https://strict.example', 'deny')
+    expect(permissions.check('ads', 'https://strict.example/')).toBe(false)
+    expect(permissions.listForPermission('ads')).toEqual([
+      { origin: 'https://strict.example', decision: 'deny' }
+    ])
+    expect(permissions.listForOrigin('https://strict.example')).toEqual([
+      { permission: 'ads', decision: 'deny' }
+    ])
+
+    permissions.setDefault('ads', null)
+    expect(permissions.defaultFor('ads')).toBeUndefined()
+    expect(permissions.check('ads', 'https://any.example/')).toBe(false)
+  })
+
+  it('notifies subscribers when the site-information sheet resets an origin', () => {
+    const { permissions } = service()
+    permissions.set('ads', 'https://a.example', 'allow')
+    permissions.set('camera', 'https://a.example', 'allow')
+    permissions.set('ads', 'https://b.example', 'allow')
+    const changes: PermissionChange[] = []
+    const unsubscribe = permissions.subscribe((c) => changes.push(c))
+
+    permissions.resetOrigin('https://a.example', 'camera')
+    expect(changes).toEqual([{ permission: 'camera', origin: 'https://a.example' }])
+    permissions.resetOrigin('https://a.example')
+    expect(changes).toEqual([
+      { permission: 'camera', origin: 'https://a.example' },
+      { permission: 'ads', origin: 'https://a.example' }
+    ])
+    expect(permissions.listForPermission('ads')).toEqual([
+      { origin: 'https://b.example', decision: 'allow' }
+    ])
+    // Nothing to forget: no write, no notification.
+    permissions.resetOrigin('https://a.example')
+    expect(changes).toHaveLength(2)
+
+    unsubscribe()
+    permissions.reset()
+    expect(changes).toHaveLength(2)
+    expect(permissions.listForPermission('ads')).toEqual([])
+  })
+
+  it('still prompts once for the prompted permissions and remembers the answer', async () => {
+    const { permissions, prompts } = service(true)
+    const changes: PermissionChange[] = []
+    permissions.subscribe((c) => changes.push(c))
+    expect(await permissions.decide('camera', 'https://meet.example/room')).toBe(true)
+    expect(await permissions.decide('camera', 'https://meet.example/other')).toBe(true)
+    expect(prompts).toEqual(['Allow meet.example to use your camera?'])
+    expect(changes).toEqual([{ permission: 'camera', origin: 'https://meet.example' }])
+    expect(permissions.get('camera', 'https://meet.example')).toBe('allow')
+  })
+})
+
+/*
+ * Chrome's Incognito rule for prompts answered in a private window or tab (`privateContainerId`
+ * on the request): the regular profile's stored decisions and defaults are read as they are – a
+ * stored block stands in private – but nothing answered in private reaches the store. An Allow
+ * or a Block lasts the private session (`forgetContainer` ends it), a prompt dismissed three
+ * times in private earns the site no stored block, no activity is counted, and "Always allow"
+ * given in private is private too.
+ */
+describe('PermissionService: private windows leave no trace', () => {
+  const PRIVATE: PermissionRequestDetails = { tabId: 'tab_p', privateContainerId: 'private' }
+
+  it('an Allow in private is not written, holds for the private session, and is gone with it', async () => {
+    const io = fakeIo()
+    const d = prompts(true)
+    const p = new PermissionService(io, d)
+    expect(await p.decide('geolocation', PAGE, PRIVATE)).toBe(true)
+    expect(d.asked).toHaveLength(1)
+    expect(io.writes).toEqual([])
+    // Asked again in the same private session: the answer holds, no second prompt.
+    expect(await p.decide('geolocation', PAGE, { ...PRIVATE, tabId: 'tab_q' })).toBe(true)
+    expect(d.asked).toHaveLength(1)
+    // A regular window is none the wiser: it is asked afresh.
+    expect(p.resolve('geolocation', PAGE, { tabId: 'tab_r' })).toBe('ask')
+    expect(p.get('geolocation', PAGE)).toBeUndefined()
+    // The private session ends: the answer goes, and the next private request asks again.
+    p.forgetContainer('private')
+    expect(p.resolve('geolocation', PAGE, PRIVATE)).toBe('ask')
+  })
+
+  it('a stored block is inherited in private; a Block given in private is not stored', async () => {
+    const io = fakeIo()
+    const d = prompts(false)
+    const p = new PermissionService(io, d)
+    p.set('camera', PAGE, 'deny')
+    const writes = io.writes.length
+    // The regular profile's block stands in private, without a prompt.
+    expect(await p.decide('camera', PAGE, PRIVATE)).toBe(false)
+    expect(d.asked).toHaveLength(0)
+    // A Block answered in private is remembered for the session only.
+    expect(await p.decide('notifications', PAGE, PRIVATE)).toBe(false)
+    expect(d.asked).toHaveLength(1)
+    expect(p.resolve('notifications', PAGE, PRIVATE)).toBe('deny')
+    expect(p.get('notifications', PAGE)).toBeUndefined()
+    expect(io.writes).toHaveLength(writes)
+  })
+
+  it('three dismissals in private earn the site no stored block', async () => {
+    const io = fakeIo()
+    const d = prompts('dismiss')
+    const p = new PermissionService(io, d)
+    for (let i = 0; i < 3; i++) expect(await p.decide('geolocation', PAGE, PRIVATE)).toBe(false)
+    expect(d.asked).toHaveLength(3)
+    expect(io.writes).toEqual([])
+    expect(p.get('geolocation', PAGE)).toBeUndefined()
+    // In private the block holds for the session, as Chrome's Incognito does.
+    expect(p.resolve('geolocation', PAGE, PRIVATE)).toBe('deny')
+    // The regular profile still asks.
+    expect(p.resolve('geolocation', PAGE, { tabId: 'tab_r' })).toBe('ask')
+  })
+
+  it('a stored allow used in private counts no activity, and "Always allow" in private stays private', async () => {
+    const io = fakeIo()
+    const p = new PermissionService(io, prompts(true))
+    p.set('notifications', PAGE, 'allow')
+    const writes = io.writes.length
+    expect(await p.decide('notifications', PAGE, PRIVATE)).toBe(true)
+    expect(p.activity('notifications')).toEqual([])
+    // The same request from a regular tab is the profile's own use.
+    expect(await p.decide('notifications', PAGE, { tabId: 'tab_r' })).toBe(true)
+    expect(p.activity('notifications')).toEqual([{ origin: permissionSite(PAGE), count: 1 }])
+    // "Always allow pop-ups on this site" from a private tab: the session's, not the store's.
+    p.remember('popups', PAGE, 'allow', PRIVATE)
+    expect(p.resolve('popups', PAGE, PRIVATE)).toBe('allow')
+    expect(p.get('popups', PAGE)).toBeUndefined()
+    expect(io.writes).toHaveLength(writes)
+  })
+
+  it('the site-information sheet hears of private answers and of the session ending, each as the container’s change', async () => {
+    const p = new PermissionService(fakeIo(), prompts(true))
+    const changes: PermissionChange[] = []
+    p.subscribe((change) => changes.push(change))
+    const origin = permissionSite(PAGE)
+    // A private answer's change names its container (`PermissionChange.container`), so a
+    // listener minding the regular profile's own state – the quiet mark a dismissed
+    // notification prompt leaves – can tell it from the profile's rule moving.
+    await p.decide('geolocation', PAGE, PRIVATE)
+    expect(changes).toEqual([{ permission: 'geolocation', origin, container: 'private' }])
+    // The session's end forgets the answer: the same container's change.
+    p.forgetContainer('private')
+    expect(changes).toHaveLength(2)
+    expect(changes[1]).toEqual({ permission: 'geolocation', origin, container: 'private' })
+    p.forgetContainer('private')
+    expect(changes).toHaveLength(2)
+    // A regular window's answer is the store's, and so is a rule set or forgotten by hand: no
+    // container on either.
+    expect(await p.decide('geolocation', PAGE, { tabId: 'tab_r' })).toBe(true)
+    expect(changes).toHaveLength(3)
+    expect(changes[2]).toEqual({ permission: 'geolocation', origin })
+    expect(changes[2]).not.toHaveProperty('container')
+    p.forgetRule(origin!, 'geolocation')
+    expect(changes).toHaveLength(4)
+    expect(changes[3]).toEqual({ permission: 'geolocation', origin })
+    expect(changes[3]).not.toHaveProperty('container')
+    // "Always allow" from a private tab: the container's too.
+    p.remember('popups', PAGE, 'allow', PRIVATE)
+    expect(changes[4]).toEqual({ permission: 'popups', origin, container: 'private' })
+  })
+
+  const SITE = 'https://app.example'
+  const MOUSE = { deviceId: 'g1', name: 'Mouse', vendorId: 1, productId: 2, serialNumber: 'S1' }
+  const PAD = { deviceId: 'g2', name: 'Pad' }
+  const STICK = { deviceId: 'g3', name: 'Stick' }
+  const IN_PRIVATE = { privateContainerId: 'private' }
+  /** The store's debounced write lands, if one was scheduled. */
+  const settle = async (): Promise<void> => {
+    await vi.advanceTimersByTimeAsync(1_000)
+  }
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('a device picked in private is granted for its private session alone and never written', async () => {
+    vi.useFakeTimers()
+    const io = fakeIo()
+    const p = new PermissionService(io, prompts(true), () => 5)
+    p.grantDevice('hid', SITE, MOUSE, IN_PRIVATE)
+    // The private session's own status question is answered; a regular window's is not.
+    expect(p.hasDeviceGrant('hid', SITE, MOUSE, IN_PRIVATE)).toBe(true)
+    expect(p.hasDeviceGrant('hid', SITE, MOUSE)).toBe(false)
+    expect(p.hasDeviceGrant('hid', SITE, MOUSE, { privateContainerId: 'other' })).toBe(false)
+    expect(p.hasDeviceGrant('usb', SITE, MOUSE, IN_PRIVATE)).toBe(false)
+    // No list shows it: Settings and the site-information rows read the store only.
+    expect(p.deviceGrants()).toEqual([])
+    expect(p.deviceGrantsFor(SITE)).toEqual([])
+    expect(p.listForPermission('hid')).toEqual([])
+    await settle()
+    expect(io.writes).toEqual([])
+  })
+
+  it('a private grant goes with its session, and a regular grant is read in private', async () => {
+    vi.useFakeTimers()
+    const io = fakeIo()
+    const p = new PermissionService(io, prompts(true), () => 5)
+    const changes: PermissionChange[] = []
+    p.subscribe((change) => changes.push(change))
+    // A private pick's change names its container, as a private answer's does.
+    p.grantDevice('hid', SITE, MOUSE, IN_PRIVATE)
+    expect(changes).toEqual([{ permission: 'hid', origin: SITE, container: 'private' }])
+    p.forgetContainer('private')
+    expect(changes).toHaveLength(2)
+    expect(changes[1]).toEqual({ permission: 'hid', origin: SITE, container: 'private' })
+    expect(p.hasDeviceGrant('hid', SITE, MOUSE, IN_PRIVATE)).toBe(false)
+    p.forgetContainer('private')
+    expect(changes).toHaveLength(2)
+    await settle()
+    expect(io.writes).toEqual([])
+    // The regular profile's connection stands in private too (the store is read first); its
+    // change is the store's, with no container.
+    p.grantDevice('hid', SITE, MOUSE)
+    expect(changes).toHaveLength(3)
+    expect(changes[2]).toEqual({ permission: 'hid', origin: SITE })
+    expect(changes[2]).not.toHaveProperty('container')
+    await settle()
+    expect(io.writes).toHaveLength(1)
+    expect(JSON.parse(io.writes[0]).devices).toEqual([
+      { origin: SITE, kind: 'hid', ...MOUSE, grantedAt: 5 }
+    ])
+    expect(p.hasDeviceGrant('hid', SITE, MOUSE, IN_PRIVATE)).toBe(true)
+    // A block of the site refuses a private request for the device as it does a regular one.
+    p.set('hid', SITE, 'deny')
+    expect(p.hasDeviceGrant('hid', SITE, MOUSE, IN_PRIVATE)).toBe(false)
+  })
+
+  it('a private page’s forget() drops the session’s grant only, and a reset drops it with the rest', async () => {
+    vi.useFakeTimers()
+    const io = fakeIo()
+    const p = new PermissionService(io, prompts(true), () => 5)
+    p.grantDevice('hid', SITE, MOUSE)
+    await settle()
+    expect(io.writes).toHaveLength(1)
+    p.grantDevice('hid', SITE, PAD, IN_PRIVATE)
+    p.grantDevice('usb', SITE, STICK, IN_PRIVATE)
+    const changes: PermissionChange[] = []
+    p.subscribe((change) => changes.push(change))
+    p.forgetDevice('hid', SITE, MOUSE, IN_PRIVATE)
+    // The stored grant is not the private session's to take away.
+    expect(p.hasDeviceGrant('hid', SITE, MOUSE)).toBe(true)
+    expect(p.hasDeviceGrant('hid', SITE, MOUSE, IN_PRIVATE)).toBe(true)
+    expect(changes).toEqual([])
+    // A private page's forget() is the container's change.
+    p.forgetDevice('hid', SITE, PAD, IN_PRIVATE)
+    expect(p.hasDeviceGrant('hid', SITE, PAD, IN_PRIVATE)).toBe(false)
+    expect(p.hasDeviceGrant('usb', SITE, STICK, IN_PRIVATE)).toBe(true)
+    expect(changes).toEqual([{ permission: 'hid', origin: SITE, container: 'private' }])
+    // A regular forget of the kind leaves the private session's grant where it is.
+    p.forgetDevice('usb', SITE)
+    expect(p.hasDeviceGrant('usb', SITE, STICK, IN_PRIVATE)).toBe(true)
+    expect(changes).toHaveLength(1)
+    await settle()
+    expect(io.writes).toHaveLength(1)
+    expect(JSON.parse(io.writes[0]).devices).toHaveLength(1)
+    // Clear browsing data's "Site settings" takes the private session's connections too: the
+    // store's goodbye without a container, the private session's with its own.
+    p.resetSites()
+    expect(p.hasDeviceGrant('usb', SITE, STICK, IN_PRIVATE)).toBe(false)
+    expect(p.hasDeviceGrant('hid', SITE, MOUSE)).toBe(false)
+    expect(changes.slice(1)).toEqual([
+      { permission: 'hid', origin: SITE },
+      { permission: 'usb', origin: SITE, container: 'private' }
+    ])
+    expect(changes[1]).not.toHaveProperty('container')
+  })
+})
+
+describe("PermissionService: an AI agent's tab", () => {
+  /** Tab `agent` is an agent's: its prompts go to `answers` (null leaves them to the chrome). */
+  function agentSide(answer: PermissionPromptAnswer | null): {
+    asked: PermissionPrompt[]
+    release(): void
+    takes(tabId: string): boolean
+    ask(request: PermissionPrompt): Promise<PermissionPromptAnswer | null> | null
+  } {
+    let release = (): void => undefined
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    const side = {
+      asked: [] as PermissionPrompt[],
+      release: () => release(),
+      takes: (tabId: string) => tabId === 'agent',
+      ask: (request: PermissionPrompt) => {
+        if (request.tabId !== 'agent') return null
+        side.asked.push(request)
+        return gate.then(() => answer)
+      }
+    }
+    return side
+  }
+
+  it("asks the agent instead of the chrome, and remembers nothing of the agent's allow", async () => {
+    const d = prompts(true)
+    const p = new PermissionService(fakeIo(), d)
+    const agent = agentSide('allow-once')
+    p.agentPrompts = agent
+    const granted = p.decide('geolocation', PAGE, { tabId: 'agent' })
+    await Promise.resolve()
+    agent.release()
+    expect(await granted).toBe(true)
+    expect(agent.asked).toHaveLength(1)
+    expect(d.asked).toEqual([])
+    expect(p.rules()).toEqual([])
+    expect(p.check('geolocation', 'https://example.com')).toBe(false)
+  })
+
+  it("never lets a user's tab wait on, or take, the agent's answer to the same question", async () => {
+    const d = prompts(false)
+    const p = new PermissionService(fakeIo(), d)
+    const agent = agentSide('allow-once')
+    p.agentPrompts = agent
+    const theirs = p.decide('camera', PAGE, { tabId: 'agent' })
+    const mine = p.decide('camera', PAGE, { tabId: 'user' })
+    expect(await mine).toBe(false)
+    expect(d.asked).toHaveLength(1)
+    agent.release()
+    expect(await theirs).toBe(true)
+  })
+
+  it("an agent's refusal is not a block for the site", async () => {
+    const p = new PermissionService(fakeIo(), prompts(true))
+    const agent = agentSide(null)
+    agent.release()
+    p.agentPrompts = { ...agent, ask: (r) => (r.tabId === 'agent' ? Promise.resolve(null) : null) }
+    expect(await p.decide('notifications', PAGE, { tabId: 'agent' })).toBe(false)
+    expect(p.get('notifications', 'https://example.com')).toBeUndefined()
+    expect(await p.decide('notifications', PAGE, { tabId: 'user' })).toBe(true)
+  })
+
+  it("keeps an agent's device pick to its tab: never written or listed, gone with the tab", () => {
+    const io = fakeIo()
+    const p = new PermissionService(io, prompts(true))
+    const pen = { deviceId: 'd1', name: 'Pen', vendorId: 1, productId: 2, serialNumber: 'S1' }
+    p.grantDevice('usb', PAGE, pen, { agentTabId: 'agent' })
+    p.flushSync()
+    expect(io.writes).toEqual([])
+    expect(p.deviceGrants()).toEqual([])
+    expect(p.deviceGrantsFor(PAGE)).toEqual([])
+    // The engine asks per site; the device found again under a new id is still the agent's pick.
+    expect(p.hasDeviceGrant('usb', PAGE, { ...pen, deviceId: 'd2' })).toBe(true)
+    expect(p.hasDeviceGrant('hid', PAGE, pen)).toBe(false)
+    p.forgetAgentTab('other')
+    expect(p.hasDeviceGrant('usb', PAGE, pen)).toBe(true)
+    p.forgetAgentTab('agent')
+    expect(p.hasDeviceGrant('usb', PAGE, pen)).toBe(false)
+    p.flushSync()
+    expect(io.writes).toEqual([])
+    // The user's own pick is stored as before.
+    p.grantDevice('usb', PAGE, pen)
+    p.flushSync()
+    expect(p.deviceGrants()).toHaveLength(1)
+    expect(JSON.parse(io.writes.at(-1) ?? '{}').devices).toHaveLength(1)
+  })
+
+  it("lets a page's forget() and a blocked site end an agent's device pick", () => {
+    const p = new PermissionService(fakeIo(), prompts(true))
+    const key = { deviceId: 'k1', name: 'Key', vendorId: 3, productId: 4, serialNumber: null }
+    p.grantDevice('hid', PAGE, key, { agentTabId: 'agent' })
+    p.set('hid', 'https://example.com', 'deny')
+    expect(p.hasDeviceGrant('hid', PAGE, key)).toBe(false)
+    p.set('hid', 'https://example.com', null)
+    expect(p.hasDeviceGrant('hid', PAGE, key)).toBe(true)
+    p.forgetDevice('hid', PAGE, key)
+    expect(p.hasDeviceGrant('hid', PAGE, key)).toBe(false)
+  })
+})

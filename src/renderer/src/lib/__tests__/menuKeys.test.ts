@@ -1,0 +1,496 @@
+// @vitest-environment happy-dom
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { UIState } from '@shared/types'
+
+vi.mock('../api', () => ({ cmd: vi.fn(), run: vi.fn(), onEvent: vi.fn(() => () => undefined) }))
+
+import {
+  contextMenuAnchor,
+  controlMenuAnchor,
+  focusedRect,
+  handleMenuKey,
+  menuItemLabel,
+  menuKeyIntent,
+  mnemonicActivates,
+  mnemonicKey,
+  mnemonicMatch,
+  returnKeyboardMenuFocus,
+  trackKeyboardMenuSource,
+  type MenuKeyLike
+} from '../menuKeys'
+import { browserStore } from '../ui'
+
+/*
+ * The keyboard of the chrome's menus (lib/menuKeys.ts; a11y-08): how Shift+F10 and the Menu key
+ * ask for a context menu at the focused element, and how a menu the renderer draws answers the
+ * arrows, Home/End and a letter – Chromium's `MenuController` rules, the ones Chrome's native
+ * menus follow on Windows and Linux.
+ */
+
+const key = (k: string, mods: Partial<MenuKeyLike> = {}): MenuKeyLike => ({
+  key: k,
+  shiftKey: false,
+  ctrlKey: false,
+  altKey: false,
+  metaKey: false,
+  ...mods
+})
+
+const platform = (p: UIState['platform']): void =>
+  browserStore.set({ state: { platform: p } as unknown as UIState })
+
+afterEach(() => {
+  browserStore.set({ state: null })
+  document.body.innerHTML = ''
+})
+
+describe('contextMenuAnchor', () => {
+  const event = (init: MouseEventInit & { firesTouchEvents?: boolean }): MouseEvent => {
+    const e = new MouseEvent('contextmenu', init)
+    if (init.firesTouchEvents !== undefined)
+      Object.defineProperty(e, 'sourceCapabilities', {
+        value: { firesTouchEvents: init.firesTouchEvents }
+      })
+    return e
+  }
+
+  it("a right-click's menu opens at the pointer, a pointer's menu", () => {
+    expect(contextMenuAnchor(event({ button: 2, clientX: 40.4, clientY: 300.6 }))).toEqual({
+      x: 40,
+      y: 301
+    })
+  })
+
+  it('Shift+F10 and the Menu key come with no button: at the spot, in keyboard mode', () => {
+    // Chromium raises the event at the middle of the focused element with `button` -1 (kNoButton).
+    expect(contextMenuAnchor(event({ button: -1, clientX: 120, clientY: 64 }))).toEqual({
+      x: 120,
+      y: 64,
+      keyboard: true
+    })
+    // Any button but the right one reads the same (a synthetic event's default 0).
+    expect(contextMenuAnchor(event({ button: 0, clientX: 1, clientY: 2 }))).toEqual({
+      x: 1,
+      y: 2,
+      keyboard: true
+    })
+  })
+
+  it("a long-press has no button either but is a finger's: a pointer's menu at the finger", () => {
+    expect(
+      contextMenuAnchor(event({ button: 0, clientX: 10, clientY: 20, firesTouchEvents: true }))
+    ).toEqual({ x: 10, y: 20 })
+  })
+
+  it("a keyboard menu carries the focused element's box, for a host that hangs the menu from it (§9.23)", () => {
+    const row = boxed('button', { left: 12, top: 40, width: 200, height: 28 })
+    row.focus()
+    expect(document.activeElement).toBe(row)
+    // Chromium's point is the element's middle; the box says where its bottom-left is.
+    expect(contextMenuAnchor(event({ button: -1, clientX: 112, clientY: 54 }))).toEqual({
+      x: 112,
+      y: 54,
+      keyboard: true,
+      rect: { x: 12, y: 40, width: 200, height: 28 }
+    })
+  })
+
+  it("a pointer's menu never carries a box, whatever has the focus", () => {
+    boxed('button', { left: 12, top: 40, width: 200, height: 28 }).focus()
+    expect(contextMenuAnchor(event({ button: 2, clientX: 400, clientY: 300 }))).toEqual({
+      x: 400,
+      y: 300
+    })
+  })
+})
+
+/** An element in the document with a measured box – happy-dom lays nothing out by itself. */
+function boxed(
+  tag: string,
+  box: { left: number; top: number; width: number; height: number }
+): HTMLElement {
+  const el = document.createElement(tag)
+  document.body.append(el)
+  el.getBoundingClientRect = () =>
+    ({
+      ...box,
+      x: box.left,
+      y: box.top,
+      right: box.left + box.width,
+      bottom: box.top + box.height,
+      toJSON: () => box
+    }) as DOMRect
+  return el
+}
+
+describe('focusedRect', () => {
+  it('is nothing while the document itself has the focus', () => {
+    expect(document.activeElement).toBe(document.body)
+    expect(focusedRect()).toBeUndefined()
+  })
+
+  it("is the focused element's box in window pixels", () => {
+    boxed('input', { left: 300.5, top: 8, width: 600, height: 32 }).focus()
+    expect(focusedRect()).toEqual({ x: 300.5, y: 8, width: 600, height: 32 })
+  })
+
+  it('is nothing for a focused element without a box – display: none, or not laid out', () => {
+    boxed('button', { left: 0, top: 0, width: 0, height: 0 }).focus()
+    expect(focusedRect()).toBeUndefined()
+  })
+})
+
+describe('controlMenuAnchor', () => {
+  it("a pointer's click on a row's ⋯ hangs the menu from the control: its bottom-left, the box along", () => {
+    const more = boxed('button', { left: 700.4, top: 4, width: 19.6, height: 16.6 })
+    expect(controlMenuAnchor({ currentTarget: more, detail: 1 })).toEqual({
+      x: 700,
+      y: 21,
+      keyboard: false,
+      rect: { x: 700.4, y: 4, width: 19.6, height: 16.6 }
+    })
+  })
+
+  it('Enter or Space on the control – a click with a `detail` of 0 – opens it in keyboard mode', () => {
+    const more = boxed('button', { left: 700, top: 4, width: 20, height: 16 })
+    expect(controlMenuAnchor({ currentTarget: more, detail: 0 })).toEqual({
+      x: 700,
+      y: 20,
+      keyboard: true,
+      rect: { x: 700, y: 4, width: 20, height: 16 }
+    })
+  })
+
+  it('a control with no box still names a point, the origin, and no box', () => {
+    expect(controlMenuAnchor({ currentTarget: null, detail: 1 })).toEqual({
+      x: 0,
+      y: 0,
+      keyboard: false
+    })
+    const bare = boxed('button', { left: 0, top: 0, width: 0, height: 0 })
+    expect(controlMenuAnchor({ currentTarget: bare, detail: 0 })).toEqual({
+      x: 0,
+      y: 0,
+      keyboard: true
+    })
+  })
+})
+
+describe('returning the keyboard when a menu closes (§9.23)', () => {
+  /*
+   * Measured on Electron 44.4.5/Linux: a native popup takes the chrome document's focus while it
+   * stands – the element blurs, `activeElement` falls to the body – and the document gets its
+   * focus back on close with no element in it. The renderer therefore remembers the element a
+   * keyboard-invoked menu hung from and refocuses it when the main process reports the close.
+   */
+  let off: () => void = () => undefined
+  beforeEach(() => {
+    off = trackKeyboardMenuSource()
+  })
+  afterEach(() => {
+    off()
+    vi.restoreAllMocks()
+    // Whatever a test armed and did not use, cleared for the next.
+    vi.spyOn(document, 'hasFocus').mockReturnValue(false)
+    returnKeyboardMenuFocus()
+    vi.restoreAllMocks()
+  })
+
+  /** The menu Chromium raises for Shift+F10 or the Menu key: at the focused element, no button. */
+  const askFromKeyboard = (el: HTMLElement, init: MouseEventInit = {}): void => {
+    el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, button: -1, ...init }))
+  }
+  /** The native menu standing: the element blurred, the document's focus fallen to the body. */
+  const menuTakesFocus = (el: HTMLElement): void => {
+    el.blur()
+    expect(document.activeElement).toBe(document.body)
+  }
+
+  it('Shift+F10 on a row: the row loses the keyboard to the menu and has it back when the menu closes', () => {
+    const row = boxed('button', { left: 8, top: 144, width: 200, height: 28 })
+    row.focus()
+    askFromKeyboard(row)
+    menuTakesFocus(row)
+    returnKeyboardMenuFocus()
+    expect(document.activeElement).toBe(row)
+  })
+
+  it('Enter or Space on a "⋯" arms the return through its anchor; a pointer’s click on it does not', () => {
+    const more = boxed('button', { left: 700, top: 4, width: 20, height: 16 })
+    more.focus()
+    controlMenuAnchor({ currentTarget: more, detail: 0 })
+    menuTakesFocus(more)
+    returnKeyboardMenuFocus()
+    expect(document.activeElement).toBe(more)
+
+    controlMenuAnchor({ currentTarget: more, detail: 1 })
+    menuTakesFocus(more)
+    returnKeyboardMenuFocus()
+    expect(document.activeElement).toBe(document.body)
+  })
+
+  it("a right-click's menu and a long-press's are a pointer's: nothing to return to", () => {
+    const row = boxed('button', { left: 8, top: 144, width: 200, height: 28 })
+    row.focus()
+    askFromKeyboard(row, { button: 2 })
+    menuTakesFocus(row)
+    returnKeyboardMenuFocus()
+    expect(document.activeElement).toBe(document.body)
+
+    row.focus()
+    const touch = new MouseEvent('contextmenu', { bubbles: true, button: -1 })
+    Object.defineProperty(touch, 'sourceCapabilities', { value: { firesTouchEvents: true } })
+    row.dispatchEvent(touch)
+    menuTakesFocus(row)
+    returnKeyboardMenuFocus()
+    expect(document.activeElement).toBe(document.body)
+  })
+
+  it('a pick that moved the keyboard itself – to a rename field, a dialog – keeps it there', () => {
+    const row = boxed('button', { left: 8, top: 144, width: 200, height: 28 })
+    row.focus()
+    askFromKeyboard(row)
+    menuTakesFocus(row)
+    const field = boxed('input', { left: 8, top: 144, width: 200, height: 28 })
+    field.focus()
+    returnKeyboardMenuFocus()
+    expect(document.activeElement).toBe(field)
+  })
+
+  it('a pick that opened another window – this document no longer focused – is left alone', () => {
+    const row = boxed('button', { left: 8, top: 144, width: 200, height: 28 })
+    row.focus()
+    askFromKeyboard(row)
+    menuTakesFocus(row)
+    vi.spyOn(document, 'hasFocus').mockReturnValue(false)
+    returnKeyboardMenuFocus()
+    expect(document.activeElement).toBe(document.body)
+  })
+
+  it('an element the pick removed, and a menu already returned from, give nothing back', () => {
+    const row = boxed('button', { left: 8, top: 144, width: 200, height: 28 })
+    row.focus()
+    askFromKeyboard(row)
+    menuTakesFocus(row)
+    row.remove()
+    expect(() => returnKeyboardMenuFocus()).not.toThrow()
+    expect(document.activeElement).toBe(document.body)
+
+    const other = boxed('button', { left: 8, top: 172, width: 200, height: 28 })
+    other.focus()
+    askFromKeyboard(other)
+    menuTakesFocus(other)
+    returnKeyboardMenuFocus()
+    expect(document.activeElement).toBe(other)
+    // The same close reported twice, or a later pointer menu's: the element is not refocused again.
+    menuTakesFocus(other)
+    returnKeyboardMenuFocus()
+    expect(document.activeElement).toBe(document.body)
+  })
+
+  it('the listener comes off with its remover', () => {
+    off()
+    const row = boxed('button', { left: 8, top: 144, width: 200, height: 28 })
+    row.focus()
+    askFromKeyboard(row)
+    menuTakesFocus(row)
+    returnKeyboardMenuFocus()
+    expect(document.activeElement).toBe(document.body)
+  })
+})
+
+describe('mnemonicKey', () => {
+  it('one printable character, Shift allowed, lowercased', () => {
+    expect(mnemonicKey(key('c'))).toBe('c')
+    expect(mnemonicKey(key('C', { shiftKey: true }))).toBe('c')
+    expect(mnemonicKey(key('ü'))).toBe('ü')
+  })
+
+  it('not a mnemonic: a named key, Space, or a letter with Control, Alt or Command', () => {
+    expect(mnemonicKey(key('ArrowDown'))).toBeNull()
+    expect(mnemonicKey(key('Enter'))).toBeNull()
+    expect(mnemonicKey(key(' '))).toBeNull()
+    expect(mnemonicKey(key('c', { ctrlKey: true }))).toBeNull()
+    expect(mnemonicKey(key('c', { altKey: true }))).toBeNull()
+    expect(mnemonicKey(key('c', { metaKey: true }))).toBeNull()
+  })
+})
+
+describe('mnemonicMatch', () => {
+  const labels = ['Copy', 'Cut', 'Paste', null, 'Close Tab', 'Delete']
+
+  it("the only item starting with the letter is meant: Chrome's menus run it", () => {
+    expect(mnemonicMatch(labels, 'p', -1)).toEqual({ index: 2, unique: true })
+    expect(mnemonicMatch(labels, 'd', 0)).toEqual({ index: 5, unique: true })
+  })
+
+  it('several: the first match after the current item, round to the first', () => {
+    expect(mnemonicMatch(labels, 'c', -1)).toEqual({ index: 0, unique: false })
+    expect(mnemonicMatch(labels, 'c', 0)).toEqual({ index: 1, unique: false })
+    expect(mnemonicMatch(labels, 'c', 1)).toEqual({ index: 4, unique: false })
+    expect(mnemonicMatch(labels, 'c', 4)).toEqual({ index: 0, unique: false })
+  })
+
+  it('skips items given as null (disabled, separators) and matches case-insensitively', () => {
+    expect(mnemonicMatch(['Alpha', null, 'apple'], 'a', 0)).toEqual({ index: 2, unique: false })
+    expect(mnemonicMatch([null, 'Beta'], 'b', -1)).toEqual({ index: 1, unique: true })
+  })
+
+  it('no item starts with the letter: null, the key does nothing', () => {
+    expect(mnemonicMatch(labels, 'z', 0)).toBeNull()
+    expect(mnemonicMatch([], 'a', -1)).toBeNull()
+  })
+})
+
+describe('menuKeyIntent', () => {
+  const labels = ['Open', null, 'Rename…', 'Remove']
+
+  it('Down and Up step over disabled items and wrap', () => {
+    expect(menuKeyIntent(key('ArrowDown'), labels, 0)).toEqual({ kind: 'move', index: 2 })
+    expect(menuKeyIntent(key('ArrowDown'), labels, 3)).toEqual({ kind: 'move', index: 0 })
+    expect(menuKeyIntent(key('ArrowUp'), labels, 2)).toEqual({ kind: 'move', index: 0 })
+    expect(menuKeyIntent(key('ArrowUp'), labels, 0)).toEqual({ kind: 'move', index: 3 })
+  })
+
+  it('from no highlight (the menu itself has focus) Down starts at the first item, Up at the last', () => {
+    expect(menuKeyIntent(key('ArrowDown'), labels, -1)).toEqual({ kind: 'move', index: 0 })
+    expect(menuKeyIntent(key('ArrowUp'), labels, -1)).toEqual({ kind: 'move', index: 3 })
+  })
+
+  it('Home and End jump to the first and last enabled item', () => {
+    expect(menuKeyIntent(key('Home'), [null, 'A', 'B'], 2)).toEqual({ kind: 'move', index: 1 })
+    expect(menuKeyIntent(key('End'), ['A', 'B', null], 0)).toEqual({ kind: 'move', index: 1 })
+  })
+
+  it('a letter is nothing without mnemonics; with them it moves, and the only match runs off macOS', () => {
+    expect(menuKeyIntent(key('r'), labels, 0)).toBeNull()
+    expect(menuKeyIntent(key('r'), labels, 0, { mnemonics: true, platform: 'win32' })).toEqual({
+      kind: 'move',
+      index: 2
+    })
+    expect(menuKeyIntent(key('o'), labels, 2, { mnemonics: true, platform: 'win32' })).toEqual({
+      kind: 'activate',
+      index: 0
+    })
+    expect(menuKeyIntent(key('o'), labels, 2, { mnemonics: true, platform: 'linux' })).toEqual({
+      kind: 'activate',
+      index: 0
+    })
+    // macOS menus only highlight what is typed.
+    expect(menuKeyIntent(key('o'), labels, 2, { mnemonics: true, platform: 'darwin' })).toEqual({
+      kind: 'move',
+      index: 0
+    })
+  })
+
+  it('Enter, Space, Escape and other keys are not the model’s; an all-disabled menu answers nothing', () => {
+    expect(menuKeyIntent(key('Enter'), labels, 0)).toBeNull()
+    expect(menuKeyIntent(key(' '), labels, 0, { mnemonics: true })).toBeNull()
+    expect(menuKeyIntent(key('Escape'), labels, 0)).toBeNull()
+    expect(menuKeyIntent(key('ArrowDown'), [null, null], -1)).toBeNull()
+  })
+
+  it('mnemonicActivates: Chrome runs a unique match on Windows and Linux, not on macOS', () => {
+    expect(mnemonicActivates('win32')).toBe(true)
+    expect(mnemonicActivates('linux')).toBe(true)
+    expect(mnemonicActivates('darwin')).toBe(false)
+    expect(mnemonicActivates(undefined)).toBe(true)
+  })
+})
+
+describe('handleMenuKey', () => {
+  const menu = (
+    labels: Array<string | { label: string; disabled?: boolean; name?: string }>
+  ): { root: HTMLDivElement; items: HTMLButtonElement[] } => {
+    const root = document.createElement('div')
+    root.setAttribute('role', 'menu')
+    root.tabIndex = -1
+    const items = labels.map((entry) => {
+      const spec = typeof entry === 'string' ? { label: entry } : entry
+      const b = document.createElement('button')
+      b.setAttribute('role', 'menuitem')
+      if (spec.name) b.setAttribute('aria-label', spec.name)
+      b.innerHTML = `<span class="icon"></span><span>${spec.label}</span><span class="hint">Ctrl+X</span>`
+      b.disabled = Boolean(spec.disabled)
+      root.append(b)
+      return b
+    })
+    document.body.append(root)
+    return { root, items }
+  }
+  const press = (k: string, mods: Partial<KeyboardEventInit> = {}): KeyboardEvent => {
+    const e = new KeyboardEvent('keydown', { key: k, cancelable: true, ...mods })
+    return e
+  }
+
+  it('reads the label as the accessible name, else the text (the hint follows the label)', () => {
+    const { items } = menu(['Copy Link', { label: 'x', name: 'Named' }])
+    expect(menuItemLabel(items[0])).toBe('Copy LinkCtrl+X')
+    expect(menuItemLabel(items[1])).toBe('Named')
+  })
+
+  it('arrows and Home/End move focus among the enabled items', () => {
+    const { root, items } = menu(['Open', { label: 'Rename', disabled: true }, 'Remove'])
+    root.focus()
+    let e = press('ArrowDown')
+    expect(handleMenuKey(e, items)).toBe(true)
+    expect(e.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(items[0])
+    e = press('ArrowDown')
+    handleMenuKey(e, items)
+    expect(document.activeElement).toBe(items[2])
+    handleMenuKey(press('Home'), items)
+    expect(document.activeElement).toBe(items[0])
+    handleMenuKey(press('End'), items)
+    expect(document.activeElement).toBe(items[2])
+  })
+
+  it('a letter goes to the next item it names, and runs the only one on Windows', () => {
+    platform('win32')
+    const { items } = menu(['Copy', 'Cut', 'Paste'])
+    const clicks = items.map(() => vi.fn())
+    items.forEach((el, i) => el.addEventListener('click', clicks[i]))
+    items[0].focus()
+    expect(handleMenuKey(press('c'), items, { mnemonics: true })).toBe(true)
+    expect(document.activeElement).toBe(items[1])
+    expect(clicks.some((fn) => fn.mock.calls.length > 0)).toBe(false)
+    expect(handleMenuKey(press('p'), items, { mnemonics: true })).toBe(true)
+    expect(clicks[2]).toHaveBeenCalledTimes(1)
+  })
+
+  it('on macOS the only match is highlighted, not run', () => {
+    platform('darwin')
+    const { items } = menu(['Copy', 'Paste'])
+    const click = vi.fn()
+    items[1].addEventListener('click', click)
+    items[0].focus()
+    handleMenuKey(press('p'), items, { mnemonics: true })
+    expect(document.activeElement).toBe(items[1])
+    expect(click).not.toHaveBeenCalled()
+  })
+
+  it('a letter without mnemonics, a modified letter, or one typed into a text field is not the menu’s', () => {
+    platform('win32')
+    const { root, items } = menu(['Copy', 'Paste'])
+    items[0].focus()
+    expect(handleMenuKey(press('p'), items)).toBe(false)
+    expect(handleMenuKey(press('p', { ctrlKey: true }), items, { mnemonics: true })).toBe(false)
+    expect(document.activeElement).toBe(items[0])
+    const field = document.createElement('input')
+    root.append(field)
+    field.focus()
+    expect(handleMenuKey(press('p'), items, { mnemonics: true })).toBe(false)
+    expect(document.activeElement).toBe(field)
+  })
+
+  it('with `tab`, Tab and Shift+Tab walk the items like the arrows and wrap', () => {
+    const { items } = menu(['A', 'B', 'C'])
+    items[2].focus()
+    expect(handleMenuKey(press('Tab'), items, { tab: true })).toBe(true)
+    expect(document.activeElement).toBe(items[0])
+    handleMenuKey(press('Tab', { shiftKey: true }), items, { tab: true })
+    expect(document.activeElement).toBe(items[2])
+    // Without it, Tab is left to the popover's own wrap.
+    expect(handleMenuKey(press('Tab'), items)).toBe(false)
+  })
+})

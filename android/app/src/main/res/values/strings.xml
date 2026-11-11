@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Ione</string>
+    <string name="permission_denied">Ione needs this permission to continue.</string>
+    <string name="leave_page_title">Leave page?</string>
+    <string name="leave_page_message">Information you’ve entered may not be saved.</string>
+    <string name="leave">Leave</string>
+    <string name="stay">Stay</string>
+
+    <!-- The omnibox field's floating toolbar (FieldToolbar.kt, OMN-23): Ione's item beside the
+         system's own Paste and Select all takes their sentence case, not the app's Title Case. -->
+    <string name="paste_and_go">Paste and go</string>
+    <string name="paste_and_search">Paste and search</string>
+
+    <!-- The launcher's long-press shortcuts (src/main/shortcuts/shortcuts.xml): New tab, New private
+         tab, Search, Scan QR code – each landing the app straight in its state (Landing.kt). -->
+    <string name="shortcut_new_tab_short">New tab</string>
+    <string name="shortcut_new_tab_long">New tab in Ione</string>
+    <string name="shortcut_private_short">New private tab</string>
+    <string name="shortcut_private_long">New private tab in Ione</string>
+    <string name="shortcut_search_short">Search</string>
+    <string name="shortcut_search_long">Search with Ione</string>
+    <string name="shortcut_scan_short">Scan QR code</string>
+    <string name="shortcut_scan_long">Scan a QR code with Ione</string>
+
+    <!-- The Home-screen search widget (SearchWidgetProvider, res/layout/widget_search.xml; WID-01).
+         The hint is the omnibox's own; the mic's and the mask's names are the accessible names the
+         drivers read (WidgetDemo). -->
+    <string name="widget_search_label">Ione search</string>
+    <string name="widget_search_description">Search or enter an address, search with your voice, or open a new private tab</string>
+    <string name="widget_search_hint">Search or enter address</string>
+    <string name="widget_search_mic">Search with your voice</string>
+    <string name="widget_search_private">New private tab</string>
+
+    <!-- Custom tabs (another app's link rendered by Ione). Menu items are Title Case (v2 §9.1). -->
+    <string name="cct_close">Close</string>
+    <string name="cct_menu">Menu</string>
+    <string name="cct_minimize">Minimize</string>
+    <!-- The toolbar's Share button (CCT-17): its accessible name, a control's word like Close and Menu; the menu's row keeps its ellipsis. -->
+    <string name="cct_share_button">Share</string>
+    <string name="cct_minimized_card">Minimized page: %1$s</string>
+    <string name="cct_secure">Connection is secure</string>
+    <string name="cct_not_secure">Connection is not secure</string>
+    <string name="cct_secure_detail">Everything you send to this site is encrypted on the way.</string>
+    <string name="cct_not_secure_detail">Anyone on the way can read what you send to this site. Don’t enter passwords or card details here.</string>
+    <string name="cct_local_site">Local site</string>
+    <string name="cct_local_site_detail">Served from this device; nothing crosses the network.</string>
+    <string name="cct_done">Done</string>
+    <string name="cct_cancel">Cancel</string>
+    <string name="cct_add">Add</string>
+    <string name="cct_shortcut_name">Name</string>
+    <string name="cct_share">Share…</string>
+    <string name="cct_copy_link">Copy Link</string>
+    <string name="cct_reload">Reload</string>
+    <string name="cct_find_in_page">Find in Page</string>
+    <string name="cct_add_to_home_screen">Add to Home Screen</string>
+    <string name="cct_desktop_site">Desktop Site</string>
+    <string name="cct_open_in_ione">Open in Ione</string>
+    <string name="cct_forward">Forward</string>
+    <string name="cct_bookmark">Bookmark</string>
+    <string name="cct_edit_bookmark">Edit Bookmark</string>
+    <string name="cct_remove_bookmark">Remove Bookmark</string>
+    <string name="cct_download_page">Download Page</string>
+    <string name="cct_page_info">Page Info</string>
+    <string name="cct_stop">Stop</string>
+    <string name="cct_bookmarked">Bookmarked</string>
+    <string name="cct_bookmark_removed">Bookmark removed</string>
+    <string name="cct_page_saved">Saved %1$s</string>
+    <string name="cct_download_failed">Couldn’t save the page</string>
+    <string name="cct_powered_by">Powered by Ione</string>
+    <string name="cct_link_copied">Link copied</string>
+    <string name="cct_find_hint">Find in page</string>
+    <string name="cct_find_close">Close find bar</string>
+    <string name="cct_find_next">Next match</string>
+    <string name="cct_find_previous">Previous match</string>
+    <string name="cct_downloading">Downloading %1$s</string>
+    <string name="cct_download_insecure">%1$s can’t be downloaded securely</string>
+    <!-- A custom tab's permission prompt on the native prompt sheet (PermissionPromptSheet, v2 §9.23): the
+         permission family's question naming the site's host, one per permission a page can ask for, with the
+         pair Block | Allow (cct_block, cct_allow) under it. Answered per request; a custom tab remembers nothing. -->
+    <string name="cct_permission_question_camera">Allow %1$s to use your camera?</string>
+    <string name="cct_permission_question_microphone">Allow %1$s to use your microphone?</string>
+    <string name="cct_permission_question_media">Allow %1$s to use your camera and microphone?</string>
+    <string name="cct_permission_question_location">Allow %1$s to know your location?</string>
+    <string name="cct_permission_question_protected_media">Allow %1$s to play protected content?</string>
+    <string name="cct_allow">Allow</string>
+    <string name="cct_block">Block</string>
+    <!-- A custom tab's Open in <App>? confirmation on the native prompt sheet (CustomTabOpenInAppPrompt, v2 §9.23):
+         the browser window's ExternalProtocolSheet's words. The title with the app's name or without one; the
+         sentence under it – a site's own app offered for a web address (the page loads regardless), or the page
+         wanting to open the object its link's scheme names (one object per scheme the browser sheet names, the
+         others as "a <scheme>: link"); the address on its own line; the pair Not now | Open (cct_not_now, cct_open). -->
+    <string name="cct_open_in_app">Open in %1$s?</string>
+    <string name="cct_open_in_another_app">Open in another app?</string>
+    <string name="cct_open_link_also_in_app">This link can also open in %1$s</string>
+    <string name="cct_open_link_also_in_an_app">This link can also open in an app</string>
+    <string name="cct_open_wants">%1$s wants to open %2$s</string>
+    <string name="cct_this_page">This page</string>
+    <string name="cct_open_object_mailto">an email address</string>
+    <string name="cct_open_object_tel">a phone number</string>
+    <string name="cct_open_object_sms">a text message</string>
+    <string name="cct_open_object_market">a Play Store listing</string>
+    <string name="cct_open_object_geo">a map location</string>
+    <string name="cct_open_object_app">an app</string>
+    <string name="cct_open_object_other">a %1$s: link</string>
+    <string name="cct_open">Open</string>
+    <string name="cct_not_now">Not now</string>
+    <string name="cct_no_app">No app can open this link</string>
+    <string name="cct_find_count">%1$d/%2$d</string>
+
+    <!-- An installed web app's own window (WebAppActivity, PWA-02): a page's Notification ask on the native
+         prompt sheet (PermissionPromptSheet, v2 §9.23) – the permission family's question naming the requester,
+         with the pair Block | Allow (cct_block, cct_allow) under it. -->
+    <string name="webapp_notifications_question">Allow %1$s to show notifications?</string>
+    <!-- PWA-13: the installed app's window says whose it is on the app's first launch (Chrome's "Running in
+         Chrome", IDS_WEBAPK_RUNNING_IN_CHROME's shape) on the §9.33 toast card drawn natively (NativeToastCard,
+         WebAppDisclosure) in the first-time hint's plain form: no action; the product name is app_name. -->
+    <string name="webapp_disclosure">Running in %1$s</string>
+
+    <!-- The unresponsive-page prompt (ERR-16) on the native prompt sheet, since the chrome shares the hung renderer. -->
+    <string name="unresponsive_description">This page isn’t responding. You can wait for it to respond, or exit the page.</string>
+    <string name="unresponsive_wait">Wait</string>
+    <string name="unresponsive_exit">Exit page</string>
+    <!-- The native prompt sheet's grabber (NativePromptSheet, v2 §9.9): a tap on it is the dismissal. -->
+    <string name="prompt_sheet_dismiss">Dismiss</string>
+
+    <!-- A page's own dialogs (PUI-27, PUI-28) on the native prompt sheet (PageDialogSheet.kt, the words read
+         through PageDialogWords; PageDialogsTest pins them to Chrome's). Chrome's lines: the title names the
+         frame's site (IDS_JAVASCRIPT_MESSAGEBOX_TITLE, …_IFRAME for a frame of another origin), or none for a
+         file, data: or about: document (…_NONSTANDARD_URL, …_NONSTANDARD_URL_IFRAME for a frame of an opaque
+         origin); the checkbox from the page's second dialog of a visit (…_SUPPRESS_OPTION); the beforeunload
+         question (IDS_BEFOREUNLOAD_MESSAGEBOX_*, IDS_BEFORERELOAD_MESSAGEBOX_* for a reload). -->
+    <string name="page_dialog_title_site">%1$s says</string>
+    <string name="page_dialog_title_embedded">An embedded page at %1$s says</string>
+    <string name="page_dialog_title_embedded_no_site">An embedded page on this page says</string>
+    <string name="page_dialog_title_no_site">This page says</string>
+    <string name="page_dialog_leave_title">Leave site?</string>
+    <string name="page_dialog_reload_title">Reload site?</string>
+    <string name="page_dialog_leave_message">Changes you made may not be saved.</string>
+    <string name="page_dialog_suppress">Don\'t let this page create more dialogs</string>
+    <string name="page_dialog_cancel">Cancel</string>
+    <string name="page_dialog_ok">OK</string>
+    <string name="page_dialog_leave">Leave</string>
+    <string name="page_dialog_reload">Reload</string>
+
+    <!-- The Home-screen quick actions widget (QuickActionsWidgetProvider, res/layout/widget_quick_actions_*.xml;
+         WID-02): Chrome's quick action search widget's words in Ione's – the picker's name and description
+         (Chrome's "Chromium quick action search", "Search using keyboard, voice, Incognito, or camera"), the
+         short hint the small and extra-small bars carry (Chrome's search_widget_default "Search"; the medium bar
+         carries the omnibox's own, widget_search_hint), and the scanner's accessible name in Chrome's Lens slot.
+         The mic's and the mask's names are the search widget's (widget_search_mic, widget_search_private). -->
+    <string name="widget_quick_actions_label">Ione quick actions</string>
+    <string name="widget_quick_actions_description">Search or enter an address, search with your voice, open a new private tab, or scan a QR code</string>
+    <string name="widget_quick_actions_hint_short">Search</string>
+    <string name="widget_quick_actions_scan">Scan a QR code</string>
+
+    <!-- The Home-screen game widget (GameWidgetProvider, res/layout/widget_game.xml; WID-04 / ERR-03): the
+         picker's name and description as gate #607 (f) ruled them, and the one-cell face's accessible name –
+         Roll is the game's name (shared/game/page.ts GAME_NAME), so the face says what a tap does. -->
+    <string name="widget_game_label">Ione Roll</string>
+    <string name="widget_game_description">Play Roll, Ione\'s offline game</string>
+    <string name="widget_game_face">Play Roll</string>
+</resources>

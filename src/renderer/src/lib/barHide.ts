@@ -1,0 +1,811 @@
+import type { PhoneBarPosition, Rect } from '@shared/types'
+import { isEmptyTabUrl, isInternalUrl } from '@shared/url'
+import { dockStore } from './gestures/dock'
+import { settleTarget, SWIPE_THRESHOLDS } from './gestures/swipe'
+import { SPRING_SNAPPY, SpringAnimation } from './motion/spring'
+import { VelocityTracker } from './motion/velocity'
+import { pullStore } from './pull'
+import { activeTab } from './selectors'
+import { createStore } from './store'
+import { browserStore, contentAreaStore, pageHidden, uiStore, type UiState } from './ui'
+
+/**
+ * The phone bar hiding on scroll (Chrome / Edge parity; design language v2 draft §11.5, chrome
+ * that hides on scroll).
+ *
+ * The host owns the page WebView and its touches; it streams the page's scroll here as `start`
+ * (a finger down), `move` (how far the page scrolled since the last report, CSS px, positive
+ * when the page moves up under a finger going down the page) and `end` (the finger lifted),
+ * batched per frame (see `BarHideGesture.kt`). This module turns that stream into one value –
+ * how far the bar has gone off its edge, 0 … {@link travel} – clamped and one to one with the
+ * scroll while a finger or a fling drives it, and snapped fully in or out on `SPRING_SNAPPY`
+ * when the scroll ends, by the app's one set of swipe thresholds (`SWIPE_THRESHOLDS`, §11.5).
+ * The value is published three ways every frame: `--zen-bar-hide` (0 shown … 1 hidden) on the
+ * elements that move with the bar (`bindBarHide`: the bar itself and the message cards on its
+ * edge; a registered, non-inherited property, so a frame's write recalculates the style of that
+ * one element and nothing under or beside it – written on the root it recalculated the whole
+ * chrome), the host command that moves the page's edge to follow (the page gets the bar's band
+ * as the bar leaves it), and `uiStore.barHidden`, a boolean that flips only at the two rests,
+ * so the content column re-lays itself out at the two ends of the motion and never in between.
+ * The root carries two attributes for the stylesheet: `data-bar-away` while the page holds its
+ * tall layout (below; the message frame takes the page's tall box for the gesture, once, and its
+ * cards ride the bar by transform), and `data-bar-hidden` at the hidden rest.
+ *
+ * The page's two layouts (§11.5) and when they land: the page is laid out TALL – into the bar's
+ * band – at the hide's first frame, since the clip that uncovers it as the bar leaves needs
+ * content to uncover, and SHORT again at the shown REST, once the finger is off and nothing
+ * flings, not the frame the bar arrives home: the host hears `tall` with every frame and lays
+ * the page out for it (`BarHidePlacement.of`), so the return's one relayout – the biggest task a
+ * heavy page does in the gesture (#270 measured 105 ms on github.com) – lands after the gesture's
+ * frames, never inside them, and the page under a bar that has come home but whose finger is
+ * still down keeps its tall layout clipped to the bar's edge, which is the same picture. One
+ * layout per transition, never one per frame (the lead's ruling on #270, §11.5 as amended).
+ *
+ * The rule every write here keeps (the performance program's): a gesture and its spring touch
+ * only `transform` and `opacity` on promoted layers and never lay out or paint the page in the
+ * frame. The chrome's layout changes twice per hide (the column at the hidden rest, the message
+ * frame's box at the gesture's start), never per frame.
+ *
+ * Gating (`barMayHide`): the bar stays put on the new tab page and the internal pages, while
+ * the omnibox is editing, while a sheet or any chrome covers the page, while find or the zoom
+ * panel is docked, during a pull-to-refresh, while the keyboard is up, while the pill is being
+ * carried, while an accessibility service explores the screen by touch, and with the setting
+ * off. A gate closing on a hidden bar brings it back on the spring.
+ */
+
+export type BarHidePhase = 'rest' | 'dragging' | 'flinging' | 'settling'
+
+export type BarScrollPhase = 'start' | 'move' | 'end' | 'show'
+
+export interface BarScrollPayload {
+  /** The page's scroll since the last report, CSS px, positive when scrolling down the page. */
+  delta?: number
+  /** Timestamp of the sample, ms on any monotonic clock. */
+  time?: number
+}
+
+/**
+ * A lift while the page scrolls slower than this (px/s) is the end of the scroll: the bar snaps
+ * at once. A faster one leaves the page flinging, and the bar rides the fling and snaps when it
+ * ends. Not a snap threshold – those are `SWIPE_THRESHOLDS` – but whether there is a fling to
+ * wait for.
+ */
+export const BAR_HIDE_SETTLE_VELOCITY = 200
+/**
+ * A fling has ended when the page has not scrolled for this long. Longer than the host's own
+ * window for a fling's scroll (`BarHideGesture.FLING_GAP_MS`, 120 ms), by a frame or two of the
+ * bridge: a fling's last report must never find the bar settled already, or it would set it
+ * flinging again for a px and snap it a second time.
+ */
+export const BAR_HIDE_FLING_GAP_MS = 150
+/** A bottom inset this large (CSS px) is the keyboard: no gesture bar comes close. */
+export const KEYBOARD_INSET_MIN = 120
+
+// ---------------------------------------------------------------------------
+// The mapping – pure, so it can be tested and reasoned about
+// ---------------------------------------------------------------------------
+
+/** Where the bar is after the page scrolled `delta` more: one to one, clamped to its travel. */
+export function stepOffset(offset: number, delta: number, travel: number): number {
+  if (!Number.isFinite(delta)) return offset
+  return Math.min(travel, Math.max(0, offset + delta))
+}
+
+/**
+ * Where a release with the bar at `offset` and the page scrolling at `velocity` px/s (positive
+ * down the page) snaps to, on the app's one set of swipe thresholds (`SWIPE_THRESHOLDS`: the tab
+ * and overview swipes and the row dismissals release on the same, §11.5): a scroll faster than
+ * the fling velocity decides by its direction wherever the bar is; a slower one commits to the
+ * far end once the bar, with the scroll projected `projectionSeconds` ahead, is `commitFraction`
+ * of its travel away from the end the gesture set out from (`origin`, 0 or `travel`), and
+ * returns there otherwise. The bar is a two-page track: page 0 shown, page 1 hidden.
+ */
+export function snapTarget(offset: number, velocity: number, travel: number, origin = 0): number {
+  if (!(travel > 0)) return 0
+  const page = settleTarget(
+    {
+      position: offset / travel,
+      origin: origin >= travel / 2 ? 1 : 0,
+      velocity,
+      extent: travel,
+      min: 0,
+      max: 1
+    },
+    SWIPE_THRESHOLDS
+  )
+  return page * travel
+}
+
+/** Everything that keeps the bar in place. */
+export interface BarHideGate {
+  /** Settings › Look and Feel › URL bar › Hide toolbar when scrolling. */
+  enabled: boolean
+  /** The active page is the new tab page (or blank) or one of the browser's own pages. */
+  internalPage: boolean
+  /** The omnibox is editing. */
+  editing: boolean
+  /** A sheet, a menu, the stage or any other chrome covers the page. */
+  covered: boolean
+  /** Find in page or the zoom panel is docked at the frame's edge (§9.32). */
+  panelDocked: boolean
+  /** The keyboard is up. */
+  keyboardUp: boolean
+  /** A pull-to-refresh is in flight. */
+  pulling: boolean
+  /** The pill is being carried to the other edge. */
+  carrying: boolean
+  /**
+   * An accessibility service explores the screen by touch (TalkBack; the host's
+   * `AccessibilityManager.isTouchExplorationEnabled`). Chrome never hides its controls while an
+   * accessibility service is on: a user reading the page by swipes would lose the toolbar and
+   * have to find it again. The same here, keyed on touch exploration – a service that leaves it
+   * off (switch access) still has the bar come back when its focus lands on the hidden pill
+   * (`showBar`). The Settings switch is left as it is.
+   */
+  touchExploring: boolean
+}
+
+export function barMayHide(gate: BarHideGate): boolean {
+  return (
+    gate.enabled &&
+    !gate.internalPage &&
+    !gate.editing &&
+    !gate.covered &&
+    !gate.panelDocked &&
+    !gate.keyboardUp &&
+    !gate.pulling &&
+    !gate.carrying &&
+    !gate.touchExploring
+  )
+}
+
+// ---------------------------------------------------------------------------
+// The machine
+// ---------------------------------------------------------------------------
+
+export interface BarHideMachineOptions {
+  /** The bar is `offset` px off its edge; runs every frame while anything moves. */
+  paint(offset: number): void
+  /** The phase changed. */
+  onChange(phase: BarHidePhase): void
+  /** Schedules `fn` after `ms` (a seam for tests); returns a cancel. */
+  later?(fn: () => void, ms: number): () => void
+}
+
+export class BarHideMachine {
+  private offset = 0
+  private phase: BarHidePhase = 'rest'
+  private allowed = true
+  /** The end the current drag or fling set out from (0 or the travel): what a slow release is measured from. */
+  private origin = 0
+  /** Cumulative scroll of the current drag or fling, what the velocity is read from. */
+  private scrolled = 0
+  private readonly tracker = new VelocityTracker()
+  private readonly spring: SpringAnimation
+  private cancelGap: (() => void) | null = null
+
+  constructor(
+    private readonly options: BarHideMachineOptions,
+    private travelPx: number
+  ) {
+    this.spring = new SpringAnimation(
+      SPRING_SNAPPY,
+      (x) => this.paintAt(x),
+      (x) => this.rested(x)
+    )
+  }
+
+  /** How far the bar goes: the band the page gains once it is hidden (CSS px). */
+  get travel(): number {
+    return this.travelPx
+  }
+
+  set travel(px: number) {
+    if (px === this.travelPx || !(px > 0)) return
+    const progress = this.travelPx > 0 ? this.offset / this.travelPx : 0
+    this.travelPx = px
+    this.paintAt(progress * px)
+  }
+
+  /** Where the bar is (CSS px off its edge). */
+  get current(): number {
+    return this.offset
+  }
+
+  get state(): BarHidePhase {
+    return this.phase
+  }
+
+  /** At rest and fully off its edge. */
+  get hidden(): boolean {
+    return this.phase === 'rest' && this.offset >= this.travelPx
+  }
+
+  /** Host → machine. */
+  dispatch(phase: BarScrollPhase, payload?: BarScrollPayload | null): void {
+    switch (phase) {
+      case 'start':
+        this.start()
+        return
+      case 'move':
+        this.move(payload?.delta ?? 0, payload?.time ?? performance.now())
+        return
+      case 'end':
+        this.end(payload?.time)
+        return
+      case 'show':
+        this.snapTo(0)
+        return
+    }
+  }
+
+  /**
+   * Whether the bar may hide right now. Closing the gate brings a bar that is off back – on the
+   * spring, or at once with `atOnce` (a sheet arriving over a bottom-docked bar: the recede is
+   * already fading the bar, and a bar sliding in while it fades is a ghost) – and ignores the
+   * scroll until it opens again.
+   */
+  setAllowed(allowed: boolean, atOnce = false): void {
+    if (this.allowed === allowed) return
+    this.allowed = allowed
+    if (!allowed) {
+      this.clearGap()
+      if (this.offset > 0 || this.phase !== 'rest') {
+        if (atOnce) this.reset()
+        else this.snapTo(0)
+      }
+    }
+  }
+
+  /** Put the bar back on the spring (a tab switch, a load). */
+  show(): void {
+    if (this.offset === 0 && this.phase === 'rest') return
+    this.clearGap()
+    this.snapTo(0)
+  }
+
+  /** Put the bar back at once, without motion (the preview's reset, a layout change). */
+  reset(): void {
+    this.spring.stop()
+    this.clearGap()
+    this.scrolled = 0
+    this.paintAt(0)
+    this.setPhase('rest')
+  }
+
+  private start(): void {
+    if (!this.allowed) return
+    // A finger landing on a spring in flight takes over from where the bar is.
+    this.spring.stop()
+    this.clearGap()
+    this.begin()
+    this.setPhase('dragging')
+  }
+
+  private move(delta: number, time: number): void {
+    if (!this.allowed) return
+    if (this.phase === 'rest' || this.phase === 'settling') {
+      // The page scrolls with no finger on it (a fling, an in-page scroll): the bar rides along.
+      this.spring.stop()
+      this.begin()
+      this.setPhase('flinging')
+    }
+    this.scrolled += delta
+    this.tracker.add(time, 0, this.scrolled)
+    this.paintAt(stepOffset(this.offset, delta, this.travelPx))
+    if (this.phase === 'flinging') this.armGap()
+  }
+
+  /** A drag or a fling sets out: from the nearer end (a finger landing mid-spring sets out from the end it was nearer to). */
+  private begin(): void {
+    this.scrolled = 0
+    this.tracker.reset()
+    this.origin = this.offset >= this.travelPx / 2 ? this.travelPx : 0
+  }
+
+  private end(time?: number): void {
+    if (this.phase !== 'dragging') return
+    const v = this.tracker.velocity(time).vy
+    if (Math.abs(v) < BAR_HIDE_SETTLE_VELOCITY) {
+      this.snapTo(snapTarget(this.offset, v, this.travelPx, this.origin), v)
+      return
+    }
+    // A fling: the page keeps scrolling and the bar with it; it settles when the scroll ends.
+    this.setPhase('flinging')
+    this.armGap()
+  }
+
+  /**
+   * The fling's scroll stopped: the bar settles by where the fling left it (Chrome's controls
+   * do the same at a scroll's end). No velocity is projected – the page has not moved for the
+   * gap, whatever its last frames measured, and a fling cut short by the page's end must not be
+   * read as still heading somewhere.
+   */
+  private gapClosed(): void {
+    this.cancelGap = null
+    if (this.phase !== 'flinging') return
+    this.snapTo(snapTarget(this.offset, 0, this.travelPx, this.origin))
+  }
+
+  private armGap(): void {
+    this.clearGap()
+    const later =
+      this.options.later ??
+      ((fn, ms) => {
+        const id = setTimeout(fn, ms)
+        return () => clearTimeout(id)
+      })
+    this.cancelGap = later(() => this.gapClosed(), BAR_HIDE_FLING_GAP_MS)
+  }
+
+  private clearGap(): void {
+    this.cancelGap?.()
+    this.cancelGap = null
+  }
+
+  private snapTo(target: number, velocity = 0): void {
+    if (this.offset === target) {
+      this.spring.stop()
+      this.setPhase('rest')
+      return
+    }
+    this.setPhase('settling')
+    this.spring.start(this.offset, velocity, target)
+  }
+
+  private paintAt(x: number): void {
+    const next = Math.min(this.travelPx, Math.max(0, x))
+    if (next === this.offset) return
+    this.offset = next
+    this.options.paint(next)
+  }
+
+  private rested(x: number): void {
+    this.paintAt(x)
+    if (this.phase === 'settling') this.setPhase('rest')
+  }
+
+  private setPhase(phase: BarHidePhase): void {
+    if (this.phase === phase) return
+    this.phase = phase
+    this.options.onChange(phase)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The chrome's instance
+// ---------------------------------------------------------------------------
+
+export interface BarHideState {
+  /** 0 shown … 1 hidden, per frame (`--zen-bar-hide` on the bound elements). */
+  progress: number
+  phase: BarHidePhase
+  /** The edge the bar hides off (the phone bar's dock). */
+  edge: PhoneBarPosition
+  /** The band the page gains once the bar is hidden (CSS px). */
+  travel: number
+  /** Whether the bar may hide right now (the gate). */
+  allowed: boolean
+  /**
+   * The page holds its tall layout, into the bar's band (`BarHideHostFrame.tall`): from the frame
+   * the bar leaves its shown rest to the frame it rests there again. `progress > 0` implies it;
+   * a bar home under a finger still down, or mid-fling, leaves it on.
+   */
+  tall: boolean
+}
+
+export const barHideStore = createStore<BarHideState>(
+  { progress: 0, phase: 'rest', edge: 'bottom', travel: 50, allowed: false, tall: false },
+  'bar-hide'
+)
+
+/** What the host is told each frame: where to put the page's edge on the bar's side. */
+export interface BarHideHostFrame {
+  edge: PhoneBarPosition
+  /** How far the bar is off (CSS px, 0 … `travel`). */
+  offset: number
+  travel: number
+  /**
+   * Window y (CSS px) of the page's edge on the bar's side with the bar fully shown – the
+   * page's, not the bar's: chrome between the two (a translate bar, a banner, the blocked
+   * pop-ups chip) is counted in.
+   */
+  shownEdge: number
+  /**
+   * The layout the page is to hold: tall – into the bar's band, clipped to what the bar has
+   * left (`BarHidePlacement.of`) – from the hide's first frame to the shown REST, or short. Read
+   * here, not off `offset` on the host: a bar that has come home under a finger still down, or
+   * under a fling not yet ended, is at `offset` 0 with the page still tall, so its one short
+   * relayout lands at the rest, after the gesture's frames (§11.5, the ruling on #270).
+   */
+  tall: boolean
+}
+
+/** The host that moves pages (Android's bridge); hosts without a phone bar set none. */
+export interface BarHideHost {
+  /** Per frame while anything moves, and once with `null` when the bar may not hide at all. */
+  apply(frame: BarHideHostFrame | null): void
+  /**
+   * The bar moved by itself – not under the finger's scroll: a gate closing, another tab, a
+   * load, a document committing, focus landing on the hidden pill, the host's own `show` – or
+   * changed phase. For the host's record, so a bar found where a finger did not put it can be
+   * read back to what put it there.
+   */
+  note?(reason: string): void
+}
+
+let host: BarHideHost | null = null
+let lastHostFrame: string | null = null
+
+export function setBarHideHost(next: BarHideHost | null): void {
+  host = next
+  lastHostFrame = null
+  publishHost()
+}
+
+function note(reason: string): void {
+  host?.note?.(reason)
+}
+
+/** A show that will move the bar (one with the bar home and at rest is nothing) is noted first. */
+function showNoted(reason: string): void {
+  if (machine.current > 0 || machine.state !== 'rest') note(`show: ${reason}`)
+  machine.show()
+}
+
+/** What the shell knows: where the bar is docked and whether this layout has one at all. */
+interface BarHideContext {
+  edge: PhoneBarPosition
+  /** The phone shell is up with its bar (not HTML fullscreen, not onboarding). */
+  present: boolean
+  /**
+   * The bar band (`--zen-phone-band`: the row and, while the active tab is grouped, the tab
+   * group strip) and the content gutter (`--zen-padding`, the theme's `chromeGutter`), CSS px.
+   * Their difference is the travel; a bar off its edge keeps its ratio when either changes (the
+   * strip entering or leaving under a hidden bar takes it off or brings it in with the row).
+   */
+  band: number
+  gutter: number
+}
+
+const context: BarHideContext = { edge: 'bottom', present: false, band: 56, gutter: 6 }
+
+function root(): HTMLElement | null {
+  return typeof document === 'undefined' ? null : document.documentElement
+}
+
+/**
+ * The page's frame as the layout reporter last measured it, read together with the column
+ * layout it was measured in: `away` when the content column had taken the bar's band
+ * (`PhoneShell`'s `barAway`). The reporter measures after the commit that laid the column out,
+ * so the pair is consistent where it is taken and is never mixed across a frame here.
+ */
+let measured: { area: Rect; away: boolean } | null = null
+
+function noteMeasured(): void {
+  const area = contentAreaStore.get().area
+  const ui = uiStore.get()
+  measured = area ? { area, away: ui.barHidden && !ui.urlbar.open } : null
+}
+
+/**
+ * Window y of the page's edge on the bar's side with the bar shown. Off the measured frame when
+ * there is one – the edge it was measured at, plus the travel when the column had the band –
+ * so chrome between the bar and the page (a translate bar, a banner, the blocked pop-ups chip)
+ * is counted in: the host tells the two column layouts apart by which lies nearer this edge,
+ * and read from the insets and the band alone a strip taller than half the travel would have
+ * made the tall layout read as the short one and put the page a band into the strip. Without a
+ * measurement (before the first report) the insets and the band stand in.
+ */
+function shownEdge(): number {
+  const travel = barHideStore.get().travel
+  if (measured) {
+    const { area, away } = measured
+    return context.edge === 'top'
+      ? area.y + (away ? travel : 0)
+      : area.y + area.height - (away ? travel : 0)
+  }
+  const insets = uiStore.get().insets
+  return context.edge === 'top'
+    ? insets.top + context.band
+    : window.innerHeight - insets.bottom - context.band
+}
+
+/** Whether the page holds its tall layout, as last read off the machine (`pageTall`). */
+let tall = false
+
+/**
+ * The page's layout, read off the machine after each of its changes (the offset in `paint`, the
+ * phase in `onChange`): tall from the frame the bar leaves its shown rest, and short again only at
+ * a REST with the bar home – not the frame it arrives there. Between, a finger still down may
+ * take the bar out again without a relayout, and the page under a bar that is home is clipped to
+ * the bar's edge, the same picture as short. The short relayout is the biggest task a heavy page
+ * does in the gesture (#270: 105 ms on github.com); at the rest it is after the gesture's frames,
+ * never inside them.
+ */
+function pageTall(): boolean {
+  if (machine.current > 0) tall = true
+  else if (machine.state === 'rest') tall = false
+  return tall
+}
+
+function publishHost(): void {
+  if (!host) return
+  const state = barHideStore.get()
+  const frame: BarHideHostFrame | null =
+    state.allowed || state.progress > 0
+      ? {
+          edge: context.edge,
+          offset: Math.round(machine.current * 100) / 100,
+          travel: state.travel,
+          shownEdge: shownEdge(),
+          tall
+        }
+      : null
+  const key = JSON.stringify(frame)
+  if (key === lastHostFrame) return
+  lastHostFrame = key
+  host.apply(frame)
+}
+
+/**
+ * The elements that move with the bar: `--zen-bar-hide` (0 shown … 1 hidden) is written on each
+ * per frame – the bar itself (the stylesheet turns it into the bar's transform) and the message
+ * frame's card containers (theirs rides the bar's edge). The property is registered on the
+ * element alone (`@property … inherits: false`, main.css), so a write recalculates that
+ * element's style and no other; written on the root, as it first was, every frame recalculated
+ * the style of the whole chrome (H4 of the bar hide profile, #270).
+ */
+const bound = new Set<HTMLElement>()
+
+function writeProgress(el: HTMLElement, progress: number): void {
+  if (progress > 0) el.style.setProperty('--zen-bar-hide', progress.toFixed(4))
+  else el.style.removeProperty('--zen-bar-hide')
+}
+
+/**
+ * Register an element that moves with the bar; it carries the current progress at once and every
+ * frame after, until the returned unbind. Its rule in main.css reads `--zen-bar-hide` off the
+ * element itself.
+ */
+export function bindBarHide(el: HTMLElement): () => void {
+  bound.add(el)
+  writeProgress(el, barHideStore.get().progress)
+  return () => {
+    bound.delete(el)
+    el.style.removeProperty('--zen-bar-hide')
+  }
+}
+
+/** Whether the root last said the page held its tall layout (`data-bar-away`). */
+let away = false
+
+/**
+ * The root's `data-bar-away`: on while the page holds its tall layout (`pageTall`: from the frame
+ * the bar leaves its shown rest to the rest it is home at), so the stylesheet gives the message
+ * frame the page's tall box for the whole gesture (one layout of the frame at the gesture's
+ * start and one at its rest, as the page itself) and moves its cards on the bar's edge by
+ * transform. Touched at the two transitions only, never per frame.
+ */
+function publishAway(next: boolean): void {
+  if (away === next) return
+  away = next
+  const el = root()
+  if (!el) return
+  if (next) el.dataset.barAway = 'true'
+  else delete el.dataset.barAway
+}
+
+const machine = new BarHideMachine(
+  {
+    paint: (offset) => {
+      const travel = machine.travel
+      const progress = travel > 0 ? Math.min(1, Math.max(0, offset / travel)) : 0
+      for (const el of bound) writeProgress(el, progress)
+      // The page (and the message frame with it) goes tall the frame the bar leaves its rest;
+      // it comes short in `onChange`, at the rest (a reset from a rest lands here at rest too).
+      const tall = pageTall()
+      publishAway(tall)
+      barHideStore.set({ progress, tall })
+      publishHost()
+      // Leaving the hidden rest: the content column takes its shown layout at once, so the page
+      // comes back under a frame that is already there for it (a reset from the hidden rest
+      // leaves the phase at rest, so this is the one place that sees it go).
+      if (progress < 1 && uiStore.get().barHidden) publishHidden(false)
+    },
+    onChange: (phase) => {
+      // The shown rest with the bar home: the page's one short relayout, after the gesture.
+      const tall = pageTall()
+      publishAway(tall)
+      barHideStore.set({ phase, tall })
+      // The boolean flips to hidden at the hidden rest and nowhere else: a finger landing on the
+      // hidden bar (rest → dragging at the full travel) or a fling passing under it has not moved
+      // the bar, and the column that flipped on the phase alone re-laid the chrome out and the
+      // page with it at every touch and every fling's end on a hidden bar (#270's H5). It flips
+      // back in `paint`, the frame the bar leaves the far end.
+      if (machine.hidden) publishHidden(true)
+      publishHost()
+      note(`${phase} at ${Math.round(machine.current * 100) / 100} of ${machine.travel}`)
+    }
+  },
+  50
+)
+
+/** The boolean at rest, on the store and the root together (`uiStore.barHidden`, `data-bar-hidden`). */
+function publishHidden(hidden: boolean): void {
+  if (uiStore.get().barHidden !== hidden) uiStore.set({ barHidden: hidden })
+  const el = root()
+  if (!el) return
+  // Written only when it changes: a set of the value already there is an attribute mutation all
+  // the same (a fling ending under a hidden bar arrives at the hidden rest a second time).
+  if (hidden === (el.dataset.barHidden === 'true')) return
+  if (hidden) el.dataset.barHidden = 'true'
+  else delete el.dataset.barHidden
+}
+
+/**
+ * Chrome listeners for a finger landing on the active page – the host's `'start'` report, the
+ * one word the chrome hears of a touch on the page's view (the in-product help bubble goes at
+ * it, `components/phone/useTabSwitcherHint.ts`, as Chrome's dismisses on any touch). Heard
+ * whatever the hide-on-scroll gate: the host reports a finger's down whether or not the bar may
+ * hide (`BarHideGesture.reports`) – the down alone; the rest of the stream comes only with the
+ * gate open, and the machine ignores a `'start'` while its gate is closed.
+ */
+const scrollStartListeners = new Set<() => void>()
+
+export function onBarScrollStart(listener: () => void): () => void {
+  scrollStartListeners.add(listener)
+  return () => {
+    scrollStartListeners.delete(listener)
+  }
+}
+
+/** Host → chrome: one report of the active page's scroll. */
+export function dispatchBarScroll(
+  tabId: string,
+  phase: BarScrollPhase,
+  payload?: BarScrollPayload | null
+): void {
+  const state = browserStore.get().state
+  // Only the page on screen moves the bar.
+  if (state && activeTab(state)?.id !== tabId) return
+  if (phase === 'start') for (const listener of scrollStartListeners) listener()
+  if (phase === 'show') note('show: the host (a fling reached the top)')
+  machine.dispatch(phase, payload)
+}
+
+/**
+ * The phone shell says where its bar is docked (and that it has one): the machine follows, and
+ * a bar off its edge comes back when the layout changes under it.
+ */
+export function setBarHideContext(next: Partial<BarHideContext>): void {
+  const edgeChanged = next.edge !== undefined && next.edge !== context.edge
+  Object.assign(context, next)
+  const travel = Math.max(1, context.band - context.gutter)
+  machine.travel = travel
+  if (barHideStore.get().travel !== travel || barHideStore.get().edge !== context.edge) {
+    barHideStore.set({ travel, edge: context.edge })
+  }
+  if (edgeChanged) machine.reset()
+  evaluateGate()
+}
+
+/** Bring the bar back (TalkBack focus landing on the hidden pill, a tap on its edge). */
+export function showBar(): void {
+  showNoted('asked by the host (focus on the hidden pill)')
+}
+
+/** Put the bar back at once and forget any motion (the preview's reset). */
+export function resetBarHide(): void {
+  machine.reset()
+}
+
+/** An accessibility service explores the screen by touch, as the host last said. */
+let touchExploration = false
+
+/**
+ * Host → chrome: touch exploration (TalkBack) turned on or off
+ * (`AccessibilityManager.isTouchExplorationEnabled` and its change listener, `Host.kt`; the
+ * boot payload carries the state at start). On, the bar does not hide and comes back if it was
+ * off its edge, as Chrome's controls stay while an accessibility service is on.
+ */
+export function setBarHideTouchExploration(enabled: boolean): void {
+  if (touchExploration === enabled) return
+  touchExploration = enabled
+  evaluateGate()
+}
+
+/** Whether an accessibility service explores by touch, as the host last said. */
+export function touchExplorationOn(): boolean {
+  return touchExploration
+}
+
+/** The gate as the stores stand. */
+export function currentGate(): BarHideGate {
+  const state = browserStore.get().state
+  const ui: UiState = uiStore.get()
+  const tab = state ? activeTab(state) : null
+  const url = tab?.url ?? ''
+  // The read-aloud player docks for its session's tab (ContentArea's rule) and holds the bar too.
+  const readAloud = state?.readAloud ?? null
+  return {
+    enabled: Boolean(state?.settings.hideToolbarOnScroll) && context.present && tab !== null,
+    internalPage: isEmptyTabUrl(url) || isInternalUrl(url),
+    editing: ui.urlbar.open,
+    covered: pageHidden(ui),
+    panelDocked:
+      ui.findOpen ||
+      ui.zoomTabId !== null ||
+      (readAloud !== null && tab !== null && readAloud.tabId === tab.id),
+    keyboardUp: ui.insets.bottom >= KEYBOARD_INSET_MIN,
+    pulling: pullStore.get().phase !== 'idle',
+    carrying: dockStore.get().phase !== 'idle',
+    touchExploring: touchExploration
+  }
+}
+
+/**
+ * Host → chrome: a navigation committed on a tab's page. A new document (`inPage` false) starts
+ * with its bar in place, as Chrome's does; a same-document navigation – `pushState`,
+ * `replaceState`, a fragment – stays on the page and keeps the bar where it is (Chrome ignores
+ * those too). The URL is not consulted at all: a page rewriting its own URL as it scrolls (a
+ * scroll-spy, an infinite feed) is the very case that must not pop the bar back.
+ */
+export function dispatchBarNavigation(tabId: string, inPage: boolean): void {
+  if (inPage) return
+  const state = browserStore.get().state
+  if (state && activeTab(state)?.id !== tabId) return
+  showNoted('a document committed on the page')
+}
+
+/** The active tab (`id`) and whether it is loading, as of the last state seen. */
+let lastTabId: string | null | undefined
+let lastLoading = false
+
+function evaluateGate(): void {
+  const gate = currentGate()
+  const allowed = barMayHide(gate)
+  const changed = barHideStore.get().allowed !== allowed
+  if (changed && !allowed && (machine.current > 0 || machine.state !== 'rest')) {
+    const closed = (Object.keys(gate) as Array<keyof BarHideGate>).filter((k) =>
+      k === 'enabled' ? !gate.enabled : gate[k]
+    )
+    note(`show: the gate closed (${closed.join(', ')})`)
+  }
+  // A sheet over a bottom-docked bar: the bar is back at once under the recede's fade (§11.1),
+  // not slid in while fading. The top bar is not in the sheet's path and is not faded, so its
+  // return is seen and rides the spring. The machine hears first, the store after: a subscriber
+  // that scrolls the moment the store says the gate is open (the preview's `barhide` state)
+  // finds the machine ready to take it.
+  machine.setAllowed(allowed, !allowed && gate.covered && context.edge === 'bottom')
+  if (changed) barHideStore.set({ allowed })
+  // Another tab, or a load starting on this one (a link followed, a reload): the bar starts in
+  // place. The document itself is keyed by the host's `navigated` event (`dispatchBarNavigation`),
+  // not by the URL, so a same-document navigation leaves the bar alone.
+  const state = browserStore.get().state
+  const tab = state ? activeTab(state) : null
+  const tabId = tab?.id ?? null
+  const loading = Boolean(tab?.loading)
+  if (lastTabId !== undefined && (tabId !== lastTabId || (loading && !lastLoading))) {
+    showNoted(tabId !== lastTabId ? 'another tab' : 'a load began on the page')
+  }
+  lastTabId = tabId
+  lastLoading = loading
+  publishHost()
+}
+
+const flags = globalThis as unknown as { __zenBarHideWired?: boolean }
+if (!flags.__zenBarHideWired) {
+  flags.__zenBarHideWired = true
+  uiStore.subscribe(evaluateGate)
+  browserStore.subscribe(evaluateGate)
+  pullStore.subscribe(evaluateGate)
+  dockStore.subscribe(evaluateGate)
+  // The page's frame moved or was measured anew (the reporter's `ResizeObserver`): the edge the
+  // host lays out against follows, with the layout it was measured in.
+  contentAreaStore.subscribe(() => {
+    noteMeasured()
+    publishHost()
+  })
+  if (typeof window !== 'undefined') window.addEventListener('resize', publishHost)
+}

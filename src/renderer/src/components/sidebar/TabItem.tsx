@@ -1,0 +1,873 @@
+import type { CSSProperties, JSX, ReactNode, RefObject } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import {
+  BluetoothConnected,
+  Bot,
+  Cable,
+  Gamepad2,
+  MonitorSmartphone,
+  Moon,
+  PictureInPicture2,
+  RectangleGoggles,
+  RotateCcw,
+  ScreenShare,
+  Snowflake,
+  Turtle,
+  Usb,
+  VenetianMask,
+  Volume2,
+  VolumeX,
+  X
+} from 'lucide-react'
+import type { AgentInfo, Tab } from '@shared/types'
+import { DEFAULT_CONTAINER_ID, PRIVATE_CONTAINER_ID } from '@shared/types'
+import { CONTAINER_COLORS } from '@shared/defaults'
+import { tabAlertTooltip, type TabAlert } from '@shared/captureState'
+import { run } from '@renderer/lib/api'
+import { closeTabFromChrome } from '@renderer/lib/closeUndo'
+import { dropStore, startTabDrag } from '@renderer/lib/drag'
+import { viewportStore } from '@renderer/lib/formFactor'
+import { hoverCard, measureRow, useHoverCardUp } from '@renderer/lib/hoverCard'
+import { contextMenuAnchor } from '@renderer/lib/menuKeys'
+import { KEEPS_KEYBOARD_ATTR } from '@renderer/lib/panes'
+import { ChromePortal } from '@renderer/lib/portals'
+import { PRIVATE_TAB_PLACEHOLDER, useTabMasked } from '@renderer/lib/privateLock'
+import { activeTab, containerOf, tabTitle, tabTooltip } from '@renderer/lib/selectors'
+import { tabRowDescription, tabRowDescriptionId, tabRowStates } from '@renderer/lib/tabRowAria'
+import {
+  browserStore,
+  clearTabSelection,
+  selectTabRange,
+  toggleTabSelection,
+  uiStore
+} from '@renderer/lib/ui'
+import { stripFocusIn, stripFocusOut, stripKeyDown, useStripTabIndex } from '@renderer/lib/tabStrip'
+import { hasStateGlyph, type StripSlot } from '@renderer/lib/tabStripLayout'
+import { cn } from '@renderer/lib/utils'
+import { useTabTouch } from '../tablet/useTabTouch'
+import { V2_TRAILING_GLYPH } from '../v2/controls'
+import { Favicon } from './Favicon'
+import { FaviconSeat } from './FaviconSeat'
+import { useListMotion } from './listMotion'
+import { useStripAxis } from './stripAxis'
+import { useTabPosition } from './TabSet'
+
+interface Props {
+  tab: Tab
+  active: boolean
+  compact: boolean
+  indent?: boolean
+  /** The strip header that folds this row away (`folder:<id>`, `header:<spaceId>`), if any. */
+  parent?: string
+  /**
+   * A pane of a split group's row (`SplitGroupRow`, design language v2 §9.35): the row's segment
+   * `index` of `count`. The segment keeps the row's favicon, title, close and the state the user
+   * cannot otherwise see (audio, an alert) and drops the rest of the trailing slot; the group's
+   * row is the list's slot (its motion and its hover fill), not the segment.
+   */
+  segment?: { index: number; count: number }
+  /**
+   * The horizontal strip's trailing slot (§9.37, `lib/tabStripLayout.ts`): `reserved` keeps the
+   * sidebar's 24 for the state glyph at rest and the × on hover; `glyph` is the same slot on a
+   * narrow tab that carries a state; `title` gives the slot to the title until the pointer
+   * arrives with the ×. Only the strip passes it; the sidebar's row has the sidebar's trailing.
+   */
+  slot?: StripSlot
+}
+
+/**
+ * The row renders again only for its own change: its tab's object (a snapshot keeps an
+ * unchanged tab's identity, `lib/structuralShare.ts`), its place and its form (`sameProps`);
+ * the stores and contexts it reads reach it on their own.
+ */
+export const TabItem = memo(function TabItem({
+  tab,
+  active,
+  compact,
+  indent,
+  parent,
+  segment,
+  slot
+}: Props): JSX.Element {
+  // The list's axis (`stripAxis.ts`): the strip lays this row along the caption band, so its
+  // drop halves are left and right, it never indents under a header, and its trailing end is
+  // the one 24 slot rather than the sidebar's run of buttons.
+  const horizontal = useStripAxis() === 'x'
+  const dragging = uiStore.use((s) => s.drag)
+  const renaming = uiStore.use((s) => s.renamingTabId === tab.id)
+  const tabIndex = useStripTabIndex(`tab:${tab.id}`, active)
+  const motion = useListMotion()
+  const inSegment = Boolean(segment)
+  const row = useRef<HTMLDivElement | null>(null)
+  const attach = useCallback(
+    (el: HTMLDivElement | null) => {
+      row.current = el
+      // The list's slot is the split row's, attached by `SplitGroupRow`; a segment is not one.
+      const slot = inSegment ? null : motion
+      slot?.attach(tab.id, el)
+      return () => {
+        row.current = null
+        slot?.attach(tab.id, null)
+      }
+    },
+    [motion, tab.id, inSegment]
+  )
+  const foreign = browserStore.use((s) => s.state?.foreignTabIds.includes(tab.id) ?? false)
+  const agent = browserStore.use(
+    (s) => s.state?.agents.find((a) => a.tabIds.includes(tab.id)) ?? null
+  )
+  const containerColor = browserStore.use((s) => {
+    if (
+      !s.state ||
+      tab.containerId === DEFAULT_CONTAINER_ID ||
+      tab.containerId === PRIVATE_CONTAINER_ID
+    )
+      return null
+    const c = containerOf(s.state, tab.containerId)
+    return c ? CONTAINER_COLORS[c.color] : null
+  })
+  const selected = uiStore.use((s) => s.selectedTabIds.includes(tab.id))
+  // An address dragged over the row (lib/dnd.ts): the row takes it, and shows so (§9.4).
+  const dropInto = dropStore.use((s) => s.key === `tab:${tab.id}:into`)
+  const isDragSource = dragging?.tabId === tab.id
+  const showDropZones = Boolean(dragging) && !isDragSource
+  // A private row under the lock (INC-05, §9.19; the overview card's rule): nothing of the page
+  // shows – the mask stands in for the favicon, the row reads "Private tab", and the trailing
+  // slot is empty, its states and its close with it – until the cover has lifted. The row lies
+  // inert under the sidebar's veil meanwhile (`PrivatePanel`); the placeholder is for the reader
+  // that reaches it all the same.
+  const masked = useTabMasked(tab)
+  const title = masked ? PRIVATE_TAB_PLACEHOLDER : tabTitle(tab)
+  const pinnedChanged = tab.pinned && tab.pinnedUrl !== null && tab.url !== tab.pinnedUrl
+  // The indicator slot shows one state, Chrome's priority: recording > capturing > PiP > audio.
+  const alert = !tab.discarded ? (tab.alert ?? null) : null
+  // What the row tells a screen reader beyond its name (a11y-31, lib/tabRowAria.ts): its pane
+  // of a split group and its states – recording, muted, playing, sleeping, pinned – as hidden
+  // text the row is described by, and its place in its list as `aria-posinset` / `aria-setsize`
+  // (the list's `TabSet`). Hidden text rather than `aria-description` because the hover card,
+  // when it stands, is the row's `aria-describedby` too, and a describedby replaces an
+  // aria-description outright: the two ids are read together, the states first.
+  const description = tabRowDescription(tabRowStates(tab, alert, masked), segment)
+  const descriptionId = tabRowDescriptionId(tab.id)
+  const position = useTabPosition(tab.id)
+
+  // On the tablet a finger's hold lifts the row (TABLET-02: the menu on release, the reorder on
+  // a move) and takes the browser's long-press menu; elsewhere the hook does nothing.
+  const tabletTouch = viewportStore.use((v) => v.formFactor === 'tablet')
+  const touch = useTabTouch(tab, tabletTouch)
+
+  const onPointerDown = (e: React.PointerEvent<HTMLElement>): void => {
+    if (touch.onPointerDown(e)) return
+    if (onRowControl(e)) return
+    if (e.button === 1) {
+      e.preventDefault()
+      return
+    }
+    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return
+    startTabDrag(tab, e)
+  }
+
+  // Activating a tab moves keyboard focus into the page, which resets Chromium's click counter,
+  // so a native `dblclick` never fires here. Detect the second click ourselves instead.
+  const lastClick = useRef(0)
+  const onClick = (e: React.MouseEvent): void => {
+    if (touch.swallowsClick()) return
+    if (onRowControl(e)) return
+    if (dragging) return
+    if (e.altKey) {
+      // Zen 1.19: Alt+click splits the tab with the active one (again: separates it).
+      e.preventDefault()
+      run('tab.altClick', { tabId: tab.id })
+      return
+    }
+    const current = browserStore.get().state
+    const activeId = current ? (activeTab(current)?.id ?? null) : null
+    if (e.ctrlKey || e.metaKey) {
+      // Zen: Ctrl+click builds a multi-selection to split / move / close tabs together.
+      e.preventDefault()
+      toggleTabSelection(tab.id, activeId)
+      return
+    }
+    if (e.shiftKey) {
+      e.preventDefault()
+      selectTabRange(tab.id, activeId)
+      return
+    }
+    clearTabSelection()
+    uiStore.set({ selectionAnchorId: tab.id })
+    const now = performance.now()
+    if (now - lastClick.current < 400 && !compact) {
+      lastClick.current = 0
+      uiStore.set({ renamingTabId: tab.id })
+      return
+    }
+    lastClick.current = now
+    run('tab.activate', { tabId: tab.id })
+  }
+
+  const onContextMenu = (e: React.MouseEvent<HTMLElement>): void => {
+    if (touch.onContextMenu(e)) return
+    e.preventDefault()
+    // At the pointer, or – Shift+F10, the Menu key on the focused row – at the row, in
+    // keyboard mode (lib/menuKeys.ts).
+    const anchor = contextMenuAnchor(e)
+    const ids = uiStore.get().selectedTabIds
+    if (ids.length > 1 && ids.includes(tab.id)) {
+      run('tab.selectionContextMenu', { tabIds: ids, ...anchor })
+      return
+    }
+    clearTabSelection()
+    run('tab.contextMenu', { tabId: tab.id, ...anchor })
+  }
+
+  // The middle-click closes as the × does: with Undo on the toast on a touch layout (§9.23).
+  const onAuxClick = (e: React.MouseEvent): void => {
+    if (e.button === 1) {
+      e.preventDefault()
+      closeTabFromChrome(tab.id)
+    }
+  }
+
+  // The hover card (lib/hoverCard.ts) replaces the row's native tooltip: it shows after the
+  // pointer rests on the row, or at once when keyboard focus lands on it (§9.22), never for the
+  // focus a click leaves behind; the controller holds it back while a popover, a menu, a dialog
+  // or an overlay has the chrome. The row's buttons keep their own tooltips. The card the row
+  // is described by (`aria-describedby` below) is the chrome's own or a native host's alike.
+  const cardUp = useHoverCardUp(tab.id)
+  const onPointerEnter = (e: React.PointerEvent): void => {
+    // The card would read the page's title and address: none for a masked row.
+    if (e.pointerType !== 'mouse' || renaming || dragging || masked) return
+    const el = e.currentTarget as HTMLElement
+    hoverCard.pointerEnter(tab.id, () => measureRow(el))
+  }
+  const onPointerLeave = (): void => hoverCard.pointerLeave(tab.id)
+  const onFocus = (e: React.FocusEvent<HTMLDivElement>): void => {
+    stripFocusIn(e)
+    const el = e.currentTarget
+    if (e.target !== el || !el.matches(':focus-visible') || masked) return
+    hoverCard.focus(tab.id, () => measureRow(el))
+  }
+  const onBlur = (e: React.FocusEvent<HTMLDivElement>): void => {
+    stripFocusOut(e)
+    if (e.target === e.currentTarget) hoverCard.blur(tab.id)
+  }
+
+  // Keyboard reach (§9.22, a11y-07): the strip is one tab stop; arrows, Home/End, Enter/Space,
+  // Delete and Escape are the strip's (lib/tabStrip.ts). The row's own controls take no focus
+  // (`RowControl`): Delete closes, the row's context menu has the rest.
+  // In a split row a segment keeps what names the tab and what it must show – the favicon, the
+  // title, the close, a live audio or alert state – and not the trailing slot's other buttons,
+  // whose room a segment does not have (§9.35); their states stay in the row's fade, its tooltip
+  // and its context menu.
+  const trailing = !segment && !masked
+  // The strip's row shows one state at its trailing end (§9.37's slot), the sidebar's priority:
+  // what the user cannot otherwise see first (an alert, audio), then the page's own state. A
+  // masked row shows none: nothing of the page, its states included.
+  const stateGlyph = horizontal && !compact && !renaming && !masked ? hasStateGlyph(tab) : false
+  return (
+    <div
+      ref={attach}
+      className={cn(
+        'zen-tab group',
+        segment && 'zen-split-seg',
+        compact && 'justify-center px-0',
+        indent && !horizontal && 'ml-5'
+      )}
+      role="tab"
+      aria-selected={active}
+      aria-label={title}
+      aria-posinset={position?.pos}
+      aria-setsize={position?.size}
+      data-active={active}
+      data-selected={selected || undefined}
+      data-indent={(indent && !horizontal) || undefined}
+      data-discarded={tab.discarded}
+      data-frozen={tab.frozen}
+      data-agent={agent ? true : undefined}
+      data-masked={masked || undefined}
+      data-lifted={isDragSource || undefined}
+      data-drop-into={dropInto || undefined}
+      data-tab-id={tab.id}
+      data-strip-item={`tab:${tab.id}`}
+      data-strip-parent={parent}
+      data-slot={horizontal ? slot : undefined}
+      data-state={stateGlyph || undefined}
+      tabIndex={tabIndex}
+      aria-describedby={
+        [description ? descriptionId : null, cardUp ? 'zen-tab-hover-card' : null]
+          .filter(Boolean)
+          .join(' ') || undefined
+      }
+      data-renaming={renaming || undefined}
+      data-testid="tab"
+      style={agent ? { boxShadow: `inset 0 0 0 1.5px ${agent.color}80` } : undefined}
+      onPointerDown={onPointerDown}
+      onPointerMove={touch.onPointerMove}
+      onPointerUp={touch.onPointerUp}
+      onPointerCancel={touch.onPointerCancel}
+      onPointerEnter={onPointerEnter}
+      onPointerLeave={onPointerLeave}
+      onFocus={onFocus}
+      onBlur={onBlur}
+      onKeyDown={stripKeyDown}
+      onClick={onClick}
+      onAuxClick={onAuxClick}
+      onContextMenu={onContextMenu}
+    >
+      {description && (
+        <span id={descriptionId} hidden>
+          {description}
+        </span>
+      )}
+      {showDropZones && horizontal && (
+        <>
+          <div
+            data-drop={`tab:${tab.id}:before`}
+            className="absolute inset-y-0 left-0 w-1/2 z-10"
+          />
+          <div
+            data-drop={`tab:${tab.id}:after`}
+            className="absolute inset-y-0 right-0 w-1/2 z-10"
+          />
+        </>
+      )}
+      {showDropZones && !horizontal && (
+        <>
+          <div data-drop={`tab:${tab.id}:before`} className="absolute inset-x-0 top-0 h-1/2 z-10" />
+          <div
+            data-drop={`tab:${tab.id}:after`}
+            className="absolute inset-x-0 bottom-0 h-1/2 z-10"
+          />
+        </>
+      )}
+      {containerColor && (
+        <span
+          className="pointer-events-none absolute inset-y-2 left-0 w-0.5 rounded-full"
+          style={{ background: containerColor }}
+          aria-hidden
+        />
+      )}
+      {tab.loading && !tab.discarded && !masked && (
+        <span className="zen-tab-progress" aria-hidden />
+      )}
+      {agent && compact && !masked && (
+        <span
+          className="pointer-events-none absolute right-0.5 top-0.5 h-2 w-2 rounded-full ring-1 ring-white/70"
+          style={{ background: agent.color }}
+          aria-hidden
+        />
+      )}
+      {compact && alert && !masked && (
+        <span
+          className="zen-tab-audio-dot zen-tab-alert-dot"
+          data-alert={alert}
+          role="img"
+          aria-label={tabAlertTooltip(alert)}
+        />
+      )}
+      {compact && !alert && !masked && (tab.audible || tab.muted) && (
+        <span
+          className="zen-tab-audio-dot"
+          data-muted={tab.muted || undefined}
+          aria-label={tab.muted ? 'Muted' : 'Playing audio'}
+        />
+      )}
+      {masked ? (
+        // The private marker in the favicon's slot (§9.19), at the stand-in's 69% (§10.4).
+        <VenetianMask className="zen-tab-favicon h-4 w-4 shrink-0 opacity-[0.69]" aria-hidden />
+      ) : tab.pinned || tab.essential ? (
+        // A pinned row's favicon sits in a seat that can wear the attention dot (tabs-11). One
+        // disc per icon (§9.29, the lead's #436 ruling 3 widened to every favicon-only seat): the
+        // compact rail draws its alert or audio disc on the icon and the attention dot yields to
+        // it; the wide row's audio is a glyph in the trailing slot, so its dot stays.
+        <FaviconSeat tab={tab} marked={compact && (Boolean(alert) || tab.audible || tab.muted)} />
+      ) : (
+        <Favicon tab={tab} />
+      )}
+      {!compact && (
+        <>
+          {/* The title's box stays while the row is renamed, blank, and the field draws over it
+              from the chrome layer (`RenameInput`): a text field inside a tab would be a
+              focusable child of a widget whose children are presentational (a11y-31, axe
+              nested-interactive), so it stands beside the row instead. */}
+          <span
+            className="zen-tab-title min-w-0 flex-1"
+            data-testid="tab-title"
+            style={renaming && !masked ? { visibility: 'hidden' } : undefined}
+          >
+            {title}
+          </span>
+          {renaming && !masked && <RenameInput tab={tab} row={row} />}
+          {trailing && agent && !renaming && <AgentBadge agent={agent} tabId={tab.id} />}
+          {trailing && foreign && active && (
+            <MonitorSmartphone
+              className={cn(V2_TRAILING_GLYPH, 'text-[var(--v2-control-text-deemphasized)]')}
+              aria-label="Shown in another window"
+            />
+          )}
+          {horizontal ? (
+            // A masked row's trailing slot is empty: no state, no × (the lock's rule above).
+            !masked && (
+              <StripTrailing tab={tab} active={active} trailing={trailing} renaming={renaming} />
+            )
+          ) : (
+            <>
+              {trailing && tab.discarded && !renaming && <SleepingButton tab={tab} />}
+              {trailing && tab.frozen && !renaming && <FrozenButton tab={tab} />}
+              {trailing && !tab.frozen && tab.cpuThrottle > 1 && !renaming && (
+                <ThrottledButton tab={tab} />
+              )}
+              {alert && !renaming && !masked && <AlertIndicator alert={alert} />}
+              {!alert && (tab.audible || tab.muted) && !renaming && !masked && (
+                <AudioButton tab={tab} />
+              )}
+              {trailing && pinnedChanged ? (
+                <ResetPinnedButton tab={tab} />
+              ) : (
+                !masked && <CloseButton tab={tab} />
+              )}
+            </>
+          )}
+        </>
+      )}
+    </div>
+  )
+}, sameProps)
+
+/**
+ * The row's props one by one; the segment by its place, since `SplitGroupRow` builds the object
+ * afresh on each of its renders.
+ */
+function sameProps(a: Props, b: Props): boolean {
+  return (
+    a.tab === b.tab &&
+    a.active === b.active &&
+    a.compact === b.compact &&
+    a.indent === b.indent &&
+    a.parent === b.parent &&
+    a.slot === b.slot &&
+    (a.segment === b.segment ||
+      (a.segment !== undefined &&
+        b.segment !== undefined &&
+        a.segment.index === b.segment.index &&
+        a.segment.count === b.segment.count))
+  )
+}
+
+/** The selector of a row's own controls, whose presses and clicks are theirs and not the row's. */
+const ROW_CONTROL = 'button, [role="button"]'
+
+/** Whether an event on the row came from one of the row's own controls (`RowControl`). */
+function onRowControl(e: {
+  target: EventTarget | null
+  currentTarget: EventTarget | null
+}): boolean {
+  const control = (e.target as HTMLElement | null)?.closest(ROW_CONTROL) ?? null
+  return (
+    control !== null &&
+    control !== e.currentTarget &&
+    e.currentTarget instanceof Node &&
+    e.currentTarget.contains(control)
+  )
+}
+
+/**
+ * A control in the row – close, mute, wake, reset, the agent badge: a button by role, named by
+ * its tooltip, that takes no focus. The `title` is the chrome tooltip's text (`data-tooltip`,
+ * lib/tooltip.ts – §9.31's one vocabulary, never the native one; the word is PillChip's), and
+ * the control's accessible name unless an `aria-label` says otherwise: its glyph is hidden from
+ * the tree. The children of a `tab` are presentational (ARIA), so a focusable element inside one
+ * is a control the keyboard cannot name (axe `nested-interactive`; a negative tabindex does not
+ * make it one it can): the row's own keys stand for these – Delete closes, Enter wakes, the
+ * context menu has the rest (§9.22) – and the pointer has the control itself. A press on it
+ * never lifts the row and its click never activates the tab.
+ */
+function RowControl({
+  onClick,
+  children,
+  title,
+  'aria-label': ariaLabel,
+  ...rest
+}: {
+  onClick: () => void
+  children: ReactNode
+  className: string
+  title: string
+  style?: CSSProperties
+  'aria-label'?: string
+  'aria-pressed'?: boolean
+  'data-muted'?: true
+}): JSX.Element {
+  return (
+    <span
+      role="button"
+      data-tooltip={title}
+      aria-label={ariaLabel ?? title}
+      {...rest}
+      onClick={(e) => {
+        e.stopPropagation()
+        onClick()
+      }}
+    >
+      {children}
+    </span>
+  )
+}
+
+/**
+ * The strip's trailing end (design language v2 §9.37): the sidebar's 24 as one slot
+ * (`.zen-tab-slot`). An inactive tab shows its one state glyph there at rest – the alert, the
+ * audio button, the sleeping moon, the governor's snowflake or turtle, in the sidebar's priority
+ * – and the × in the glyph's place while the pointer is on the tab, so nothing in the title
+ * shifts; the active tab keeps its × in the slot always and draws its state glyph in flow ahead
+ * of it (`.zen-tab-state`; the stylesheet drops it under 160, where the × alone fits). A row
+ * whose `data-slot` is `title` has no slot at rest (the stylesheet hides it until the hover).
+ * A split row's segment (`trailing` false) keeps the alert and the audio, as in the sidebar.
+ */
+function StripTrailing({
+  tab,
+  active,
+  trailing,
+  renaming
+}: {
+  tab: Tab
+  active: boolean
+  trailing: boolean
+  renaming: boolean
+}): JSX.Element | null {
+  if (renaming) return null
+  const alert = !tab.discarded ? (tab.alert ?? null) : null
+  const pinnedChanged = tab.pinned && tab.pinnedUrl !== null && tab.url !== tab.pinnedUrl
+  let glyph: JSX.Element | null = null
+  if (alert) glyph = <AlertIndicator alert={alert} />
+  else if (tab.audible || tab.muted) glyph = <AudioButton tab={tab} />
+  else if (trailing && tab.discarded) glyph = <SleepingButton tab={tab} />
+  else if (trailing && tab.frozen) glyph = <FrozenButton tab={tab} />
+  else if (trailing && tab.cpuThrottle > 1) glyph = <ThrottledButton tab={tab} />
+  return (
+    <>
+      {active && glyph && <span className="zen-tab-state">{glyph}</span>}
+      <span className="zen-tab-slot">
+        {!active && glyph}
+        {trailing && pinnedChanged ? <ResetPinnedButton tab={tab} /> : <CloseButton tab={tab} />}
+      </span>
+    </>
+  )
+}
+
+/** The row's ×; `.zen-tab-close` shows it on hover (and always on the strip's active tab). */
+function CloseButton({ tab }: { tab: Tab }): JSX.Element {
+  return (
+    <RowControl
+      className="zen-tab-close zen-toolbar-button h-6 w-6 shrink-0"
+      title={tab.pinned ? 'Close (keep pinned)' : 'Close tab'}
+      // On a touch layout (the tablet's strip) with Undo on the toast, as the overview's cards'
+      // closes (lib/closeUndo.ts, §9.23); the desktop's close as it was, its page free to ask.
+      onClick={() => closeTabFromChrome(tab.id)}
+    >
+      <X className={V2_TRAILING_GLYPH} />
+    </RowControl>
+  )
+}
+
+/** A pinned tab that has left its pinned page: the arrow that takes it back, in the ×'s place. */
+function ResetPinnedButton({ tab }: { tab: Tab }): JSX.Element {
+  return (
+    <RowControl
+      className="zen-toolbar-button h-6 w-6 shrink-0"
+      title="Reset pinned tab to its original URL"
+      onClick={() => run('tab.resetPinned', { tabId: tab.id })}
+    >
+      <RotateCcw className={V2_TRAILING_GLYPH} />
+    </RowControl>
+  )
+}
+
+/** A sleeping (discarded) page's moon; the click wakes it. */
+function SleepingButton({ tab }: { tab: Tab }): JSX.Element {
+  return (
+    <RowControl
+      className="zen-toolbar-button zen-tab-sleeping h-6 w-6 shrink-0"
+      title={tabTooltip(tab)}
+      aria-label="Sleeping – click to wake"
+      onClick={() => run('tab.activate', { tabId: tab.id })}
+    >
+      <Moon className={V2_TRAILING_GLYPH} />
+    </RowControl>
+  )
+}
+
+/** A page the resource governor froze; the click wakes it. */
+function FrozenButton({ tab }: { tab: Tab }): JSX.Element {
+  return (
+    <RowControl
+      className="zen-toolbar-button h-6 w-6 shrink-0 text-[var(--v2-control-text-deemphasized)]"
+      title="Frozen by the resource governor – click to wake"
+      onClick={() => run('tab.wake', { tabId: tab.id })}
+    >
+      <Snowflake className={V2_TRAILING_GLYPH} />
+    </RowControl>
+  )
+}
+
+/** A page the resource governor throttles; the click lifts it. */
+function ThrottledButton({ tab }: { tab: Tab }): JSX.Element {
+  return (
+    <RowControl
+      className="zen-toolbar-button h-6 w-6 shrink-0 text-[var(--v2-control-text-deemphasized)]"
+      title={`CPU throttled ×${tab.cpuThrottle} by the resource governor – click to lift`}
+      onClick={() => run('tab.wake', { tabId: tab.id })}
+    >
+      <Turtle className={V2_TRAILING_GLYPH} />
+    </RowControl>
+  )
+}
+
+/** The tab's audio state as its mute toggle (`.zen-tab-audio`). */
+function AudioButton({ tab }: { tab: Tab }): JSX.Element {
+  return (
+    <RowControl
+      className="zen-toolbar-button zen-tab-audio h-6 w-6 shrink-0"
+      data-muted={tab.muted || undefined}
+      title={tab.muted ? 'Unmute tab' : 'Mute tab'}
+      aria-pressed={tab.muted}
+      onClick={() => run('tab.toggleMute', { tabId: tab.id })}
+    >
+      {tab.muted ? (
+        <VolumeX className={V2_TRAILING_GLYPH} />
+      ) : (
+        <Volume2 className={V2_TRAILING_GLYPH} />
+      )}
+    </RowControl>
+  )
+}
+
+/** The alert kinds Chrome draws in red: a capture of the user, or of the screen. */
+const ALERT_IN_RED: ReadonlySet<TabAlert> = new Set<TabAlert>(['recording', 'capturing'])
+
+/**
+ * The tab's alert indicator (tabs-43), in the slot the audio indicator takes otherwise: Chrome's
+ * red dot for a camera or microphone in use, the sharing glyph for a screen, window or tab being
+ * shared (Chrome draws its desktop capture in the same red), and in the row's deemphasised ink
+ * the device sessions the page holds – a connected Bluetooth device, a USB device, a HID device
+ * (Chrome's gamepad glyph), a serial port (its cable) – picture-in-picture, and a VR headset
+ * presented to. Not a control – the tooltip says what it is – so it sits in the 24 px slot
+ * without the button's hover fill; the context menu keeps Mute Site.
+ */
+function AlertIndicator({ alert }: { alert: TabAlert }): JSX.Element {
+  const label = tabAlertTooltip(alert)
+  return (
+    <span
+      className={cn(
+        'zen-tab-alert flex h-6 w-6 shrink-0 items-center justify-center',
+        ALERT_IN_RED.has(alert)
+          ? 'text-[var(--v2-danger)]'
+          : 'text-[var(--v2-control-text-deemphasized)]'
+      )}
+      data-alert={alert}
+      role="img"
+      data-tooltip={label}
+      aria-label={label}
+    >
+      {alert === 'recording' && (
+        <svg className={V2_TRAILING_GLYPH} viewBox="0 0 24 24" aria-hidden focusable="false">
+          <circle cx="12" cy="12" r="7" fill="currentColor" />
+        </svg>
+      )}
+      {alert === 'capturing' && <ScreenShare className={V2_TRAILING_GLYPH} aria-hidden />}
+      {alert === 'bluetooth' && <BluetoothConnected className={V2_TRAILING_GLYPH} aria-hidden />}
+      {alert === 'usb' && <Usb className={V2_TRAILING_GLYPH} aria-hidden />}
+      {alert === 'hid' && <Gamepad2 className={V2_TRAILING_GLYPH} aria-hidden />}
+      {alert === 'serial' && <Cable className={V2_TRAILING_GLYPH} aria-hidden />}
+      {alert === 'pip' && <PictureInPicture2 className={V2_TRAILING_GLYPH} aria-hidden />}
+      {alert === 'vr' && <RectangleGoggles className={V2_TRAILING_GLYPH} aria-hidden />}
+    </span>
+  )
+}
+
+/** Marks a tab an AI agent is driving; click to take the tab back. */
+function AgentBadge({ agent, tabId }: { agent: AgentInfo; tabId: string }): JSX.Element {
+  return (
+    <RowControl
+      className="zen-toolbar-button flex h-5 shrink-0 items-center gap-1 rounded-full px-1.5 text-white"
+      style={{ background: agent.color }}
+      title={`Driven by ${agent.name} (${agent.mode} mode) — click to take this tab back`}
+      onClick={() => run('agent.releaseTab', { tabId })}
+    >
+      <Bot className="h-3 w-3" />
+    </RowControl>
+  )
+}
+
+/** The rename field's height: the row's 32 less the fill's 4 px inset each side. */
+const RENAME_FIELD_HEIGHT = 24
+
+/**
+ * How long after the field opens a loss of the document's focus may be the row's own doing. The
+ * first click of the pair that opened it activated the tab, and the core hands the keyboard to
+ * the page for a click (`tab.activate` without `keepFocus`, `win.focusContent()`); when the
+ * main process is slow that landing – the page's view taking the keyboard, `focus.page` – comes
+ * after the second click has opened the field, and would blur it shut before it was seen (the
+ * a11y-2 drive's finding: a double click 1 ms apart lost the field 2 ms after it opened). For
+ * this span the field carries {@link KEEPS_KEYBOARD_ATTR}: `pageTookKeyboard` (lib/panes.ts)
+ * leaves it the document's focused element and asks the chrome's keyboard back, which Chromium
+ * gives the field again with the frame's. A blur without a taker inside the span waits as long
+ * again for the keyboard to return before it commits; focus coming back cancels the commit.
+ * Past the span a blur is the user's, and commits at once.
+ */
+const RENAME_FOCUS_GRACE_MS = 300
+
+type RenameBox = { left: number; top: number; width: number }
+
+/** The field's box: on the title's, the row's height centred; null before the row has a layout. */
+function renameBox(row: RefObject<HTMLDivElement | null>): RenameBox | null {
+  const title = row.current?.querySelector<HTMLElement>('.zen-tab-title')
+  const rowBox = row.current?.getBoundingClientRect()
+  if (!title || !rowBox) return null
+  const titleBox = title.getBoundingClientRect()
+  return {
+    left: Math.round(titleBox.left),
+    top: Math.round(rowBox.top + (rowBox.height - RENAME_FIELD_HEIGHT) / 2),
+    width: Math.max(40, Math.round(titleBox.width))
+  }
+}
+
+const sameBox = (a: RenameBox | null, b: RenameBox | null): boolean =>
+  a === b || (!!a && !!b && a.left === b.left && a.top === b.top && a.width === b.width)
+
+/**
+ * The row's rename field (a11y-31). It draws over the row's title from the chrome layer,
+ * beside the row in the tree rather than inside it: a `tab`'s children are presentational, so a
+ * text field among them is a focusable element the keyboard cannot name (axe
+ * `nested-interactive`), and a tablist may hold nothing but tabs, so it cannot stand as the
+ * row's sibling either. The chrome layer is where every surface anchored to chrome goes
+ * (`ChromePortal`); the row's own keys stay the row's (the field's keys stop at the field), the
+ * field's press never lifts the row, and its click never activates the tab. The roving tabindex
+ * (lib/tabStrip.ts) is untouched: focus leaving the row for the field makes the active row the
+ * strip's stop, as leaving the strip does, and Enter or Escape hand focus back to the row that
+ * was renamed, which takes the stop again; a blur – the user went elsewhere – commits and
+ * leaves focus where it went (a blur to nowhere in the field's first moments, the opening
+ * pair's activation handing the keyboard to the page, excepted: `RENAME_FOCUS_GRACE_MS`).
+ */
+function RenameInput({
+  tab,
+  row
+}: {
+  tab: Tab
+  row: RefObject<HTMLDivElement | null>
+}): JSX.Element {
+  const [value, setValue] = useState(tabTitle(tab))
+  // Measured before the first commit, so the field is visible when its focus effect runs: the
+  // browser refuses focus to an element under `visibility: hidden`, and the effect of the first
+  // commit runs before a layout effect's measurement can land (the a11y-2 drive's finding).
+  const [box, setBox] = useState<RenameBox | null>(() => renameBox(row))
+  const ref = useRef<HTMLInputElement>(null)
+  const done = useRef(false)
+  const took = useRef(false)
+  // The field's first moments (`RENAME_FOCUS_GRACE_MS`): the mark is set on the element itself,
+  // not rendered, so its removal is no render of the field. `pendingCommit` is a blur to
+  // nowhere inside them, waiting for the keyboard to return.
+  const keeps = useRef(true)
+  const pendingCommit = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    const el = ref.current
+    el?.setAttribute(KEEPS_KEYBOARD_ATTR, '')
+    const grace = setTimeout(() => {
+      keeps.current = false
+      el?.removeAttribute(KEEPS_KEYBOARD_ATTR)
+    }, RENAME_FOCUS_GRACE_MS)
+    return () => {
+      clearTimeout(grace)
+      if (pendingCommit.current) clearTimeout(pendingCommit.current)
+    }
+  }, [])
+  useEffect(() => {
+    if (!box || took.current) return
+    took.current = true
+    // The field takes the keyboard: the chrome's – the opening pair's first click may have
+    // handed it to the page already – and its own.
+    run('focus.chrome', undefined)
+    ref.current?.focus()
+    ref.current?.select()
+  }, [box])
+  // The field sits on the title's box, the row's height centred; it follows the row through a
+  // scroll or a resize (rare mid-rename – a press anywhere commits – but never wrong).
+  useLayoutEffect(() => {
+    const measure = (): void => {
+      const next = renameBox(row)
+      setBox((old) => (!next || sameBox(old, next) ? old : next))
+    }
+    measure()
+    document.addEventListener('scroll', measure, { capture: true, passive: true })
+    window.addEventListener('resize', measure)
+    return () => {
+      document.removeEventListener('scroll', measure, { capture: true })
+      window.removeEventListener('resize', measure)
+    }
+  }, [row])
+  const commit = (save: boolean, byKey: boolean): void => {
+    if (done.current) return
+    done.current = true
+    uiStore.set({ renamingTabId: null })
+    if (byKey) row.current?.focus()
+    if (!save) return
+    const trimmed = value.trim()
+    run('tab.rename', { tabId: tab.id, title: trimmed && trimmed !== tab.title ? trimmed : null })
+  }
+  const onBlur = (e: React.FocusEvent<HTMLInputElement>): void => {
+    // Focus left the document – no element in it took it – in the field's first moments: the
+    // pair's first click handing the keyboard to the page, which `pageTookKeyboard` asks back.
+    // The commit waits for it; focus returning (`onFocus`) cancels the wait.
+    if (e.relatedTarget === null && keeps.current) {
+      pendingCommit.current ??= setTimeout(() => {
+        pendingCommit.current = null
+        commit(true, false)
+      }, RENAME_FOCUS_GRACE_MS)
+      return
+    }
+    commit(true, false)
+  }
+  const onFocus = (): void => {
+    if (!pendingCommit.current) return
+    clearTimeout(pendingCommit.current)
+    pendingCommit.current = null
+  }
+  const stop = (e: { stopPropagation: () => void }): void => e.stopPropagation()
+  return (
+    <ChromePortal>
+      <div
+        className="zen-tab-rename"
+        data-surface="window"
+        data-tab-rename={tab.id}
+        style={{
+          position: 'fixed',
+          left: box?.left ?? 0,
+          top: box?.top ?? 0,
+          width: box?.width ?? 0,
+          height: RENAME_FIELD_HEIGHT,
+          visibility: box ? 'visible' : 'hidden'
+        }}
+        onPointerDown={stop}
+        onPointerUp={stop}
+        onClick={stop}
+        onAuxClick={stop}
+        onContextMenu={stop}
+      >
+        <input
+          ref={ref}
+          value={value}
+          aria-label="Rename tab"
+          onChange={(e) => setValue(e.target.value)}
+          onFocus={onFocus}
+          onBlur={onBlur}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commit(true, true)
+            if (e.key === 'Escape') commit(false, true)
+            e.stopPropagation()
+          }}
+          className="zen-no-drag zen-squircle box-border h-full w-full rounded-md bg-[var(--v2-control-fill)] px-1.5 text-[length:var(--zen-sidebar-font)] text-[var(--zen-fg)] outline-none ring-1 ring-[var(--v2-control-accent)]"
+        />
+      </div>
+    </ChromePortal>
+  )
+}

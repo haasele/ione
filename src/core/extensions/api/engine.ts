@@ -1,0 +1,1274 @@
+/**
+ * The emulated engine: the part of `chrome.*` Chromium's extension system provides natively,
+ * for hosts that have none. Ione for Android runs extensions on the system WebView, so a
+ * context (content script, background page, popup, options page) starts with no `chrome` at
+ * all. `createEmulatedEngine` builds the engine half (`runtime` identity and messaging, ports,
+ * `i18n`, the members `engineSpec.ts` marks `engine`), installs the shared shim over it
+ * (`installExtensionApi` with the merged `engineApiSpec` table, exactly as the desktop installs
+ * it over Electron's bindings) and speaks the host's JSON bridge for both.
+ *
+ * Wire format (context → host), every message carries `token` and `ep` (endpoint id):
+ *  hello          { ctx, ext, url, top, world? }                  register this endpoint
+ *  call           { id, ns, method, args }                        → reply
+ *  msg            { id, target, data, userScript?, external? }    runtime/tabs.sendMessage → reply
+ *  msgReply       { id, handled, willRespond?, response?, listeners? }
+ *  connect        { portId, name, target, userScript?, external? } runtime/tabs.connect
+ *  portAccept     { portId, accept }                              answer to portConnect
+ *  portMsg        { portId, data }
+ *  portDisconnect { portId }
+ *  listen         { event, on, filterId?, filters? }             first/last unfiltered listener of an event, or one filtered listener (its UrlFilters)
+ *  ready          {}                                              extension page finished loading
+ *  popupSize      { width, height }                               popup document size changed
+ *  closePopup     {}
+ *  proxyBody      { ticket, body }                                body (base64) of a ticketed CORS-proxied fetch (Android)
+ *
+ * Host → context: reply { id, ok, result | error }, deliver { id, data, sender, userScript?, external? },
+ * event { ns, name, args, delivery? } (`delivery` addresses filtered listeners), portConnect { portId, name, sender, userScript?, external? }, portAccept
+ * { portId, accept, error? }, portMsg { portId, data }, portDisconnect { portId, error? }.
+ * `external` marks a web page's message or port (`externally_connectable`): it lands on
+ * `runtime.onMessageExternal` / `onConnectExternal`, its sender has no `id`.
+ */
+import { ENGINE_NOOPS, ENGINE_STUB_RESULTS, engineApiSpec, namespaceGranted } from './engineSpec'
+import { getMessage, normalizeSubstitutions, predefinedMessages, type LocaleMessages } from './i18n'
+import { captureIconWireEnv, compactIconDetails, type IconWireEnv } from './iconWire'
+import { redirectUrl } from './identity'
+import {
+  installExtensionApi,
+  type EventDelivery,
+  type InvokeResult,
+  type ShimDiagnostics,
+  type ShimHost
+} from './shim'
+
+/**
+ * Where a context runs. `userScript` is the `USER_SCRIPT` world of `chrome.userScripts`: it
+ * gets `runtime.sendMessage` / `connect` only, and its messages arrive at
+ * `runtime.onUserScriptMessage` / `onUserScriptConnect`. `page` is an extension document opened
+ * as a tab (an options page with `open_in_tab`, a changelog).
+ */
+export type EngineContextKind =
+  'content' | 'userScript' | 'background' | 'popup' | 'options' | 'sidePanel' | 'offscreen' | 'page'
+
+export interface EngineConfig {
+  id: string
+  /** The extension's synthetic origin (`https://<id>.ext.ione.invalid`), `runtime.getURL`'s base. */
+  origin: string
+  manifest: Record<string, unknown>
+  manifestVersion: 2 | 3
+  /** The API permissions granted: the required ones and the optional ones granted so far. */
+  permissions: string[]
+  /**
+   * The manifest's optional API permissions not granted yet. Their namespaces stay undefined
+   * until a `permissions.request` grants one, and are defined then (in this context at once, in
+   * the others on the host's `__zen.grants`), as Chrome's bindings do; `permissions.remove`
+   * deletes them again. Absent or empty: the granted set is all there is.
+   */
+  optionalPermissions?: string[]
+  messages: LocaleMessages | null
+  uiLanguage: string
+  context: EngineContextKind
+  token: string
+  endpointId: string
+  /** Frame URL the endpoint runs in. */
+  url: string
+  isTopFrame: boolean
+  /**
+   * The endpoint runs in a real isolated world (content scripts on a WebView with world
+   * injection). The host then routes `scripting.executeScript` through the world's own endpoint.
+   */
+  world?: boolean
+  /**
+   * The endpoint is a web page's connection to the extension (`externally_connectable`): its
+   * `runtime.sendMessage` / `connect` go out marked `external`, for the extension's
+   * `onMessageExternal` / `onConnectExternal` with a page sender. The bootstrap keeps this
+   * engine's `chrome` to itself and hands the page the two functions.
+   */
+  externalSender?: boolean
+  /**
+   * Chars a message envelope (`runtime.sendMessage`'s, `port.postMessage`'s, serialized) may
+   * have; a longer one is refused in the sender's realm with Chrome's error for a message over
+   * `kMaxMessageLength` (64 MB there, [MAX_MESSAGE_LENGTH] here by default). The host sets it
+   * from its heap (`ext.env`'s `messageLimit`): a message the host would refuse never crosses.
+   */
+  maxMessageLength?: number
+  /** The bound on what this endpoint posts ahead of the host's reading ([FlowLimits]); the defaults otherwise. */
+  flow?: Partial<FlowLimits>
+}
+
+/**
+ * The per-endpoint bound on messages posted and not yet read by the host. A frame's posts land
+ * on the host's Java heap as pending `onPostMessage` callbacks until its main thread takes each
+ * one; a burst of big messages (Trust Wallet's background on WebView 156, compat round 11b: a
+ * 144 K-char store snapshot to each subscriber on connect, a thousand of them in seconds) filled
+ * that heap before the host read the first, past every bound the host keeps on what it has read.
+ * The engine knows what the host has read: the channel is ordered, so the host's reply to any
+ * post proves every earlier post was taken off the heap. Every post is counted; a `msg` or
+ * `portMsg` that would take the unread chars or count over [inFlightChars] / [inFlightCount]
+ * waits at the page (serialized already, in order) until a reply says there is room – a reply
+ * the engine asks for itself (a `runtime.getContexts` of nothing, the fence) when none is due.
+ * What waits is bounded too: over [heldChars] or [heldCount] the arrival is dropped, a `msg`
+ * with the host guard's own error, a `portMsg` silently, and the extension's error console gets
+ * one line per such episode. Chars are UTF-16 units of the serialized envelope.
+ */
+export interface FlowLimits {
+  /** Chars posted and not yet read before a `msg` / `portMsg` waits; a lone post of any size always goes. */
+  inFlightChars: number
+  /** Posts not yet read before a `msg` / `portMsg` waits. */
+  inFlightCount: number
+  /** Chars waiting at the page beyond which a `msg` / `portMsg` is dropped (the first waiting post is always kept). */
+  heldChars: number
+  /** Posts waiting at the page beyond which a `msg` / `portMsg` is dropped. */
+  heldCount: number
+}
+
+/** The flow bound's counters, live on [EmulatedEngine.flow] (the debug stats and the compat sweep read them). */
+export interface FlowStats {
+  /** Posts handed to the transport, of every kind, and their chars. */
+  posted: number
+  postedChars: number
+  /** Posts the host is known to have read (fenced by a reply), and their chars. */
+  read: number
+  readChars: number
+  /** The most chars posted and unread at once. */
+  inFlightPeak: number
+  /** Posts waiting at the page right now, and their chars. */
+  held: number
+  heldChars: number
+  /** The most waiting at once. */
+  heldPeak: number
+  heldCharsPeak: number
+  /** Bounded posts that waited at all. */
+  delayed: number
+  /** Posts dropped at the ceiling, and their chars. */
+  dropped: number
+  droppedChars: number
+  /** Fences the engine posted itself. */
+  fences: number
+  /** Console lines posted (one per drop episode). */
+  warnings: number
+}
+
+export interface EngineTransport {
+  post(message: string): void
+}
+
+export interface EngineOptions {
+  /**
+   * The object whose `chrome` and `browser` the engine defines and the shim patches;
+   * `globalThis` by default. Content scripts without an isolated world hand over a private
+   * scope object, so the page never sees `chrome`.
+   */
+  root?: object
+  /**
+   * The drawing surfaces `action.setIcon`'s pixels are compacted with before they are posted
+   * (`iconWire.ts`); the realm's own, captured at creation, by default. Tests hand in theirs.
+   */
+  iconWire?: IconWireEnv
+  /**
+   * The `this` an API callback or event listener is called with. Chrome runs a frame's through
+   * Blink with an undefined receiver (`ScriptContext::SafeCallFunction`, the frame branch) and
+   * a service worker's with the worker's global (its other branch), so a strict-mode listener
+   * that reads `this` – ZeroOmega's `chrome.proxy.settings.get({}, impl._proxyChangeListener)`,
+   * an ES module's unbound method reading `this._proxyChangeWatchers` – finds the global in a
+   * worker and throws in a page. Undefined by default (the frame's); the emulated worker page
+   * hands in what its script reads as `self`.
+   */
+  receiver?: object
+  /**
+   * What `runtime.getURL` answers in place of the served URL it built, or null for the served
+   * one. A content world hands in the script recovery's `aliasFor`: once the page's policy
+   * refused a module of the extension and the page-origin alias carried it, a script file's
+   * URL is spelled as the alias, where the graph's own chunk imports load
+   * (`extensionScriptRecovery.ts`). Absent: the served URL always.
+   */
+  scriptAlias?: (url: string) => string | null
+}
+
+/**
+ * Functions captured before the page's own scripts run, so a page that patches `JSON.stringify`
+ * or `setTimeout` cannot break the bridge. Content scripts in the page's world share prototypes
+ * with the page; this is the part of the isolation the engine can still guarantee.
+ */
+export interface Primordials {
+  stringify: (value: unknown) => string
+  parse: (text: string) => unknown
+  setTimeout: (callback: () => void, ms: number) => number
+  queueMicrotask: (callback: () => void) => void
+  error: (...args: unknown[]) => void
+  /** Notices that are not failures (a member the engine deliberately does nothing for). */
+  warn: (...args: unknown[]) => void
+  /** The wall clock in ms (`Date.now`), for the ages of the posts still unanswered; the engine captures `Date.now` itself when absent. */
+  now?: () => number
+}
+
+export function capturePrimordials(): Primordials {
+  const g = globalThis as typeof globalThis & { queueMicrotask?: (cb: () => void) => void }
+  const stringify = JSON.stringify
+  const parse = JSON.parse
+  const timeout = g.setTimeout
+  const micro = g.queueMicrotask ?? ((cb: () => void) => void Promise.resolve().then(cb))
+  const error = console.error
+  const warn = console.warn
+  const now = Date.now
+  return {
+    stringify: (value) => stringify(value),
+    parse: (text) => parse(text),
+    setTimeout: (cb, ms) => timeout(cb, ms) as unknown as number,
+    queueMicrotask: (cb) => micro(cb),
+    error: (...args) => error(...args),
+    warn: (...args) => warn(...args),
+    now: () => now()
+  }
+}
+
+type Listener = (...args: unknown[]) => unknown
+
+/** A `chrome.Event` the engine owns (messaging events and port events). */
+export interface EngineEvent {
+  addListener(listener: Listener): void
+  removeListener(listener: Listener): void
+  hasListener(listener: Listener): boolean
+  hasListeners(): boolean
+  /** Calls every listener, isolating their exceptions; returns their return values. */
+  dispatch(...args: unknown[]): unknown[]
+}
+
+export interface MessageSender {
+  /** The sending extension's id; absent for a web page's message (`externally_connectable`), as in Chrome. */
+  id?: string
+  url?: string
+  origin?: string
+  tab?: Record<string, unknown>
+  frameId?: number
+  documentId?: string
+  documentLifecycle?: 'prerender' | 'active' | 'cached' | 'pending_deletion'
+}
+
+export interface EmulatedEngine {
+  /** The `chrome` object of this context (also `browser`). */
+  chrome: Record<string, unknown>
+  /** Feed a host → context message (already parsed). */
+  receive(message: Record<string, unknown>): void
+  /** Called by the bootstrap once (extension pages: after `load`). */
+  ready(): void
+  /** Send a bootstrap-level message (`popupSize`, `closePopup`); `token` and `ep` are stamped. */
+  post(message: Record<string, unknown>): void
+  /**
+   * A host call outside `chrome` (a bootstrap-level platform such as a page's Web Speech API):
+   * `{ t: 'call', ns, method, args }`, answered like the shim's, and the host's events for
+   * `ns` through [onHostEvent] once the bootstrap has asked for them with a `listen` post.
+   */
+  call(ns: string, method: string, args: unknown[]): Promise<unknown>
+  onHostEvent(listener: (namespace: string, event: string, args: unknown[]) => void): void
+  diagnostics: ShimDiagnostics | null
+  /** The flow bound's counters ([FlowStats]), updated in place. */
+  flow: FlowStats
+  /**
+   * The host-bound posts of this context still without their reply, oldest first: what each
+   * asked and how long ago it went out. The discriminator, when a page's `init` never
+   * finishes, between a runtime reply that never came and a page-side `await` of its own
+   * (RoValra's row, compat round 21): an empty list with the page still waiting is the page's.
+   */
+  unanswered(): UnansweredCall[]
+}
+
+/** One host-bound post awaiting its reply ([EmulatedEngine.unanswered]). */
+export interface UnansweredCall {
+  id: number
+  /** `ns.method` of a `chrome` call; `msg` for a message awaiting its answer; `fence` for the flow bound's fence. */
+  what: string
+  /** ms since the post went out, by the clock captured at the engine's creation. */
+  ageMs: number
+}
+
+interface PendingCall {
+  resolve: (value: unknown) => void
+  reject: (error: Error) => void
+  /** What the post asked ([UnansweredCall.what]). */
+  what: string
+  /** When it went out (the captured clock's ms). */
+  since: number
+}
+
+interface Port {
+  name: string
+  sender?: MessageSender
+  onMessage: EngineEvent
+  onDisconnect: EngineEvent
+  postMessage(message: unknown): void
+  disconnect(): void
+}
+
+interface HostMessage {
+  t: string
+  id?: number
+  ok?: boolean
+  result?: unknown
+  error?: string
+  data?: unknown
+  sender?: MessageSender
+  ns?: string
+  name?: string
+  args?: unknown[]
+  portId?: string
+  accept?: boolean
+  userScript?: boolean
+  external?: boolean
+  delivery?: unknown
+}
+
+/**
+ * The host's `{ unfiltered, matched }` for an event some listeners filtered by URL, or nothing;
+ * `url` when the host could not match this context's filters yet (the shim matches them).
+ */
+function eventDelivery(raw: unknown): EventDelivery | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const d = raw as { unfiltered?: unknown; matched?: unknown; url?: unknown }
+  const delivery: EventDelivery = {
+    unfiltered: d.unfiltered !== false,
+    matched: Array.isArray(d.matched) ? d.matched.filter((m) => typeof m === 'number') : []
+  }
+  if (typeof d.url === 'string') delivery.url = d.url
+  return delivery
+}
+
+const EXTENSION_ID = /^[a-p]{32}$/
+
+/** Chrome's `runtime.lastError` for a native messaging host that does not exist. */
+export const NATIVE_HOST_NOT_FOUND = 'Specified native messaging host not found.'
+
+/** Chrome's error for a message over its maximum (`messaging_util::kMessageTooLongError`). */
+export const MESSAGE_TOO_LONG = 'Message length exceeded maximum allowed length.'
+
+/** Chrome's `kMaxMessageLength`, 64 MB, as the default when the host names no limit. */
+export const MAX_MESSAGE_LENGTH = 64 * 1024 * 1024
+
+/**
+ * The host guard's error for a message it dropped under a flood (`ext/BridgeForward.kt`'s
+ * `MESSAGE_REFUSED`, the same text): what a `runtime.sendMessage` dropped at the page hears.
+ */
+export const MESSAGE_REFUSED =
+  'Ione dropped this message: too many messages from this frame were waiting to reach the browser.'
+
+/** The error console's line for a drop episode at the page (a fixed text: the ring folds repeats). */
+export const WARN_FLOW_DROPPED =
+  'Bridge messages were dropped at the page: too many were waiting for the browser to read them. The page sends faster than the browser can take; batch or throttle its calls.'
+
+/**
+ * [FlowLimits] by default: a megabyte of chars (two on the Java heap) and 512 posts unread per
+ * endpoint before a message waits, four times that waiting before one is dropped. The chars
+ * bound never exceeds the host's message limit, so a lone message the host takes always goes.
+ */
+export const FLOW_IN_FLIGHT_CHARS = 1024 * 1024
+export const FLOW_IN_FLIGHT_COUNT = 512
+export const FLOW_HELD_COUNT = 4096
+
+/** Reply-bearing posts remembered for the fence, at most; a burst past this forgets its oldest (a later reply still fences them). */
+const FLOW_MARKS = 8192
+
+const isExtensionId = (value: unknown): value is string =>
+  typeof value === 'string' && EXTENSION_ID.test(value)
+
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error)
+
+export function createEmulatedEngine(
+  config: EngineConfig,
+  transport: EngineTransport,
+  primordials: Primordials,
+  options: EngineOptions = {}
+): EmulatedEngine {
+  const root = (options.root ?? globalThis) as Record<string, unknown>
+  /** What callbacks and listeners are called with as `this` ([EngineOptions.receiver]). */
+  const receiver: object | undefined = options.receiver
+  let seq = 0
+  const pending = new Map<number, PendingCall>()
+  // The clock for the pending posts' ages, captured before the page's scripts can patch it.
+  const dateNow = Date.now
+  const now: () => number = primordials.now ?? ((): number => dateNow())
+  const ports = new Map<string, { port: Port; connected: boolean }>()
+  const userScript = config.context === 'userScript'
+  /** A web page's engine: its messages and ports go out marked for the external events. */
+  const external = config.externalSender === true
+
+  const rethrow = (error: unknown): void => {
+    primordials.setTimeout(() => {
+      throw error
+    }, 0)
+  }
+
+  /**
+   * [message] stamped for the host and serialized; undefined (logged) when it cannot be. The
+   * stamps go first: the host reads a big message's envelope with a scanner that walks the
+   * text's top-level members (`ext/BridgeEnvelope.kt`), and `token`, `ep` and `t` at the head
+   * are read before the payload is reached.
+   */
+  const serialize = (message: Record<string, unknown>): string | undefined => {
+    try {
+      return primordials.stringify({ token: config.token, ep: config.endpointId, ...message })
+    } catch (error) {
+      primordials.error('[Ione] extension bridge post failed', error)
+      return undefined
+    }
+  }
+
+  const deliver = (text: string): void => {
+    try {
+      transport.post(text)
+    } catch (error) {
+      primordials.error('[Ione] extension bridge post failed', error)
+    }
+  }
+
+  const maxMessageLength = config.maxMessageLength ?? MAX_MESSAGE_LENGTH
+
+  // --- the flow bound ([FlowLimits]) -------------------------------------------------------------
+
+  const inFlightChars =
+    config.flow?.inFlightChars ?? Math.min(FLOW_IN_FLIGHT_CHARS, maxMessageLength)
+  const limits: FlowLimits = {
+    inFlightChars,
+    inFlightCount: config.flow?.inFlightCount ?? FLOW_IN_FLIGHT_COUNT,
+    heldChars: config.flow?.heldChars ?? 4 * inFlightChars,
+    heldCount: config.flow?.heldCount ?? FLOW_HELD_COUNT
+  }
+  const flow: FlowStats = {
+    posted: 0,
+    postedChars: 0,
+    read: 0,
+    readChars: 0,
+    inFlightPeak: 0,
+    held: 0,
+    heldChars: 0,
+    heldPeak: 0,
+    heldCharsPeak: 0,
+    delayed: 0,
+    dropped: 0,
+    droppedChars: 0,
+    fences: 0,
+    warnings: 0
+  }
+  /** Chars and posts handed to the transport so far, and the point up to which the host is known to have read them. */
+  let postedChars = 0
+  let postedCount = 0
+  let readChars = 0
+  let readCount = 0
+  /** Reply-bearing posts in the order they went, each with the counters as they stood after it. */
+  const marks: { id: number; chars: number; count: number }[] = []
+  /** Posts waiting at the page, in order: serialized texts, with the id of a `msg` (its reply). */
+  const held: { text: string; id?: number }[] = []
+  let heldChars = 0
+  /** The fence the engine posted itself and has no reply to yet. */
+  let fenceId: number | null = null
+  /** A drop episode's console line went; reset when the wait drains. */
+  let dropWarned = false
+
+  /** The one hand-over to the transport: counts the post and, for one that gets a reply, marks it. */
+  const send = (text: string, id?: number): void => {
+    postedCount += 1
+    postedChars += text.length
+    flow.posted = postedCount
+    flow.postedChars = postedChars
+    const unread = postedChars - readChars
+    if (unread > flow.inFlightPeak) flow.inFlightPeak = unread
+    if (id !== undefined) {
+      marks.push({ id, chars: postedChars, count: postedCount })
+      if (marks.length > FLOW_MARKS) marks.splice(0, marks.length - FLOW_MARKS)
+    }
+    deliver(text)
+  }
+
+  /** Whether [chars] more may go now: nothing unread, or room under both in-flight bounds. */
+  const fits = (chars: number): boolean => {
+    const unread = postedCount - readCount
+    return (
+      unread === 0 ||
+      (postedChars - readChars + chars <= limits.inFlightChars && unread < limits.inFlightCount)
+    )
+  }
+
+  /**
+   * A reply that costs the host nothing and changes nothing (`runtime.getContexts` filtered to
+   * no context answers `[]`), posted behind what waits: its reply says everything before it was
+   * read. One outstanding at a time.
+   */
+  const fence = (): void => {
+    const id = ++seq
+    fenceId = id
+    flow.fences += 1
+    pending.set(id, {
+      resolve: () => undefined,
+      reject: () => undefined,
+      what: 'fence',
+      since: now()
+    })
+    const text = serialize({
+      t: 'call',
+      id,
+      ns: 'runtime',
+      method: 'getContexts',
+      args: [{ contextIds: [] }]
+    })
+    if (text !== undefined) send(text, id)
+  }
+
+  /** Sends what waits and fits, in order; asks for a fence while something still waits. */
+  const flush = (): void => {
+    while (held.length > 0 && fits(held[0].text.length)) {
+      const next = held.shift() as { text: string; id?: number }
+      heldChars -= next.text.length
+      send(next.text, next.id)
+    }
+    flow.held = held.length
+    flow.heldChars = heldChars
+    if (held.length > 0) {
+      if (fenceId === null) fence()
+    } else dropWarned = false
+  }
+
+  /** A post that goes past what waits (a call, a listen, a reply to the host): counted, never held. */
+  const post = (message: Record<string, unknown>): void => {
+    const text = serialize(message)
+    if (text !== undefined) send(text)
+  }
+
+  /** The drop episode's one line: the page's console and, through the host, the extension's error console. */
+  const warnOnce = (): void => {
+    if (dropWarned) return
+    dropWarned = true
+    flow.warnings += 1
+    primordials.warn(`[Ione] ${WARN_FLOW_DROPPED}`)
+    post({ t: 'console', level: 'warning', message: WARN_FLOW_DROPPED })
+  }
+
+  /**
+   * A `msg` or `portMsg`: sent when nothing waits and it fits, held at the page otherwise, in
+   * order; false when the wait is at its ceiling and the message is dropped instead.
+   */
+  const postBounded = (text: string, id?: number): boolean => {
+    if (held.length === 0 && fits(text.length)) {
+      send(text, id)
+      return true
+    }
+    if (
+      held.length > 0 &&
+      (heldChars + text.length > limits.heldChars || held.length >= limits.heldCount)
+    ) {
+      flow.dropped += 1
+      flow.droppedChars += text.length
+      warnOnce()
+      return false
+    }
+    held.push({ text, id })
+    heldChars += text.length
+    flow.delayed += 1
+    flow.held = held.length
+    flow.heldChars = heldChars
+    if (held.length > flow.heldPeak) flow.heldPeak = held.length
+    if (heldChars > flow.heldCharsPeak) flow.heldCharsPeak = heldChars
+    if (fenceId === null) fence()
+    return true
+  }
+
+  /** A post that keeps its place behind what waits (a port's disconnect after its held messages). */
+  const postBehind = (message: Record<string, unknown>): void => {
+    const text = serialize(message)
+    if (text === undefined) return
+    if (held.length === 0) send(text)
+    else {
+      held.push({ text })
+      heldChars += text.length
+      flow.held = held.length
+      flow.heldChars = heldChars
+    }
+  }
+
+  /** The host answered post [id]: everything posted up to it has been read; what waits may go. */
+  const replied = (id: number): void => {
+    const at = marks.findIndex((mark) => mark.id === id)
+    if (at >= 0) {
+      const mark = marks[at]
+      marks.splice(0, at + 1)
+      if (mark.chars > readChars) readChars = mark.chars
+      if (mark.count > readCount) readCount = mark.count
+      flow.read = readCount
+      flow.readChars = readChars
+    }
+    if (id === fenceId) fenceId = null
+    flush()
+  }
+
+  /**
+   * Serializes a messaging envelope after Chrome's `kMaxMessageLength` check, made here in the
+   * sender's realm on the serialized text: over the limit nothing is posted and the caller gets
+   * `tooLong()` thrown, as Chrome throws from `runtime.sendMessage` and `port.postMessage`. The
+   * limit is the host's, so a message its bridge would refuse on raw length (the phone's heap,
+   * not Chrome's 64 MB) stops in the realm that built it: a popup broadcasting its whole store
+   * to its pages on every change hears the error in place of a dead process.
+   */
+  const measured = (message: Record<string, unknown>, tooLong: () => Error): string | undefined => {
+    const text = serialize(message)
+    if (text === undefined) return undefined
+    if (text.length > maxMessageLength) throw tooLong()
+    return text
+  }
+
+  const call = (ns: string, method: string, args: unknown[]): Promise<unknown> =>
+    new Promise((resolve, reject) => {
+      const id = ++seq
+      pending.set(id, { resolve, reject, what: `${ns}.${method}`, since: now() })
+      const text = serialize({ t: 'call', id, ns, method, args })
+      if (text !== undefined) send(text, id)
+    })
+
+  /** The posts still awaiting their reply, oldest first ([EmulatedEngine.unanswered]). */
+  const unanswered = (): UnansweredCall[] => {
+    const at = now()
+    const list: UnansweredCall[] = []
+    for (const [id, entry] of pending)
+      list.push({ id, what: entry.what, ageMs: Math.max(0, at - entry.since) })
+    return list
+  }
+
+  /**
+   * `action.setIcon`'s `imageData` compacted for the text bridge before the call is posted:
+   * the shim hands over the `ImageData`'s bytes as they are, which `stringify` would write
+   * member by member (0.3 M chars for a 96 px icon, sixty times a second from an extension
+   * that animates its icon – the host's heap, compat round 11b). `iconWire.ts` scales them to
+   * the slot the chrome draws and writes them as base64; the host reads that form.
+   */
+  const iconWire = options.iconWire ?? captureIconWireEnv()
+  const forWire = (ns: string, method: string, args: unknown[]): unknown[] => {
+    if (ns !== 'action' || method !== 'setIcon' || args.length === 0) return args
+    return [compactIconDetails(args[0], iconWire), ...args.slice(1)]
+  }
+
+  // --- events ------------------------------------------------------------------------------------
+
+  const events = new Map<string, EngineEvent>()
+
+  function createEvent(fullName: string, notifyHost: boolean): EngineEvent {
+    const listeners: Listener[] = []
+    const event: EngineEvent = {
+      addListener: (listener) => {
+        if (typeof listener !== 'function') throw new TypeError('listener must be a function')
+        if (listeners.includes(listener)) return
+        listeners.push(listener)
+        if (listeners.length === 1 && notifyHost) post({ t: 'listen', event: fullName, on: true })
+      },
+      removeListener: (listener) => {
+        const index = listeners.indexOf(listener)
+        if (index === -1) return
+        listeners.splice(index, 1)
+        if (listeners.length === 0 && notifyHost) post({ t: 'listen', event: fullName, on: false })
+      },
+      hasListener: (listener) => listeners.includes(listener),
+      hasListeners: () => listeners.length > 0,
+      dispatch: (...args) => {
+        const results: unknown[] = []
+        for (const listener of [...listeners]) {
+          try {
+            results.push(Reflect.apply(listener, receiver, args))
+          } catch (error) {
+            results.push(undefined)
+            primordials.error(`[Ione] chrome.${fullName} listener threw`, error)
+          }
+        }
+        return results
+      }
+    }
+    // Declarative-rule members exist on every chrome.Event; keep callers that probe them happy.
+    Object.assign(event, {
+      addRules: () => undefined,
+      getRules: (...raw: unknown[]) => {
+        const cb = takeCallback(raw)
+        if (cb) Reflect.apply(cb, receiver, [[]])
+      },
+      removeRules: (...raw: unknown[]) => {
+        const cb = takeCallback(raw)
+        if (cb) Reflect.apply(cb, receiver, [])
+      }
+    })
+    events.set(fullName, event)
+    return event
+  }
+
+  // --- calling convention ------------------------------------------------------------------------
+
+  const runtime: Record<string, unknown> = {}
+
+  // runtime.lastError exists only while an error callback runs, then is deleted: the same dance
+  // the shim performs, so the two never see each other's value.
+  let lastErrorDepth = 0
+  function withLastError(message: string, fn: () => void): void {
+    const error = { message }
+    try {
+      Object.defineProperty(runtime, 'lastError', {
+        get: () => error,
+        configurable: true,
+        enumerable: true
+      })
+    } catch {
+      /* not configurable */
+    }
+    lastErrorDepth += 1
+    try {
+      fn()
+    } finally {
+      lastErrorDepth -= 1
+      if (lastErrorDepth === 0) {
+        try {
+          delete runtime.lastError
+        } catch {
+          /* not configurable */
+        }
+      }
+    }
+  }
+
+  function takeCallback(raw: unknown[]): Listener | undefined {
+    if (raw.length > 0 && typeof raw[raw.length - 1] === 'function') {
+      return raw.pop() as Listener
+    }
+    return undefined
+  }
+
+  /** Callback-or-promise: with a callback, failures surface through runtime.lastError. */
+  function settle(
+    promise: Promise<unknown>,
+    callback: Listener | undefined
+  ): Promise<unknown> | undefined {
+    if (!callback) return promise
+    promise.then(
+      (value) => {
+        try {
+          Reflect.apply(callback, receiver, value === undefined ? [] : [value])
+        } catch (error) {
+          rethrow(error)
+        }
+      },
+      (error: unknown) => {
+        withLastError(errorMessage(error), () => {
+          try {
+            Reflect.apply(callback, receiver, [])
+          } catch (thrown) {
+            rethrow(thrown)
+          }
+        })
+      }
+    )
+    return undefined
+  }
+
+  // --- messaging ---------------------------------------------------------------------------------
+
+  type MessageTarget = { extensionId?: string | null; tabId?: unknown; options?: unknown }
+
+  /**
+   * `callback`: the sender passed one, so a port every listener let close without a response is
+   * reported to it as an error, as Chrome reports it ("The message port closed before a response
+   * was received."); the promise form resolves with undefined there.
+   */
+  const sendMessage = (
+    target: MessageTarget,
+    data: unknown,
+    callback: boolean
+  ): Promise<unknown> => {
+    const id = ++seq
+    const reply = new Promise<unknown>((resolve, reject) => {
+      pending.set(id, { resolve, reject, what: 'msg', since: now() })
+    })
+    let text: string | undefined
+    try {
+      // Chrome throws the oversized-message TypeError from `sendMessage` itself, synchronously,
+      // before any promise or callback is in play.
+      text = measured(
+        {
+          t: 'msg',
+          id,
+          target,
+          data: data === undefined ? null : data,
+          ...(callback ? { callback: true } : {}),
+          ...(userScript ? { userScript: true } : {}),
+          ...(external ? { external: true } : {})
+        },
+        () => new TypeError(MESSAGE_TOO_LONG)
+      )
+    } catch (error) {
+      pending.delete(id)
+      throw error
+    }
+    if (text !== undefined && !postBounded(text, id)) {
+      // Dropped at the page's ceiling: the sender hears what it would hear from the host's guard.
+      const entry = pending.get(id)
+      pending.delete(id)
+      entry?.reject(new Error(MESSAGE_REFUSED))
+    }
+    return reply
+  }
+
+  /** `runtime.sendMessage([extensionId], message, [options], [callback])`. */
+  const parseSendMessageArgs = (
+    args: unknown[]
+  ): { extensionId: string | null; message: unknown; options: unknown; callback?: Listener } => {
+    const rest = [...args]
+    const callback = takeCallback(rest)
+    let extensionId: string | null = null
+    if (rest.length >= 2 && (isExtensionId(rest[0]) || rest[0] === null || rest[0] === undefined)) {
+      extensionId = (rest.shift() as string | null | undefined) ?? null
+    }
+    const message = rest.shift()
+    const options = rest.shift()
+    return { extensionId, message, options, callback }
+  }
+
+  /** A port; `local` ones (a native port that never reached a host) have no host side to tell. */
+  const createPort = (
+    portId: string,
+    name: string,
+    sender: MessageSender | undefined,
+    local = false
+  ): Port => {
+    const port: Port = {
+      name,
+      sender,
+      onMessage: createEvent(`Port.onMessage:${portId}`, false),
+      onDisconnect: createEvent(`Port.onDisconnect:${portId}`, false),
+      postMessage: (message: unknown) => {
+        const entry = ports.get(portId)
+        if (!entry || !entry.connected)
+          throw new Error('Attempting to use a disconnected port object')
+        if (local) return
+        const text = measured(
+          { t: 'portMsg', portId, data: message === undefined ? null : message },
+          () => new Error(MESSAGE_TOO_LONG)
+        )
+        // A port message has no reply to carry a refusal: dropped at the ceiling, it goes the
+        // way the host's guard drops one, silently, with the episode's console line.
+        if (text !== undefined) postBounded(text)
+      },
+      disconnect: () => {
+        const entry = ports.get(portId)
+        if (!entry || !entry.connected) return
+        entry.connected = false
+        ports.delete(portId)
+        events.delete(`Port.onMessage:${portId}`)
+        events.delete(`Port.onDisconnect:${portId}`)
+        if (!local) postBehind({ t: 'portDisconnect', portId })
+      }
+    }
+    ports.set(portId, { port, connected: true })
+    return port
+  }
+
+  const connect = (target: MessageTarget, connectInfo: unknown): Port => {
+    const info = (connectInfo ?? {}) as { name?: unknown }
+    const portId = `${config.endpointId}:${++seq}`
+    const port = createPort(portId, info.name === undefined ? '' : String(info.name), undefined)
+    post({
+      t: 'connect',
+      portId,
+      name: port.name,
+      target,
+      ...(userScript ? { userScript: true } : {}),
+      ...(external ? { external: true } : {})
+    })
+    return port
+  }
+
+  const closePort = (portId: string, error: string | undefined): void => {
+    const entry = ports.get(portId)
+    if (!entry) return
+    entry.connected = false
+    ports.delete(portId)
+    const fire = (): void => {
+      entry.port.onDisconnect.dispatch(entry.port)
+      events.delete(`Port.onMessage:${portId}`)
+      events.delete(`Port.onDisconnect:${portId}`)
+    }
+    if (error) withLastError(error, fire)
+    else fire()
+  }
+
+  /**
+   * `runtime.connectNative` is synchronous in Chrome: a Port at once, and when no native
+   * messaging host of that name answers, `onDisconnect` a moment later with `lastError`
+   * "Specified native messaging host not found.". The phone has no native messaging hosts, so
+   * every native port ends that way; an extension that probes for its desktop companion this way
+   * (1Password) reads the disconnect as "no desktop app" and carries on. A routed rejection in
+   * its place handed back a Promise, and `port.onMessage.addListener` threw on it.
+   */
+  const connectNative = (...args: unknown[]): Port => {
+    if (typeof args[0] !== 'string')
+      throw new TypeError(
+        'Error in invocation of runtime.connectNative(string application): No matching signature.'
+      )
+    const portId = `${config.endpointId}:native:${++seq}`
+    const port = createPort(portId, '', undefined, true)
+    primordials.setTimeout(() => closePort(portId, NATIVE_HOST_NOT_FOUND), 0)
+    return port
+  }
+
+  // --- runtime -----------------------------------------------------------------------------------
+
+  const scriptAlias = options.scriptAlias
+  const getURL = (path: unknown): string => {
+    const url = `${config.origin}/${String(path ?? '').replace(/^\/+/, '')}`
+    return scriptAlias ? (scriptAlias(url) ?? url) : url
+  }
+
+  // What every context has, a `USER_SCRIPT` world with `messaging` on included: Chrome gives
+  // user-script worlds the identity bits and messaging both ways – `sendMessage` / `connect` to
+  // the extension (its `onUserScriptMessage` / `onUserScriptConnect`) and `onMessage` /
+  // `onConnect` for what the extension sends the tab (`shared/userScriptWorld.ts` is the
+  // desktop's copy of this surface). Tampermonkey's content.js runs in that world and adds its
+  // `runtime.onMessage` listener unguarded.
+  Object.assign(runtime, {
+    id: config.id,
+    getURL,
+    getPlatformInfo: (...args: unknown[]) =>
+      settle(
+        Promise.resolve({ os: 'android', arch: 'arm64', nacl_arch: 'arm' }),
+        takeCallback(args)
+      ),
+    sendMessage: (...args: unknown[]) => {
+      const { extensionId, message, options, callback } = parseSendMessageArgs(args)
+      return settle(
+        sendMessage({ extensionId, options: options ?? null }, message, callback !== undefined),
+        callback
+      )
+    },
+    connect: (...args: unknown[]) => {
+      const rest = [...args]
+      let extensionId: string | null = null
+      if (rest.length >= 1 && (isExtensionId(rest[0]) || (rest.length === 2 && rest[0] === null))) {
+        extensionId = (rest.shift() as string | null) ?? null
+      }
+      return connect({ extensionId }, rest[0])
+    },
+    onMessage: createEvent('runtime.onMessage', true),
+    onConnect: createEvent('runtime.onConnect', true)
+  })
+
+  if (!userScript) {
+    Object.assign(runtime, {
+      // Chrome defines it only with the `nativeMessaging` permission.
+      ...(config.permissions.includes('nativeMessaging') ? { connectNative } : {}),
+      getManifest: () => config.manifest,
+      onMessageExternal: createEvent('runtime.onMessageExternal', true),
+      onConnectExternal: createEvent('runtime.onConnectExternal', true),
+      onUserScriptMessage: createEvent('runtime.onUserScriptMessage', true),
+      onUserScriptConnect: createEvent('runtime.onUserScriptConnect', true)
+    })
+  }
+
+  const chrome: Record<string, unknown> = { runtime }
+  // The world's `chrome.extension` is the incognito flag alone (the shim's default for a content
+  // script, which has no private-tab notion here either).
+  if (userScript) chrome.extension = { inIncognitoContext: false }
+
+  // --- engine members the table marks `engine` -------------------------------------------------
+
+  const granted = (ns: string): boolean =>
+    namespaceGranted(ns, config.permissions, config.manifestVersion)
+  const contentScript = config.context === 'content'
+
+  if (!userScript) {
+    // The predefined messages answer as in Chrome: `@@extension_id` (the id, what a script
+    // builds its resource URLs from), `@@ui_locale`, the `@@bidi_*` four.
+    const predefined = predefinedMessages(config.uiLanguage, config.id)
+    chrome.i18n = {
+      getMessage: (name: unknown, substitutions?: unknown) =>
+        predefined[String(name).toLowerCase()] ??
+        getMessage(config.messages, String(name), normalizeSubstitutions(substitutions)),
+      getUILanguage: () => config.uiLanguage,
+      getAcceptLanguages: (...args: unknown[]) =>
+        settle(Promise.resolve([config.uiLanguage]), takeCallback(args))
+    }
+    chrome.dom = {
+      openOrClosedShadowRoot: (element: unknown) =>
+        element && typeof element === 'object'
+          ? ((element as { shadowRoot?: unknown }).shadowRoot ?? null)
+          : null
+    }
+  }
+
+  if (!userScript && !contentScript) {
+    chrome.tabs = {
+      sendMessage: (...args: unknown[]) => {
+        const rest = [...args]
+        const tabId = rest.shift()
+        const callback = takeCallback(rest)
+        const [message, options] = rest
+        return settle(
+          sendMessage({ tabId, options: options ?? null }, message, callback !== undefined),
+          callback
+        )
+      },
+      connect: (tabId: unknown, connectInfo?: unknown) => connect({ tabId }, connectInfo)
+    }
+    if (granted('scripting')) {
+      chrome.scripting = {
+        // `func` cannot cross the JSON transport: send its source, the host wraps it with `args`.
+        executeScript: (...args: unknown[]) => {
+          const callback = takeCallback(args)
+          const injection = { ...((args[0] ?? {}) as Record<string, unknown>) }
+          const fn = injection.func ?? injection.function
+          if (typeof fn === 'function') {
+            injection.funcSource = (fn as () => void).toString()
+            delete injection.func
+            delete injection.function
+          }
+          return settle(call('scripting', 'executeScript', [injection]), callback)
+        }
+      }
+    }
+    // contextMenus is the shim's: `create` answers its id synchronously and the wire carries
+    // `[properties, id]` (functions such as `onclick` stay on this side).
+    if (granted('idle')) chrome.idle = { setDetectionInterval: () => undefined }
+    // Chrome's redirect host (`https://<id>.chromiumapp.org/`), which OAuth providers have
+    // registered; the emulated origin only serves the extension's files. The host ends
+    // `launchWebAuthFlow` on the way back there.
+    if (granted('identity'))
+      chrome.identity = { getRedirectURL: (path?: unknown) => redirectUrl(config.id, path) }
+    // `chrome.privacy`'s ChromeSettings are the shim's, routed to the host (`spec.ts` `settings`;
+    // the phone's `extensionPrivacy.ts` answers them), since compat round 20.
+    // `system.display`, `system.storage`, `system.cpu` and `system.memory` are the table's, for
+    // the extensions that declared them (`engineSpec.ts`); the host answers each. The holder
+    // `chrome.system` is the table's too, made once one of those permissions is held, as Chrome
+    // defines it (Coinbase Wallet's worker feature-detects `chrome.system?.cpu?.getInfo` before
+    // it reads the CPU load; run 35787391495 had every extension's holder carry a rejecting `cpu`).
+  }
+
+  // --- the shim over the engine ------------------------------------------------------------------
+
+  const hostEventListeners: Array<
+    (namespace: string, event: string, args: unknown[], delivery?: EventDelivery) => void
+  > = []
+  const warned = new Set<string>()
+
+  const shimHost: ShimHost = {
+    kind: 'frame',
+    invoke: (ns, method, args): Promise<InvokeResult> => {
+      const key = `${ns}.${method}`
+      if (ENGINE_NOOPS.has(key)) {
+        if (!warned.has(key)) {
+          warned.add(key)
+          primordials.warn(`[Ione] chrome.${key} is a no-op on Ione for Android`)
+        }
+        return Promise.resolve({ ok: true, value: undefined })
+      }
+      if (Object.prototype.hasOwnProperty.call(ENGINE_STUB_RESULTS, key)) {
+        const stub = ENGINE_STUB_RESULTS[key]
+        return Promise.resolve({ ok: true, value: primordials.parse(primordials.stringify(stub)) })
+      }
+      return call(ns, method, forWire(ns, method, args)).then(
+        (value) => ({ ok: true, value }) as InvokeResult,
+        (error: unknown) => ({ ok: false, error: errorMessage(error) }) as InvokeResult
+      )
+    },
+    notify: (kind, payload) => {
+      // `hello` went out from the engine before the shim ran; storage areas are host-backed, so
+      // `storage-changed` never happens here. Listener bookkeeping is what the host wants.
+      if (kind !== 'listen' && kind !== 'unlisten') return
+      const p = (payload ?? {}) as { event?: unknown; filterId?: unknown; filters?: unknown }
+      if (typeof p.event !== 'string') return
+      const message: Record<string, unknown> = {
+        t: 'listen',
+        event: p.event,
+        on: kind === 'listen'
+      }
+      if (typeof p.filterId === 'number') {
+        message.filterId = p.filterId
+        if (kind === 'listen') message.filters = Array.isArray(p.filters) ? p.filters : []
+      }
+      post(message)
+    },
+    onEvent: (listener) => {
+      hostEventListeners.push(listener)
+    }
+  }
+
+  Object.defineProperty(root, 'chrome', { value: chrome, writable: true, configurable: true })
+  let diagnostics: ShimDiagnostics | null = null
+  if (!userScript) {
+    // The table carries every declared permission's namespace, the optional ones among them;
+    // the shim defines those whose permission is granted and follows the grants from there
+    // (`ShimOptions.granted`), so `permissions.request` defines a namespace and `remove` deletes
+    // it, as in Chrome. Without optional permissions the granted set is the declared set.
+    const optional = (config.optionalPermissions ?? []).filter(
+      (p) => !config.permissions.includes(p)
+    )
+    diagnostics = installExtensionApi(
+      shimHost,
+      engineApiSpec({
+        permissions:
+          optional.length > 0 ? [...config.permissions, ...optional] : config.permissions,
+        manifestVersion: config.manifestVersion,
+        context: contentScript ? 'content' : 'page'
+      }),
+      {
+        root,
+        ...(optional.length > 0 ? { granted: config.permissions } : {}),
+        ...(receiver ? { receiver } : {})
+      }
+    )
+    // The shim always builds `storage`; Chrome only exposes it with the permission.
+    if (!granted('storage')) delete chrome.storage
+  } else {
+    Object.defineProperty(root, 'browser', { value: chrome, writable: true, configurable: true })
+  }
+
+  // --- host → context ----------------------------------------------------------------------------
+
+  const deliverMessage = (
+    id: number,
+    data: unknown,
+    sender: MessageSender,
+    viaUserScript: boolean,
+    viaWebPage: boolean
+  ): void => {
+    // A web page's message (`externally_connectable`) lands on `onMessageExternal` alone, a
+    // user script's on `onUserScriptMessage`, as in Chrome; the plain event hears neither.
+    const event = events.get(
+      viaWebPage
+        ? 'runtime.onMessageExternal'
+        : viaUserScript
+          ? 'runtime.onUserScriptMessage'
+          : 'runtime.onMessage'
+    )
+    if (!event || !event.hasListeners()) {
+      post({ t: 'msgReply', id, handled: false, listeners: false })
+      return
+    }
+    let responded = false
+    let response: unknown
+    let asyncResponse = false
+    const sendResponse = (value?: unknown): void => {
+      if (responded) return
+      responded = true
+      response = value === undefined ? null : value
+      if (asyncResponse) post({ t: 'msgReply', id, handled: true, response })
+    }
+    const results = event.dispatch(data, sender, sendResponse)
+    if (responded) {
+      post({ t: 'msgReply', id, handled: true, response })
+      return
+    }
+    // `return true` keeps the channel open; a returned promise answers with its value.
+    const thenable = results.find(
+      (r): r is PromiseLike<unknown> =>
+        Boolean(r) && typeof (r as PromiseLike<unknown>).then === 'function'
+    )
+    if (results.some((r) => r === true) || thenable) {
+      asyncResponse = true
+      post({ t: 'msgReply', id, handled: true, willRespond: true })
+      if (thenable)
+        thenable.then(
+          (value) => sendResponse(value),
+          (error: unknown) => {
+            primordials.error('[Ione] runtime.onMessage listener rejected', error)
+            sendResponse(undefined)
+          }
+        )
+    } else {
+      post({ t: 'msgReply', id, handled: false, listeners: true })
+    }
+  }
+
+  const receive = (raw: Record<string, unknown>): void => {
+    const message = raw as unknown as HostMessage
+    switch (message.t) {
+      case 'reply': {
+        const id = Number(message.id)
+        // Whatever the answer, the post it answers was read, and every post before it.
+        replied(id)
+        const entry = pending.get(id)
+        if (!entry) return
+        pending.delete(id)
+        if (message.ok) entry.resolve(message.result)
+        else entry.reject(new Error(message.error ?? 'Unknown error'))
+        return
+      }
+      case 'deliver':
+        deliverMessage(
+          Number(message.id),
+          message.data,
+          message.sender ?? { id: config.id },
+          message.userScript === true,
+          message.external === true
+        )
+        return
+      case 'event': {
+        const ns = String(message.ns)
+        const name = String(message.name)
+        const args = Array.isArray(message.args) ? message.args : []
+        const delivery = eventDelivery(message.delivery)
+        for (const listener of hostEventListeners) listener(ns, name, args, delivery)
+        if (ns === 'storage' && name === 'onChanged') {
+          // `storage.<area>.onChanged(changes)` mirrors the area-level event.
+          const [changes, area] = args
+          for (const listener of hostEventListeners)
+            listener('storage', `${String(area)}.onChanged`, [changes])
+        }
+        return
+      }
+      case 'portConnect': {
+        const portId = String(message.portId)
+        const event = events.get(
+          message.external
+            ? 'runtime.onConnectExternal'
+            : message.userScript
+              ? 'runtime.onUserScriptConnect'
+              : 'runtime.onConnect'
+        )
+        if (!event || !event.hasListeners()) {
+          post({ t: 'portAccept', portId, accept: false })
+          return
+        }
+        const port = createPort(portId, String(message.name ?? ''), message.sender)
+        post({ t: 'portAccept', portId, accept: true })
+        event.dispatch(port)
+        return
+      }
+      case 'portAccept':
+        if (message.accept) return
+        closePort(
+          String(message.portId),
+          message.error ?? 'Could not establish connection. Receiving end does not exist.'
+        )
+        return
+      case 'portMsg': {
+        const entry = ports.get(String(message.portId))
+        if (entry && entry.connected) entry.port.onMessage.dispatch(message.data, entry.port)
+        return
+      }
+      case 'portDisconnect':
+        closePort(String(message.portId), message.error)
+        return
+    }
+  }
+
+  post({
+    t: 'hello',
+    ctx: config.context,
+    ext: config.id,
+    url: config.url,
+    top: config.isTopFrame,
+    ...(config.world ? { world: true } : {})
+  })
+
+  return {
+    chrome,
+    receive,
+    ready: () => post({ t: 'ready' }),
+    post,
+    call,
+    onHostEvent: (listener) => {
+      hostEventListeners.push(listener)
+    },
+    diagnostics,
+    flow,
+    unanswered
+  }
+}
