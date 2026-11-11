@@ -30,7 +30,7 @@ interface Props {
 export function HorizontalChrome({ state, tab, showBar, floating, trailing }: Props): JSX.Element {
   return (
     <header
-      className={cn('zen-animate-fade flex shrink-0 flex-col gap-1', floating && 'zen-panel')}
+      className={cn('zen-animate-fade flex shrink-0 flex-col gap-1 pb-2', floating && 'zen-panel')}
       data-surface="window"
       data-horizontal-chrome
       data-testid="horizontal-chrome"

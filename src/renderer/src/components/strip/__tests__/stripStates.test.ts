@@ -55,7 +55,7 @@ describe('the active tab (§9.37: the separated pill, never merged into the tool
     expect(root).not.toMatch(/\b(bg-|border|shadow)/)
     const header = chromeSource.match(/<header[\s\S]*?>/)?.[0] ?? ''
     expect(header).toContain(
-      "cn('zen-animate-fade flex shrink-0 flex-col gap-1', floating && 'zen-panel')"
+      "cn('zen-animate-fade flex shrink-0 flex-col gap-1 pb-2', floating && 'zen-panel')"
     )
     expect(header).not.toMatch(/\b(bg-|border|shadow)/)
   })

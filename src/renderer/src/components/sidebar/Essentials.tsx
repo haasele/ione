@@ -1,9 +1,11 @@
-import type { JSX } from 'react'
+import type { CSSProperties, JSX } from 'react'
 import type { Tab } from '@shared/types'
 import { run } from '@renderer/lib/api'
 import { closeTabFromChrome } from '@renderer/lib/closeUndo'
 import { contextMenuAnchor } from '@renderer/lib/menuKeys'
 import { dropStore, startTabDrag } from '@renderer/lib/drag'
+import { useFaviconSrc } from '@renderer/lib/favicons'
+import { useFaviconGradient } from '@renderer/lib/faviconColors'
 import { activeTab, tabTitle, tabTooltip } from '@renderer/lib/selectors'
 import { stripFocusIn, stripFocusOut, stripKeyDown, useStripTabIndex } from '@renderer/lib/tabStrip'
 import {
@@ -90,6 +92,10 @@ function EssentialTile({
 }): JSX.Element {
   const selected = uiStore.use((s) => s.selectedTabIds.includes(tab.id))
   const tabIndex = useStripTabIndex(`tile:${tab.id}`, active)
+  // Zen's coloured posters: the tile's gradient comes from the page's favicon, and the icon
+  // itself draws over it. A page with no readable icon keeps the neutral window fill.
+  const favicon = useFaviconSrc(tab.favicon)
+  const tint = useFaviconGradient(favicon)
   // The tile's audio disc at its corner while the tab plays; the seat's attention dot yields to
   // it (one disc per icon, §9.29) and comes back when the sound stops or is muted.
   const playing = tab.audible && !tab.muted
@@ -107,6 +113,12 @@ function EssentialTile({
       tabIndex={tabIndex}
       data-frozen={tab.frozen}
       data-lifted={lifted || undefined}
+      data-tinted={tint ? true : undefined}
+      style={
+        tint
+          ? ({ '--zen-essential-gradient': tint.gradient } as CSSProperties)
+          : undefined
+      }
       data-drop-into={dropKey === `tab:${tab.id}:into` || undefined}
       data-tooltip={tabTooltip(tab)}
       onFocus={stripFocusIn}

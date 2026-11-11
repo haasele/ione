@@ -112,6 +112,9 @@ export async function faviconResponse(url: string, favicon: FaviconResponder): P
     headers: {
       'content-type': icon.mime,
       'content-length': String(icon.bytes.length),
+      // The chrome samples the colours for Zen's Essentials posters (`faviconColors.ts`); an
+      // `<img>` needs no CORS, a canvas does.
+      'access-control-allow-origin': '*',
       'cache-control': 'public, max-age=31536000, immutable'
     }
   })

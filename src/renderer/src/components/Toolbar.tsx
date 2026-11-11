@@ -38,7 +38,7 @@ export function Toolbar({
     // Floating, it is a panel; the slide that brings it out is its host's (`CompactToolbar`).
     // A `header` outside the sidebar and the page box: the window's banner landmark (a11y-02).
     <header
-      className={cn('zen-animate-fade', floating && 'zen-panel')}
+      className={cn('zen-animate-fade pb-2', floating && 'zen-panel')}
       data-surface="window"
       data-testid="toolbar"
     >
