@@ -30,6 +30,22 @@ function state(io: StoreIO): BrowserState {
 
 const tick = (): Promise<void> => new Promise((r) => setImmediate(r))
 
+describe('the Ione layout migration', () => {
+  const loaded = (version: number, toolbarLayout: string): BrowserState =>
+    state(
+      fakeIo(
+        JSON.stringify({ version, settings: { toolbarLayout }, tabs: [], spaces: [], window: null })
+      )
+    )
+
+  it('moves the old Only sidebar default to the centered titlebar once', () => {
+    expect(loaded(6, 'single').settings.toolbarLayout).toBe('multiple')
+    // A profile written after the migration keeps a deliberate Only sidebar choice.
+    expect(loaded(7, 'single').settings.toolbarLayout).toBe('single')
+    expect(loaded(6, 'horizontal').settings.toolbarLayout).toBe('horizontal')
+  })
+})
+
 describe('BrowserState commits', () => {
   it('persists a commit even when a volatile commit was scheduled first in the same tick', async () => {
     const io = fakeIo()
@@ -396,7 +412,7 @@ describe('state.json v5 (new tab page)', () => {
     await s.flush()
     const written = JSON.parse(io.writes.at(-1) ?? '{}') as Persisted
     expect(written.version).toBe(PERSISTED_VERSION)
-    expect(written.version).toBe(6)
+    expect(written.version).toBe(PERSISTED_VERSION)
     expect(written.newTabDevice).toEqual({
       shortcuts: [{ id: 'sc_1', title: 'Zen', url: 'https://zen-browser.app/' }],
       hiddenHosts: ['news.example'],
@@ -609,7 +625,7 @@ describe('state.json v5 (new tab page)', () => {
     await s.flush()
     const first = io.writes.at(-1) ?? '{}'
     const keys = newTabKeys(first)
-    expect(keys.version).toBe(6)
+    expect(keys.version).toBe(PERSISTED_VERSION)
     expect(keys.newTabPhone).toBeUndefined()
     expect(keys.newTabShortcuts).toBeUndefined()
     expect(keys.newTabHiddenHosts).toBeUndefined()
@@ -704,7 +720,7 @@ describe('state.json v6 (Expand on hover on by default)', () => {
     s.commit()
     await s.flush()
     const written = JSON.parse(io.writes.at(-1) ?? '{}') as Persisted
-    expect(written.version).toBe(6)
+    expect(written.version).toBe(PERSISTED_VERSION)
     expect(written.settings.sidebarExpandOnHover).toBe(false)
     const again = state(fakeIo(io.writes.at(-1) ?? '{}'))
     expect(again.settings.sidebarExpandOnHover).toBe(false)

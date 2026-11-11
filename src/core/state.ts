@@ -232,7 +232,7 @@ export interface PersistedWindow {
  * rail's Expand on hover on by default (a stored value is a choice from v6 on).
  */
 export interface Persisted {
-  version: 1 | 2 | 3 | 4 | 5 | 6
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7
   spaces: Space[]
   tabs: Tab[]
   essentialTabIds: string[]
@@ -322,7 +322,7 @@ export interface Persisted {
  * profile from before v6 holds the old default (`false`) whether or not the user ever saw the
  * row, and `applyPersisted` reads that write-back as no choice; from v6 on a stored value is one.
  */
-export const PERSISTED_VERSION = 6
+export const PERSISTED_VERSION = 7
 
 export type StateListener = () => void
 
@@ -765,7 +765,7 @@ export class BrowserState {
   /** Load the profile from disk (or create the first-run defaults). */
   load(): void {
     const data = this.store.readSync()
-    if (data && [1, 2, 3, 4, 5, 6].includes(data.version)) {
+    if (data && [1, 2, 3, 4, 5, 6, 7].includes(data.version)) {
       this.applyPersisted(data)
       // Profiles from before the marker count as clean; only an explicit false is a crash.
       this.uncleanExit = data.cleanExit === false
@@ -784,6 +784,9 @@ export class BrowserState {
       Object.assign(this.settings, freshPerformanceDefaults(this.platform))
     }
     this.ensureValid()
+    // A profile read from an older schema is written back at the current version, so a one-time
+    // migration (the Ione titlebar default) is not replayed on the next start.
+    if (data && data.version < PERSISTED_VERSION) this.commit()
     // The blobs' folder hears which ids the session refers to; the documents of the others go at
     // the store's first fire (nothing is read here).
     this.navigationState.load(
@@ -917,6 +920,10 @@ export class BrowserState {
       data.settings?.toolbarLayout,
       DEFAULT_SETTINGS.toolbarLayout
     )
+    // Ione's first release moves the old "Only sidebar" default to the centered titlebar.
+    // Version 7 remembers that: a user who deliberately picks Only sidebar from now keeps it.
+    if (data.version < 7 && this.settings.toolbarLayout === 'single')
+      this.settings.toolbarLayout = 'multiple'
     // Window transparency (Appearance): a profile from before the row, or a value that is none
     // of the three (a hand-edited profile), reads off – the opaque frame every build had.
     const transparency: unknown = data.settings?.windowTransparency
