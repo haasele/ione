@@ -1,0 +1,25 @@
+import './assets/main.css'
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { PopupSurface } from './components/surface/PopupSurface'
+import { ErrorBoundary, Root } from './Root'
+import { chromeSurface } from './lib/formFactor'
+import { startFaviconSync } from './lib/favicons'
+import './lib/lastInput'
+import { startBrowserSync } from './lib/ui'
+import { startEngineRelay } from './translate/engine'
+
+startBrowserSync()
+startFaviconSync()
+
+// The same document serves the window's chrome and, with `?surface=popup`, the popup surface the
+// desktop host floats over the page (`ElectronWindow.setPopupSurface`: the autofill picker, the
+// selection's mini menu).
+const surface = chromeSurface()
+if (surface !== 'popup') startEngineRelay()
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <ErrorBoundary>{surface === 'popup' ? <PopupSurface /> : <Root />}</ErrorBoundary>
+  </StrictMode>
+)

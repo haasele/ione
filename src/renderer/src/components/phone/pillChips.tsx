@@ -1,0 +1,698 @@
+/* eslint-disable react-refresh/only-export-components -- the pill's chip kit: the run that draws the chips ships with the chip models it draws and the rows the site-information sheet lists */
+import type { JSX, ReactNode } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
+import { AudioLines, BellOff, BookOpenText, Languages, Shield, ShieldOff } from 'lucide-react'
+import { siteOriginOf } from '@shared/blocking'
+import { internalPageOf } from '@shared/internalPages'
+import { securityIndicator, type IndicatorState } from '@shared/siteInfo'
+import type { TranslateTabState } from '@shared/translate'
+import type { Tab, UIState } from '@shared/types'
+import { isWebPageUrl } from '@shared/url'
+import { run } from '@renderer/lib/api'
+import {
+  TRACKER_REPORT_TITLE,
+  chipCount,
+  requests,
+  siteBlockingState
+} from '@renderer/lib/blockingUi'
+import { extensionPageChrome } from '@renderer/lib/extensions/pages'
+import { mediaSession } from '@renderer/lib/media'
+import { MOTION_STATE_MS } from '@renderer/lib/motion/tokens'
+import { openSettings } from '@renderer/lib/pages'
+import { PRIVATE_TAB_PLACEHOLDER, mediaMasked } from '@renderer/lib/privateLock'
+import {
+  foldPillChips,
+  liveArrival,
+  pillChipFold,
+  type PillChipFold,
+  type PillFold
+} from '@renderer/lib/pillChips'
+import { readerArticleTab } from '@renderer/lib/readerEntry'
+import {
+  crossReaderView,
+  isReaderUrl,
+  readerCrossingOf,
+  readerCrossingStore
+} from '@renderer/lib/readerTransition'
+import { openQuietPrompt, quietPermissionPrompt } from '@renderer/lib/security'
+import { securityToneClass, securityVerdict } from '@renderer/lib/securityVerdict'
+import { closeSiteInfo, dismissSiteInfo } from '@renderer/lib/siteInfo'
+import { barStateOf, isTranslating, pairLabel, translateStateOf } from '@renderer/lib/translate'
+import { openMediaSheet, overlayAvailable, uiStore } from '@renderer/lib/ui'
+import { cn } from '@renderer/lib/utils'
+import { PillChip } from '../urlbar/PillChip'
+
+/*
+ * The phone pill's trailing chips as data (OMN-02; v2 §9.29 as amended on Bennett's ruling, see
+ * `lib/pillChips.ts`): what each one is, what it says, what it does, how it draws – built once
+ * from the browser state, then drawn by the pill (the lock, or the live state chip in its
+ * slot), by the ghost that cross-fades a change, and listed by the site-information sheet (the
+ * shield with its count, the translate offer, a state waiting behind a newer one) as rows with
+ * the same names, states and actions the chips had (#115's shield, #106's translate offer,
+ * #233's media chip re-hosted, not rewritten: their words and their commands are the services'
+ * helpers), so nothing is lost, only moved.
+ */
+
+/**
+ * The chips the phone pill knows after the address, in the pill's order. The first four are the
+ * one site-information glyph in its states (`securityVerdict`, ERR-09): the lock on a secure
+ * page, the open lock on a plain http page, the triangle over a certificate that failed, the
+ * shield on a Safe Browsing verdict – one id per state, so a navigation that changes the
+ * verdict cross-fades the slot (§11.4) as the lock and the media chip do. `save-prompt` is
+ * §9.29's other state chip – a save-password or save-address key – for when the phone grows one
+ * (the desktop has `AutofillChip`); the slot rule already holds for it. `reader` is §9.29's
+ * reader chip: the sheet's Reader View row on an article page (PUI-14) and the slot's one offer
+ * there (CT-37), and on `zen://reader` the lit exit in the same slot.
+ */
+export type PillChipId =
+  | 'lock'
+  | 'not-secure'
+  | 'certificate-error'
+  | 'dangerous'
+  | 'blocked'
+  | 'translate'
+  | 'reader'
+  | 'media'
+  | 'save-prompt'
+  | 'notifications-blocked'
+
+/** The quiet notification ask's name, on the bell and its sheet row (Chrome's words; a harness contract). */
+export const NOTIFICATIONS_BLOCKED_LABEL = 'Notifications blocked'
+
+/**
+ * The Reader View row's name in the site-information sheet – the app menu's row's word for the
+ * same door (`core/menus.ts`; a harness contract) – and the state TalkBack hears of it at the
+ * address, the way it hears "Translation offered" of the translate row.
+ */
+export const READER_ROW_LABEL = 'Reader View'
+export const READER_ROW_SPOKEN = 'Reader View available'
+/** The reader chip's description (its tooltip on a mouse or keyboard, §9.31): the desktop chip's words (`SidebarTop`). */
+export const READER_CHIP_HINT = 'Enter Reader View'
+/** The lit exit's words on `zen://reader` (§9.29's checked exit; the desktop chip's other title). */
+export const READER_EXIT_HINT = 'Exit Reader View'
+/** What the address speaks of the lit exit while a live state holds its slot: the page's state, not an offer. */
+export const READER_ON_SPOKEN = 'Reader View on'
+/** The sheet row's value on `zen://reader`: the state the exit row reports, as the translate row reports its languages. */
+export const READER_ON_VALUE = 'On'
+
+/** The glyph slot's chip id for a connection state that has a verdict to draw. */
+const VERDICT_CHIP_IDS = {
+  secure: 'lock',
+  insecure: 'not-secure',
+  'certificate-error': 'certificate-error',
+  dangerous: 'dangerous'
+} as const satisfies Partial<Record<IndicatorState, PillChipId>>
+
+/** How long a chip's arrival or departure cross-fades, on opacity (v2 §11.4; the same under reduced motion). */
+export const CHIP_FOLD_FADE_MS = MOTION_STATE_MS
+
+/** A chip's row in the site-information sheet: the same name, state and action. */
+export interface PillChipRow {
+  glyph: ReactNode
+  label: string
+  value?: string
+  /** What the row does, sheet included: it leaves the sheet when what it opens replaces it. */
+  activate: () => void
+  /**
+   * The row is a §10.4 detail row: in the sheet it opens this level one down instead of acting
+   * (the shield's row opens the tracker report, PS-33); `activate` is the door where the sheet
+   * has no levels to open.
+   */
+  level?: 'trackers'
+}
+
+export interface PillChipModel {
+  id: PillChipId
+  fold: PillChipFold
+  /** The state TalkBack hears at the address for a chip in the sheet; '' for nothing to report. */
+  spoken: string
+  /** Draw the chip in the pill: a real button, or an inert span for the ghost and the carried pill. A sheet chip has none. */
+  render?: (interactive: boolean) => ReactNode
+  /** Its row in the sheet. The glyph has none; a state chip has both, for when it waits behind a newer state. */
+  row?: PillChipRow
+}
+
+/** What the pill's chips need to know of the chrome around them. */
+export interface PillChipContext {
+  siteInfoOpen: boolean
+  mediaSheetOpen: boolean
+  /** The quiet notification prompt's sheet is up, opened from the bell (NOT-03). */
+  quietPromptOpen?: boolean
+  /** The tab on screen, for a row that opens something over its picture. */
+  activeTabId: string | null
+  /**
+   * The tab is a private tab under the lock (INC-05): nothing of the page's identity is drawn or
+   * spoken – no lock, no shield, no translate offer – until the screen lock is passed. A live
+   * state (Now playing) is not identity and stays, as Chrome's media notification does.
+   */
+  locked?: boolean
+  /**
+   * The §9.33 "Show Reader View?" strip (PUI-14's auto-offer) stands under the pill for this
+   * tab: the reader chip waits in the sheet while the strip asks the same question, and takes
+   * the slot when the strip leaves by any end (CT-37's coexistence; the design gate rules on it).
+   */
+  readerOfferUp?: boolean
+}
+
+/** A §9.3 44 × 44 box laid over the pill's 28 pitch (#237): the negative margins carry the difference. */
+const CHIP_CLASS = '-mx-3 flex h-11 w-11 shrink-0 items-center justify-center rounded-full'
+
+function translateSpoken(translation: TranslateTabState): string {
+  switch (translation.status) {
+    case 'offered':
+      return 'Translation offered'
+    case 'downloading':
+    case 'translating':
+      return 'Translating'
+    case 'translated':
+      return 'Translated'
+    case 'error':
+      return 'Translation failed'
+    default:
+      return ''
+  }
+}
+
+/** The translate row's value: the pair on offer in the bar's words, else where the translation is. */
+function translateValue(translation: TranslateTabState): string | undefined {
+  switch (translation.status) {
+    case 'offered':
+      return pairLabel(translation.source, translation.target) || undefined
+    case 'downloading':
+    case 'translating':
+      return 'Translating…'
+    case 'translated':
+      return 'Translated'
+    case 'error':
+      return 'Failed'
+    default:
+      return undefined
+  }
+}
+
+/**
+ * Reader View for `tabId` from the pill's chip or the sheet's row (PUI-14, CT-37): the crossing
+ * where it runs (`crossReaderView`, MOT-36), begun on the picture the sheet holds of the page
+ * when the sheet is up – so the page is never let back between the sheet's going and the
+ * surface's coming (the menu row's way, `lib/ui.ts` `pickMenuItem`) – and on the crossing's own
+ * picture from the pill, where no sheet stands; the sheet, if up, leaves with its spring. On
+ * `zen://reader` the same crossing is the exit: the core's toggle uncovers the page (the lit
+ * chip's tap, the sheet's row, the app menu's row and Back are that one door). A second tap
+ * while the tab's crossing runs – the chip under a finger as the offer's strip leaves, a quick
+ * double-tap – asks nothing more: `crossReaderView` makes a call during a crossing the plain
+ * toggle, and a second extraction is not what the finger meant.
+ */
+export function enterReaderView(tabId: string): void {
+  const ui = uiStore.get()
+  const picture = ui.snapshotTabId === tabId ? ui.snapshot : null
+  closeSiteInfo()
+  if (readerCrossingOf(readerCrossingStore.get(), tabId) !== null) return
+  void crossReaderView(tabId, { picture })
+}
+
+/**
+ * Whether the reader chip stands on `tab`: an article page – the probe's word, `readerArticleTab`
+ * – where it is the offer, or Reader View itself, where it is the lit exit (§9.29). The pill's
+ * tap route (`PhoneShell`) and the chip's builder ask the one question.
+ */
+export function readerChipTab(tab: Pick<Tab, 'url' | 'readerable' | 'discarded'> | null): boolean {
+  return tab !== null && (isReaderUrl(tab.url) || readerArticleTab(tab))
+}
+
+/**
+ * The chips the phone pill has after the address for `tab`, in the pill's order: the lock, the
+ * blocking shield with its count, the translate offer, the Now playing chip – each present on
+ * the same terms as when the pill drew them all (#106, #115, #233), `lib/pillChips.ts`'s rule
+ * deciding which the pill draws and which the sheet lists. Nothing for an internal page, an
+ * extension's page or no tab.
+ */
+export function phonePillChips(
+  state: UIState,
+  tab: Tab | null,
+  ctx: PillChipContext
+): PillChipModel[] {
+  if (!tab) return []
+  const extension = extensionPageChrome(tab.url, state.extensions)
+  // An internal page (Settings) has no site: no shield, no lock (v2 §10.1); an extension's page
+  // is neither a secure site nor an insecure one (§10.1 applied to extension pages).
+  const page = internalPageOf(tab.url) !== null
+  // A private tab under the lock says nothing of its page (§9.19): the identity chips wait for
+  // the unlock; the media state alone is drawn.
+  const identity = !ctx.locked
+  const chips: PillChipModel[] = []
+
+  // The pill's one site-information glyph after the host, in the connection's state (ERR-09;
+  // `securityVerdict` – the same glyph, tone and name the sheet's title block draws): the lock
+  // on a secure page, quiet in the deemphasised window ink (§9.19, §9.29: "secure" is the state
+  // of nearly every page and a colour that is always on says nothing); the open lock in the
+  // warn ink on a plain http page – "Not secure", the word the address speaks; the triangle in
+  // the danger ink over a certificate that failed verification, proceeded past or not. Chrome
+  // Android's omnibox carries the security icon alone the same way (no verbose text), and the
+  // glyph takes the lock's room exactly (Bennett's OMN-02 ruling on the chip room: a text chip
+  // would cost the host about 65 px of its 170 and take it under the 150 floor). It opens the
+  // site information, as the favicon ahead of the host does, where the verdict is explained. The
+  // Safe Browsing and HTTPS-only interstitials stand at the address they block, so they carry
+  // the shield and the open lock the address speaks ("Dangerous", "Not secure"), as Chrome's
+  // omnibox does over its interstitials; a plain error page reads as an internal page and has
+  // none. Nothing on an internal page (Settings) or an extension's page: there is no site.
+  const connection =
+    identity && !extension && !page
+      ? securityIndicator(tab.url, tab.errorCode ?? null, tab.certificateError ?? null).state
+      : null
+  const verdict = connection ? securityVerdict(connection) : null
+  if (verdict && connection && connection in VERDICT_CHIP_IDS) {
+    const id = VERDICT_CHIP_IDS[connection as keyof typeof VERDICT_CHIP_IDS]
+    const Glyph = verdict.glyph
+    chips.push({
+      id,
+      fold: pillChipFold(id),
+      spoken: '',
+      render: (interactive) => (
+        <PillChip
+          inert={!interactive}
+          label={verdict.name}
+          popup="dialog"
+          expanded={ctx.siteInfoOpen}
+          data-site-info
+          data-verdict={verdict.tone}
+          className={cn(CHIP_CLASS, securityToneClass(verdict.tone) || 'zen-pill-quiet')}
+        >
+          <Glyph className="h-3.5 w-3.5" />
+        </PillChip>
+      )
+    })
+  }
+
+  // The quiet notification ask (NOT-03; Chrome's quiet permission UI): a site the user dismissed
+  // before, or a request made without a gesture, does not get a sheet over the page – the
+  // bell-off glyph takes the slot while the page's question waits, named as Chrome names it,
+  // "Notifications blocked"; its tap opens the quiet sheet (Allow / Keep blocking). It is
+  // §9.29's quiet state, in the slot's REST ink – 69 %, `zen-pill-quiet`, the ink a stored block
+  // rests in – not a live one (the design gate's ruling, 2026-09-24: a quiet request is quiet,
+  // it does not call for the full ink a live capture has; the precedence, one glyph at a time,
+  // is the danger glyph, a live state, a stored block, the quiet request, the connection's
+  // glyph, and the request leaves the slot when granted). Under the danger glyph – a
+  // certificate that failed, a Safe Browsing verdict – the identity in question keeps the slot
+  // (§9.29's first rule) and the bell is the sheet's row; under a live state (Now playing, a
+  // key) it is the sheet's row too, and the slot's again when the state ends.
+  const quiet = identity && !page && !extension ? quietPermissionPrompt(state, tab.id) : null
+  if (quiet) {
+    const open = (): void => {
+      dismissSiteInfo()
+      openQuietPrompt(quiet.id)
+    }
+    chips.push({
+      id: 'notifications-blocked',
+      fold: verdict?.tone === 'danger' ? 'sheet' : pillChipFold('notifications-blocked'),
+      spoken: NOTIFICATIONS_BLOCKED_LABEL,
+      row: {
+        glyph: <BellOff />,
+        label: NOTIFICATIONS_BLOCKED_LABEL,
+        value: 'Tap to review',
+        activate: open
+      },
+      render: (interactive) => (
+        <PillChip
+          inert={!interactive}
+          label={NOTIFICATIONS_BLOCKED_LABEL}
+          popup="dialog"
+          expanded={ctx.quietPromptOpen === true}
+          data-quiet-bell
+          data-testid="quiet-bell"
+          className={cn(CHIP_CLASS, 'zen-pill-quiet')}
+        >
+          <BellOff className="h-3.5 w-3.5" />
+        </PillChip>
+      )
+    })
+  }
+
+  // The blocking shield and its count (#115): on every web page while the host blocks requests.
+  // In the sheet it is the row the count goes on – the shield glyph, "Trackers blocked", the
+  // count as the value (the chip's own formatting), "Off for this site" or "Blocking off" when
+  // nothing is blocked here – a §10.4 detail row that opens the tracker report one level down
+  // (PS-33: the sites blocked on the page, by domain and count; `SiteInfoSheet`'s `trackers`
+  // level), whose footer leads on to Settings › Privacy and security, where the lists and the
+  // site exceptions are. `activate` keeps that door for a host without the level; the sheet
+  // leaves first, as its Site settings row does. Asked for this site
+  // (`zen://settings/privacy?site=<origin>`, Chrome's `siteDetails?site=`), the page opens with
+  // the site's own group – "Block on <host>", one screen down in Chrome's order – on screen.
+  if (identity && !page && !extension && state.capabilities.requestBlocking) {
+    const siteState = siteBlockingState(tab, state.blocking, state.settings.blocking)
+    const origin = siteOriginOf(tab.url)
+    if (siteState !== 'no-site' && origin) {
+      const count = tab.blockedCount
+      const value =
+        siteState === 'blocking'
+          ? chipCount(count)
+          : siteState === 'excepted'
+            ? 'Off for this site'
+            : 'Blocking off'
+      const spoken =
+        siteState === 'blocking'
+          ? count > 0
+            ? `${requests(count)} blocked`
+            : ''
+          : siteState === 'excepted'
+            ? 'Blocking off for this site'
+            : 'Blocking off'
+      chips.push({
+        id: 'blocked',
+        fold: pillChipFold('blocked'),
+        spoken,
+        row: {
+          glyph: siteState === 'blocking' ? <Shield /> : <ShieldOff />,
+          label: TRACKER_REPORT_TITLE,
+          value,
+          level: 'trackers',
+          activate: () => {
+            if (!overlayAvailable('settings')) dismissSiteInfo()
+            openSettings('privacy', { site: origin })
+          }
+        }
+      })
+    }
+  }
+
+  // The translate offer (#106): there once the page has been offered or translated. The chip
+  // raised the translate bar or put it away; the row does the same from the sheet, which closes
+  // so the bar under the pill is seen. The value is the pair on offer in the bar's words.
+  const translation = identity && isWebPageUrl(tab.url) ? translateStateOf(state, tab.id) : null
+  if (translation) {
+    const barUp = barStateOf(state, tab.id) !== null
+    const label = barUp ? 'Hide the translation bar' : 'Translate this page'
+    const toggle = (): void => {
+      if (barUp) run('translate.dismiss', { tabId: tab.id })
+      else run('translate.offer', { tabId: tab.id })
+    }
+    chips.push({
+      id: 'translate',
+      fold: pillChipFold('translate'),
+      spoken: translateSpoken(translation),
+      row: {
+        glyph: (
+          <Languages
+            className={isTranslating(translation) ? 'text-[var(--zen-accent)]' : undefined}
+          />
+        ),
+        label,
+        value: translateValue(translation),
+        activate: () => {
+          closeSiteInfo()
+          toggle()
+        }
+      }
+    })
+  }
+
+  // Reader View (PUI-14; §9.29's reader chip; CT-37's phone half): on an article page – the
+  // reader core's probe said so at its dom-ready (`readerArticleTab`, the same predicate the
+  // §9.33 offer stands on; the verdict consumed, never re-run) – the sheet lists the Reader View
+  // row, the same door the offer's action and the app menu's row open: Reader View for this tab
+  // through the crossing where it runs (`crossReaderView`, MOT-36), begun on the picture the
+  // sheet already holds of the page so the page is never let back between the sheet's going and
+  // the surface's coming (the menu row's way, `lib/ui.ts` `pickMenuItem`); the sheet leaves with
+  // its spring. Not on a page the probe did not read as an article; in Reader View itself the
+  // same chip is the exit (below).
+  //
+  // The pill's readerable indicator (CT-37; Chrome Android's adaptive-toolbar Reader mode button
+  // – `AdaptiveToolbarButtonVariant.READER_MODE`, `ReaderModeToolbarButtonController` – which
+  // appears on a distillable page and opens the simplified view; Ione's phone bar has no
+  // toolbar slot, so the pill's glyph slot is the seat, the least deviation from §9.29's fixed
+  // pill): the same chip is the one offer of `lib/pillChips.ts` – drawn in the slot while the
+  // slot is quiet, the sheet's row always. It never displaces a status glyph (the open lock, the
+  // triangle, the Safe Browsing shield: the identity's state beats an offer, as it beats the
+  // quiet bell), and it waits in the sheet while the §9.33 strip asks the same question under
+  // the pill (`readerOfferUp`), taking the slot when the strip leaves by any end – a muted site
+  // has the chip from dom-ready, the strip never comes. The glyph is the desktop chip's
+  // (`BookOpenText`, `SidebarTop`), in the slot's rest ink as the lock and the bell are – the
+  // deemphasised window ink, `.zen-phone-pill .zen-pill-quiet` (the press fill is the docked
+  // pill's own, `.zen-phone-pill-docked:active`); its name is the row's, its description the desktop chip's
+  // vocabulary ("Enter Reader View") without the desktop's chord – the phone's chips carry none,
+  // and §9.31's tooltip is a mouse's or a keyboard's, so here the words are TalkBack's alone.
+  // The tap is routed by `PhoneShell`'s pill (`data-reader-chip`) to the same crossing.
+  //
+  // The lit exit (§9.29 as amended; the design lead's one fold on CT-37's gate): on `zen://reader`
+  // the same chip stays in the slot, lit in the accent with `aria-pressed` – the phone's twin of
+  // the desktop's lit Reader View exit (`SidebarTop`) and of Chrome's checked "Hide Reading mode"
+  // – and its tap runs the same crossing, which the core's toggle takes back to the page
+  // (`reader.toggle` uncovers a reader URL, `src/core/reader.ts`). The reader URL alone decides
+  // (`isReaderUrl`: the probe's flag is the article's and may be stale); the fold is the article
+  // page's – the offer's kind, the identity's warn or danger glyph keeping the slot, a live state
+  // folding it to the sheet, where its row is listed under every state as on the article page,
+  // its value the state it reports ("On") and its tap the same exit; the app menu's row and Back
+  // are the core's other doors. The §9.33 strip never stands on the reader page, so
+  // `readerOfferUp` is the article's alone. The lit ink is the window family's accent, the Now
+  // playing chip's while it plays; the desktop chip's title is the exit's description.
+  const inReader = isReaderUrl(tab.url)
+  if (identity && !page && !extension && readerChipTab(tab)) {
+    const quietSlot = verdict === null || verdict.tone === 'neutral'
+    chips.push({
+      id: 'reader',
+      fold:
+        quietSlot && (inReader || ctx.readerOfferUp !== true) ? pillChipFold('reader') : 'sheet',
+      spoken: inReader ? READER_ON_SPOKEN : READER_ROW_SPOKEN,
+      row: {
+        glyph: <BookOpenText className={inReader ? 'text-[var(--zen-accent)]' : undefined} />,
+        label: READER_ROW_LABEL,
+        value: inReader ? READER_ON_VALUE : undefined,
+        activate: () => enterReaderView(tab.id)
+      },
+      render: (interactive) => (
+        <PillChip
+          inert={!interactive}
+          label={READER_ROW_LABEL}
+          title={inReader ? READER_EXIT_HINT : READER_CHIP_HINT}
+          pressed={inReader || undefined}
+          data-reader-chip
+          data-testid="reader-chip"
+          className={cn(CHIP_CLASS, inReader ? 'text-[var(--zen-accent)]' : 'zen-pill-quiet')}
+        >
+          <BookOpenText className="h-3.5 w-3.5" />
+        </PillChip>
+      )
+    })
+  }
+
+  // Now playing (MW-16, #233; §9.33): a transient state chip, in the pill while a tab holds the
+  // media session – whichever pill is up – and gone otherwise; in the accent while it plays. It
+  // takes the glyph's slot (§9.29: the lock gives way and returns when the media stops). Opens
+  // the in-app player – from the pill, or from its sheet row while a newer state has the slot,
+  // the sheet leaving for the player. The session a locked private tab's (`MediaState.private`
+  // under the lock, INC-05): the state is said, the title is not – the row reads "Private tab"
+  // (§9.19), as the player it opens does.
+  const session = mediaSession(state)
+  if (session) {
+    const label = session.playing ? 'Now playing' : 'Media paused'
+    const masked = mediaMasked(session)
+    chips.push({
+      id: 'media',
+      fold: pillChipFold('media'),
+      spoken: label,
+      row: {
+        glyph: <AudioLines className={session.playing ? 'text-[var(--zen-accent)]' : undefined} />,
+        label,
+        value: masked ? PRIVATE_TAB_PLACEHOLDER : session.title?.trim() || undefined,
+        activate: () => {
+          dismissSiteInfo()
+          void openMediaSheet(session.tabId, ctx.activeTabId)
+        }
+      },
+      render: (interactive) => (
+        <PillChip
+          inert={!interactive}
+          label={label}
+          popup="dialog"
+          expanded={ctx.mediaSheetOpen}
+          data-media
+          data-testid="media-chip"
+          data-state={session.playing ? 'playing' : 'paused'}
+          className={cn(
+            CHIP_CLASS,
+            session.playing ? 'text-[var(--zen-accent)]' : 'zen-pill-quiet'
+          )}
+        >
+          <AudioLines className="h-3.5 w-3.5" />
+        </PillChip>
+      )
+    })
+  }
+
+  return chips
+}
+
+/*
+ * The live states' order of arrival (`liveArrival`), oldest first, as the pill has seen them:
+ * the one record the pill and the sheet both fold by, so they agree on which state has the
+ * slot and which waits. Brought up to date from every set of chips built – idempotent for the
+ * same set, so the pill, the carried pill and the sheet building the same state in one commit
+ * leave it as they found it.
+ */
+let arrival: readonly string[] = []
+
+/** Forget the states' order of arrival (tests). */
+export function resetLiveArrival(): void {
+  arrival = []
+}
+
+function arrivalOf(chips: readonly PillChipModel[]): readonly string[] {
+  const live = chips.filter((c) => c.fold === 'live').map((c) => c.id)
+  const next = liveArrival(arrival, live)
+  if (next.length !== arrival.length || next.some((id, i) => id !== arrival[i])) arrival = next
+  return arrival
+}
+
+/** The pill's chips folded by the rule and the states' record: what the pill draws, what the sheet lists, what gave way. */
+export function foldPhonePillChips(chips: readonly PillChipModel[]): PillFold<PillChipModel> {
+  return foldPillChips(chips, arrivalOf(chips))
+}
+
+/** The chips the pill draws after the address: the lock, or the live state chip in its slot. */
+export function pillChipsDrawn(chips: readonly PillChipModel[]): PillChipModel[] {
+  return foldPhonePillChips(chips).shown
+}
+
+/** The chips the sheet lists for `tab`, in the pill's order, each with its row. */
+export function pillChipRows(
+  state: UIState,
+  tab: Tab,
+  ctx: PillChipContext
+): Array<PillChipModel & { row: PillChipRow }> {
+  return foldPhonePillChips(phonePillChips(state, tab, ctx)).folded.filter(
+    (chip): chip is PillChipModel & { row: PillChipRow } => chip.row !== undefined
+  )
+}
+
+/**
+ * What TalkBack hears of the sheet's chips at the pill's one stop, in the pill's order: their
+ * states – "5 requests blocked", "Translation offered" – which `phoneAddressLabel` (#237's
+ * address label, `lib/pillLabel.ts`) speaks after the connection's state. States rather than a
+ * count: "2 more in site information" would send the user to the sheet to learn what a glance
+ * at its rows tells a sighted user; the states say it here. A chip with nothing to report
+ * (nothing blocked yet) says nothing, so the label on a quiet page is #237's alone. A live state
+ * waiting in the sheet is spoken here too ("Now playing"); the one in the pill has its own stop –
+ * as the reader chip does while the pill draws it (an offer is the sheet's row even then, and
+ * would be heard twice: at its own stop and here).
+ */
+export function pillChipsSpoken(chips: readonly PillChipModel[]): string[] {
+  const fold = foldPhonePillChips(chips)
+  return fold.folded.filter((chip) => !fold.shown.includes(chip)).map((chip) => chip.spoken)
+}
+
+// ---------------------------------------------------------------------------
+// The chip run and its cross-fade
+// ---------------------------------------------------------------------------
+
+/** Each chip's slot counted from the run's end, where the run is anchored. */
+function slotsFromEnd(ids: readonly string[]): Map<string, number> {
+  const slots = new Map<string, number>()
+  ids.forEach((id, i) => slots.set(id, ids.length - 1 - i))
+  return slots
+}
+
+interface Ghost {
+  key: number
+  /** The run the pill showed until the change: the ghost's copies. */
+  chips: readonly PillChipModel[]
+  /** The run it changed to, by id: what fades in, what keeps its slot. */
+  live: readonly string[]
+}
+
+/**
+ * The chips after the address, drawn in the pill. When the set changes – the lock arrives or
+ * leaves on a navigation, a live state takes the lock's slot and gives it back (§9.29), one
+ * state replaces another – the run it showed until this commit is kept as a ghost over the new
+ * one, anchored at the run's end like the run itself, and the change cross-fades on opacity
+ * over {@link CHIP_FOLD_FADE_MS} in place (v2 §11.4; the same under reduced motion): a chip
+ * that keeps its slot does not move or flicker (its ghost copy is hidden), a chip that leaves
+ * fades out where it stood, a chip that arrives fades in where it stands – the lock and the
+ * media chip swap in the one slot. Never a slide. The carried pill (`interactive` false) draws
+ * the run plain: it is a picture of the docked one.
+ */
+export function ChipRun({
+  chips,
+  interactive
+}: {
+  chips: readonly PillChipModel[]
+  interactive: boolean
+}): JSX.Element | null {
+  const runRef = useRef<HTMLSpanElement | null>(null)
+  const ghostRef = useRef<HTMLSpanElement | null>(null)
+  const key = chips.map((c) => c.id).join('|')
+  /** What the last commit drew: the run a change of set keeps as the ghost. */
+  const shown = useRef<{ key: string; chips: readonly PillChipModel[] } | null>(null)
+  const [ghost, setGhost] = useState<Ghost | null>(null)
+  useLayoutEffect(() => {
+    const last = shown.current
+    shown.current = { key, chips }
+    if (interactive && last && last.key !== key) {
+      const live = chips.map((c) => c.id)
+      setGhost((g) => ({ key: (g?.key ?? 0) + 1, chips: last.chips, live }))
+    }
+  }, [key, chips, interactive])
+  // Keyed on the ghost alone: the pill re-renders freely during the 120 ms (a blocked count
+  // ticking up, a store change) without the fade starting over; a further set change makes a
+  // new ghost of the run it interrupted.
+  useLayoutEffect(() => {
+    if (!ghost) return
+    // Started before the paint, so the first frame already has the ghost over the new run.
+    const fade = (el: Element | null | undefined, to: 0 | 1): Animation | null => {
+      if (!(el instanceof HTMLElement) || typeof el.animate !== 'function') return null
+      const rest = Number(getComputedStyle(el).opacity) || 1
+      const anim = el.animate(
+        to === 0 ? [{ opacity: rest }, { opacity: 0 }] : [{ opacity: 0 }, { opacity: rest }],
+        { duration: CHIP_FOLD_FADE_MS, easing: 'linear', fill: to === 0 ? 'forwards' : 'none' }
+      )
+      // A cancelled animation rejects its `finished`; nothing waits on it.
+      anim.finished.catch(() => undefined)
+      return anim
+    }
+    const live = slotsFromEnd(ghost.live)
+    const was = slotsFromEnd(ghost.chips.map((c) => c.id))
+    const anims: Animation[] = []
+    ghost.chips.forEach((chip, i) => {
+      const copy = ghostRef.current?.children[i]
+      if (!(copy instanceof HTMLElement)) return
+      if (live.get(chip.id) === was.get(chip.id)) copy.style.visibility = 'hidden'
+      else anims.push(...[fade(copy, 0)].filter((a): a is Animation => a !== null))
+    })
+    ghost.live.forEach((id, i) => {
+      if (was.get(id) === live.get(id)) return
+      // The live chip itself: its wrapper is `display: contents` and paints nothing.
+      const el = runRef.current?.children[i]?.firstElementChild
+      anims.push(...[fade(el, 1)].filter((a): a is Animation => a !== null))
+    })
+    const timer = window.setTimeout(
+      () => setGhost((g) => (g?.key === ghost.key ? null : g)),
+      CHIP_FOLD_FADE_MS
+    )
+    return () => {
+      window.clearTimeout(timer)
+      for (const a of anims) a.cancel()
+    }
+  }, [ghost])
+  if (chips.length === 0 && !ghost) return null
+  return (
+    <span ref={runRef} className="zen-pill-run" data-testid="pill-chips">
+      {chips.map((chip) => (
+        <span key={chip.id} className="contents" data-chip={chip.id}>
+          {chip.render?.(interactive)}
+        </span>
+      ))}
+      {ghost && (
+        <span
+          key={ghost.key}
+          ref={ghostRef}
+          className="zen-pill-run zen-pill-run-ghost"
+          aria-hidden="true"
+        >
+          {ghost.chips.map((chip) => (
+            <span key={chip.id} className="inline-flex shrink-0 items-center">
+              {chip.render?.(false)}
+            </span>
+          ))}
+        </span>
+      )}
+    </span>
+  )
+}

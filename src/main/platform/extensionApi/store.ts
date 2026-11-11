@@ -1,0 +1,311 @@
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import type { StoreIO } from '../../../core/platform'
+import { JsonStore } from '../../../core/store/JsonStore'
+import type { Alarm } from '../../../core/extensions/api/alarms'
+import type { ContentSettingRule } from '../../../core/extensions/api/contentSettings'
+import type { PersistedMenuItem } from '../../../core/extensions/api/contextMenus'
+import type { FontValues } from '../../../core/extensions/api/fontSettings'
+import type { InstanceIdRecord } from '../../../core/extensions/api/instanceId'
+import type { PermissionSet } from '../../../core/extensions/api/permissions'
+import type { ScopedValues } from '../../../core/extensions/api/privacy'
+import type { StorageItems } from '../../../core/extensions/api/storage'
+import type { PersistedUserScripts } from '../../../core/extensions/api/userScripts'
+import { FileStoreIO } from '../storeIo'
+
+interface PersistedApi {
+  version: 1
+  /** Version seen at the last load, per extension (drives `runtime.onInstalled`'s reason). */
+  installed: Record<string, { version: string }>
+  alarms: Record<string, Alarm[]>
+  grants: Record<string, PermissionSet>
+  uninstallUrls: Record<string, string>
+  /** Events an extension's worker listened to, so it can be woken for them after a restart. */
+  workerEvents: Record<string, string[]>
+  /** `sidePanel.setPanelBehavior`: extensions whose toolbar click opens their side panel. */
+  sidePanelOnActionClick?: Record<string, boolean>
+  /** `chrome.privacy` values per extension, by `category.setting`, then scope. */
+  privacy?: Record<string, Record<string, ScopedValues>>
+  /** `chrome.proxy.settings` values per extension (canonical configs as JSON text), by scope. */
+  proxy?: Record<string, ScopedValues>
+  /** `chrome.fontSettings` values per extension (the slotted families and the two sizes). */
+  fontSettings?: Record<string, FontValues>
+  /** `chrome.contentSettings` rules per extension, by type name (regular scope only). */
+  contentSettings?: Record<string, Record<string, ContentSettingRule[]>>
+  /**
+   * `chrome.contextMenus` items of extensions with a lazy background (Chrome's `MenuManager`
+   * storage): parents before children, restored when the extension loads.
+   */
+  contextMenus?: Record<string, PersistedMenuItem[]>
+  /** `chrome.instanceID`: the ID generated for the install and when (until `deleteID`). */
+  instanceIds?: Record<string, InstanceIdRecord>
+}
+
+function emptyPersisted(): PersistedApi {
+  return {
+    version: 1,
+    installed: {},
+    alarms: {},
+    grants: {},
+    uninstallUrls: {},
+    workerEvents: {},
+    sidePanelOnActionClick: {},
+    privacy: {},
+    proxy: {},
+    fontSettings: {},
+    contentSettings: {},
+    contextMenus: {},
+    instanceIds: {}
+  }
+}
+
+/**
+ * Everything the browser layer remembers about extensions across restarts: one document for the
+ * small per-extension records, one document per extension for `storage.sync` (shared by every
+ * container partition the extension is loaded into), one per extension for its registered
+ * `chrome.userScripts` (whole userscripts, as large as `storage.sync`), and read-only
+ * `storage.managed` policy files dropped into `<userData>/extensions/managed/<id>.json`.
+ */
+export class ApiStore {
+  private readonly main: JsonStore<PersistedApi>
+  private readonly data: PersistedApi
+  private readonly syncIo: StoreIO
+  private readonly syncStores = new Map<
+    string,
+    { store: JsonStore<StorageItems>; items: StorageItems }
+  >()
+  private readonly userScriptsIo: StoreIO
+  private readonly userScriptsStores = new Map<string, JsonStore<PersistedUserScripts>>()
+  private readonly managedDir: string
+
+  constructor(io: StoreIO, userDataDir: string) {
+    this.main = new JsonStore<PersistedApi>(io, 'extension-api.json', 300)
+    const loaded = this.main.readSync()
+    this.data =
+      loaded && loaded.version === 1 ? { ...emptyPersisted(), ...loaded } : emptyPersisted()
+    this.syncIo = new FileStoreIO(join(userDataDir, 'zen', 'extension-sync'))
+    this.userScriptsIo = new FileStoreIO(join(userDataDir, 'zen', 'extension-user-scripts'))
+    this.managedDir = join(userDataDir, 'extensions', 'managed')
+  }
+
+  // --- small records -----------------------------------------------------------
+
+  installedVersion(extensionId: string): string | undefined {
+    return this.data.installed[extensionId]?.version
+  }
+
+  setInstalledVersion(extensionId: string, version: string): void {
+    this.data.installed[extensionId] = { version }
+    this.save()
+  }
+
+  alarms(extensionId: string): Alarm[] {
+    return this.data.alarms[extensionId] ?? []
+  }
+
+  setAlarms(extensionId: string, alarms: Alarm[]): void {
+    if (alarms.length === 0) delete this.data.alarms[extensionId]
+    else this.data.alarms[extensionId] = alarms
+    this.save()
+  }
+
+  grants(extensionId: string): PermissionSet | undefined {
+    return this.data.grants[extensionId]
+  }
+
+  setGrants(extensionId: string, grants: PermissionSet): void {
+    this.data.grants[extensionId] = grants
+    this.save()
+  }
+
+  uninstallUrl(extensionId: string): string | undefined {
+    return this.data.uninstallUrls[extensionId]
+  }
+
+  setUninstallUrl(extensionId: string, url: string): void {
+    if (url) this.data.uninstallUrls[extensionId] = url
+    else delete this.data.uninstallUrls[extensionId]
+    this.save()
+  }
+
+  workerEvents(extensionId: string): string[] {
+    return this.data.workerEvents[extensionId] ?? []
+  }
+
+  setWorkerEvents(extensionId: string, events: string[]): void {
+    if (events.length === 0) delete this.data.workerEvents[extensionId]
+    else this.data.workerEvents[extensionId] = events
+    this.save()
+  }
+
+  sidePanelOnActionClick(extensionId: string): boolean {
+    return this.data.sidePanelOnActionClick?.[extensionId] === true
+  }
+
+  setSidePanelOnActionClick(extensionId: string, enabled: boolean): void {
+    const table = (this.data.sidePanelOnActionClick ??= {})
+    if (enabled) table[extensionId] = true
+    else delete table[extensionId]
+    this.save()
+  }
+
+  privacyValues(extensionId: string): Record<string, ScopedValues> {
+    return this.data.privacy?.[extensionId] ?? {}
+  }
+
+  setPrivacyValues(extensionId: string, values: Record<string, ScopedValues>): void {
+    const privacy = this.data.privacy ?? (this.data.privacy = {})
+    if (Object.keys(values).length === 0) delete privacy[extensionId]
+    else privacy[extensionId] = values
+    this.save()
+  }
+
+  proxyValues(extensionId: string): ScopedValues {
+    return this.data.proxy?.[extensionId] ?? {}
+  }
+
+  setProxyValues(extensionId: string, values: ScopedValues): void {
+    const proxy = this.data.proxy ?? (this.data.proxy = {})
+    if (Object.keys(values).length === 0) delete proxy[extensionId]
+    else proxy[extensionId] = values
+    this.save()
+  }
+
+  fontSettingsValues(extensionId: string): FontValues {
+    return this.data.fontSettings?.[extensionId] ?? {}
+  }
+
+  setFontSettingsValues(extensionId: string, values: FontValues): void {
+    const fontSettings = this.data.fontSettings ?? (this.data.fontSettings = {})
+    if (Object.keys(values).length === 0) delete fontSettings[extensionId]
+    else fontSettings[extensionId] = values
+    this.save()
+  }
+
+  contentSettingRules(extensionId: string): Record<string, ContentSettingRule[]> {
+    return this.data.contentSettings?.[extensionId] ?? {}
+  }
+
+  setContentSettingRules(extensionId: string, rules: Record<string, ContentSettingRule[]>): void {
+    const all = this.data.contentSettings ?? (this.data.contentSettings = {})
+    if (Object.keys(rules).length === 0) delete all[extensionId]
+    else all[extensionId] = rules
+    this.save()
+  }
+
+  /** The persisted menu items, unvalidated (`MenuRegistry.restore` validates). */
+  contextMenuItems(extensionId: string): unknown {
+    return this.data.contextMenus?.[extensionId] ?? []
+  }
+
+  setContextMenuItems(extensionId: string, items: PersistedMenuItem[]): void {
+    const all = this.data.contextMenus ?? (this.data.contextMenus = {})
+    if (items.length === 0) delete all[extensionId]
+    else all[extensionId] = items
+    this.save()
+  }
+
+  /** The Instance ID record, unvalidated (`isInstanceIdRecord` validates). */
+  instanceId(extensionId: string): unknown {
+    return this.data.instanceIds?.[extensionId]
+  }
+
+  setInstanceId(extensionId: string, record: InstanceIdRecord | null): void {
+    const all = this.data.instanceIds ?? (this.data.instanceIds = {})
+    if (record) all[extensionId] = record
+    else delete all[extensionId]
+    this.save()
+  }
+
+  /** The extension is gone for good: drop everything about it. */
+  forget(extensionId: string): void {
+    delete this.data.installed[extensionId]
+    delete this.data.alarms[extensionId]
+    delete this.data.grants[extensionId]
+    delete this.data.uninstallUrls[extensionId]
+    delete this.data.workerEvents[extensionId]
+    delete this.data.sidePanelOnActionClick?.[extensionId]
+    delete this.data.privacy?.[extensionId]
+    delete this.data.proxy?.[extensionId]
+    delete this.data.fontSettings?.[extensionId]
+    delete this.data.contentSettings?.[extensionId]
+    delete this.data.contextMenus?.[extensionId]
+    delete this.data.instanceIds?.[extensionId]
+    this.save()
+    this.syncStores.get(extensionId)?.store.write({})
+    this.setUserScripts(extensionId, null)
+  }
+
+  private save(): void {
+    this.main.write(this.data)
+  }
+
+  // --- chrome.userScripts ------------------------------------------------------
+
+  /** The persisted registrations and world configurations, unvalidated (the host validates). */
+  userScripts(extensionId: string): unknown {
+    return this.userScriptsStore(extensionId).readSync()
+  }
+
+  /** Null: the extension is gone for good, its document is emptied. */
+  setUserScripts(extensionId: string, state: PersistedUserScripts | null): void {
+    this.userScriptsStore(extensionId).write(state ?? { version: 1, scripts: [], worlds: [] })
+  }
+
+  private userScriptsStore(extensionId: string): JsonStore<PersistedUserScripts> {
+    let store = this.userScriptsStores.get(extensionId)
+    if (!store) {
+      store = new JsonStore<PersistedUserScripts>(this.userScriptsIo, `${extensionId}.json`, 300)
+      this.userScriptsStores.set(extensionId, store)
+    }
+    return store
+  }
+
+  // --- storage.sync ------------------------------------------------------------
+
+  syncItems(extensionId: string): StorageItems {
+    return this.syncEntry(extensionId).items
+  }
+
+  setSyncItems(extensionId: string, items: StorageItems): void {
+    const entry = this.syncEntry(extensionId)
+    entry.items = items
+    entry.store.write(items)
+  }
+
+  private syncEntry(extensionId: string): { store: JsonStore<StorageItems>; items: StorageItems } {
+    let entry = this.syncStores.get(extensionId)
+    if (!entry) {
+      const store = new JsonStore<StorageItems>(this.syncIo, `${extensionId}.json`, 300)
+      const items = store.readSync()
+      entry = { store, items: items && typeof items === 'object' ? items : {} }
+      this.syncStores.set(extensionId, entry)
+    }
+    return entry
+  }
+
+  // --- storage.managed ---------------------------------------------------------
+
+  managedItems(extensionId: string): StorageItems {
+    const file = join(this.managedDir, `${extensionId}.json`)
+    if (!existsSync(file)) return {}
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as StorageItems)
+        : {}
+    } catch {
+      return {}
+    }
+  }
+
+  get managedDirectory(): string {
+    return this.managedDir
+  }
+
+  flushSync(): void {
+    this.main.flushSync()
+    for (const entry of this.syncStores.values()) entry.store.flushSync()
+    for (const store of this.userScriptsStores.values()) store.flushSync()
+  }
+}

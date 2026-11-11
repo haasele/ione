@@ -1,0 +1,81 @@
+import type { JSX } from 'react'
+import { internalPageOf, parseInternalPageUrl } from '@shared/internalPages'
+import type { Tab, UIState } from '@shared/types'
+import { cn } from '@renderer/lib/utils'
+import { LegalPage } from './about/LegalPage'
+import { WhatsNewPage } from './about/WhatsNewPage'
+import { BookmarkManager } from './bookmarks/BookmarkManager'
+import { DownloadsPage } from './downloads/DownloadsPage'
+import { HistoryPage } from './history/HistoryPage'
+import { LicencesPage } from './licences/LicencesPage'
+import { ManagementPage } from './management/ManagementPage'
+import { ReadingListPage } from './readingList/ReadingListPage'
+import { SettingsPage } from './settings/SettingsPage'
+import { TasksPage } from './tasks/TasksPage'
+
+/**
+ * The content area's stand-in for a page view: a chrome page tab (`shared/internalPages.ts`,
+ * `render: 'chrome'`) has no WebView, so the chrome draws the page itself where the page would
+ * be – an opaque `--v2-page` surface filling the content frame edge to edge at the frame's own
+ * radius (v2 §10.1), nothing behind it. One component per registered chrome page id – Settings,
+ * History, the bookmarks manager, Downloads, the reading list, Licences, What's new, the two
+ * legal pages, the task manager – each reading its section and query from `tab.url`; a document page renders
+ * nothing here, its view shows it. `data-surface="page"`
+ * puts the page family of tokens (§9.29) on the root, for every chip, badge and icon button
+ * drawn inside.
+ *
+ * `hidden` keeps the page mounted but out of sight and out of reach (the phone's gesture stage
+ * draws its own cards where the page was).
+ */
+export function InternalPageHost({
+  state,
+  tab,
+  hidden = false
+}: {
+  state: UIState
+  tab: Tab
+  hidden?: boolean
+}): JSX.Element | null {
+  const ref = parseInternalPageUrl(tab.url)
+  if (!ref || internalPageOf(tab.url)?.render !== 'chrome') return null
+  const page = pageFor(ref.id, state, tab)
+  if (!page) return null
+  return (
+    <div
+      className={cn('zen-page-host absolute inset-0', hidden && 'invisible')}
+      data-page={ref.id}
+      data-surface="page"
+      inert={hidden || undefined}
+    >
+      {page}
+    </div>
+  )
+}
+
+function pageFor(id: string, state: UIState, tab: Tab): JSX.Element | null {
+  switch (id) {
+    case 'settings':
+      return <SettingsPage state={state} tab={tab} />
+    case 'history':
+      return <HistoryPage state={state} tab={tab} />
+    case 'bookmarks':
+      return <BookmarkManager state={state} tab={tab} />
+    case 'downloads':
+      return <DownloadsPage state={state} tab={tab} />
+    case 'reading-list':
+      return <ReadingListPage state={state} tab={tab} />
+    case 'licences':
+      return <LicencesPage state={state} tab={tab} />
+    case 'whats-new':
+      return <WhatsNewPage state={state} tab={tab} />
+    case 'privacy-notice':
+    case 'terms':
+      return <LegalPage id={id} state={state} tab={tab} />
+    case 'tasks':
+      return <TasksPage state={state} tab={tab} />
+    case 'management':
+      return <ManagementPage />
+    default:
+      return null
+  }
+}

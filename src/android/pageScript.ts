@@ -1,0 +1,530 @@
+import { installPageScript, type PageScriptFlags, type WebAppHostMessage } from '@shared/pageScript'
+import type { PageHint } from '@shared/fullscreenHint'
+import type { NewTabPageCommand, NewTabPageState, PageRules } from '@shared/types'
+import { installNewTabPage } from '@shared/newTabPageScript'
+import { isNewTabUrl } from '@shared/url'
+import { installFormsScript } from '@shared/formsScript'
+import { installImageOwner } from '@shared/imageOwner'
+import { installPasskeyObserver } from '@shared/passkeyObserver'
+import type { FormsCommand } from '@shared/forms'
+import type { MediaSessionHostMessage } from '@shared/mediaSession'
+import type { NotificationHostMessage } from '@shared/notifications'
+import type { ReadAloudHostMessage } from '@shared/readAloud'
+import { installNotificationPolyfill } from '@shared/notificationScript'
+import { installCaptureReporter, installCaptureShim } from '@shared/captureState'
+import { installShareBridge, installShareShim, type ShareOutcome } from '@shared/share'
+import { installClipboardReadShim, type ClipboardReadResult } from '@shared/clipboardRead'
+import { installTextFragmentScript, type TextFragmentHostMessage } from '@shared/textFragmentScript'
+import { focusEdge } from '@shared/focusEdge'
+import { installContentGuards } from '@shared/contentGuards'
+import {
+  blockedGuardsWith,
+  type ContentRules,
+  type ResolvedContentRulesFor
+} from '@shared/contentRules'
+import { downloadNameOf, rememberDownloadName, type DownloadNames } from './downloadNames'
+import { rememberClearedSelection } from './selectionMemory'
+import { installViewportController, type PageRulesConfig } from './viewport'
+import { installRequestObserver, type RequestObserver } from './requestObserver'
+import { installReferrerPolicyReporter } from './referrerPolicy'
+
+/**
+ * Injected by Kotlin into every page WebView (document-start). Transport is the
+ * `WebViewCompat.addWebMessageListener` object `__zenPageBridge`: messages go up with
+ * `postMessage`, flags and forms commands come back through its `onmessage`. Kotlin replaces
+ * `__ZEN_TOKEN__` with a per-session secret so pages cannot forge browser messages.
+ *
+ * Kotlin prefixes the script with the page-controls rules (`window.__zenPageRules`) and the
+ * view's width (`window.__zenDeviceWidth`), so zoom, the desktop layout and force-zoom are laid
+ * out from the first viewport meta on; rule changes arrive live as `pageRules` messages. It
+ * prefixes the host's word on rotate-to-fullscreen too (`window.__zenRotateToFullscreen`): the
+ * phone's window alone runs it, as Chrome gates it (`PageHost.rotateToFullscreen`, §9.36), and
+ * the per-site content rules the page-world guards of a blocked site's document are installed
+ * from (`contentGuards.ts`) before any of the page's own script: the core's resolved answer for
+ * the navigation (`window.__zenResolvedRules`, tagged with its site – an extension's rule over
+ * the user's, `ContentRulesService.resolveAll`) first, the pushed document
+ * (`window.__zenContentRules`) for a document the navigation did not announce.
+ */
+interface PageBridge {
+  postMessage(message: string): void
+  onmessage: ((event: { data: string }) => void) | null
+  addEventListener?(type: 'message', listener: (event: { data: string }) => void): void
+}
+
+const TOKEN = '__ZEN_TOKEN__'
+
+/**
+ * Keep the `download` attribute of clicked anchors where Kotlin can read it
+ * (`window.__ioneDownloadNames`, keyed as in `downloadNames.ts`): the WebView's download
+ * callback never carries it, and it is the only name a `blob:` or `data:` download has. Real
+ * clicks are seen in the capture phase; programmatic `a.click()` on a detached anchor (the
+ * common save-a-blob pattern) is seen through the prototype.
+ */
+function installDownloadNames(w: Window & { __ioneDownloadNames?: DownloadNames }): void {
+  const names: DownloadNames = {}
+  w.__ioneDownloadNames = names
+  const remember = (anchor: HTMLAnchorElement): void => {
+    const hit = downloadNameOf(anchor)
+    if (hit) rememberDownloadName(names, hit.href, hit.name)
+  }
+  w.addEventListener(
+    'click',
+    (event) => {
+      const target = event.target
+      if (!(target instanceof Element)) return
+      const anchor = target.closest('a[download]')
+      if (anchor instanceof HTMLAnchorElement) remember(anchor)
+    },
+    true
+  )
+  const proto = HTMLAnchorElement.prototype as HTMLAnchorElement & { click(): void }
+  const nativeClick = proto.click
+  proto.click = function (this: HTMLAnchorElement): void {
+    try {
+      remember(this)
+    } catch {
+      /* a page's own subclass may throw on attribute access */
+    }
+    nativeClick.call(this)
+  }
+}
+
+/**
+ * The page-world guards of the rows no WebView switch covers (motion sensors, third-party
+ * sign-in, payment handlers – `contentGuards.ts`), read for the top document's site as the
+ * desktop reads them for its WebContents' URL: a frame follows the page it is in (Chromium's
+ * `location.ancestorOrigins` ends at the top document; a sandboxed top's "null" gets each row's
+ * default, as `contentRuleSite` has no site for it). The core's answer for this navigation
+ * decides where it is the top document's site's (`blockedGuardsWith`); the pushed rules
+ * otherwise.
+ */
+function installGuards(
+  w: Window,
+  rules: ContentRules,
+  resolved: ResolvedContentRulesFor | null | undefined
+): void {
+  const ancestors = w.location.ancestorOrigins
+  const top = ancestors && ancestors.length > 0 ? ancestors.item(ancestors.length - 1) : null
+  const blocked = blockedGuardsWith(rules, resolved, top ?? w.location.href)
+  if (blocked.length > 0) installContentGuards(blocked)
+}
+
+;(() => {
+  const w = window as unknown as Window & {
+    __zenPageBridge?: PageBridge
+    __zenPageInstalled?: boolean
+    __ioneDownloadNames?: DownloadNames
+    __zenPageRules?: PageRules
+    __zenDeviceWidth?: number
+    __zenRotateToFullscreen?: boolean
+    __zenContentRules?: ContentRules
+    __zenResolvedRules?: ResolvedContentRulesFor | null
+  }
+  if (w.__zenPageInstalled) return
+  w.__zenPageInstalled = true
+  // First, before any of the page's own script can reach the APIs: a blocked site's document
+  // gets the refusals of its rows (the desktop asks its main process the same at document start).
+  try {
+    if (w.__zenContentRules) installGuards(w, w.__zenContentRules, w.__zenResolvedRules)
+  } catch {
+    /* a page that has already frozen a prototype keeps the API; the store's word is unchanged */
+  }
+  delete w.__zenContentRules
+  delete w.__zenResolvedRules
+  try {
+    installDownloadNames(w)
+  } catch {
+    /* pages that freeze the anchor prototype keep their downloads, just without the name */
+  }
+
+  // Only the top frame's viewport meta lays anything out, so only the top frame gets the
+  // controller: an iframe (an ad, an embed) is spared an observer over its whole document.
+  const topFrame = w === w.top
+  let viewport =
+    topFrame && w.__zenPageRules
+      ? installViewportController({
+          rules: w.__zenPageRules,
+          deviceWidth: typeof w.__zenDeviceWidth === 'number' ? w.__zenDeviceWidth : 0
+        })
+      : null
+  // Rotate-to-fullscreen is the phone's alone (MED-02, §9.36: Chrome's `device_is_phone`); the
+  // host's word on the screen's class comes with the rules (`PageHost.rotateToFullscreen`, from
+  // the same 600 dp number the tablet layout is picked on), and a host that says nothing turns
+  // nothing.
+  const rotateToFullscreen = w.__zenRotateToFullscreen === true
+  // The rules were only ever for this script; pages keep no trace of them.
+  delete w.__zenPageRules
+  delete w.__zenDeviceWidth
+  delete w.__zenRotateToFullscreen
+
+  const bridge = w.__zenPageBridge
+  if (!bridge) return
+
+  /**
+   * A message up the bridge, the session token written last so no field of the message can
+   * displace it: Kotlin drops a message whose `token` is not the session's as a page's forgery
+   * (`routePageMessage`), silently. A message's own token – the PDF viewer report's – rides
+   * under its own name (`pdfToken`), which the router leaves in place.
+   */
+  const up = (message: object): void =>
+    bridge.postMessage(JSON.stringify({ ...message, token: TOKEN }))
+
+  let onFlags: ((flags: PageScriptFlags) => void) | null = null
+  let onZap: ((on: boolean) => void) | null = null
+  let onForms: ((command: FormsCommand) => void) | null = null
+  let onWebApp: ((message: WebAppHostMessage) => void) | null = null
+  let onMediaSession: ((message: MediaSessionHostMessage) => void) | null = null
+  let onNotification: ((message: NotificationHostMessage) => void) | null = null
+  let onReadAloud: ((message: ReadAloudHostMessage) => void) | null = null
+  let onHint: ((hint: PageHint | null) => void) | null = null
+  let onShareResult: ((id: string, result: ShareOutcome) => void) | null = null
+  let onClipboardRead: ((result: ClipboardReadResult) => void) | null = null
+  let onTextFragment: ((message: TextFragmentHostMessage) => void) | null = null
+  let onNewTabState: ((state: NewTabPageState) => void) | null = null
+  let onNewTabCommand: ((command: NewTabPageCommand) => void) | null = null
+  // The extension runtime's observer of the page's fetch / XHR responses (`requestObserver.ts`,
+  // blocking-rule-interface.md 7.10): laid over `fetch` and `XMLHttpRequest` only once the host
+  // says a response-stage `webRequest` listener exists (`extObserve`: the hello reply carries
+  // the current word, a flip comes as a message of its own), in every frame – an embedded
+  // player's requests are its frame's – and passing through while the word is off.
+  let requestObserver: RequestObserver | null = null
+  const selectionMemory = rememberClearedSelection(document)
+  const onMessage = (event: { data: string }): void => {
+    try {
+      const data = JSON.parse(event.data) as {
+        type?: string
+        flags?: PageScriptFlags
+        on?: boolean
+        rules?: PageRules
+        deviceWidth?: number
+        command?: FormsCommand
+        action?: string
+        outcome?: WebAppHostMessage['outcome']
+        seekTime?: number
+        seekOffset?: number
+        status?: NotificationHostMessage['status']
+        id?: string
+        hint?: PageHint | null
+        result?: string
+        text?: string
+        image?: ClipboardReadResult['image']
+        error?: string
+        edge?: string
+        state?: NewTabPageState
+      }
+      if (data.type === 'flags' && data.flags) onFlags?.(data.flags)
+      // `zen://newtab`'s state and commands (NTP-35; `views.ts` `sendNewTabState` /
+      // `sendNewTabCommand`), heard only where the page installed (below).
+      else if (data.type === 'newtab-state' && data.state) onNewTabState?.(data.state)
+      else if (data.type === 'newtab-command' && data.command)
+        onNewTabCommand?.(data.command as unknown as NewTabPageCommand)
+      else if (data.type === 'zap') onZap?.(Boolean(data.on))
+      else if (data.type === 'extObserve') {
+        if (data.on) {
+          requestObserver ??= installRequestObserver(window, {
+            send: (observation) => up(observation)
+          })
+          requestObserver.setOn(true)
+        } else requestObserver?.setOn(false)
+      }
+      // The browser's fullscreen hint, drawn over the page in its top layer (null takes it down).
+      else if (data.type === 'hint') onHint?.(data.hint ?? null)
+      else if (data.type === 'forms' && data.command) onForms?.(data.command)
+      else if (data.type === 'webapp' && data.action)
+        onWebApp?.({
+          type: 'webapp',
+          action: data.action as WebAppHostMessage['action'],
+          outcome: data.outcome
+        })
+      else if (data.type === 'mediaSession' && data.action) {
+        const message: MediaSessionHostMessage = {
+          type: 'mediaSession',
+          action: data.action as MediaSessionHostMessage['action']
+        }
+        if (typeof data.seekTime === 'number') message.seekTime = data.seekTime
+        if (typeof data.seekOffset === 'number') message.seekOffset = data.seekOffset
+        if (typeof data.on === 'boolean') message.on = data.on
+        onMediaSession?.(message)
+      } else if (data.type === 'notification' && data.action) {
+        const message: NotificationHostMessage = {
+          type: 'notification',
+          action: data.action as NotificationHostMessage['action']
+        }
+        if (data.status !== undefined) message.status = data.status
+        if (typeof data.id === 'string') message.id = data.id
+        onNotification?.(message)
+      } else if (data.type === 'readAloud' && data.action) {
+        // The core's extraction request or highlight (`readAloudScript.ts` checks the fields).
+        const message = data as unknown as ReadAloudHostMessage
+        // The selection toolbar's Read Aloud: the action mode's finish collapsed the selection
+        // before this request arrived, so the one it cleared stands in (`selectionMemory.ts`).
+        if (message.action === 'extract' && message.from === 'selection') {
+          selectionMemory.withCleared(() => onReadAloud?.(message))
+        } else {
+          onReadAloud?.(message)
+        }
+      } else if (data.type === 'share' && typeof data.id === 'string') {
+        // A `navigator.share` call's outcome from the system sheet (SH-14): the promise settles.
+        onShareResult?.(data.id, data.result === 'shared' ? 'shared' : 'aborted')
+      } else if (data.type === 'clipboardRead' && typeof data.id === 'string') {
+        // One clipboard read's answer (MW-38): the text when the site's `clipboard-read`
+        // permission allowed it – with the clip's image beside it for a `read()`, the host's
+        // PNG the shim checks and decodes – else the denial the shim turns into Chrome's rejection.
+        onClipboardRead?.(
+          typeof data.text === 'string'
+            ? { id: data.id, text: data.text, image: data.image }
+            : { id: data.id, error: 'denied' }
+        )
+      } else if (
+        data.type === 'textFragment' &&
+        data.action === 'generate' &&
+        typeof data.id === 'string'
+      ) {
+        // The core wants a link to the highlight (SH-11): the toolbar's finish has collapsed the
+        // selection by now, so the one it cleared stands in, as for Read Aloud above.
+        const message: TextFragmentHostMessage = {
+          type: 'textFragment',
+          action: 'generate',
+          id: data.id
+        }
+        onTextFragment?.(message)
+      } else if (data.type === 'pageRules' && data.rules && topFrame) {
+        const config: PageRulesConfig = {
+          rules: data.rules,
+          deviceWidth: typeof data.deviceWidth === 'number' ? data.deviceWidth : 0
+        }
+        if (viewport) viewport.update(config)
+        else viewport = installViewportController(config)
+      } else if (data.type === 'focus' && topFrame) {
+        // A hardware keyboard's Tab entering the page from the chrome (A11Y-09): the host gave
+        // this view the keyboard, Blink's initial focus on the first tabbable as a keyboard focus
+        // (the ring's condition; `TabWebView.focusEdge`), and the landing is confirmed on the
+        // document's first tabbable or moved to its last, read here (`@shared/focusEdge`). The top
+        // frame's: a frame element in the order stands for its document.
+        focusEdge(data.edge === 'last' ? 'last' : 'first', document)
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (bridge.addEventListener) bridge.addEventListener('message', onMessage)
+  else bridge.onmessage = onMessage
+
+  // The frame-owner protocol of the image-search row (`shared/imageOwner.ts`,
+  // frame-owner-protocol-interface.md): in every frame, this frame's answer to the host's
+  // "which of you holds this image?" and, when it is the owner, the thumbnail of its own <img>.
+  // Installed after the listener above – on a bridge with a single `onmessage` slot it chains
+  // that one rather than take it – and doing nothing until a message arrives: the built-ins it
+  // will call are captured now, before any page script, and no image is enumerated or hashed at
+  // load. Its answers ride up with the session token like every other message.
+  try {
+    installImageOwner(bridge, document, { token: TOKEN })
+  } catch {
+    /* a frame whose world lacks the protocol's built-ins answers nothing; the host's window lapses */
+  }
+
+  // The document's DOMContentLoaded, for the core's `dom-ready` (Kotlin raises the view event
+  // once per document): from the top frame only – the legacy bridge cannot tell frames apart –
+  // and at once from a script that runs after the fact (no document-start support, so it arrived
+  // at page finished).
+  if (w.self === w.top) {
+    const domReady = (): void => up({ type: 'domReady' })
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', domReady, { once: true })
+    } else {
+      domReady()
+    }
+    // The user typing into the page (OS-37): one `formEdited` per document, the core's "form in
+    // progress" guard on the sleep memory pressure asks of hidden pages (Chrome's
+    // HadFormInteraction). The user's own edits (`isTrusted`: a field, a textarea, an editable
+    // region), not a script's synthetic events; the top frame's, since the view hears the main
+    // frame alone (`TabWebView.onPageMessage`) – a frame's form is that document's own.
+    const onInput = (event: Event): void => {
+      if (!event.isTrusted) return
+      document.removeEventListener('input', onInput, true)
+      up({ type: 'formEdited' })
+    }
+    document.addEventListener('input', onInput, true)
+    // The page's own referrer policy (W6-S9): the document's `<meta name=referrer>` as it
+    // appears, and the tapped anchor's `rel=noreferrer` / `referrerpolicy` at the capture
+    // phase of the click, told to the view before the navigation reaches its hook – the
+    // navigation it holds for the core's content-settings answer is re-issued under that
+    // policy (`TabWebView.holdForContentRules`, `ReferrerPolicyWord`). The top document's:
+    // the view holds main-frame navigations alone.
+    try {
+      installReferrerPolicyReporter(w, (word) => up({ type: 'referrerPolicy', ...word }))
+    } catch {
+      /* a document whose world lacks the observer keeps the default policy on its held hop */
+    }
+  }
+
+  // This script runs in the page's own world, so the WebAuthn observer installs directly.
+  try {
+    installPasskeyObserver(w)
+  } catch {
+    /* a page that seals navigator.credentials keeps its passkeys unlisted */
+  }
+  installFormsScript({
+    send: (forms) => up({ type: 'forms', forms }),
+    onCommand: (listener) => {
+      onForms = listener
+    }
+  })
+
+  installPageScript({
+    trackMedia: true,
+    // The WebView blocks pop-ups itself; this script runs in the page's world and can see which.
+    reportBlockedPopups: true,
+    // A page's OpenSearch description makes it a "Recently visited" engine in Settings > Search.
+    discoverSearchEngines: true,
+    // A fullscreen video's size turns the screen (Host.kt, MED-01). This script runs in the top
+    // document and in every frame, and each reports its own fullscreen: an embed's video goes
+    // fullscreen from its frame's document, the one that knows the size, while the top document
+    // sees only the <iframe>. The view lets a frame's fullscreen report through alone
+    // (TabWebView.onPageMessage); the host weighs it against the top document's.
+    reportFullscreen: true,
+    // Rotate-to-fullscreen (MED-02): the turn of the screen takes a playing video with native
+    // controls fullscreen and the turn away brings it back, inside the page's own `change` event
+    // (shared/rotateToFullscreen.ts); the host holds and releases the screen (FullscreenRotation.kt).
+    // In a phone's window alone (the host's word, above): a tablet keeps its layout through the
+    // turn and its video goes fullscreen by the player's own control (§9.36).
+    rotateToFullscreen,
+    send: (message) => up(message),
+    // The fullscreen exit hint (GN-20): the chrome is under the fullscreen layer, so the hint
+    // is drawn in the page's top layer, as the desktop's fullscreen hints are.
+    onHint: (listener) => {
+      onHint = listener
+    },
+    onFlags: (listener) => {
+      onFlags = listener
+      // Ask for the current flags; the reply arrives through the listener above. The hello
+      // carries this document's navigation start (`performance.timeOrigin`: one monotonic clock
+      // for every frame of the process, on the wall clock): the main frame's hello is the tab's
+      // document boundary for the image search's frame registry, and a sub-frame registers
+      // with its own stamp, so a frame of the new document – whose navigation began after its
+      // parent's – outlives the boundary whichever order the two hellos land in
+      // (`TabWebView.onPageMessage`, `ImageOwner.documentStarted`).
+      up({ type: 'hello', documentStart: performance.timeOrigin })
+    },
+    onZap: (listener) => {
+      onZap = listener
+    },
+    onWebApp: (listener) => {
+      onWebApp = listener
+    },
+    onMediaSession: (listener) => {
+      onMediaSession = listener
+    },
+    // Read aloud (A11Y-06; services' model, #246): the core's `readAloud.extract` request is
+    // answered with the document's blocks and its `readAloud.highlight` messages are painted
+    // through the CSS Custom Highlight API. Kotlin posts to the main frame alone, so only the
+    // top document ever hears these; the answer rides the `pageMessage` view event like the rest.
+    onReadAloud: (listener) => {
+      onReadAloud = listener
+    }
+  })
+
+  // The page's camera and microphone (NOT-13): the shared shim counts the tracks `getUserMedia`
+  // hands out and the reporter sends one `capture-state` per change – in every frame, since an
+  // embedded call (a meeting in an iframe) holds the device as much as the top document's – the
+  // same fold the desktop runs (`TabManager.refreshAlert`): the tab's alert, the pill's live
+  // glyph, and here the host's "is using your microphone" card and the foreground service that
+  // keeps the capture alive in the background. The shim and the bridge share this one world.
+  try {
+    installCaptureReporter({
+      send: (message) => up(message),
+      installShim: (name) => installCaptureShim(name)
+    })
+  } catch {
+    /* a page that sealed `navigator.mediaDevices` keeps the engine's own capture, unreported */
+  }
+
+  // `Notification` for the pages: the WebView hides the API, the browser shows the shade's cards
+  // under the site's channel. Top frame only: an embedded frame's notifications are its own
+  // page's business in Chrome too (they come through the embedder's permission).
+  if (topFrame) {
+    try {
+      installNotificationPolyfill({
+        send: (message) => up(message),
+        onNotification: (listener) => {
+          onNotification = listener
+        }
+      })
+    } catch {
+      /* a page that sealed `window` keeps going without notifications */
+    }
+    // `navigator.share` / `canShare` (SH-14): the WebView has neither. The shim and its bridge
+    // share this one world (no isolated world here), so the shim installs directly; the call
+    // goes up with its files as base64 (Kotlin writes them to its cache on the way, the core
+    // hands the OS's sheet the addresses) and the sheet's outcome comes back through `onmessage`
+    // above. The shim keeps Chrome's rules: a secure top-level document, a user gesture, one
+    // share at a time, Chrome's file limits.
+    try {
+      installShareBridge({
+        send: (call) => up({ type: 'share', share: call }),
+        onResult: (listener) => {
+          onShareResult = listener
+        },
+        installShim: (events) => installShareShim(events)
+      })
+    } catch {
+      /* a page that sealed `navigator` keeps the engine's absence of the API */
+    }
+    // `navigator.clipboard.read()` / `readText()` (MW-38): the WebView's permission manager
+    // refuses every clipboard read, so the engine's own methods reject on every page. The shim
+    // lays the two methods over `Clipboard.prototype` and no more at load: a call goes up as
+    // `{ type: 'clipboardRead', clipboardRead: call }` (Kotlin's router forwards the type to
+    // the core unchanged, from the main frame alone), the core runs the site's `clipboard-read`
+    // permission – the prompt, the remembered decision – and answers through `onmessage` above
+    // with the host clipboard's text, or the denial the shim turns into Chrome's
+    // `NotAllowedError`. Top frame only: the host's replies reach the main document alone.
+    try {
+      installClipboardReadShim({
+        send: (call) => up({ type: 'clipboardRead', clipboardRead: call }),
+        onResult: (listener) => {
+          onClipboardRead = listener
+        }
+      })
+    } catch {
+      /* a page that sealed `Clipboard.prototype` keeps the engine's own refusal */
+    }
+    // Links to a highlight (SH-11): the core's request for the selection's `text=` directive,
+    // answered from the selection – or the one the action mode just cleared – and, on this
+    // WebView, which leaves text fragments off, the URL's own directive scrolled to and painted.
+    try {
+      installTextFragmentScript({
+        send: (message) => up(message),
+        onCommand: (listener) => {
+          onTextFragment = listener
+        },
+        withSelection: (work) => selectionMemory.withCleared(work)
+      })
+    } catch {
+      /* a page without a body yet, or one that sealed `document`: no link to its text */
+    }
+    // The new tab page (NTP-35): the document the core served as `zen://newtab` (the tablet's
+    // new tab; `views.ts` `loadURL`) is filled by the shared page script over this bridge, the
+    // way the desktop's preload fills it over its IPC (`preload/page.ts`). Its actions ride up
+    // as `{ type: 'newtab', action }` (`views.ts` routes them to `onNewTabAction`); the state
+    // and the tile menu's commands come down through `onmessage` above. No state is known before
+    // the first paint here (the desktop fetches it synchronously): the page's `ready` action has
+    // the core push it at once, and the document the core served this host awaits that push
+    // transparent, coming in whole once it is applied (`newTabPage.ts` `data-await-state`).
+    if (isNewTabUrl(w.location.href)) {
+      try {
+        installNewTabPage({
+          initialState: () => null,
+          onState: (listener) => {
+            onNewTabState = listener
+          },
+          onCommand: (listener) => {
+            onNewTabCommand = listener
+          },
+          send: (action) => up({ type: 'newtab', action })
+        })
+      } catch {
+        /* the served document without its shell: the URL bar is the new tab */
+      }
+    }
+  }
+})()

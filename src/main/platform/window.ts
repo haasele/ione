@@ -1,0 +1,944 @@
+import {
+  BrowserWindow,
+  WebContentsView,
+  app,
+  nativeImage,
+  screen,
+  shell,
+  type NativeImage
+} from 'electron'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { is } from '@electron-toolkit/utils'
+import { quitChordOf, relayDevtoolsQuitChord } from './devtoolsKeys'
+import { devtoolsQuitHoldNotice } from './devtoolsQuitHoldNotice'
+import { focusedDocumentOf } from './focusedDocument'
+import { ElectronShortcuts } from './shortcuts'
+import type {
+  EventName,
+  Events,
+  QuitHoldState,
+  Rect,
+  UIState,
+  WindowChrome
+} from '../../shared/types'
+import { CAPTION_HEIGHT, type CaptionColors } from '../../shared/theme'
+import { forcesRail, hasTopToolbar } from '../../shared/toolbarLayout'
+import type { Browser } from '../../core/browser'
+import type { ZenWindow } from '../../core/window'
+import type {
+  KeyEventInput,
+  TabView,
+  WindowCreateInit,
+  WindowHost,
+  WindowHostFactory
+} from '../../core/platform'
+import { TitleThrottle } from '../../shared/windowTitle'
+import { privateIconPath, privateWindowIcon, windowIcon } from './appIcon'
+import { EdgeTracker, edgeState, type EdgeZone } from './edgeReveal'
+import { privateAppDetails } from './privateTaskbar'
+import { StartupHold } from './startupHold'
+import { placeWindow, planFramedWindow, type DisplayArea } from './windowPlacement'
+import { showWhenReady } from './windowShow'
+import { NO_WINDOW_SWITCHES, windowLaunchState, type WindowSwitches } from '../cli'
+
+const MIN_WIDTH = 640
+const MIN_HEIGHT = 420
+/** A first window's size (within the display). */
+const DEFAULT_WIDTH = 1280
+const DEFAULT_HEIGHT = 820
+/** Popups are as small as the page asked for, within reason. */
+const POPUP_MIN_WIDTH = 320
+const POPUP_MIN_HEIGHT = 200
+/** An app window's first size (Chrome opens installed apps at about this); the app's own after. */
+const APP_DEFAULT_WIDTH = 1024
+const APP_DEFAULT_HEIGHT = 720
+/**
+ * A page's utility window (the task manager, `WindowChrome` `page`): CONTENT sizes – the OS
+ * frame comes on top of them (`planFramedWindow`, `useContentSize`) – summed from the page's
+ * parts so the table shows whole rows and a 32 / 32 column, on every OS (W5-18 C3 / C4). The
+ * width: the 664 text column + 32 either side (the page's 16 plus the rows' 16) + the §9.20
+ * scrollbar's 8 gutter = 736. The height: the field's 16 top inset + the 32 field + 12 under it
+ * (60) + the sticky column header's 34 (32 + its 2) + seven whole 52 rows (364: the browser, its
+ * window, the GPU, the network service and three tabs, the common set) + the footer's 12 + 32 +
+ * 16 (60) = 518 – no sliver of an eighth row. The window comes back where it was left; the
+ * minimum keeps the table's columns.
+ */
+const PAGE_DEFAULT_WIDTH = 736
+const PAGE_DEFAULT_HEIGHT = 518
+const PAGE_MIN_WIDTH = 480
+const PAGE_MIN_HEIGHT = 320
+/** Width (px) of the edge zone that reveals the sidebar in compact mode. */
+const COMPACT_REVEAL_ZONE = 14
+/**
+ * Height (px) of the top zone that reveals the hidden toolbar. Narrower than the sidebar's: a
+ * fullscreen page's own top row sits right under it, and the cursor parks on the screen edge.
+ */
+const TOOLBAR_REVEAL_ZONE = 4
+/** How far below the top edge the cursor may roam before a revealed toolbar is asked to go. */
+const TOOLBAR_KEEP_ZONE = 120
+/**
+ * Windows 11 draws the caption buttons itself (Window Controls Overlay), which is what gives the
+ * maximise button its Snap Layouts flyout. macOS keeps its traffic lights; Linux draws Ione's.
+ */
+const CAPTION_OVERLAY = process.platform === 'win32'
+/**
+ * The popup surface is kept loaded for this long after it was last shown, so the next picker
+ * comes up without a document load; then it is closed to give its memory back.
+ */
+const POPUP_SURFACE_IDLE_MS = 30_000
+
+/** Where the factory keeps the chrome documents that may send commands for a window. */
+export interface ChromeContentsRegistry {
+  add(id: number): void
+  remove(id: number): void
+}
+
+/**
+ * The Electron side of one `ZenWindow`: a frameless `BrowserWindow` whose web contents render
+ * Zen's chrome. Tab pages are `WebContentsView` children the core positions through the window's
+ * layout reports. Frame events (focus, bounds, close) are forwarded to the core window. The popup
+ * surface (`setPopupSurface`) is a second chrome document in a `WebContentsView` above the pages.
+ */
+export class ElectronWindow implements WindowHost {
+  readonly win: BrowserWindow
+  /**
+   * `--kiosk` (`cli.ts`): the window is fullscreen for its life. Requests to leave (F11, Esc
+   * held) are refused here, and the hidden strips never come back on the cursor's edge.
+   */
+  readonly kiosk: boolean
+  /** The OS draws this window's frame (`WindowChrome` `page`): no caption overlay to recolour. */
+  private readonly framed: boolean
+  private boundsTimer: ReturnType<typeof setTimeout> | null = null
+  private compactTimer: ReturnType<typeof setInterval> | null = null
+  private readonly sidebarEdge = new EdgeTracker()
+  private readonly toolbarEdge = new EdgeTracker()
+  private readonly titles: TitleThrottle
+  private captionColors: CaptionColors
+  private popup: WebContentsView | null = null
+  private popupIdleTimer: ReturnType<typeof setTimeout> | null = null
+  /** A mouse button is down on the chrome (`input-event`): a press held, a tab row's drag. */
+  private buttonHeld = false
+
+  constructor(
+    private readonly browser: Browser,
+    readonly zen: ZenWindow,
+    init: WindowCreateInit,
+    private readonly registry: ChromeContentsRegistry = {
+      add: () => undefined,
+      remove: () => undefined
+    },
+    switches: WindowSwitches = NO_WINDOW_SWITCHES,
+    startupHold: StartupHold = new StartupHold()
+  ) {
+    const launch = windowLaunchState(switches, init)
+    this.kiosk = launch.kiosk
+    // A page's utility window (the task manager) keeps the OS frame: its title bar and caption
+    // buttons are the system's, and the chrome draws the page alone inside them. A browser
+    // window opts into the same frame with Settings › Appearance › Use system window controls
+    // (Linux only; macOS and Windows already draw their own controls over the frameless chrome).
+    const pageWindow = init.chrome === 'page'
+    const nativeFrame = process.platform === 'linux' && init.nativeWindowControls
+    const framed = pageWindow || nativeFrame
+    this.framed = framed
+    let initial = init.bounds
+    let displayId = init.displayId
+    let anchor: Rect | null = null
+    if (!initial && init.cascadeFrom?.alive) {
+      const from = (init.cascadeFrom.host as ElectronWindow).win
+      const b = from.getNormalBounds()
+      // A browser window opens a step down and right of the one it was asked from; a utility
+      // window comes up centred over it at its own size, as a dialog would (`planFramedWindow`).
+      if (pageWindow) anchor = b
+      else initial = { x: b.x + 28, y: b.y + 28, width: b.width, height: b.height }
+      displayId = screen.getDisplayMatching(b).id
+    }
+    // A framed window's sizes are its PAGE's (`useContentSize`): the OS puts its title bar and
+    // borders outside them, so 736×518 is the same seven whole rows under a Windows caption as
+    // on X11, and 480×320 is the least page, not the least frame. Its remembered bounds are outer
+    // (`getNormalBounds`, through `onBoundsChanged`) and go back through `setBounds` below –
+    // the matching setter; restoring them as a content size would grow it a frame per open.
+    const framedPlan = pageWindow
+      ? planFramedWindow(
+          {
+            saved: initial,
+            displayId,
+            anchor,
+            minWidth: PAGE_MIN_WIDTH,
+            minHeight: PAGE_MIN_HEIGHT,
+            defaultSize: { width: PAGE_DEFAULT_WIDTH, height: PAGE_DEFAULT_HEIGHT }
+          },
+          displayAreas()
+        )
+      : null
+    const isMac = process.platform === 'darwin'
+    // A see-through window (Settings › Appearance › Window transparency) lets the compositor show
+    // and blur what is behind the chrome. Only frameless windows can be transparent, so a page
+    // window or a native-framed one stays opaque. Mica and transparency both show the
+    // desktop through the chrome by different means: a transparent window has no material.
+    const transparent = !framed && init.transparency !== 'off'
+    const mica = !transparent && init.material === 'mica' && process.platform === 'win32'
+    // Popups and app windows are as small as the page (or the app) wants, within reason.
+    const compactChrome = init.chrome !== 'full'
+    this.captionColors = init.captionColors
+    // A private window wears the private icon (the mask on the private purple, os-56); a copy
+    // that ships none falls back to the variant's like every other window.
+    const privateIcon = zen.isPrivate && !isMac ? privateWindowIcon() : null
+    this.win = new BrowserWindow({
+      ...(framedPlan
+        ? framedPlan.options
+        : {
+            ...sanitizeBounds(initial, displayId, init.chrome),
+            minWidth: compactChrome ? POPUP_MIN_WIDTH : MIN_WIDTH,
+            minHeight: compactChrome ? POPUP_MIN_HEIGHT : MIN_HEIGHT
+          }),
+      show: false,
+      // Chrome's kiosk mode: fullscreen from the first frame (on macOS also without the Dock and
+      // the menu bar); the layout below hides the chrome for a fullscreen browser window.
+      kiosk: launch.kiosk,
+      frame: framed,
+      titleBarStyle: framed
+        ? undefined
+        : isMac
+          ? 'hiddenInset'
+          : CAPTION_OVERLAY
+            ? 'hidden'
+            : undefined,
+      // Centred on the 38px header row (12px lights: 16 + 6 = 22 = 6 + 32 / 2); a toolbar-only
+      // window's 40px toolbar row (and an app window's title row) is centred at 20. A framed
+      // window's lights sit where the system puts them.
+      trafficLightPosition: isMac && !framed ? { x: 14, y: compactChrome ? 14 : 16 } : undefined,
+      titleBarOverlay:
+        CAPTION_OVERLAY && !framed
+          ? {
+              color: init.captionColors.color,
+              symbolColor: init.captionColors.symbolColor,
+              height: CAPTION_HEIGHT
+            }
+          : undefined,
+      // A material window paints its web contents on a see-through background (no
+      // `transparent`, which would cost the resize border); the chrome leaves the material
+      // visible through its gradient. Window transparency makes that trade deliberately: the
+      // window is clear (`#00000000`) so the compositor can blur what is behind it and the
+      // chrome paints its gradient at the setting's alpha (`--zen-window-alpha`); off keeps the
+      // resize border and the solid background as before.
+      ...(transparent
+        ? { transparent: true, backgroundColor: '#00000000' }
+        : mica
+          ? { backgroundMaterial: 'mica' as const }
+          : { backgroundColor: init.backgroundColor }),
+      autoHideMenuBar: true,
+      title: init.title,
+      // Windows and Linux take the icon per window (macOS shows the bundle's, or the Dock's); an
+      // app window carries its app's icon into the taskbar and the window switcher.
+      ...(process.platform === 'darwin'
+        ? {}
+        : {
+            icon:
+              appWindowIcon(init.app?.icon ?? null) ??
+              (privateIcon && !privateIcon.isEmpty()
+                ? privateIcon
+                : windowIcon(browser.state.settings.appIcon))
+          }),
+      webPreferences: {
+        preload: join(__dirname, '../preload/index.js'),
+        sandbox: true,
+        contextIsolation: true,
+        nodeIntegration: false,
+        spellcheck: false,
+        backgroundThrottling: false
+      }
+    })
+    const win = this.win
+    if (framedPlan) {
+      // Only now is the frame's size known (the content plus what the OS drew round it, or the
+      // content alone on X11, whose window manager frames it later): the FRAME goes where the
+      // plan centres it – or exactly back where it stood, outer for outer.
+      const [width, height] = win.getSize()
+      win.setBounds(framedPlan.outerBounds({ width, height }))
+    }
+    this.titles = new TitleThrottle((title) => {
+      if (this.alive) win.setTitle(title)
+    }, init.title)
+    // Windows groups taskbar buttons by AppUserModelID: an installed app's windows get their
+    // own group, icon and pin ("pin to taskbar" relaunches the app), as Chrome's app windows do.
+    if (process.platform === 'win32' && init.app?.appId) {
+      const icon = init.app.icon?.startsWith('file:') ? fileURLToPath(init.app.icon) : null
+      const ico = icon ? icon.replace(/\.png$/i, '.ico') : null
+      win.setAppDetails({
+        appId: ElectronShortcuts.appUserModelId(init.app.appId),
+        ...(ico ? { appIconPath: ico, appIconIndex: 0 } : {}),
+        relaunchCommand: ElectronShortcuts.relaunchCommand(init.app.startUrl),
+        relaunchDisplayName: init.app.name
+      })
+    } else if (process.platform === 'win32' && zen.isPrivate) {
+      // Private windows group on a taskbar button of their own under a second id, with the
+      // private icon; the button's pin and jump list relaunch this copy on this profile with a
+      // private window (os-56; `privateTaskbar.ts`).
+      win.setAppDetails(
+        privateAppDetails(
+          {
+            execPath: process.execPath,
+            isPackaged: app.isPackaged,
+            appPath: app.getAppPath(),
+            userDataDir: switches.userDataDir
+          },
+          app.getName(),
+          privateIconPath('ico')
+        )
+      )
+    }
+    // Saved maximised, or `--start-maximized` for a browser window (never a kiosk's fullscreen).
+    if (launch.maximize) win.maximize()
+
+    // Shown once the chrome has painted – or after a bounded wait when Electron never says so
+    // (`windowShow.ts`): a window that stays hidden is worse than one that paints a beat late.
+    showWhenReady(win)
+    win.on('maximize', () => zen.onWindowStateChanged())
+    win.on('unmaximize', () => zen.onWindowStateChanged())
+    win.on('enter-full-screen', () => zen.onWindowStateChanged())
+    win.on('leave-full-screen', () => zen.onWindowStateChanged())
+    // A page's `document.visibilityState` follows its window's state as a Chrome tab's does
+    // (W6-F6): minimised or hidden the window's tab views go down to Chromium so their pages read
+    // `hidden`, shown or restored they come back to where the core's layout left them. Blur alone
+    // (the window on screen but not key) is not concealment; occlusion by another app's window is
+    // Chromium's own to track (Windows / macOS; none on X11) and is not touched here.
+    win.on('minimize', () => this.refreshTabViewConcealment())
+    win.on('restore', () => this.refreshTabViewConcealment())
+    win.on('hide', () => this.refreshTabViewConcealment())
+    win.on('show', () => this.refreshTabViewConcealment())
+    win.on('focus', () => zen.onFocused())
+    // `blur` is the window resigning key status, which on macOS covers the app deactivating too
+    // (⌘Tab, Spotlight, a notification clicked: `windowDidResignKey` fires for the key window) –
+    // the one signal a quit hold needs to know its key up went elsewhere (`ZenWindow.onBlur`).
+    win.on('blur', () => zen.onBlur())
+    win.on('resize', () => this.scheduleBoundsSave())
+    win.on('move', () => this.scheduleBoundsSave())
+    win.on('swipe', (_e, direction) => {
+      // macOS three-finger swipe switches spaces like Zen's touchpad gesture.
+      if (zen.kind !== 'synced') return
+      if (direction === 'left') browser.actions.run('space.next', { sourceTabId: null, win: zen })
+      if (direction === 'right') browser.actions.run('space.prev', { sourceTabId: null, win: zen })
+    })
+    // The mouse's back and forward buttons (Windows: WM_APPCOMMAND; Linux: buttons 8 and 9),
+    // wherever in the window they are pressed, navigate the active tab like Chrome's do.
+    win.on('app-command', (_e, command) => {
+      // On Linux Chromium already applies the side-button navigation to the hovered WebContents.
+      // Electron also emits app-command there, so forwarding it to the active tab navigates twice.
+      if (process.platform === 'linux') return
+
+      const action =
+        command === 'browser-backward' ? 'nav.back' : command === 'browser-forward' ? 'nav.forward' : null
+      if (!action) return
+
+      browser.actions.run(action, { sourceTabId: null, win: zen })
+    })
+    win.on('close', (event) => {
+      // The caption button, Alt+F4 and the window manager arrive here first: the browser runs
+      // its checks (the tab-count warning, every page's "Leave site?") and closes again once
+      // they pass. Windows the browser closes itself, and every window while quitting, go.
+      if (!zen.closeApproved && !browser.quitting) {
+        event.preventDefault()
+        // Off the event: the checks may pass at once and close again, which must not re-enter
+        // the close that is being cancelled here.
+        setImmediate(() => void browser.requestWindowClose(zen))
+        return
+      }
+      if (this.boundsTimer) clearTimeout(this.boundsTimer)
+      zen.onClosing()
+    })
+    // Windows: the user logs off or the system shuts down and the process is about to be ended.
+    // Persist (with the clean-exit marker) and go without questions.
+    win.on('session-end', () => browser.shutdown())
+    win.on('closed', () => {
+      this.stopCompactTracking()
+      this.titles.cancel()
+      this.closePopupSurface()
+      zen.onClosed()
+    })
+    // A page window has no sidebar or toolbar to bring back at its edges.
+    if (!framed) this.startCompactTracking()
+
+    const wc = win.webContents
+    wc.on('before-input-event', (event, input) => {
+      const key: KeyEventInput = {
+        type: input.type as KeyEventInput['type'],
+        key: input.key,
+        control: input.control,
+        alt: input.alt,
+        shift: input.shift,
+        meta: input.meta,
+        isAutoRepeat: input.isAutoRepeat
+      }
+      if (browser.keys.handle(key, null, zen)) event.preventDefault()
+    })
+    // The chrome's mouse buttons, for the parked views' synthesized pointer moves
+    // (`ElectronTabView.park`): none while one is down. A move's modifiers carry the state too,
+    // so a press or release the observer missed rights itself at the next move.
+    wc.on('input-event', (_event, input) => {
+      if (input.type === 'mouseDown') this.buttonHeld = true
+      else if (input.type === 'mouseUp') this.buttonHeld = false
+      else if (input.type === 'mouseMove') {
+        this.buttonHeld = (input.modifiers ?? []).some((m) => m.endsWith('buttondown'))
+      }
+    })
+    // The chrome's own toolbox (the Browser Console, `openChromeDevTools`): its keys raise no
+    // `before-input-event` either, so the quit chord typed there is relayed from the frontend's
+    // console into the table as a chrome key, as a page's toolbox relays it (`devtoolsKeys.ts`).
+    // It always stands in a window of its own, so a hold armed from it is its to show (§9.23).
+    wc.on('devtools-opened', () => {
+      const frontend = wc.devToolsWebContents
+      if (!frontend || frontend.isDestroyed()) return
+      relayDevtoolsQuitChord(
+        frontend,
+        () => quitChordOf(browser.state.shortcuts),
+        (key) => void browser.keys.handle(key, null, zen),
+        { notice: devtoolsQuitHoldNotice, window: () => win, detached: () => true }
+      )
+    })
+    wc.setWindowOpenHandler(({ url }) => {
+      if (/^https?:/.test(url)) void shell.openExternal(url)
+      return { action: 'deny' }
+    })
+    wc.on('will-navigate', (event) => event.preventDefault())
+    // The chrome's rows show their menus themselves (and cancel the DOM event, which keeps this
+    // one from firing); what reaches here is a text field, the URL bar or plain chrome. Shift+F10
+    // and the Menu key arrive as a keyboard-sourced event at the caret or the focused element.
+    wc.on('context-menu', (_event, params) =>
+      zen.onContextMenu({
+        x: params.x,
+        y: params.y,
+        keyboard: params.menuSourceType === 'keyboard',
+        isEditable: params.isEditable,
+        selectionText: params.selectionText,
+        editFlags: params.editFlags
+      })
+    )
+    // The chrome document's <title> is a constant "Ione"; keep Electron from copying it over the
+    // per-window title the core sets (active tab name) via setTitle. This has to be the window's
+    // event: BrowserWindow applies the title right after emitting it unless it was prevented.
+    win.on('page-title-updated', (event) => event.preventDefault())
+    wc.on('did-finish-load', () => zen.onChromeReady())
+
+    // The chrome's document waits for the extension layer's first publish like the pages' do
+    // (`startupHold.ts`): what the user types into it is the suggestions fetch's one source, and
+    // its rows read the layer (the private New Tab's cookie line, the controlled Settings rows).
+    startupHold.run(() => {
+      if (win.isDestroyed()) return
+      if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+        void win.loadURL(process.env['ELECTRON_RENDERER_URL'])
+      } else {
+        void win.loadFile(join(__dirname, '../renderer/index.html'))
+      }
+    })
+  }
+
+  get alive(): boolean {
+    return !this.win.isDestroyed()
+  }
+
+  // ---------------------------------------------------------------------------
+  // WindowHost
+  // ---------------------------------------------------------------------------
+
+  send<K extends EventName>(name: K, payload: Events[K]): void {
+    if (!this.alive) return
+    // The hold the state carries goes where the keyboard is (§9.23): a detached toolbox the quit
+    // chord is down in draws it in its own document, and the chrome reads no hold meanwhile
+    // (`DevtoolsQuitHoldNotice`); it is taken down there with the hold.
+    if (name === 'state') payload = this.quitHoldRouted(payload as UIState) as Events[K]
+    // A layout applied with the chrome off the content: a view parked under the chrome that this
+    // layout did not show again (its tab switched away from meanwhile; the page beneath the
+    // reader's cover, hidden on the cover's word while the chrome was over the content) is
+    // hidden for good (`ElectronTabView.setVisible` on why a page under the chrome is parked,
+    // not hidden). Every view of the window, the pages beneath the reader's covers included – a
+    // page hidden beneath its cover is in no layout, and would otherwise stay parked until the
+    // reader's exit.
+    if (name === 'layout.applied' && !(payload as Events['layout.applied']).contentHidden) {
+      for (const view of this.browser.tabs.allViewsOwnedBy(this.zen)) {
+        if (hasHideParked(view)) view.hideParked()
+      }
+    }
+    this.win.webContents.send('zen:event', name, payload)
+    // The popup surface mirrors the window's state like the chrome does (the picker lives in it).
+    const popup = this.popup?.webContents
+    if (popup && !popup.isDestroyed()) popup.send('zen:event', name, payload)
+  }
+
+  private quitHoldRouted(state: UIState): UIState {
+    return devtoolsQuitHoldNotice.route(this.win, state, (hold: QuitHoldState) =>
+      this.browser.quitHold.panelFor(this.zen, hold)
+    )
+  }
+
+  /**
+   * The window was minimised, restored, hidden or shown: every tab view of it is told to go down
+   * to Chromium or come back (W6-F6, `ElectronTabView.applyWindowVisible`) so its page's
+   * `document.visibilityState` follows the window as a Chrome tab's does. Concealed is the window
+   * minimised or not visible; a window merely blurred while on screen is not. Idempotent – the
+   * view ignores a state it already holds, and the core window is told the same state once
+   * (`ZenWindow.onWindowVisibleChanged`: what waits for the window's return hears it there).
+   * Every view of the window, the pages beneath the reader's covers included: a page that never
+   * heard the window go would come up in the concealed window at the reader's exit.
+   */
+  private refreshTabViewConcealment(): void {
+    if (!this.alive) return
+    const visible = !this.win.isMinimized() && this.win.isVisible()
+    for (const view of this.browser.tabs.allViewsOwnedBy(this.zen)) {
+      if (hasWindowVisibility(view)) view.applyWindowVisible(visible)
+    }
+    this.zen.onWindowVisibleChanged(visible)
+  }
+
+  /** Whether a mouse button is down on the chrome page (`ElectronTabView.park`'s pointer moves wait). */
+  pointerButtonHeld(): boolean {
+    return this.buttonHeld
+  }
+
+  focusChrome(): void {
+    if (this.alive) this.win.webContents.focus()
+  }
+
+  focusedDocument(): 'chrome' | 'other' | 'none' {
+    if (!this.alive) return 'none'
+    return focusedDocumentOf({
+      focused: this.win.isFocused(),
+      chrome: this.win.webContents,
+      contentView: this.win.contentView
+    })
+  }
+
+  openChromeDevTools(): void {
+    if (this.alive) this.win.webContents.openDevTools({ mode: 'detach' })
+  }
+
+  /**
+   * The `data-zen-menu` element under a chrome point, read from the chrome document itself –
+   * with its tab (`data-zen-menu-tab`) and, for a toolbar control's button, the control
+   * (`data-zen-menu-control`).
+   */
+  async menuTargetAt(
+    x: number,
+    y: number
+  ): Promise<{ target: string; tabId: string | null; control: string | null } | null> {
+    if (!this.alive) return null
+    const result: unknown = await this.win.webContents
+      .executeJavaScript(
+        `(() => {
+          const hit = document.elementFromPoint(${Math.round(x)}, ${Math.round(y)});
+          const el = hit && hit.closest('[data-zen-menu]');
+          if (!el) return null;
+          return {
+            target: el.getAttribute('data-zen-menu'),
+            tabId: el.getAttribute('data-zen-menu-tab') || null,
+            control: el.getAttribute('data-zen-menu-control') || null
+          };
+        })()`,
+        true
+      )
+      .catch(() => null)
+    if (!result || typeof result !== 'object') return null
+    const hit = result as { target?: unknown; tabId?: unknown; control?: unknown }
+    if (typeof hit.target !== 'string') return null
+    return {
+      target: hit.target,
+      tabId: typeof hit.tabId === 'string' ? hit.tabId : null,
+      control: typeof hit.control === 'string' ? hit.control : null
+    }
+  }
+
+  /**
+   * The chrome document's focused element's box, read from the document itself – where a menu
+   * Shift+F10 or the Menu key asked for hangs (§9.23). Null when the focus is on the document
+   * (body) or the element has no box to speak of.
+   */
+  async focusedRect(): Promise<Rect | null> {
+    if (!this.alive) return null
+    const result: unknown = await this.win.webContents
+      .executeJavaScript(
+        `(() => {
+          const el = document.activeElement;
+          if (!el || el === document.body || el === document.documentElement) return null;
+          const r = el.getBoundingClientRect();
+          if (!(r.width > 0) || !(r.height > 0)) return null;
+          return { x: r.left, y: r.top, width: r.width, height: r.height };
+        })()`,
+        true
+      )
+      .catch(() => null)
+    if (!result || typeof result !== 'object') return null
+    const box = result as Record<keyof Rect, unknown>
+    const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
+    if (!finite(box.x) || !finite(box.y) || !finite(box.width) || !finite(box.height)) return null
+    return { x: box.x, y: box.y, width: box.width, height: box.height }
+  }
+
+  contentSize(): { width: number; height: number } {
+    const [width, height] = this.win.getContentSize()
+    return { width, height }
+  }
+
+  isFullScreen(): boolean {
+    return this.alive && this.win.isFullScreen()
+  }
+
+  setFullScreen(fullscreen: boolean): void {
+    // A kiosk window never leaves fullscreen (F11, Esc held: `Browser.toggleFullscreen`).
+    if (this.kiosk && !fullscreen) return
+    if (this.alive) this.win.setFullScreen(fullscreen)
+  }
+
+  isMaximized(): boolean {
+    return this.alive && this.win.isMaximized()
+  }
+
+  isFocused(): boolean {
+    return this.alive && this.win.isFocused()
+  }
+
+  isVisible(): boolean {
+    return this.alive && this.win.isVisible()
+  }
+
+  minimize(): void {
+    if (this.alive) this.win.minimize()
+  }
+
+  maximize(): void {
+    if (this.alive) this.win.maximize()
+  }
+
+  unmaximize(): void {
+    if (this.alive) this.win.unmaximize()
+  }
+
+  show(): void {
+    if (this.alive) this.win.show()
+  }
+
+  focus(): void {
+    if (this.alive) this.win.focus()
+  }
+
+  close(): void {
+    if (this.alive) this.win.close()
+  }
+
+  /** Rate limited to ten native title changes a second (`TitleThrottle`). */
+  setTitle(title: string): void {
+    if (this.alive) this.titles.set(title)
+  }
+
+  normalBounds(): Rect | null {
+    return this.alive ? this.win.getNormalBounds() : null
+  }
+
+  /** The chrome document's place on the screen (DIP); the frameless window has no frame to add. */
+  contentBounds(): Rect | null {
+    return this.alive && this.win.isVisible() && !this.win.isMinimized()
+      ? this.win.getContentBounds()
+      : null
+  }
+
+  displayId(): number | null {
+    return this.alive ? screen.getDisplayMatching(this.win.getBounds()).id : null
+  }
+
+  setCaptionColors(colors: CaptionColors): void {
+    if (!CAPTION_OVERLAY || this.framed || !this.alive) return
+    const current = this.captionColors
+    if (colors.color === current.color && colors.symbolColor === current.symbolColor) return
+    this.captionColors = colors
+    this.win.setTitleBarOverlay({ color: colors.color, symbolColor: colors.symbolColor })
+  }
+
+  // ---------------------------------------------------------------------------
+  // Popup surface
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The popup surface's document (`index.html?surface=popup`: the autofill picker, the
+   * selection's mini menu) in a `WebContentsView` above every page view, at `bounds` (window CSS
+   * pixels); null hides it. Showing never moves the keyboard: the view is added without focus and
+   * the page field keeps typing. Hidden, the document stays loaded for `POPUP_SURFACE_IDLE_MS` so
+   * the next picker or menu is instant, then it is closed.
+   */
+  setPopupSurface(bounds: Rect | null): void {
+    if (!this.alive) return
+    if (!bounds) {
+      this.hidePopupSurface()
+      return
+    }
+    if (this.popupIdleTimer) {
+      clearTimeout(this.popupIdleTimer)
+      this.popupIdleTimer = null
+    }
+    const view = this.popup ?? this.createPopupSurface()
+    view.setBounds({
+      x: Math.round(bounds.x),
+      y: Math.round(bounds.y),
+      width: Math.round(bounds.width),
+      height: Math.round(bounds.height)
+    })
+    // Adding again moves the view to the top of the z-order, over a page view placed since.
+    this.win.contentView.addChildView(view)
+    if (!view.getVisible()) view.setVisible(true)
+  }
+
+  private createPopupSurface(): WebContentsView {
+    const view = new WebContentsView({
+      webPreferences: {
+        preload: join(__dirname, '../preload/index.js'),
+        sandbox: true,
+        contextIsolation: true,
+        nodeIntegration: false,
+        spellcheck: false,
+        backgroundThrottling: false
+      }
+    })
+    // The panel draws its own background and shadow; the margin around it shows the page.
+    view.setBackgroundColor('#00000000')
+    this.popup = view
+    const wc = view.webContents
+    const id = wc.id
+    this.registry.add(id)
+    wc.setWindowOpenHandler(({ url }) => {
+      if (/^https?:/.test(url)) void shell.openExternal(url)
+      return { action: 'deny' }
+    })
+    wc.on('will-navigate', (event) => event.preventDefault())
+    wc.on('context-menu', (event) => event.preventDefault())
+    wc.on('destroyed', () => {
+      this.registry.remove(id)
+      if (this.popup === view) this.popup = null
+    })
+    if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+      const url = new URL(process.env['ELECTRON_RENDERER_URL'])
+      url.searchParams.set('surface', 'popup')
+      void wc.loadURL(url.toString())
+    } else {
+      void wc.loadFile(join(__dirname, '../renderer/index.html'), {
+        query: { surface: 'popup' }
+      })
+    }
+    return view
+  }
+
+  private hidePopupSurface(): void {
+    const view = this.popup
+    if (!view) return
+    if (view.getVisible()) view.setVisible(false)
+    if (this.alive) this.win.contentView.removeChildView(view)
+    if (this.popupIdleTimer) clearTimeout(this.popupIdleTimer)
+    this.popupIdleTimer = setTimeout(() => {
+      this.popupIdleTimer = null
+      this.closePopupSurface()
+    }, POPUP_SURFACE_IDLE_MS)
+  }
+
+  private closePopupSurface(): void {
+    if (this.popupIdleTimer) clearTimeout(this.popupIdleTimer)
+    this.popupIdleTimer = null
+    const view = this.popup
+    if (!view) return
+    this.popup = null
+    if (this.alive) this.win.contentView.removeChildView(view)
+    const wc = view.webContents
+    this.registry.remove(wc.id)
+    if (!wc.isDestroyed()) wc.close()
+  }
+
+  // ---------------------------------------------------------------------------
+  // Bounds persistence
+  // ---------------------------------------------------------------------------
+
+  private scheduleBoundsSave(): void {
+    if (this.boundsTimer) clearTimeout(this.boundsTimer)
+    this.boundsTimer = setTimeout(() => this.zen.onBoundsChanged(), 500)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Compact mode: native cursor tracking
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Like Zen, reveal the hidden sidebar by tracking the real cursor position instead of relying
+   * on DOM hover: the page view and the frameless resize border never deliver mouse events to
+   * the chrome, so a DOM-only edge strip is unreliable. The hidden top toolbar is revealed the
+   * same way: in a fullscreen window the page runs edge to edge and covers every strip the
+   * chrome could hover.
+   */
+  private startCompactTracking(): void {
+    if (this.compactTimer) return
+    this.compactTimer = setInterval(() => this.pollCompactCursor(), 120)
+  }
+
+  private stopCompactTracking(): void {
+    if (this.compactTimer) clearInterval(this.compactTimer)
+    this.compactTimer = null
+  }
+
+  private pollCompactCursor(): void {
+    // A kiosk shows the page alone: no strip comes back at the screen's edge.
+    if (!this.alive || !this.win.isVisible() || this.kiosk) return
+    const state = this.browser.state
+    const zen = this.zen
+    const cm = state.settings.compactMode
+    // The window's fullscreen hides the chrome like compact mode with both switches on.
+    const fullscreen = zen.chrome === 'full' && this.win.isFullScreen()
+    const sidebarHidden =
+      fullscreen || (zen.compactEnabled && cm.hideSidebar && !zen.compactSidebarPersistent)
+    const toolbarHidden =
+      hasTopToolbar(state.settings.toolbarLayout) &&
+      (fullscreen || (zen.compactEnabled && cm.hideToolbar))
+    if (zen.htmlFullscreenTabId || (!sidebarHidden && !toolbarHidden)) {
+      this.sidebarEdge.reset()
+      this.toolbarEdge.reset()
+      return
+    }
+    if (!this.win.isFocused() && !zen.compactSidebarRevealed && !zen.compactToolbarRevealed) return
+    const bounds = this.win.getContentBounds()
+    const cursor = screen.getCursorScreenPoint()
+    if (sidebarHidden) {
+      // The width the hidden sidebar comes back at: the rail's 56 where the layout fixes it.
+      const sidebarWidth =
+        state.settings.sidebarExpanded && !forcesRail(state.settings.toolbarLayout)
+          ? state.settings.sidebarWidth
+          : 56
+      const zone: EdgeZone = {
+        edge: state.settings.sidebarSide,
+        reveal: COMPACT_REVEAL_ZONE,
+        keep: sidebarWidth + 32
+      }
+      const send = this.sidebarEdge.sample(
+        edgeState(cursor, bounds, zone),
+        zen.compactSidebarRevealed
+      )
+      if (send !== null) this.send('compact.reveal', { revealed: send, edge: 'sidebar' })
+    } else {
+      this.sidebarEdge.reset()
+    }
+    if (toolbarHidden) {
+      const zone: EdgeZone = { edge: 'top', reveal: TOOLBAR_REVEAL_ZONE, keep: TOOLBAR_KEEP_ZONE }
+      const send = this.toolbarEdge.sample(
+        edgeState(cursor, bounds, zone),
+        zen.compactToolbarRevealed
+      )
+      if (send !== null) this.send('compact.reveal', { revealed: send, edge: 'toolbar' })
+    } else {
+      this.toolbarEdge.reset()
+    }
+  }
+}
+
+/** Creates `ElectronWindow`s for the core and maps chrome web contents back to their windows. */
+export class ElectronWindowFactory implements WindowHostFactory {
+  private readonly byWebContentsId = new Map<number, ZenWindow>()
+  private browser!: Browser
+  /**
+   * The hold on the run's first documents until the extension layer's first publish
+   * (`startupHold.ts`), for every chrome document it creates; the platform's one hold, shared
+   * with the tab views (`ElectronPlatform.start`).
+   */
+  startupHold = new StartupHold()
+
+  /** `switches`: the run's `--kiosk` / `--start-maximized`, for every window it creates. */
+  constructor(private readonly switches: WindowSwitches = NO_WINDOW_SWITCHES) {}
+
+  bind(browser: Browser): void {
+    this.browser = browser
+  }
+
+  create(win: ZenWindow, init: WindowCreateInit): WindowHost {
+    // The popup surface's document sends commands for the window like the chrome does.
+    const host = new ElectronWindow(
+      this.browser,
+      win,
+      init,
+      {
+        add: (id) => this.byWebContentsId.set(id, win),
+        remove: (id) => this.byWebContentsId.delete(id)
+      },
+      this.switches,
+      this.startupHold
+    )
+    const id = host.win.webContents.id
+    this.byWebContentsId.set(id, win)
+    host.win.on('closed', () => this.byWebContentsId.delete(id))
+    return host
+  }
+
+  windowForWebContents(id: number): ZenWindow | undefined {
+    const win = this.byWebContentsId.get(id)
+    return win?.alive ? win : undefined
+  }
+}
+
+/**
+ * A tab view that parks under the chrome (`ElectronTabView.park`, `hideParked`); the core hands
+ * its views out as `TabView`s, and a host of another kind (tests) has no parking to end.
+ */
+function hasHideParked(view: TabView): view is TabView & { hideParked(): void } {
+  return typeof (view as { hideParked?: unknown }).hideParked === 'function'
+}
+
+/**
+ * A tab view that follows its window's minimise / hide state (`ElectronTabView.applyWindowVisible`,
+ * W6-F6); a host of another kind (tests) has no engine view to conceal.
+ */
+function hasWindowVisibility(
+  view: TabView
+): view is TabView & { applyWindowVisible(visible: boolean): void } {
+  return typeof (view as { applyWindowVisible?: unknown }).applyWindowVisible === 'function'
+}
+
+/**
+ * Saved bounds go back onto the display they were saved on (or the one they lie on, or the
+ * primary), fitted into its work area; see `placeWindow`.
+ */
+function sanitizeBounds(saved: Rect | null, displayId: number | null, chrome: WindowChrome): Rect {
+  return placeWindow(
+    {
+      saved,
+      displayId,
+      minWidth:
+        chrome === 'full' ? MIN_WIDTH : chrome === 'page' ? PAGE_MIN_WIDTH : POPUP_MIN_WIDTH,
+      minHeight:
+        chrome === 'full' ? MIN_HEIGHT : chrome === 'page' ? PAGE_MIN_HEIGHT : POPUP_MIN_HEIGHT,
+      defaultSize:
+        chrome === 'app'
+          ? { width: APP_DEFAULT_WIDTH, height: APP_DEFAULT_HEIGHT }
+          : chrome === 'page'
+            ? { width: PAGE_DEFAULT_WIDTH, height: PAGE_DEFAULT_HEIGHT }
+            : { width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT }
+    },
+    displayAreas()
+  )
+}
+
+/** The displays as placement sees them, the primary first. */
+function displayAreas(): DisplayArea[] {
+  const primary = screen.getPrimaryDisplay()
+  return [primary, ...screen.getAllDisplays().filter((d) => d.id !== primary.id)].map((d) => ({
+    id: d.id,
+    workArea: d.workArea
+  }))
+}
+
+/**
+ * An app window's icon for the frame and taskbar: the launcher icon the shortcut host kept (a
+ * `file:` URL under the profile) or a data URL; null when there is none or it cannot be read.
+ */
+function appWindowIcon(icon: string | null): NativeImage | null {
+  if (!icon) return null
+  try {
+    const image = icon.startsWith('data:')
+      ? nativeImage.createFromDataURL(icon)
+      : icon.startsWith('file:')
+        ? nativeImage.createFromPath(fileURLToPath(icon))
+        : null
+    return image && !image.isEmpty() ? image : null
+  } catch {
+    return null
+  }
+}

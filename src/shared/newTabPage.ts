@@ -1,0 +1,457 @@
+import chromeCss from '../renderer/src/assets/main.css?raw'
+
+/**
+ * `zen://newtab`: the document of the new tab page. It is a static shell – search box, grid,
+ * the private explainer with its "Block third-party cookies" row, Customise button and the Undo
+ * toast's container – that the page script
+ * (`newTabPageScript.ts`, run from the host's preload) fills from `NewTabPageState`. The page
+ * has no scripts of its own and no network access beyond favicons and the custom background
+ * image. It draws no popover, menu or dialog (design language v2 §9.20–9.23): the tile menu is
+ * the host's, the add / edit dialog and Customise are the chrome's.
+ *
+ * Design: the page is the window showing through the frame (design language v2 §9.29, as Zen's
+ * blank tab is) – the space gradient, painted by the page itself so a space switch crossfades
+ * over 600 ms like the chrome, with the tiles, captions and Customise in the window's ink and
+ * fills, and the search field a page surface on it. The page defines no token of its own: its
+ * stylesheet starts with the chrome's token blocks, taken verbatim from main.css at build time
+ * (`chromeTokenCss`), then the new tab page's shared rules – the one `.zen-ntp-*` vocabulary the
+ * phone page draws with, cut from main.css as well (`newTabSharedCss`) – and reads `--v2-*` for
+ * every surface, radius, size and weight; the space theme's `--zen-*` values arrive inline from
+ * the page script. Motion is v1 §7: 120 ms state changes, 180 ms pop for the toast, springs for
+ * the drag.
+ */
+
+/** A token block's selector: `:root`, `:root[attribute]`, or a `data-surface` family root (§9.29). */
+const TOKEN_BLOCK_SELECTOR = /^(?::root(?:\[[^\]]*\])?|\[data-surface='(?:window|page)'\])$/
+
+/**
+ * The chrome's token blocks from main.css, comments dropped: the window's `:root` defaults (the
+ * space theme overrides them inline), their dark overrides, then the design language v2 tokens
+ * with their dark, pointer and form-factor overrides and the two `data-surface` families' control
+ * roles. It stops at the first rule that is not such a block, so no chrome rule leaks into the page.
+ */
+export function chromeTokenCss(css: string = chromeCss): string {
+  const bare = css.replace(/\/\*[\s\S]*?\*\//g, '')
+  const first = bare.search(/^:root \{/m)
+  if (first < 0) throw new Error('main.css: no :root token block')
+  const blocks: string[] = []
+  let at = first
+  for (;;) {
+    const open = bare.indexOf('{', at)
+    if (open < 0) break
+    const selector = bare.slice(at, open).trim()
+    if (!TOKEN_BLOCK_SELECTOR.test(selector)) break
+    const close = bare.indexOf('}', open)
+    if (close < 0) break
+    const body = bare
+      .slice(open + 1, close)
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join(' ')
+    blocks.push(`${selector} { ${body} }`)
+    at = close + 1
+  }
+  return blocks.join('\n')
+}
+
+/**
+ * Where the new tab page's shared rules start in main.css: the one `.zen-ntp-*` block both pages
+ * draw with (`v2Tokens.test.ts` lists it among the v2 surfaces). The rules run from the field to
+ * the comment that opens the phone page's own additions, which are gated on the phone form factor
+ * and never wanted here.
+ */
+export const NEW_TAB_RULES_START = '.zen-ntp-field {'
+export const NEW_TAB_RULES_END = "/*\n   * The phone's page (components/newtab/NewTabPage.tsx)"
+
+/**
+ * The new tab page's shared rules, cut from the chrome's stylesheet (design language v2 §9.29,
+ * one vocabulary on both platforms): the field's surface, radius, shadow and no border; the
+ * tile's fill, radius, hover and press; the caption's, the empty sentence's and the fallbacks'
+ * ink; the picture's scrim. Comments dropped, blank lines collapsed. Every size is left to each
+ * platform's layout (`NEW_TAB_PAGE_STYLE` here, the phone page's classes there). An empty string
+ * when a marker is gone – the page then degrades to its layout over the tokens rather than
+ * failing (`newTabPage.test.ts` fails instead).
+ */
+export function newTabSharedCss(css: string = chromeCss): string {
+  const start = css.indexOf(NEW_TAB_RULES_START)
+  const end = start === -1 ? -1 : css.indexOf(NEW_TAB_RULES_END, start)
+  if (end === -1) return ''
+  return css
+    .slice(start, end)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\n(?:[ \t]*\n)+/g, '\n')
+    .trim()
+}
+
+/**
+ * The page's own rules: its layout. Every colour, radius and weight comes from the shared rules
+ * or is a token read from the blocks above; the only literals are the page's sizes (the field's
+ * 48 × 560, the four by two grid of 64 px tiles at a 12 gap, the 32 px favicon, the 8 under a
+ * tile, the 12 in from the corner – the desktop's numbers in §9.29) and the v1 motion timings.
+ *
+ * The page is the window (design language v2 §9.29): its root is `data-surface="window"`, so
+ * the tiles, captions, empty sentence, explainer and Customise draw in the window's ink and
+ * fills (`--v2-control-*` resolve to the window family); the search field and the Undo toast
+ * are page surfaces on it. Over a picture the ink is white and the fills white alphas under a
+ * neutral scrim. The class names are the phone page's (`NewTabPage.tsx`, #51) so the two pages
+ * are one vocabulary: `zen-ntp-field`, `zen-v2-shortcut`, `zen-ntp-tile`, `zen-ntp-caption`,
+ * `zen-ntp-empty`, `zen-ntp-icon`, `zen-ntp-letter`, `zen-ntp-scrim`.
+ */
+export const NEW_TAB_PAGE_STYLE = `
+  :root { color-scheme: light; }
+  :root[data-theme='dark'] { color-scheme: dark; }
+  html, body { margin: 0; min-height: 100%; }
+  html { height: 100%; }
+  body {
+    position: relative;
+    min-height: 100%;
+    background: transparent;
+    color: var(--v2-control-text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    font-size: var(--v2-font-body);
+    line-height: var(--v2-line-body);
+    font-weight: var(--v2-weight-body);
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Over a picture (§9.29): white ink, white fills a little stronger, the scrim below. */
+  body[data-bg='image'] {
+    --zen-fg: #fff;
+    --zen-fg-rgb: 255 255 255;
+    --v2-window-fill: rgb(255 255 255 / 0.16);
+    --v2-window-fill-hover: rgb(255 255 255 / 0.26);
+  }
+  ::selection { background: var(--v2-selection); color: inherit; }
+  button, input { font: inherit; color: inherit; }
+  button { cursor: default; }
+  svg { stroke-width: var(--v2-icon-stroke); }
+  /* The script shows and hides with the attribute; a class setting display must not win over it. */
+  [hidden] { display: none !important; }
+  /* One focus ring (v2 §1): 2 px accent, outside on buttons and tiles, inside on the field. */
+  :focus-visible { outline: 2px solid var(--v2-ring); outline-offset: 2px; }
+  .zen-ntp-field:focus-within { outline: 2px solid var(--v2-ring); outline-offset: -2px; }
+  .zen-ntp-field input:focus-visible { outline: none; }
+
+  /* Two stacked background layers: the next background fades in over the current one. */
+  .zen-bg { position: fixed; inset: 0; z-index: -2; background-position: center; background-size: cover; background-repeat: no-repeat; }
+  #zen-bg-next { opacity: 0; transition: opacity 600ms var(--zen-ease); }
+  #zen-bg-next[data-fading] { opacity: 1; }
+  /* The legibility scrim over a picture (its gradient is the shared rule's). */
+  .zen-ntp-scrim { position: fixed; inset: 0; z-index: -1; }
+  body:not([data-bg='image']) .zen-ntp-scrim { display: none; }
+
+  .zen-ntp {
+    display: flex; flex-direction: column; align-items: center;
+    box-sizing: border-box; min-height: 100vh;
+    padding: clamp(48px, 26vh, 220px) 24px 96px;
+  }
+  .zen-greeting {
+    margin: 0 0 20px; color: var(--v2-control-text);
+    font-size: var(--v2-font-title); line-height: 28px; font-weight: var(--v2-weight-heading);
+  }
+
+  /*
+   * The resting field is the floating URL bar's field (§9.29): 48 tall, at most 560 wide, the
+   * placeholder 15/400 at 69 %; its surface, radius 12, panel shadow and no border are the
+   * shared rule's. A page surface on the window: it takes the page family. Its leading glyph is
+   * the default engine's favicon at 16 (§6, as the pill's empty tab draws it – radius 3, its own
+   * colours), the 16 magnifier at the row stroke in its place while no favicon has come or the
+   * engine has none (components/urlbar/EngineFieldGlyph is the chrome's form of the same slot).
+   */
+  .zen-ntp-field {
+    display: flex; align-items: center; gap: 12px; box-sizing: border-box;
+    width: min(560px, 100%); height: 48px; padding: 0 16px;
+  }
+  .zen-ntp-glyph { position: relative; display: flex; align-items: center; justify-content: center; width: 16px; height: 16px; flex: none; }
+  .zen-ntp-field svg { width: 16px; height: 16px; color: var(--v2-text-deemphasized); flex: none; }
+  .zen-ntp-engine-favicon { width: 16px; height: 16px; border-radius: 3px; flex: none; opacity: 0; transition: opacity 120ms var(--zen-ease); }
+  .zen-ntp-engine-favicon[data-shown] { opacity: 1; }
+  .zen-ntp-field input {
+    flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; background: transparent;
+    font-size: var(--v2-font-body); font-weight: var(--v2-weight-body); line-height: var(--v2-line-body); color: var(--v2-text);
+  }
+  .zen-ntp-field input::placeholder { color: var(--v2-text-deemphasized); opacity: 1; }
+
+  /* Empty state (§9.17): the shared rule's one sentence in the deemphasised window ink, 32 under the field. */
+  .zen-ntp-empty { margin: 32px 0 0; }
+
+  /*
+   * A private window's explainer stands where the tiles would (§9.29): a title block (§9.23) –
+   * padding 16, the title 17/600 at 22, the description 15 at 69 % 4 under it – centred, in the
+   * window's ink. The block's 16 padding under a 16 margin puts the title's line 32 below the field.
+   */
+  .zen-ntp-private { box-sizing: border-box; width: min(560px, 100%); margin: 16px 0 0; padding: 16px; text-align: center; }
+  .zen-ntp-private h2 { margin: 0; color: var(--v2-control-text); font-size: var(--v2-font-heading); line-height: 22px; font-weight: var(--v2-weight-heading); }
+  .zen-ntp-private p { margin: 4px 0 0; color: var(--v2-control-text-deemphasized); }
+
+  /*
+   * The private page's one row, under the title block: "Block third-party cookies", the switch
+   * Chrome's Incognito page has, for the private-only setting. The shared v2 row (main.css's
+   * \`.zen-v2-row\`, §9.34) in its static form – the geometry alone: the switch is the target,
+   * not the row, so no fill and no role – at the title block's measure and centred like it, its
+   * box 8 below the block's (§9.26), the row's own padding around the text (§9.21: padding, not
+   * gap): two 20 px lines plus 6 above and below make the two-line row's 52 (§9.2). The label
+   * 15/400 in the window ink, the description 13 at 69 % under it on the 20 px line, two lines
+   * at most (§9.2); the switch trails, centred on the row (§9.18).
+   */
+  .zen-v2-row {
+    position: relative; display: flex; align-items: center; gap: 12px; box-sizing: border-box;
+    width: 100%; min-height: var(--v2-row); padding: var(--v2-row-pad) 16px;
+    color: var(--v2-control-text); text-align: left;
+    font-size: var(--v2-font-body); font-weight: var(--v2-weight-body); line-height: var(--v2-line-body);
+  }
+  .zen-ntp-cookies { width: min(560px, 100%); margin: 8px 0 0; }
+  .zen-ntp-cookies-text { flex: 1; min-width: 0; }
+  .zen-ntp-cookies-label { display: block; overflow-wrap: anywhere; }
+  .zen-ntp-cookies-desc {
+    display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+    margin: 0; color: var(--v2-control-text-deemphasized);
+    font-size: var(--v2-font-small); line-height: var(--v2-line-small);
+  }
+  /*
+   * The shared switch (main.css's \`.zen-v2-switch\`, §9.34, §10.4: a 36 × 20 track at radius 10,
+   * a 16 thumb inset 2, travel 16, 150 ms), the same rule set read in the window family (§9.29):
+   * the off track is the window ink at 25 % where the primitive has the page ink at 25 %, the on
+   * track the surface's accent (\`--v2-control-accent\`, the theme's accent on this root), and the
+   * thumb is the ink that reads on the accent in both states – the window has no page colour to
+   * lend the off thumb, and \`--v2-on-accent\` keeps the primitive's polarity (light on light, dark
+   * on dark), so the thumb moves and barely changes, as the primitive's does. A real
+   * \`<button role="switch">\` here rather than the chrome's span inside a row that is the switch,
+   * so the button's own chrome is zeroed. Disabled – the setting locked by Settings > Privacy and
+   * Security – is §9.30's one number, .4 on the whole control, laid out at full size, and it does
+   * not transition: only the knob and the track colour ever move.
+   */
+  .zen-v2-switch {
+    position: relative; display: block; flex-shrink: 0; box-sizing: border-box; appearance: none;
+    width: 36px; height: 20px; margin: 0; padding: 0; border: 0; border-radius: 10px;
+    background: rgb(var(--zen-fg-rgb) / 0.25);
+    transition: background 150ms var(--zen-ease);
+  }
+  .zen-v2-switch::after {
+    content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+    background: var(--v2-on-accent);
+    transition: transform 150ms var(--zen-ease), background 150ms var(--zen-ease);
+  }
+  .zen-v2-switch[aria-checked='true'] { background: var(--v2-control-accent); }
+  .zen-v2-switch[aria-checked='true']::after { background: var(--v2-on-accent); transform: translateX(16px); }
+  .zen-v2-switch:disabled { opacity: 0.4; }
+
+  /*
+   * The grid (§9.29): four columns by two rows at a 12 gap, centred under the field. A cell is a
+   * 104 px column – the 64 tile centred in it, the caption across it – so the grid is 452 wide;
+   * narrower pages shrink the columns, never the gap.
+   */
+  .zen-grid {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 104px)); gap: 12px; justify-content: center;
+    width: min(452px, 100%); margin-top: 32px;
+  }
+  .zen-tile { position: relative; min-width: 0; touch-action: none; }
+  /* The shortcut: tile and caption as one target, 8 between them, no card behind them. */
+  .zen-v2-shortcut {
+    display: flex; flex-direction: column; align-items: center; gap: 8px; box-sizing: border-box;
+    width: 100%; margin: 0; padding: 0; border: 0; background: transparent;
+    color: inherit; text-decoration: none; text-align: center;
+  }
+  .zen-v2-shortcut:focus-visible { outline: none; }
+  .zen-v2-shortcut:focus-visible .zen-ntp-tile { outline: 2px solid var(--v2-ring); outline-offset: 2px; }
+  /* The tile: a 64 square holding the 32 favicon; its fill, radius, hover and press are the shared rules'. */
+  .zen-ntp-tile { display: grid; place-items: center; flex: none; box-sizing: border-box; width: 64px; height: 64px; }
+  .zen-ntp-icon { width: 32px; height: 32px; border-radius: 8px; }
+  /* The fallbacks – the site's letter, or the globe when there is none – at 32, in the shared rules' ink. */
+  .zen-ntp-tile svg { width: 32px; height: 32px; }
+  .zen-tile-add .zen-ntp-tile svg { width: 24px; height: 24px; }
+  /*
+   * The caption: the shared rules' 13 in the deemphasised window ink. Two centred lines at most,
+   * wrapping at a letter so a long host (dash.cloudflare.com) does not overflow the 104 column
+   * or sit as one truncated mid-word smear.
+   */
+  .zen-ntp-caption {
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+    max-width: 100%; overflow-wrap: anywhere; white-space: normal; text-overflow: unset;
+  }
+  /* Dragging (v2 §9.4): the tile lifts to v1 level 2 at 90%; the page script adds scale(1.02). */
+  .zen-tile[data-dragging] { z-index: 2; }
+  .zen-tile[data-dragging] .zen-v2-shortcut { opacity: 0.9; }
+  .zen-tile[data-dragging] .zen-ntp-tile { box-shadow: var(--zen-shadow-2); transition: none; }
+  .zen-caret { position: fixed; width: 2px; border-radius: 1px; background: var(--v2-accent); pointer-events: none; z-index: 3; }
+
+  /*
+   * The shared v2 button (main.css's \`.zen-v2-button\`, same geometry: the control's height and
+   * radius, padding 16, weight 500, press scale(.98)), reading the surface's control roles so it
+   * takes the window family on the page and the page family in the toast; a 16 glyph sits 8
+   * before the label.
+   */
+  .zen-v2-button {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px; box-sizing: border-box;
+    height: var(--v2-control); min-width: 96px; padding: 0 16px; border: 0; border-radius: var(--v2-radius-control);
+    background: var(--v2-control-fill); color: var(--v2-control-text);
+    font-size: var(--v2-font-body); font-weight: var(--v2-weight-button); line-height: var(--v2-line-body); white-space: nowrap;
+    transition: background-color 120ms var(--zen-ease), transform 120ms var(--zen-ease);
+  }
+  .zen-v2-button:hover { background: var(--v2-control-fill-hover); }
+  .zen-v2-button:active:not(:disabled) { background: var(--v2-control-fill-hover); transform: scale(0.98); }
+  .zen-v2-button:disabled { opacity: 0.4; }
+  .zen-v2-button svg { width: var(--v2-icon); height: var(--v2-icon); flex: none; }
+  /* Customise (§9.29): the window-family button 12 in from the page's bottom trailing corner. */
+  .zen-customize { position: fixed; right: 12px; bottom: 12px; z-index: 4; }
+  /*
+   * A finger on the page (the tablet's served page, NTP-35): the chrome's touch numbers, which
+   * main.css gates on the root's form factor and pointer – attributes the served document does
+   * not carry, so the pointer query stands in for them here. The field 56 tall, Customise the
+   * touch layouts' 40 control with the coarse block's 6 radius; the tiles stay the 64 square
+   * (§9.29 as amended; the toast's 32 control is the toast's own).
+   */
+  @media (pointer: coarse) {
+    .zen-ntp-field { height: 56px; }
+    .zen-customize { height: 40px; border-radius: 6px; }
+  }
+
+  /* The Undo toast: a panel surface holding a 32 px control, so 40 tall (v2 §9.21). */
+  .zen-toast {
+    position: fixed; left: 50%; bottom: 24px; z-index: 5; display: flex; align-items: center; gap: 12px; box-sizing: border-box;
+    height: 40px; padding: 0 4px 0 12px; transform: translateX(-50%);
+    background: var(--v2-panel); color: var(--v2-text); border: 1px solid var(--v2-border);
+    border-radius: var(--v2-radius-card); box-shadow: var(--v2-shadow-panel);
+    animation: zen-pop 180ms var(--zen-ease);
+  }
+
+  @keyframes zen-pop { from { opacity: 0; transform: scale(0.94); } to { opacity: 1; transform: none; } }
+  @keyframes zen-fade { from { opacity: 0; } to { opacity: 1; } }
+  /*
+   * Reduced motion (v2 §11.3 as amended, main.css's rule): every transition and animation is
+   * removed, never shortened – a shortened one still draws its start value for a frame – and the
+   * one fade that stays, the Undo toast's appearance, is re-declared here as a 120 ms opacity
+   * fade, !important past the remover. The background's 600 ms crossfade cuts.
+   */
+  @media (prefers-reduced-motion: reduce) {
+    *, ::before, ::after, ::backdrop { transition-property: none !important; animation: none !important; }
+    .zen-toast { animation: zen-fade 120ms var(--zen-ease) !important; }
+  }
+`
+
+/**
+ * On the document's root while it awaits its first state, on a host whose state comes after the
+ * first paint (the Android host's page script has none to hand before the document renders,
+ * `src/android/pageScript.ts`; the desktop's preload fetches it synchronously and never sets
+ * this). The page script takes it off once the state is applied and the icons are in hand
+ * (`newTabPageScript.ts` `reveal`).
+ */
+export const NEW_TAB_AWAIT_STATE_ATTR = 'data-await-state'
+
+/**
+ * The awaiting document's rules (NTP-35, the tablet's served page; the lead's conditions of form
+ * on #563): the root is transparent while it awaits its state – the view is transparent over the
+ * chrome, so the frame's ground shows through where the page will be, and nothing of the shell
+ * (the field in the wrong scheme, the grid before its tiles) is ever painted – and comes in
+ * WHOLE on the language's 120 ms opacity fade once the script lets it (the fill applied, the
+ * icons decoded). Under reduced motion the arrival stays that fade (§11.3: fades stay and springs
+ * go – a fade is not a cut): the page's remover above takes every transition, the root's among
+ * them, so the root's fade is re-declared under the query, `!important` past the remover (`:root`
+ * outranks `*` at equal importance), in the one form the §11.3 guard admits – opacity alone, one
+ * segment, 120 ms written out, the page's own easing (as its Undo toast's kept fade). Nothing else
+ * on the page transitions there. Appended to the document only where the attribute is set
+ * (`newTabPageHtml`); the desktop's document is as it was.
+ */
+export const NEW_TAB_AWAIT_STATE_STYLE = `
+  :root { transition: opacity 120ms var(--zen-ease); }
+  :root[${NEW_TAB_AWAIT_STATE_ATTR}] { opacity: 0; }
+  @media (prefers-reduced-motion: reduce) {
+    :root { transition: opacity 120ms var(--zen-ease) !important; }
+  }
+`
+
+/** Lucide-style glyphs (stroke 1.5; sized by the stylesheet) inlined so the page needs no assets. */
+export const NEW_TAB_ICONS = {
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  globe:
+    '<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  sliders: '<path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3M14 2v4M8 10v4M16 18v4"/>'
+} as const
+
+export type NewTabIcon = keyof typeof NEW_TAB_ICONS
+
+export function newTabIconSvg(name: NewTabIcon): string {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${NEW_TAB_ICONS[name]}</svg>`
+}
+
+/**
+ * What a private window's page says where its tiles would be (design language v2 §9.29, a
+ * §9.23 title block): sentence case, no dash, no link until there is a page to link.
+ */
+export const PRIVATE_EXPLAINER = {
+  title: "You're in a private window",
+  description:
+    "Ione won't keep this window's history, cookies or site data after you close it. Your school, employer or internet provider can still see what you visit."
+} as const
+
+/**
+ * The private page's "Block third-party cookies" row (Chrome's Incognito switch), bound to
+ * `privacy.thirdPartyCookiesPrivate` – private windows only, regular browsing never changes.
+ * Sentence case (§9.1). The locked description stands while Settings › Privacy and Security
+ * blocks third-party cookies in every window, when the switch is on and disabled – the pane by
+ * its actual name behind the language's path glyph (the lead's ruling on #522). Each description
+ * is a sentence and takes its full stop, as the phone's twins and every settings row's do (the
+ * lead's amendment of 08:40).
+ */
+export const PRIVATE_COOKIES = {
+  label: 'Block third-party cookies',
+  description: 'Blocks third-party cookies in private windows.',
+  lockedDescription: 'Blocked in every window by Settings › Privacy and Security.'
+} as const
+
+/**
+ * The locked line while an extension holds `chrome.privacy.websites.thirdPartyCookiesAllowed`
+ * (services pass 10), at either pole – "Blocked" under `false`, "Allowed" under `true`, when the
+ * switch is off and locked since a tap would spring back – the holder named, as Settings'
+ * controlled rows name theirs; "an extension" only where the name is not to hand. The desktop
+ * document's own noun – "window" – around the lead's sentence for the phone's page.
+ */
+export function privateCookiesLockedByExtension(blocked: boolean, name: string): string {
+  const verb = blocked ? 'Blocked' : 'Allowed'
+  const holder = name.trim()
+  return holder
+    ? `${verb} in every window by the extension ${holder}.`
+    : `${verb} in every window by an extension.`
+}
+
+/** The row's description for a state: the switch's own line, or why the switch is locked. */
+export function privateCookiesDescription(cookies: {
+  blocked: boolean
+  locked: boolean
+  lockedByExtension?: string
+}): string {
+  if (!cookies.locked) return PRIVATE_COOKIES.description
+  return cookies.lockedByExtension === undefined
+    ? PRIVATE_COOKIES.lockedDescription
+    : privateCookiesLockedByExtension(cookies.blocked, cookies.lockedByExtension)
+}
+
+export interface NewTabPageDocumentOptions {
+  /**
+   * The host fills the document after its first paint (no state to hand before it renders): the
+   * root awaits its state transparent (`NEW_TAB_AWAIT_STATE_ATTR`, `NEW_TAB_AWAIT_STATE_STYLE`)
+   * until the page script has applied one. Off, the document is the desktop's as it was.
+   */
+  awaitState?: boolean
+}
+
+/** The `zen://newtab` document. Everything dynamic is added by the page script. */
+export function newTabPageHtml(options: NewTabPageDocumentOptions = {}): string {
+  const awaitAttr = options.awaitState ? ` ${NEW_TAB_AWAIT_STATE_ATTR}` : ''
+  const awaitStyle = options.awaitState ? NEW_TAB_AWAIT_STATE_STYLE : ''
+  return `<!doctype html><html lang="en"${awaitAttr}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src * data: zen:;"><title>New Tab</title><style>${chromeTokenCss()}\n${newTabSharedCss()}${NEW_TAB_PAGE_STYLE}${awaitStyle}</style></head>
+<body data-surface="window">
+<div class="zen-bg" id="zen-bg-current"></div><div class="zen-bg" id="zen-bg-next"></div><div class="zen-ntp-scrim" aria-hidden="true"></div>
+<main class="zen-ntp" id="zen-ntp">
+  <h1 class="zen-greeting" id="zen-greeting" hidden></h1>
+  <form class="zen-ntp-field" id="zen-search" role="search" autocomplete="off" data-surface="page"><span class="zen-ntp-glyph" id="zen-engine-glyph" aria-hidden="true">${newTabIconSvg('search')}<img class="zen-ntp-engine-favicon" id="zen-engine-favicon" alt="" referrerpolicy="no-referrer" hidden></span><input id="zen-search-input" type="text" placeholder="Search or enter address" aria-label="Search or enter address" autocomplete="off" autocapitalize="off" spellcheck="false"></form>
+  <section class="zen-ntp-private" id="zen-private" aria-labelledby="zen-private-title" hidden><h2 id="zen-private-title">${PRIVATE_EXPLAINER.title}</h2><p>${PRIVATE_EXPLAINER.description}</p></section>
+  <div class="zen-v2-row zen-ntp-cookies" id="zen-cookies" data-static hidden><div class="zen-ntp-cookies-text"><label class="zen-ntp-cookies-label" id="zen-cookies-label" for="zen-cookies-switch">${PRIVATE_COOKIES.label}</label><p class="zen-ntp-cookies-desc" id="zen-cookies-desc">${PRIVATE_COOKIES.description}</p></div><button type="button" class="zen-v2-switch" id="zen-cookies-switch" role="switch" aria-checked="false" aria-describedby="zen-cookies-desc"></button></div>
+  <p class="zen-ntp-empty" id="zen-empty" hidden>Sites you visit often will appear here</p>
+  <div class="zen-grid" id="zen-grid" role="list" aria-label="Shortcuts" hidden></div>
+</main>
+<button type="button" class="zen-v2-button zen-customize" id="zen-customize" aria-haspopup="dialog">${newTabIconSvg('sliders')}<span>Customise</span></button>
+<div class="zen-toast" id="zen-toast" role="status" data-surface="page" hidden></div>
+</body></html>`
+}

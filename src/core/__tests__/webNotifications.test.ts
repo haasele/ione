@@ -1,0 +1,855 @@
+import { beforeEach, describe, expect, it } from 'vitest'
+import {
+  MAX_LIVE_PER_ORIGIN,
+  WebNotificationService,
+  asksQuietly,
+  quietNotificationPrompt,
+  quietPromptSite
+} from '../webNotifications'
+import type { Browser } from '../browser'
+import type { PermissionChange, PermissionRequestDetails } from '../permissions'
+import type { PageHostMessage, WebNotificationRequest } from '../platform'
+import type { NotificationPageRequest } from '../../shared/notifications'
+import type { PermissionPrompt, PermissionPromptAnswer } from '../../shared/types'
+
+type Decision = 'allow' | 'deny' | 'ask'
+
+interface FakeView {
+  url: string
+  destroyed: boolean
+  posted: PageHostMessage[]
+  getURL(): string
+  isDestroyed(): boolean
+  postToPage(message: PageHostMessage): void
+}
+
+interface Harness {
+  service: WebNotificationService
+  views: Map<string, FakeView>
+  decisions: Map<string, Decision>
+  shown: WebNotificationRequest[]
+  closed: string[]
+  forgotten: string[]
+  ensured: number
+  revealed: string[]
+  created: string[]
+  hostShows: boolean
+  listeners: Array<(change: PermissionChange) => void>
+  privateTabs: Set<string>
+  addTab(tabId: string, url: string): FakeView
+  closeTab(tabId: string): void
+  decideCalls: Array<{ permission: string; url: string }>
+  /** The chrome's prompt queue: the quiet prompts `show` put there, answered by `answer`. */
+  prompts: PermissionPrompt[]
+  answer(id: string, answer: PermissionPromptAnswer | null): void
+  /** What the harness's `decide` answers a loud prompt with (Allow by default). */
+  loudAnswer: PermissionPromptAnswer | null
+  remembered: Array<{ permission: string; url: string; decision: string }>
+  /** The request details each `decide` and `remember` call carried (the host's word on the request). */
+  detailsSeen: Array<PermissionRequestDetails | undefined>
+}
+
+function harness(options: { host?: boolean } = {}): Harness {
+  const views = new Map<string, FakeView>()
+  const decisions = new Map<string, Decision>()
+  const listeners: Harness['listeners'] = []
+  const privateTabs = new Set<string>()
+  const answered: Array<(prompt: PermissionPrompt, answer: PermissionPromptAnswer | null) => void> =
+    []
+  const pending = new Map<string, (answer: PermissionPromptAnswer | null) => void>()
+  const h = {
+    views,
+    decisions,
+    shown: [] as WebNotificationRequest[],
+    closed: [] as string[],
+    forgotten: [] as string[],
+    ensured: 0,
+    revealed: [] as string[],
+    created: [] as string[],
+    hostShows: true,
+    listeners,
+    privateTabs,
+    decideCalls: [] as Array<{ permission: string; url: string }>,
+    prompts: [] as PermissionPrompt[],
+    loudAnswer: 'allow' as PermissionPromptAnswer | null,
+    remembered: [] as Array<{ permission: string; url: string; decision: string }>,
+    detailsSeen: [] as Array<PermissionRequestDetails | undefined>,
+    answer: (id: string, answer: PermissionPromptAnswer | null): void => {
+      const i = h.prompts.findIndex((p) => p.id === id)
+      if (i < 0) return
+      const [prompt] = h.prompts.splice(i, 1)
+      pending.get(id)?.(answer)
+      pending.delete(id)
+      for (const listener of answered) listener(prompt!, answer)
+    }
+  }
+  const originOf = (url: string): string => new URL(url).origin
+  const host =
+    options.host === false
+      ? undefined
+      : {
+          show: async (request: WebNotificationRequest) => {
+            h.shown.push(request)
+            return h.hostShows
+          },
+          close: (id: string) => {
+            h.closed.push(id)
+          },
+          forgetOrigin: (origin: string) => {
+            h.forgotten.push(origin)
+          },
+          ensureAllowed: async () => {
+            h.ensured++
+            return true
+          }
+        }
+  const browser = {
+    platform: { webNotifications: host },
+    permissions: {
+      subscribe: (listener: (change: PermissionChange) => void) => {
+        listeners.push(listener)
+        return () => undefined
+      },
+      resolve: (permission: string, url: string) =>
+        decisions.get(`${permission}|${originOf(url)}`) ?? 'ask',
+      decide: async (permission: string, url: string, details?: PermissionRequestDetails) => {
+        h.decideCalls.push({ permission, url })
+        h.detailsSeen.push(details)
+        const decision = decisions.get(`${permission}|${originOf(url)}`) ?? 'ask'
+        if (decision === 'ask') {
+          // The prompt: this harness answers as `loudAnswer` says (Allow by default, remembered,
+          // like the user tapping Allow) and tells the prompts' listeners, as the core does.
+          const prompt: PermissionPrompt = {
+            id: `loud-${h.decideCalls.length}`,
+            tabId: details?.tabId ?? null,
+            origin: originOf(url),
+            permission,
+            message: '',
+            detail: '',
+            allowLabel: 'Allow',
+            blockLabel: 'Block',
+            allowOnce: false,
+            requestedAt: 0
+          }
+          const answer = h.loudAnswer
+          if (answer === 'allow') decisions.set(`${permission}|${originOf(url)}`, 'allow')
+          if (answer === 'block') decisions.set(`${permission}|${originOf(url)}`, 'deny')
+          for (const listener of answered) listener(prompt, answer)
+          return answer === 'allow'
+        }
+        return decision === 'allow'
+      },
+      remember: (
+        permission: string,
+        url: string,
+        decision: 'allow' | 'deny',
+        details?: PermissionRequestDetails
+      ) => {
+        h.remembered.push({ permission, url, decision })
+        h.detailsSeen.push(details)
+        decisions.set(`${permission}|${originOf(url)}`, decision)
+      }
+    },
+    permissionPrompts: {
+      show: (prompt: PermissionPrompt) =>
+        new Promise<PermissionPromptAnswer | null>((resolve) => {
+          h.prompts.push(prompt)
+          pending.set(prompt.id, resolve)
+        }),
+      onAnswered: (
+        listener: (prompt: PermissionPrompt, answer: PermissionPromptAnswer | null) => void
+      ) => {
+        answered.push(listener)
+        return () => undefined
+      }
+    },
+    tabs: {
+      tab: (id: string) => (views.has(id) ? { id } : undefined),
+      // The service speaks to the tab's page (`pageView`) – the one beneath a reader cover too.
+      pageView: (id: string) => views.get(id),
+      allViews: () => views.entries(),
+      isPrivate: (tab: { id: string }) => privateTabs.has(tab.id),
+      createTab: (opts: { url: string }) => {
+        h.created.push(opts.url)
+        return { id: 'new' }
+      }
+    },
+    revealTab: (tabId: string) => {
+      h.revealed.push(tabId)
+    },
+    focusedWindow: () => ({ id: 'w1' })
+  }
+  const service = new WebNotificationService(browser as unknown as Browser)
+  return Object.assign(h, {
+    service,
+    addTab: (tabId: string, url: string) => {
+      const view: FakeView = {
+        url,
+        destroyed: false,
+        posted: [],
+        getURL: () => view.url,
+        isDestroyed: () => view.destroyed,
+        postToPage: (m) => view.posted.push(m)
+      }
+      views.set(tabId, view)
+      return view
+    },
+    closeTab: (tabId: string) => {
+      views.delete(tabId)
+    }
+  })
+}
+
+const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
+
+function show(
+  h: Harness,
+  tabId: string,
+  id: string,
+  extra: Partial<NotificationPageRequest> = {}
+): void {
+  h.service.handle(tabId, { notification: 'show', id, title: 'Hello', body: 'World', ...extra })
+}
+
+describe('WebNotificationService', () => {
+  let h: Harness
+
+  beforeEach(() => {
+    h = harness()
+    h.addTab('t1', 'https://site.example/page')
+    h.addTab('t2', 'https://other.example/')
+  })
+
+  it('answers Notification.permission from the shared permission model', () => {
+    expect(h.service.status('t1', 'https://site.example/page')).toBe('default')
+    h.decisions.set('notifications|https://site.example', 'allow')
+    expect(h.service.status('t1', 'https://site.example/page')).toBe('granted')
+    h.decisions.set('notifications|https://site.example', 'deny')
+    expect(h.service.status('t1', 'https://site.example/page')).toBe('denied')
+    h.service.handle('t1', { notification: 'query' })
+    expect(h.views.get('t1')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'status',
+      status: 'denied'
+    })
+  })
+
+  it('reads denied in a private tab, for a page that is not a site, and for an unknown tab', () => {
+    h.privateTabs.add('t1')
+    h.decisions.set('notifications|https://site.example', 'allow')
+    expect(h.service.status('t1', 'https://site.example/page')).toBe('denied')
+    expect(h.service.status('t2', 'zen://newtab')).toBe('denied')
+    expect(h.service.status('nope', 'https://site.example/')).toBe('denied')
+  })
+
+  it('requestPermission prompts through the permission service, then secures the app-side right', async () => {
+    h.service.handle('t1', { notification: 'request', id: 'req1' })
+    await flush()
+    expect(h.decideCalls).toEqual([
+      { permission: 'notifications', url: 'https://site.example/page' }
+    ])
+    expect(h.ensured).toBe(1)
+    expect(h.views.get('t1')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'result',
+      status: 'granted',
+      id: 'req1'
+    })
+  })
+
+  it('settles a private tab’s request as denied without a prompt', async () => {
+    h.privateTabs.add('t1')
+    h.service.handle('t1', { notification: 'request', id: 'r' })
+    await flush()
+    expect(h.decideCalls).toEqual([])
+    expect(h.views.get('t1')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'result',
+      status: 'denied',
+      id: 'r'
+    })
+  })
+
+  describe('the quiet ask (NOT-03)', () => {
+    const lastPosted = (tabId: string): PageHostMessage | undefined =>
+      h.views.get(tabId)!.posted.at(-1)
+
+    it('asks quietly for a request without a gesture: a quiet prompt in the queue, no sheet through decide', async () => {
+      h.service.handle('t1', { notification: 'request', id: 'q1', gesture: false })
+      await flush()
+      expect(h.decideCalls).toEqual([])
+      expect(h.prompts).toHaveLength(1)
+      const prompt = h.prompts[0]!
+      expect(prompt).toMatchObject({
+        tabId: 't1',
+        origin: 'https://site.example',
+        permission: 'notifications',
+        quiet: true,
+        allowOnce: false,
+        message: 'Notifications blocked',
+        detail: 'You usually block notifications. To let site.example notify you, choose Allow.',
+        allowLabel: 'Allow',
+        blockLabel: 'Keep blocking'
+      })
+      // The page waits: its promise settles with the answer.
+      expect(h.views.get('t1')!.posted.filter((m) => m.type === 'notification')).toEqual([])
+
+      h.answer(prompt.id, 'allow')
+      await flush()
+      expect(h.remembered).toEqual([
+        { permission: 'notifications', url: 'https://site.example/page', decision: 'allow' }
+      ])
+      expect(h.ensured).toBe(1)
+      expect(lastPosted('t1')).toEqual({
+        type: 'notification',
+        action: 'result',
+        status: 'granted',
+        id: 'q1'
+      })
+    })
+
+    it('Keep blocking remembers a block; a withdrawn quiet prompt remembers nothing and reads default', async () => {
+      h.service.handle('t1', { notification: 'request', id: 'q1', gesture: false })
+      await flush()
+      h.answer(h.prompts[0]!.id, 'block')
+      await flush()
+      expect(h.remembered).toEqual([
+        { permission: 'notifications', url: 'https://site.example/page', decision: 'deny' }
+      ])
+      expect(h.ensured).toBe(0)
+      expect(lastPosted('t1')).toMatchObject({ action: 'result', status: 'denied', id: 'q1' })
+
+      h.service.handle('t2', { notification: 'request', id: 'q2', gesture: false })
+      await flush()
+      h.answer(h.prompts[0]!.id, null)
+      await flush()
+      expect(h.remembered).toHaveLength(1)
+      expect(lastPosted('t2')).toMatchObject({ action: 'result', status: 'default', id: 'q2' })
+    })
+
+    it('a gestured request asks loudly the first time and quietly once its prompt was dismissed', async () => {
+      h.loudAnswer = 'dismiss'
+      h.service.handle('t1', { notification: 'request', id: 'r1', gesture: true })
+      await flush()
+      expect(h.decideCalls).toHaveLength(1)
+      expect(h.prompts).toEqual([])
+      expect(lastPosted('t1')).toMatchObject({ action: 'result', status: 'default', id: 'r1' })
+      expect(h.service.dismissedBefore('https://site.example/other')).toBe(true)
+      expect(h.service.dismissedBefore('https://other.example/')).toBe(false)
+
+      // The same site, asked again with a gesture: the bell, not the sheet.
+      h.service.handle('t1', { notification: 'request', id: 'r2', gesture: true })
+      await flush()
+      expect(h.decideCalls).toHaveLength(1)
+      expect(h.prompts).toHaveLength(1)
+      expect(h.prompts[0]!.quiet).toBe(true)
+      // Another site is not marked by it.
+      h.service.handle('t2', { notification: 'request', id: 'r3', gesture: true })
+      await flush()
+      expect(h.decideCalls).toHaveLength(2)
+    })
+
+    it('a loud prompt answered Allow or Block closes the site’s question: no quiet mark', async () => {
+      h.loudAnswer = 'dismiss'
+      h.service.handle('t1', { notification: 'request', id: 'r1', gesture: true })
+      await flush()
+      expect(h.service.dismissedBefore('https://site.example/')).toBe(true)
+      h.loudAnswer = 'block'
+      // The answer arrives through the prompts' listener, as the core's does.
+      h.decisions.delete('notifications|https://site.example')
+      h.service.handle('t1', { notification: 'request', id: 'r2', gesture: true })
+      await flush()
+      // Dismissed before: this one went quietly; answering the loud path is simulated directly.
+      expect(h.prompts).toHaveLength(1)
+      h.answer(h.prompts[0]!.id, 'block')
+      await flush()
+      expect(h.service.dismissedBefore('https://site.example/')).toBe(false)
+    })
+
+    it('a site’s notification rule reset in Settings drops its quiet mark: it asks aloud again', async () => {
+      h.loudAnswer = 'dismiss'
+      h.service.handle('t1', { notification: 'request', id: 'r1', gesture: true })
+      await flush()
+      expect(h.service.dismissedBefore('https://site.example/')).toBe(true)
+      // Another site's rule changing, or another permission's, says nothing of this mark.
+      for (const listener of h.listeners) {
+        listener({ permission: 'notifications', origin: 'https://other.example' })
+        listener({ permission: 'camera', origin: 'https://site.example' })
+      }
+      expect(h.service.dismissedBefore('https://site.example/')).toBe(true)
+      // The site's own rule: a reset (`permissions.resetOrigin`, `forget`) or a hand-set answer.
+      for (const listener of h.listeners)
+        listener({ permission: 'notifications', origin: 'https://site.example' })
+      expect(h.service.dismissedBefore('https://site.example/')).toBe(false)
+      h.service.handle('t1', { notification: 'request', id: 'r2', gesture: true })
+      await flush()
+      expect(h.decideCalls).toHaveLength(2)
+      expect(h.prompts).toEqual([])
+    })
+
+    it('a private session’s change leaves the regular profile’s quiet mark; the site’s own rule moving by hand still clears it (#421’s delta read)', async () => {
+      h.loudAnswer = 'dismiss'
+      h.service.handle('t1', { notification: 'request', id: 'r1', gesture: true })
+      await flush()
+      expect(h.service.dismissedBefore('https://site.example/')).toBe(true)
+      const posted = h.views.get('t1')!.posted.length
+      // An answer given in a private window, and the private session's end forgetting it
+      // (`PermissionService.forgetContainer`): the container's changes, not the regular
+      // profile's rule – the mark stays, and the site still asks quietly.
+      for (const listener of h.listeners)
+        listener({
+          permission: 'notifications',
+          origin: 'https://site.example',
+          container: 'private'
+        })
+      expect(h.service.dismissedBefore('https://site.example/')).toBe(true)
+      // The site's pages hear their status as before: the rest of the subscriber is untouched.
+      expect(h.views.get('t1')!.posted.length).toBe(posted + 1)
+      expect(lastPosted('t1')).toMatchObject({ action: 'status', status: 'default' })
+      h.service.handle('t1', { notification: 'request', id: 'r2', gesture: true })
+      await flush()
+      expect(h.decideCalls).toHaveLength(1)
+      expect(h.prompts).toHaveLength(1)
+      expect(h.prompts[0]!.quiet).toBe(true)
+      h.answer(h.prompts[0]!.id, null)
+      await flush()
+      // The site's own rule changed by hand (a reset in Settings, the site sheet): the mark goes.
+      for (const listener of h.listeners)
+        listener({ permission: 'notifications', origin: 'https://site.example' })
+      expect(h.service.dismissedBefore('https://site.example/')).toBe(false)
+      h.service.handle('t1', { notification: 'request', id: 'r3', gesture: true })
+      await flush()
+      expect(h.decideCalls).toHaveLength(2)
+      expect(h.prompts).toEqual([])
+    })
+
+    it('a request without the gesture word (an older page script) asks loudly', async () => {
+      h.service.handle('t1', { notification: 'request', id: 'r1' })
+      await flush()
+      expect(h.decideCalls).toHaveLength(1)
+      expect(h.prompts).toEqual([])
+    })
+
+    it('a site with an answer never asks quietly: allowed reads granted, blocked reads denied', async () => {
+      h.decisions.set('notifications|https://site.example', 'deny')
+      h.service.handle('t1', { notification: 'request', id: 'r1', gesture: false })
+      await flush()
+      expect(h.prompts).toEqual([])
+      expect(h.decideCalls).toHaveLength(1)
+      expect(lastPosted('t1')).toMatchObject({ action: 'result', status: 'denied' })
+    })
+
+    it('two quiet requests from one tab share one bell and its answer', async () => {
+      h.service.handle('t1', { notification: 'request', id: 'a', gesture: false })
+      h.service.handle('t1', { notification: 'request', id: 'b', gesture: false })
+      await flush()
+      expect(h.prompts).toHaveLength(1)
+      h.answer(h.prompts[0]!.id, 'allow')
+      await flush()
+      const results = h.views
+        .get('t1')!
+        .posted.filter((m) => m.type === 'notification' && m.action === 'result')
+      expect(results.map((m) => (m as { id?: string }).id).sort()).toEqual(['a', 'b'])
+      expect(h.remembered).toHaveLength(1)
+    })
+
+    it('a request without a gesture asks aloud when the page was reached by a same-origin navigation (the carve-out)', async () => {
+      // The tab's first page, then the site's own next page: the user came from the site itself.
+      h.service.onNavigated('t1', 'https://site.example/a', false)
+      h.service.onNavigated('t1', 'https://site.example/page', false)
+      expect(h.service.arrivedSameOrigin('t1', 'https://site.example')).toBe(true)
+      // The mark is the site's: another origin is not excused on it.
+      expect(h.service.arrivedSameOrigin('t1', 'https://other.example')).toBe(false)
+      h.service.handle('t1', { notification: 'request', id: 'r1', gesture: false })
+      await flush()
+      expect(h.decideCalls).toEqual([
+        { permission: 'notifications', url: 'https://site.example/page' }
+      ])
+      expect(h.prompts).toEqual([])
+      expect(lastPosted('t1')).toMatchObject({ action: 'result', status: 'granted', id: 'r1' })
+      // An in-page navigation leaves the document, and the record, where they are; a reload
+      // reads as a same-origin navigation, as it does in Chrome.
+      h.service.onNavigated('t1', 'https://site.example/page#part', true)
+      expect(h.service.arrivedSameOrigin('t1', 'https://site.example')).toBe(true)
+      h.service.onNavigated('t1', 'https://site.example/page', false)
+      expect(h.service.arrivedSameOrigin('t1', 'https://site.example')).toBe(true)
+    })
+
+    it("a fresh tab's first page, and a page reached from another site, ask quietly without a gesture", async () => {
+      // A fresh tab: its first page is nobody's same-origin navigation.
+      h.service.onNavigated('t1', 'https://site.example/page', false)
+      expect(h.service.arrivedSameOrigin('t1', 'https://site.example')).toBe(false)
+      h.service.handle('t1', { notification: 'request', id: 'q1', gesture: false })
+      await flush()
+      expect(h.decideCalls).toEqual([])
+      expect(h.prompts).toHaveLength(1)
+      expect(h.prompts[0]!.quiet).toBe(true)
+      // A tab that came to the site from another site.
+      h.service.onNavigated('t2', 'https://site.example/elsewhere', false)
+      h.service.onNavigated('t2', 'https://other.example/', false)
+      expect(h.service.arrivedSameOrigin('t2', 'https://other.example')).toBe(false)
+      h.service.handle('t2', { notification: 'request', id: 'q2', gesture: false })
+      await flush()
+      expect(h.decideCalls).toEqual([])
+      expect(h.prompts).toHaveLength(2)
+      expect(h.prompts[1]!).toMatchObject({
+        tabId: 't2',
+        origin: 'https://other.example',
+        quiet: true
+      })
+      // A page that is no site leaves no site to come from.
+      h.service.onNavigated('t2', 'about:blank', false)
+      h.service.onNavigated('t2', 'https://other.example/', false)
+      expect(h.service.arrivedSameOrigin('t2', 'https://other.example')).toBe(false)
+    })
+
+    it('a site dismissed before asks quietly however its page was reached; a closed tab’s record goes', async () => {
+      h.loudAnswer = 'dismiss'
+      h.service.handle('t1', { notification: 'request', id: 'r1', gesture: true })
+      await flush()
+      expect(h.decideCalls).toHaveLength(1)
+      expect(h.service.dismissedBefore('https://site.example/')).toBe(true)
+      h.service.onNavigated('t1', 'https://site.example/a', false)
+      h.service.onNavigated('t1', 'https://site.example/page', false)
+      // Without a gesture and with one alike: the bell, the carve-out notwithstanding.
+      h.service.handle('t1', { notification: 'request', id: 'r2', gesture: false })
+      await flush()
+      expect(h.decideCalls).toHaveLength(1)
+      expect(h.prompts).toHaveLength(1)
+      expect(h.prompts[0]!.quiet).toBe(true)
+      h.answer(h.prompts[0]!.id, null)
+      await flush()
+      h.service.handle('t1', { notification: 'request', id: 'r3', gesture: true })
+      await flush()
+      expect(h.decideCalls).toHaveLength(1)
+      expect(h.prompts).toHaveLength(1)
+      // The tab's view goes: its record with it, and the next view's first page is fresh.
+      expect(h.service.arrivedSameOrigin('t1', 'https://site.example')).toBe(true)
+      h.service.onTabGone('t1')
+      expect(h.service.arrivedSameOrigin('t1', 'https://site.example')).toBe(false)
+      h.service.onNavigated('t1', 'https://site.example/page', false)
+      expect(h.service.arrivedSameOrigin('t1', 'https://site.example')).toBe(false)
+    })
+
+    it('the quiet rule and the quiet prompt are pure', () => {
+      expect(asksQuietly(false, false)).toBe(true)
+      expect(asksQuietly(true, true)).toBe(true)
+      expect(asksQuietly(undefined, false)).toBe(false)
+      expect(asksQuietly(true, false)).toBe(false)
+      // The carve-out: a same-origin navigation lifts the gesture rule, never the dismissal's.
+      expect(asksQuietly(false, false, true)).toBe(false)
+      expect(asksQuietly(false, true, true)).toBe(true)
+      expect(asksQuietly(true, false, true)).toBe(false)
+      expect(asksQuietly(undefined, false, true)).toBe(false)
+      expect(asksQuietly(false, false, false)).toBe(true)
+      const prompt = quietNotificationPrompt('t9', 'https://news.example:8443', 42)
+      expect(prompt.quiet).toBe(true)
+      expect(prompt.requestedAt).toBe(42)
+      // The description names the host alone – no scheme, no port (the design gate's nit).
+      expect(prompt.detail).toBe(
+        'You usually block notifications. To let news.example notify you, choose Allow.'
+      )
+      expect(prompt.id).not.toBe(quietNotificationPrompt('t9', 'https://news.example', 42).id)
+    })
+
+    describe('the host’s own request (`decide`: the engine raised it, the page bridge relayed the gesture)', () => {
+      const url = 'https://site.example/page'
+
+      it('takes the one rule – gesture × dismissed before – and resolves the grant the prompt’s answer gives', async () => {
+        // A gestured first ask: the loud prompt, through the permission service (Allow here).
+        await expect(h.service.decide('t1', url, true)).resolves.toBe(true)
+        expect(h.decideCalls).toHaveLength(1)
+        expect(h.prompts).toEqual([])
+        h.decisions.delete('notifications|https://site.example')
+        // No gesture, not dismissed: the bell; Keep blocking resolves false and is remembered.
+        const quiet = h.service.decide('t1', url, false)
+        await flush()
+        expect(h.decideCalls).toHaveLength(1)
+        expect(h.prompts).toHaveLength(1)
+        expect(h.prompts[0]!.quiet).toBe(true)
+        h.answer(h.prompts[0]!.id, 'block')
+        await expect(quiet).resolves.toBe(false)
+        expect(h.remembered).toEqual([{ permission: 'notifications', url, decision: 'deny' }])
+        h.decisions.delete('notifications|https://site.example')
+        // Dismissed before: quiet with a gesture and without one alike; Allow resolves true.
+        h.loudAnswer = 'dismiss'
+        await expect(h.service.decide('t1', url, true)).resolves.toBe(false)
+        expect(h.service.dismissedBefore(url)).toBe(true)
+        const afterDismissal = h.service.decide('t1', url, true)
+        await flush()
+        expect(h.prompts).toHaveLength(1)
+        expect(h.prompts[0]!.quiet).toBe(true)
+        h.answer(h.prompts[0]!.id, 'allow')
+        await expect(afterDismissal).resolves.toBe(true)
+        expect(h.remembered.at(-1)).toEqual({ permission: 'notifications', url, decision: 'allow' })
+        expect(h.service.dismissedBefore(url)).toBe(false)
+        h.decisions.delete('notifications|https://site.example')
+        // A gesture the host cannot vouch for counts as gestured: nothing is quieted on a guess.
+        h.loudAnswer = 'allow'
+        await expect(h.service.decide('t1', url, undefined)).resolves.toBe(true)
+        expect(h.prompts).toEqual([])
+        expect(h.decideCalls).toHaveLength(3)
+      })
+
+      it('carries the host’s request details into the loud path and the quiet answer’s memory', async () => {
+        const details: PermissionRequestDetails = { tabId: 't1', privateContainerId: 'private' }
+        await h.service.decide('t1', url, true, details)
+        expect(h.detailsSeen).toEqual([details])
+        h.decisions.delete('notifications|https://site.example')
+        const quiet = h.service.decide('t1', url, false, details)
+        await flush()
+        h.answer(h.prompts[0]!.id, 'allow')
+        await expect(quiet).resolves.toBe(true)
+        expect(h.detailsSeen).toEqual([details, details])
+        // The page script's own path carries the tab alone, as before.
+        h.decisions.delete('notifications|https://site.example')
+        h.service.handle('t2', { notification: 'request', id: 'r', gesture: true })
+        await flush()
+        expect(h.detailsSeen.at(-1)).toEqual({ tabId: 't2' })
+      })
+
+      it('answers a site with a standing decision from it, and refuses a page that is no site', async () => {
+        h.decisions.set('notifications|https://site.example', 'allow')
+        await expect(h.service.decide('t1', url, false)).resolves.toBe(true)
+        h.decisions.set('notifications|https://site.example', 'deny')
+        await expect(h.service.decide('t1', url, false)).resolves.toBe(false)
+        expect(h.prompts).toEqual([])
+        await expect(h.service.decide('t1', 'about:blank', false)).resolves.toBe(false)
+        expect(h.decideCalls).toHaveLength(2)
+      })
+
+      it('the same-origin carve-out and a shared bell hold for the host’s request too', async () => {
+        h.service.onNavigated('t1', 'https://site.example/a', false)
+        h.service.onNavigated('t1', url, false)
+        await expect(h.service.decide('t1', url, false)).resolves.toBe(true)
+        expect(h.decideCalls).toHaveLength(1)
+        expect(h.prompts).toEqual([])
+        h.decisions.delete('notifications|https://site.example')
+        h.service.onTabGone('t1')
+        const first = h.service.decide('t1', url, false)
+        const second = h.service.decide('t1', url, false)
+        await flush()
+        expect(h.prompts).toHaveLength(1)
+        h.answer(h.prompts[0]!.id, 'allow')
+        await expect(Promise.all([first, second])).resolves.toEqual([true, true])
+      })
+    })
+
+    it('names the site by its host alone, whatever the scheme and port; the file site as every prompt names it', () => {
+      expect(quietPromptSite('http://localhost:18136')).toBe('localhost')
+      expect(quietPromptSite('https://www.example.com')).toBe('www.example.com')
+      expect(quietPromptSite('http://127.0.0.1:8080')).toBe('127.0.0.1')
+      expect(quietPromptSite('file://')).toBe('file:///')
+      expect(quietPromptSite('not a url')).toBe('not a url')
+      expect(quietNotificationPrompt('t1', 'http://localhost:18136', 1).detail).toBe(
+        'You usually block notifications. To let localhost notify you, choose Allow.'
+      )
+      // The buttons: the product's own words (§9.1), Allow and Keep blocking; no Allow once.
+      const prompt = quietNotificationPrompt('t1', 'http://localhost:18136', 1)
+      expect([prompt.allowLabel, prompt.blockLabel, prompt.allowOnce]).toEqual([
+        'Allow',
+        'Keep blocking',
+        false
+      ])
+    })
+  })
+
+  it('shows an allowed site’s notification through the host under its origin and reports shown', async () => {
+    h.decisions.set('notifications|https://site.example', 'allow')
+    show(h, 't1', 'n1', {
+      icon: 'https://site.example/icon.png',
+      tag: 'chat',
+      silent: true,
+      renotify: true,
+      timestamp: 1_700_000_000_000
+    })
+    await flush()
+    expect(h.shown).toHaveLength(1)
+    expect(h.shown[0]).toEqual({
+      id: 't1/n1',
+      origin: 'https://site.example',
+      tabId: 't1',
+      url: 'https://site.example/page',
+      title: 'Hello',
+      body: 'World',
+      icon: 'https://site.example/icon.png',
+      tag: 'chat',
+      silent: true,
+      requireInteraction: false,
+      renotify: true,
+      timestamp: 1_700_000_000_000
+    })
+    expect(h.views.get('t1')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'shown',
+      id: 'n1'
+    })
+    expect(h.service.liveCount).toBe(1)
+  })
+
+  it('refuses a notification the site was not granted, and one the host would not post', async () => {
+    show(h, 't1', 'n1')
+    await flush()
+    expect(h.shown).toEqual([])
+    expect(h.views.get('t1')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'error',
+      id: 'n1'
+    })
+    h.decisions.set('notifications|https://site.example', 'allow')
+    h.hostShows = false
+    show(h, 't1', 'n2')
+    await flush()
+    expect(h.views.get('t1')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'error',
+      id: 'n2'
+    })
+    expect(h.service.liveCount).toBe(0)
+  })
+
+  it('drops a data: or relative icon (the host fetches only web URLs) and caps the text', async () => {
+    h.decisions.set('notifications|https://site.example', 'allow')
+    show(h, 't1', 'n1', { icon: 'data:image/png;base64,AAAA', body: 'x'.repeat(5000) })
+    await flush()
+    expect(h.shown[0]!.icon).toBe('')
+    expect(h.shown[0]!.body).toHaveLength(1024)
+  })
+
+  it('brings the tab forward on a tap and tells the page click; a swipe tells it close', async () => {
+    h.decisions.set('notifications|https://site.example', 'allow')
+    show(h, 't1', 'n1')
+    await flush()
+    h.service.onHostEvent('t1/n1', 'click')
+    expect(h.revealed).toEqual(['t1'])
+    expect(h.views.get('t1')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'click',
+      id: 'n1'
+    })
+    expect(h.service.liveCount).toBe(0)
+    show(h, 't1', 'n2')
+    await flush()
+    h.service.onHostEvent('t1/n2', 'close')
+    expect(h.views.get('t1')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'close',
+      id: 'n2'
+    })
+    expect(h.revealed).toEqual(['t1'])
+  })
+
+  it('opens the page again when the tab is gone at the tap, or the notification outlived the core', async () => {
+    h.decisions.set('notifications|https://site.example', 'allow')
+    show(h, 't1', 'n1')
+    await flush()
+    h.closeTab('t1')
+    h.service.onHostEvent('t1/n1', 'click')
+    expect(h.created).toEqual(['https://site.example/page'])
+    h.service.onHostEvent('gone/x', 'click', 'https://elsewhere.example/a')
+    expect(h.created).toEqual(['https://site.example/page', 'https://elsewhere.example/a'])
+    // Not a web page: nothing opens.
+    h.service.onHostEvent('gone/y', 'click', 'javascript:alert(1)')
+    expect(h.created).toHaveLength(2)
+  })
+
+  it('forgets a notification a later one replaced without a word to the page', async () => {
+    h.decisions.set('notifications|https://site.example', 'allow')
+    show(h, 't1', 'n1', { tag: 't' })
+    show(h, 't1', 'n2', { tag: 't' })
+    await flush()
+    expect(h.service.liveCount).toBe(2)
+    const posted = h.views.get('t1')!.posted.length
+    h.service.onHostEvent('t1/n1', 'replaced')
+    expect(h.service.liveCount).toBe(1)
+    expect(h.views.get('t1')!.posted.length).toBe(posted)
+  })
+
+  it('closes through the host on the page’s close()', async () => {
+    h.decisions.set('notifications|https://site.example', 'allow')
+    show(h, 't1', 'n1')
+    await flush()
+    h.service.handle('t1', { notification: 'close', id: 'n1' })
+    expect(h.closed).toEqual(['t1/n1'])
+    expect(h.service.liveCount).toBe(0)
+    // Closing again, or one never shown, is nothing.
+    h.service.handle('t1', { notification: 'close', id: 'n1' })
+    expect(h.closed).toEqual(['t1/n1'])
+  })
+
+  it('keeps a site to its cap, closing the oldest through the host', async () => {
+    h.decisions.set('notifications|https://site.example', 'allow')
+    for (let i = 0; i <= MAX_LIVE_PER_ORIGIN; i++) show(h, 't1', `n${i}`)
+    await flush()
+    expect(h.closed).toEqual(['t1/n0'])
+    expect(h.service.liveCount).toBe(MAX_LIVE_PER_ORIGIN)
+  })
+
+  it('withdraws a site’s notifications and channel when its permission goes, and tells its pages', async () => {
+    h.decisions.set('notifications|https://site.example', 'allow')
+    h.decisions.set('notifications|https://other.example', 'allow')
+    show(h, 't1', 'n1')
+    show(h, 't2', 'm1')
+    await flush()
+    h.decisions.set('notifications|https://site.example', 'deny')
+    for (const listener of h.listeners)
+      listener({ permission: 'notifications', origin: 'https://site.example' })
+    expect(h.forgotten).toEqual(['https://site.example'])
+    expect(h.service.liveCount).toBe(1)
+    expect(h.views.get('t1')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'status',
+      status: 'denied'
+    })
+    // The other site's page heard nothing new.
+    expect(h.views.get('t2')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'shown',
+      id: 'm1'
+    })
+    // Another permission's change is not this service's business.
+    const before = h.forgotten.length
+    for (const listener of h.listeners)
+      listener({ permission: 'camera', origin: 'https://other.example' })
+    expect(h.forgotten.length).toBe(before)
+  })
+
+  it('a default changing (origin null) refreshes every page’s status', () => {
+    for (const listener of h.listeners) listener({ permission: 'notifications', origin: null })
+    expect(h.views.get('t1')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'status',
+      status: 'default'
+    })
+    expect(h.views.get('t2')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'status',
+      status: 'default'
+    })
+    expect(h.forgotten).toEqual([])
+  })
+
+  it('ignores malformed page requests and requests from unknown tabs', async () => {
+    h.service.handle('t1', null as unknown as NotificationPageRequest)
+    h.service.handle('t1', { notification: 42 } as unknown as NotificationPageRequest)
+    h.service.handle('nope', { notification: 'query' })
+    h.decisions.set('notifications|https://site.example', 'allow')
+    h.service.handle('t1', { notification: 'show' })
+    await flush()
+    expect(h.shown).toEqual([])
+    expect(h.views.get('t1')!.posted).toEqual([])
+  })
+
+  it('is inert on a host without web notifications (desktop): a show answers error', async () => {
+    const plain = harness({ host: false })
+    plain.addTab('a', 'https://a.example/')
+    plain.decisions.set('notifications|https://a.example', 'allow')
+    show(plain, 'a', 'n')
+    await flush()
+    expect(plain.views.get('a')!.posted.at(-1)).toEqual({
+      type: 'notification',
+      action: 'error',
+      id: 'n'
+    })
+  })
+})

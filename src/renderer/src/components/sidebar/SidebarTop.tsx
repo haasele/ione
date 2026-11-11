@@ -1,0 +1,1692 @@
+import type { JSX, ReactNode, RefObject } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore
+} from 'react'
+import {
+  ALargeSmall,
+  AppWindow,
+  ArrowLeft,
+  ArrowRight,
+  BellOff,
+  BookOpenText,
+  Camera,
+  CameraOff,
+  Copy,
+  File,
+  House,
+  Info,
+  Languages,
+  Leaf,
+  Lock,
+  MapPinOff,
+  Mic,
+  MicOff,
+  MonitorDown,
+  MoreHorizontal,
+  RotateCw,
+  ScreenShare,
+  Search,
+  Share2,
+  Sparkles,
+  TriangleAlert,
+  VenetianMask,
+  X
+} from 'lucide-react'
+import { internalPageOf } from '@shared/internalPages'
+import type { SearchEngine, Tab, UIState } from '@shared/types'
+import { hasTopToolbar } from '@shared/toolbarLayout'
+import { toolbarPinned, type ToolbarControl } from '@shared/toolbarPins'
+import { defaultSearchEngineOf } from '@shared/search'
+import { securityIndicator, type IndicatorState } from '@shared/siteInfo'
+import {
+  addressParts,
+  displayUrl,
+  fullUrl,
+  getDomain,
+  isWebPageUrl,
+  pillText,
+  revealProbeText
+} from '@shared/url'
+import { isInstallable, launcherName, pinnedAppFor } from '@shared/webApp'
+import { useElementWidth } from '@renderer/hooks/useElementWidth'
+import { updateDotAt } from '@renderer/lib/about'
+import { addressDragOf, writeAddressDrag } from '@renderer/lib/addressDrag'
+import { run } from '@renderer/lib/api'
+import { chipPrompt } from '@renderer/lib/autofill'
+import { siteBlockingState } from '@renderer/lib/blockingUi'
+import { chromeDropStore } from '@renderer/lib/dnd'
+import { extensionPageChrome } from '@renderer/lib/extensions/pages'
+import { dropStore } from '@renderer/lib/drag'
+import { PRIVATE_TAB_PLACEHOLDER, unlockPrivateTabs, useTabMasked } from '@renderer/lib/privateLock'
+import { isPrivateTab } from '@renderer/lib/privateTabs'
+import {
+  blockedPopupsOf,
+  closeBlockedPopups,
+  closeQuietPrompt,
+  openBlockedPopups,
+  openQuietPrompt
+} from '@renderer/lib/security'
+import { isPrivateWindow, tabTitle } from '@renderer/lib/selectors'
+import { openShareFromChip, useShareChip } from '@renderer/lib/share'
+import {
+  MEMORY_SAVER_LEAF_MS,
+  siteChipName,
+  siteSlotState,
+  type SiteSlotState
+} from '@renderer/lib/siteChips'
+import { openSiteInfo, siteInfoAnchoredOn, siteInfoStore } from '@renderer/lib/siteInfo'
+import { APP_MENU_EVENT, hint, openAppMenu } from '@renderer/lib/shortcuts'
+import { barStateOf, isTranslating, translateStateOf } from '@renderer/lib/translate'
+import {
+  closeMemorySaverBubble,
+  closeReaderPreferences,
+  openMemorySaverBubble,
+  openOverlay,
+  openReaderPreferences,
+  openUrlbar,
+  uiStore
+} from '@renderer/lib/ui'
+import { cn } from '@renderer/lib/utils'
+import { AutofillChip } from '../autofill/AutofillChip'
+import { StarChip } from '../bookmarks/StarChip'
+import { useBookmarkTree } from '../bookmarks/tree'
+import { ExtensionIcon } from '../extensions/ExtensionIcon'
+import { ToolbarActions } from '../extensions/ToolbarActions'
+import { useLongPress } from '../phone/useLongPress'
+import { BlockedChip } from '../urlbar/BlockedChip'
+import { EngineFieldGlyph } from '../urlbar/EngineFieldGlyph'
+import { PillChip } from '../urlbar/PillChip'
+import {
+  CHIP_WIDTH,
+  fittingChips,
+  fittingUtilities,
+  labelFits,
+  type PillChipSpec
+} from '../urlbar/pillChipTiers'
+import { TOOLBAR_STROKE } from '../v2/controls'
+import { WindowControls } from '../WindowControls'
+import { Favicon } from './Favicon'
+import { isZoomed } from '../zoom/bubble'
+import { ZoomChip } from '../zoom/ZoomChip'
+import { DownloadButton } from '../downloads/DownloadButton'
+import { EnergySaverButton } from '../energysaver/EnergySaverButton'
+import { MediaHubButton, MediaLiveDot } from '../media/MediaHubButton'
+import { downloadButtonVisible, downloadsUi } from '@renderer/lib/downloads'
+import { energySaverLeafFits, energySaverLeafUp } from '@renderer/lib/energySaver'
+import { actionable } from '@renderer/lib/extensions/toolbar'
+import { useViewport } from '@renderer/lib/formFactor'
+import {
+  foldingButtonFits,
+  pinsFor,
+  publishToolbarTiering,
+  toolbarMenuMarks
+} from '@renderer/lib/toolbarPins'
+import {
+  mediaHubButtonFits,
+  mediaHubFoldedAt,
+  mediaHubUi,
+  mediaHubVisible,
+  mediaPlaying
+} from '@renderer/lib/mediaHub'
+
+/**
+ * Back, forward, reload, the puzzle piece and the menu: in the row at every width, never folded
+ * by the tier. Forward alone can leave it by a setting (Look and Feel › Customise toolbar,
+ * `fixedButtons` below), and the puzzle piece stands only while there are extensions. Home
+ * (Appearance › Show home button, off by default) is not of this set: shown by its pin it is
+ * tiered by the row's width as the media hub's button is (§9.29's hub-button rule,
+ * `foldingButtonFits`), folded at the 240 sidebar and back where the pill holds its floor.
+ */
+const FIXED_BUTTONS = 5
+
+/**
+ * The site-information slot's one glyph size: §9.19's 16 in the slot's 24 box, at the row's
+ * stroke (`TOOLBAR_STROKE`), whatever the slot shows – the connection's lock, the private
+ * tab's mask, a live capture's camera, a block's crossed-out glyph (§9.29's precedence). One
+ * class for the resting glyph and the state glyphs alike, so the slot's box – and with it the
+ * address's room – never changes when a state comes on; the 12 was the shield's one-off.
+ */
+const SLOT_GLYPH = 'h-4 w-4'
+
+interface Props {
+  state: UIState
+  tab: Tab | null
+  compact: boolean
+  /** Single-toolbar layout puts navigation + the address pill inside the sidebar. */
+  showToolbar: boolean
+}
+
+export function SidebarTop({ state, tab, compact, showToolbar }: Props): JSX.Element {
+  const isMac = state.platform === 'darwin'
+  const fullscreen = state.window.fullscreen
+  // Linux: the window buttons sit at the trailing end of the titlebar (the toolbar row or the
+  // horizontal strip) when the layout has one; only the sidebar-only layouts keep them here.
+  // macOS uses the native traffic lights, and Windows draws native buttons over the window's
+  // top corner, so those rows stay clear. Mobile hosts have none of these.
+  const overlay = state.capabilities.windowControlsOverlay && !fullscreen
+  const showControls =
+    state.capabilities.windowControls &&
+    !overlay &&
+    !isMac &&
+    !fullscreen &&
+    !hasTopToolbar(state.settings.toolbarLayout)
+  const reserveTitleRow = showControls || isMac || overlay
+  return (
+    // A window surface (design language v2 §9.29): the pill and its chips draw in the window family.
+    <div
+      className={cn('zen-drag flex flex-col gap-1 px-2', reserveTitleRow ? 'pt-1.5' : 'pt-2')}
+      data-surface="window"
+    >
+      {reserveTitleRow && (
+        <div className={cn('flex h-8 items-center justify-end', isMac && 'pl-16')}>
+          {showControls && !compact && <WindowControls state={state} />}
+          {showControls && compact && <WindowControls state={state} compact />}
+        </div>
+      )}
+      {showToolbar && <NavRow state={state} tab={tab} compact={compact} />}
+    </div>
+  )
+}
+
+/**
+ * One of the titlebar's three slots (the top toolbar's row, the horizontal strip's): Back /
+ * Forward / Reload and Home lead, the address's pill centres, the utilities and the menu
+ * trail. Centered, each slot is a cell of the row's grid, the pill's width capped by the 640
+ * middle column; otherwise the slot adds no box at all – a fragment keeps its controls the
+ * row's own children, as the sidebar's widths and the menus' anchors count them. `show` is
+ * the compact rail's: the pill is drawn in the rows that have a slot for it.
+ */
+function NavSlot({
+  place,
+  centered,
+  show = true,
+  children
+}: {
+  place: 'leading' | 'center' | 'trailing'
+  centered: boolean
+  show?: boolean
+  children: ReactNode
+}): JSX.Element | null {
+  if (!show) return null
+  if (!centered) return <>{children}</>
+  return (
+    <div
+      className={
+        place === 'leading'
+          ? 'flex items-center gap-1 justify-self-start'
+          : place === 'trailing'
+            ? 'flex items-center gap-1 justify-self-end'
+            : 'flex min-w-0 w-full justify-self-center'
+      }
+    >
+      {children}
+    </div>
+  )
+}
+
+export function NavRow({
+  state,
+  tab,
+  compact,
+  centered = false,
+  className,
+  leading,
+  trailing
+}: {
+  state: UIState
+  tab: Tab | null
+  compact: boolean
+  /**
+   * Zen's titlebar (the top toolbar's row and the horizontal strip's): the row lays as a grid
+   * – Back / Forward / Reload (and Home) leading, the address pill in the middle cell on its
+   * 640 ceiling, the utilities and the menu trailing. The sidebar's rows and the tablet's
+   * toolbar stay the flex line (`false`).
+   */
+  centered?: boolean
+  className?: string
+  /** Controls ahead of Back (the tablet toolbar's sidebar toggle); nothing on the desktop. */
+  leading?: ReactNode
+  /**
+   * One control before the menu (the tablet toolbar's tab-count button, Chrome's tablet order);
+   * nothing on the desktop. Counted with the fixed buttons the pill makes room against.
+   */
+  trailing?: ReactNode
+}): JSX.Element {
+  // A private tab under #250's lock (INC-05, the phone pill's rule): the pill says nothing of
+  // the page – no address, no site icon, no chip, no menu – only that it is a private tab,
+  // behind the mask; a click asks for the screen lock, as the cover's Unlock does. The tablet
+  // keeps private browsing in tabs, so this pill meets one in a regular window; the desktop's
+  // private window is never locked.
+  const masked = useTabMasked(tab ?? { containerId: '' })
+  const url = tab && !masked ? displayUrl(tab.url) : ''
+  // The address at rest elides the scheme and `www.` (Chrome); the full URL shows while the
+  // pointer or the keyboard is on the address, or always with the "Always show full URLs" setting.
+  // The reveal never costs the host (the FIRST LINE's L3 on #589): where the scheme it puts back
+  // would push the host's first character out of the field – a 56 px field read `http://…` –
+  // §9.29's trim stays under the pointer, measured before the reveal is drawn
+  // (`useRevealKeepsHost`); the setting's full URL is the user's word and is not measured.
+  const [revealed, setRevealed] = useState(false)
+  const pill = useRef<HTMLDivElement>(null)
+  const field = useRef<HTMLSpanElement>(null)
+  const probe = useRef<HTMLSpanElement>(null)
+  const revealProbe = useRef<HTMLSpanElement>(null)
+  const revealText = tab && !masked ? revealProbeText(fullUrl(tab.url)) : ''
+  const revealKeepsHost = useRevealKeepsHost(
+    field,
+    revealProbe,
+    revealed && !state.settings.showFullUrls && revealText !== ''
+  )
+  const shown =
+    tab && !masked
+      ? state.settings.showFullUrls || (revealed && revealKeepsHost)
+        ? fullUrl(tab.url)
+        : url
+      : ''
+  // An internal page's address that the pill cannot fit gives way to the page's title, as the
+  // phone pill names Ione's own pages (v2 §10.1); a site's address never does – it truncates
+  // from the end at any width, as Zen's and Firefox's sidebar bars do (§9.29; no browser's
+  // address bar shows a site's title): `pillText`, from the field's width against the address at
+  // its natural width (the probe span, drawn invisibly without truncation). The same `pill` ref
+  // serves the chip tier below (`usePillInnerWidth`).
+  const addressFits = useAddressFits(pill, field, probe, !compact)
+  const text = tab && !masked ? pillText(tab.url, shown, addressFits) : ''
+  // A title is one run of full ink; only an address dims what follows its site.
+  const address = text === shown ? addressParts(text) : { site: text, rest: '' }
+  // What the site icon says (derived in the core's site-information module, drawn here).
+  const indicator = securityIndicator(
+    masked ? '' : (tab?.url ?? ''),
+    tab?.errorCode ?? null,
+    tab?.certificateError ?? null
+  )
+  // The mask in the leading slot: the desktop's private window's pill, and a private tab's on
+  // a host that keeps private browsing in tabs (the tablet), where the theme re-inks with the
+  // tab (v2 §9.19: the mask is the private tab's identity, on the phone pill as here).
+  const isPrivate = isPrivateWindow(state) || Boolean(tab && isPrivateTab(tab))
+  // The field of a tab with no site (the lead on #406 §G; §6): it leads with the engine's
+  // favicon at 16, as the new tab page's resting field does, for the search a typed word
+  // becomes – the same resolution as the omnibox's, so the pill, the page's field and the bar
+  // agree on the engine. An empty private tab keeps the mask there instead (one leading glyph).
+  const emptyField = !url && !masked && !isPrivate
+  const engine = emptyField ? fieldEngine(state) : null
+  // A page of the web gets the site chips; an extension page is not one, whatever origin the
+  // Android runtime serves it from (v2 §10.1 applied to extension pages): its icon takes the
+  // site icon's place, titled for what it is, and no lock, shield, reader or translation chip.
+  // A masked page is no page at all to the pill: no chip speaks of it.
+  const isWebPage = Boolean(tab && !masked && isWebPageUrl(tab.url))
+  const extension = tab && !masked ? extensionPageChrome(tab.url, state.extensions) : null
+  const isReader = Boolean(tab && !masked && tab.url.startsWith('zen://reader'))
+  const boosted = Boolean(
+    tab && isWebPage && state.boosts.some((b) => b.domain === getDomain(tab.url) && b.enabled)
+  )
+  const row = useRef<HTMLDivElement>(null)
+  const rowWidth = useElementWidth(row)
+  const downloadsUiState = downloadsUi.use()
+  // What the chips have open, for their `aria-expanded`. The site information's anchor is the
+  // one chip that opened it (§9.20; `siteInfoStore.openedBy`): the slot here, or the shield –
+  // never both for one popover.
+  const siteAnchored = siteInfoStore.use((s) => siteInfoAnchoredOn(s, 'site'))
+  const boostsOpen = uiStore.use((s) => s.overlay === 'boosts')
+  const blockedOpen = uiStore.use(
+    (s) => s.blockedPopupsPanel !== null && s.blockedPopupsPanel.tabId === tab?.id
+  )
+  const readerPrefsOpen = uiStore.use(
+    (s) => s.readerPreferences !== null && s.readerPreferences.tabId === tab?.id
+  )
+  // A popup (`window.open` with features) has Chrome's read-only location bar: the address and
+  // its chips show where the page is, but nothing can be typed into it. (An app window draws
+  // its title bar in place of this row, `app/AppTitleBar.tsx`; should the row ever stand in for
+  // it, the address stays read-only there too.)
+  const readOnly = state.window.chrome === 'popup' || state.window.chrome === 'app'
+  // An address or text dragged over the pill goes to the tab as typed (lib/dnd.ts, Chrome's
+  // paste and go): the pill shows it will take the drop (§9.4) – or, read-only, that it cannot,
+  // dimmed for as long as the drag is over the window.
+  const dropInto = dropStore.use((s) => s.key === 'address:')
+  const dropInvalid = chromeDropStore.use((s) => readOnly && s.kind !== null)
+  const openField = (): void => {
+    if (readOnly) return
+    if (masked) {
+      // The URL bar would show the page's address: the click asks for the screen lock instead.
+      void unlockPrivateTabs()
+      return
+    }
+    void openUrlbar(tab ? 'edit' : 'new-tab', tab?.id ?? null, {
+      attached: state.settings.urlbarBehavior !== 'always-float'
+    })
+  }
+  const tree = useBookmarkTree(state)
+  // The star stays on a site and on an internal page whose registry entry keeps it (Chrome shows
+  // it on chrome://settings; the new tab page hides it) – `pill.showStar`, v2 §10.1.
+  // The pins (Settings › Look and Feel › Customise toolbar, settings-36): the desktop's
+  // alone – the phone and the tablet keep their own bars (`pinsFor`). A control folded away is
+  // not drawn and not measured: Forward leaves the fixed set, a chip leaves the pill's tier, the
+  // hub's button folds as the width tier folds it, with the menu's "Media Controls…" row and the
+  // dot on ⋯ standing in the same way. The lit Reader View exit on a `zen://reader` tab is the
+  // document's own control (§10.1), never a pin's.
+  const { formFactor } = useViewport()
+  const pins = pinsFor(state, formFactor)
+  const forwardUp = toolbarPinned(pins, 'forward')
+  // Home is the one control folded by default (settings-32; Chrome's `show_home_button`): shown,
+  // it seats after Reload, as Chrome's `HomeButton` sits before the location bar – where the
+  // row's width has room for it (`homeUp` below).
+  const homePinned = toolbarPinned(pins, 'home')
+  const readerPinned = toolbarPinned(pins, 'reader')
+  const translatePinned = toolbarPinned(pins, 'translate')
+  const starPinned = toolbarPinned(pins, 'star')
+  const installPinned = toolbarPinned(pins, 'install')
+  const mediaPinned = toolbarPinned(pins, 'media')
+  const starred = Boolean(tab && !masked && (isWebPage || internalPageOf(tab.url)?.pill.showStar))
+  const bookmarked = Boolean(tab && starred && tree.hasUrl(tab.url))
+  // The chips the pins keep in the pill: the star, the translate glyph, an article's Reader View.
+  const starUp = starred && starPinned
+  const readerUp = Boolean(tab && !masked && !extension && tab.readerable) && readerPinned
+  // The Install-app chip (W8-6; Chrome's `kActionInstallPwa` page action, shown while the
+  // page is "probably promotable": a manifest that passes the install bar and an app not yet
+  // installed for the profile): the desktop layout's, on a page of the web in a regular window
+  // (Chrome hides its page actions in a popup's read-only bar, and Incognito never installs),
+  // while the host can write a launcher (`capabilities.pinShortcuts`) and the pin keeps it.
+  // Once the app is installed (`state.webApps` carries a record whose scope holds the page) the
+  // chip goes, as Chrome's does on the next visibility update; the app menu's "Open in <app>"
+  // takes over. The phone and the tablet keep their own install surfaces (v2 §10.1's pill).
+  const manifest = tab?.webApp ?? null
+  const installable =
+    tab !== null &&
+    manifest !== null &&
+    isWebPage &&
+    !isPrivate &&
+    !readOnly &&
+    formFactor === 'desktop' &&
+    Boolean(state.capabilities.pinShortcuts) &&
+    isInstallable(manifest) &&
+    pinnedAppFor(tab.url, state.webApps ?? []) === null
+  const installUp = installable && installPinned
+  const installName = manifest ? launcherName(manifest, 'desktop') : ''
+  // The chip's popover is up for this tab: the prompt the user asked for, or the core's offer
+  // (`lib/installOffer.ts`), which hangs from the same chip.
+  const installOpen = uiStore.use(
+    (s) =>
+      (s.install !== null && s.install.tabId === tab?.id) ||
+      (s.installOffer !== null && s.installOffer.banner.tabId === tab?.id)
+  )
+  // The Share chip (W8-6): Chrome's desktop omnibox has no share page action now (its sharing
+  // hub is the app menu's), so the chip is the house's – a hover-only utility beside Copy URL,
+  // never a resident chip – on a page of the web where the chrome has a share sheet to show
+  // (`shareSheet`, the desktop popover) or the host one of its own (`share`). Its popover hangs
+  // from the chip (`data-share-anchor` while its request is up, `lib/share.ts`).
+  const shareable =
+    tab !== null &&
+    isWebPage &&
+    formFactor === 'desktop' &&
+    Boolean(state.capabilities.shareSheet || state.capabilities.share)
+  const shareOpen = useShareChip(state, shareable ? tab.id : null)
+  const menuButton = useRef<HTMLButtonElement>(null)
+  // Home's button and the hub's are tiered by the row's width, as the pill's chips are (§9.29's
+  // hub-button rule, `foldingButtonFits` / `mediaHubButtonFits`): at the 240 sidebar each is
+  // unmounted – never hidden with an opacity or a `visibility` that would keep its box laid out
+  // – Home folded away (its Customise toolbar row says "Hidden at this width."; there is no
+  // app-menu row for it, the lead's word on #572), the hub folded into the app menu's "Media
+  // Controls…" row; each returns where the pill, with the button's own slot back in the row,
+  // still holds the box the star returned at (126 / 110: the 298 sidebar with the always-there
+  // buttons, the pill's `PILL_BLEED` counted), so the pill reads the same on either side of the
+  // return. Home at the 240 sidebar had taken the pill from 96 to 64 and the Settings tab's
+  // title to "S…" (the FIRST LINE's F1 on #572; §9.29, §10.1). The buttons each makes room
+  // against are the ones always in the row (back, forward, reload, ⋯), the puzzle piece while
+  // there are extensions and the downloads button while it is up – and the tiered controls
+  // standing ahead of it in the bar's order (below): Home seats first in the row and is the
+  // first back, so with Home and the hub pinned the hub returns one slot (32) after Home (the
+  // 330 sidebar). The compact column has no pill to keep, so there they all stay.
+  const downloadsUp = downloadButtonVisible(state, downloadsUiState)
+  const puzzleUp = actionable(state.extensions).length > 0
+  // Forward folded by its pin leaves the fixed set (the tiers and the extensions' overflow count
+  // the buttons actually in the row); a trailing control joins it.
+  const fixedButtons = FIXED_BUTTONS - (forwardUp ? 0 : 1) + (trailing ? 1 : 0)
+  // The buttons the width-tiered controls make room against: the ones always in the row, the
+  // puzzle piece while there are extensions, the downloads button while it is up. Each tiered
+  // control then counts the tiered ones standing ahead of it in the bar's order (W8-3's Home
+  // first, on `otherButtons` alone; the leaf; the hub last), so the row gives way from the back.
+  const otherButtons = fixedButtons - (puzzleUp ? 0 : 1) + (downloadsUp ? 1 : 0)
+  const homeUp = homePinned && (compact || foldingButtonFits(rowWidth, otherButtons))
+  // The Energy Saver leaf (W8-2; Chrome's `BatterySaverButton`): the row's to draw while the
+  // governor says the mode is on and the control is pinned, ahead of the hub as Chrome's stands
+  // ahead of its media button – and tiered by the row's width on the hub's one rule
+  // (`energySaverLeafFits`, pr-584 L2): at the 240 sidebar it took the pill from "Settings" to
+  // "S…", so there it folds, unmounted like the hub's button, and returns at the 298 sidebar
+  // (the 282 row with the four always-there buttons; 32 more a button for the puzzle piece and
+  // the downloads button, and for Home while its own tier has it up). The leaf counts the row's
+  // other buttons and Home, not the hub, while the hub counts the leaf: where the row has room
+  // for one of the two, the leaf stands and the hub folds to its menu row – the leaf has no fold
+  // home, and the mode it speaks for runs on.
+  const saverPinned = energySaverLeafUp(state, pins)
+  const saverUp =
+    saverPinned && (compact || energySaverLeafFits(rowWidth, otherButtons + (homeUp ? 1 : 0)))
+  const hubUp =
+    mediaPinned &&
+    mediaHubVisible(state) &&
+    (compact || mediaHubButtonFits(rowWidth, otherButtons + (homeUp ? 1 : 0) + (saverUp ? 1 : 0)))
+  // The hub's toolbar button off the row (§9.29's fold): the ⋯ button then wears the hub's dot.
+  // Decided here, from the same width the button is mounted by, so the dot and the button move
+  // in one commit as the sidebar crosses the button's return – never both in a frame, never
+  // neither.
+  const mediaFolded = mediaHubFoldedAt(state, hubUp)
+  // An update downloaded and waiting (shortcuts-menus-101): the menu opens on its "Update
+  // Ione" row and ⋯ wears the dot for it – Chrome's dot on its ⋮ – over the hub's while
+  // both would show (one dot on the button; the menu's head row says which). One cadence on
+  // every layout, Chrome Android's (TB-12; W8-F3 for the desktop, the lead's ruling): the dot
+  // clears once the menu has been opened for the waiting version and returns for another
+  // version's `ready` (`updateDotAt`, the core's per-version record). Chrome desktop's badge
+  // persists by severity until the relaunch (`app_menu_icon_controller.cc`) – the edge left.
+  const updateReady = updateDotAt(state)
+  // The decision published for the hub's popover (`mediaHubUi.buttonUp`), from this commit's
+  // layout phase: where the button returns or folds in the row's own observer pass – a sidebar
+  // drag, no state push – the popover re-reads its anchor before the frame paints, so the hold
+  // on `aria-expanded` and the box hand over ⋯ ↔ button with the dot, in the same frame.
+  useLayoutEffect(() => {
+    mediaHubUi.set({ buttonUp: hubUp })
+    return () => mediaHubUi.set({ buttonUp: false })
+  }, [hubUp])
+  useEffect(() => {
+    // Alt+F / F10: the menu opens from this button with the keyboard on it, so Escape closes
+    // the menu and leaves the focus here (design language v2 §9.22).
+    const fromKeyboard = (e: Event): void => {
+      const button = menuButton.current
+      if (!button || e.defaultPrevented || button.offsetParent === null) return
+      e.preventDefault()
+      button.focus()
+      openAppMenu(button, true)
+    }
+    window.addEventListener(APP_MENU_EVENT, fromKeyboard)
+    return () => window.removeEventListener(APP_MENU_EVENT, fromKeyboard)
+  }, [])
+  const blocked = masked ? [] : blockedPopupsOf(state, tab?.id)
+  // Translation: the glyph stays once the page has been offered or translated (in the accent
+  // while the translation shows), and comes up on hover for every other web page.
+  const translation = tab && isWebPage && translatePinned ? translateStateOf(state, tab.id) : null
+  const translateBarUp = tab ? barStateOf(state, tab.id) !== null : false
+  // The chips fit or hide by priority (`pillChipTiers.ts`, design language v2 §9.29; the #226
+  // finding of five chips running past a 240 px sidebar's pill): the pill measures its content
+  // box and asks which of the chips present fit beside an address that keeps its minimum. The
+  // site icon and the state chips – blocked pop-ups, a save prompt's key – are never hidden;
+  // the star, the shield, the zoom chip and the informational chips (translate, Reader View)
+  // hide from the lowest priority up. The hover-only utilities (Copy URL, Share, Boost, the
+  // translate offer) are the tier's lowest rank (`extra`): they mount with the pointer over the
+  // pill into the room the resident chips left the address over its floor, and never under it
+  // (the W8-6 lead's rule on #578's first line: Boost and Copy URL mounting on hover cut the
+  // address to 14 px while every chip stood). Their mounting itself stays the stylesheet's
+  // (`hidden group-hover/pill:flex`), as does the 130 px tier under which every tool after the
+  // address goes (`zen-pill-chip`; §9.29's threshold, which the star's return here matches). A
+  // hidden chip's action stays in the app menu and the tab's menu; a chip whose popover is up
+  // stays put (§9.20). On a `zen://reader` tab the lit Reader View exit and the Text preferences
+  // chip are the document's own controls (§10.1 took the reader toolbar away and left the chip
+  // the one home of its type, theme, width, spacing and reading aids), so there both join the
+  // never-hidden class (§9.29, the lead's ruling on #265): they are counted with the state chips
+  // here, carry no `zen-pill-chip` (the lit exit sheds it; unlit, "Enter Reader View" is a tool
+  // like the star), and the address gives way to them – below the floor the pill drops its text
+  // altogether, which on the reader page costs nothing, since the document's own header carries
+  // the title, byline and host.
+  const pillInner = usePillInnerWidth(pill, !compact)
+  const shieldState =
+    tab && isWebPage && state.capabilities.requestBlocking
+      ? siteBlockingState(tab, state.blocking, state.settings.blocking)
+      : 'no-site'
+  const savePrompt = tab && isWebPage ? chipPrompt(state) : null
+  // The zoom chip stands on every host while the page's zoom deviates (§9.29's tier; §9.36's
+  // tablet pill takes it) – what it opens is the host's panel (`ZoomChip`).
+  const zoomed = Boolean(
+    tab && !masked && isZoomed(tab, state.settings.pageControls, state.pageEnvironment)
+  )
+  // The address dragged out of the pill (omnibox-43, dnd-11): the slot is the drag's handle,
+  // as Chrome's location icon is. A press that moves past Chromium's drag threshold lifts the
+  // page's link (`lib/addressDrag.ts` says what it carries); one that does not stays the slot's
+  // click. Nothing to lift from an empty tab, an Ione page or a masked private tab. The ghost
+  // in the hand is the small link card below, drawn off screen for `setDragImage`.
+  const addressDrag = tab && !masked ? addressDragOf(tab, tabTitle(tab)) : null
+  const dragGhost = useRef<HTMLDivElement>(null)
+  // The site-information slot's state (omnibox-38, §9.29): the glyph the leading chip draws in
+  // place of the connection's while the page holds the camera, the microphone or the screen
+  // (`Tab.capture`, folded from the frames' reports) or, at rest, while the user has a
+  // permission blocked on the site (the engine's live rules) – by the ruled precedence, a
+  // certificate error's glyph over both. Never a second chip: a state the slot can carry adds
+  // nothing to the tier, so the address keeps its width at 240 whatever the state. A masked
+  // page and an extension's page (its icon in the slot) say nothing of it. Below a standing
+  // block, the bell-off of a quiet notification request (NOT-03): a question the page waits
+  // on, asked without a bubble – the bubble opens from the bell alone, and its Escape or an
+  // outside press puts the bubble away and leaves the bell up, the core hearing nothing. Below
+  // the bell, the Memory Saver leaf of a tab just woken from sleep (omnibox-40): ten seconds
+  // from the wake on the slot's clock (`useLeafClock`), held while its bubble is up, its click
+  // opening that bubble rather than site information.
+  const memorySaverOpen = uiStore.use(
+    (s) => s.memorySaverBubble !== null && s.memorySaverBubble.tabId === tab?.id
+  )
+  const leafNow = useLeafClock(tab?.memorySaver?.wokeAt)
+  const slot: SiteSlotState | null =
+    tab && !masked && !extension
+      ? siteSlotState(state, tab, indicator.state, { now: leafNow, leafHeld: memorySaverOpen })
+      : null
+  // The leaf's bubble speaks for a leaf in the slot: a state coming over the leaf (a capture
+  // starting) takes the slot, and the bubble goes with the leaf.
+  const leafUp = slot?.kind === 'memory-saver'
+  useEffect(() => {
+    if (memorySaverOpen && !leafUp) closeMemorySaverBubble()
+  }, [memorySaverOpen, leafUp])
+  // The quiet prompt's bubble is the bell's in the same way: open while the bell it hangs from
+  // is in this slot (`quietPromptId` names the prompt), pressed as any open popover's anchor
+  // (§9.20); a state taking the slot over the bell, or another tab coming forward, puts the
+  // bubble away – the bell returns with the slot, the question still waiting.
+  const quietPromptId = uiStore.use((s) => s.quietPromptId)
+  const quietOpen = slot?.kind === 'quiet' && slot.promptId === quietPromptId
+  useEffect(() => {
+    if (quietPromptId !== null && !quietOpen) closeQuietPrompt()
+  }, [quietPromptId, quietOpen])
+  const anchored = siteAnchored || memorySaverOpen || quietOpen
+  // The mask draws in the slot on a private tab with a page (§9.19) at the connection glyph's
+  // rank: a state in the slot (`slot`) and the danger tier of the connection itself – a
+  // certificate error, a dangerous site – take the one 16 box over it (`maskYields`).
+  const maskDraws = isPrivate && !slot && !extension && !maskYields(indicator.state)
+  const chipsPresent: PillChipSpec[] = []
+  if (tab && url) chipsPresent.push({ id: 'site', tier: 'site', width: CHIP_WIDTH.site })
+  if (shieldState !== 'no-site') {
+    const counted = shieldState === 'blocking' && tab !== null && tab.blockedCount > 0
+    chipsPresent.push({
+      id: 'shield',
+      tier: 'shield',
+      width: CHIP_WIDTH.iconButton + (counted ? CHIP_WIDTH.badge : 0)
+    })
+  }
+  if (tab && blocked.length > 0) {
+    chipsPresent.push({
+      id: 'popups',
+      tier: 'state',
+      width: CHIP_WIDTH.iconButton + (blocked.length > 1 ? CHIP_WIDTH.badge : 0)
+    })
+  }
+  if (savePrompt && savePrompt.tabId === tab?.id) {
+    chipsPresent.push({ id: 'key', tier: 'state', width: CHIP_WIDTH.iconButton })
+  }
+  // The indicator's word before the address ("Not secure", "Dangerous"): a state the tier never
+  // hides while it stands, counted at its 13 px width so the chips – the hover-only utilities
+  // first – never take the address under its floor into the word's room (the W8-6 round on
+  // #589: uncounted, three utilities mounting on an http page left the address 2 px). It folds
+  // as the Install word does (`labelFits` below): first, by the room, one way, and under the
+  // label tier whatever the room – the stylesheet drops the word there too.
+  const indicatorSpec: PillChipSpec | null =
+    tab && url && indicator.label
+      ? { id: 'indicator', tier: 'state', width: CHIP_WIDTH.indicatorLabel }
+      : null
+  if (indicatorSpec) chipsPresent.push(indicatorSpec)
+  if (tab && starUp) chipsPresent.push({ id: 'star', tier: 'star', width: CHIP_WIDTH.star })
+  if (zoomed) chipsPresent.push({ id: 'zoom', tier: 'zoom', width: CHIP_WIDTH.small })
+  // The Install chip is listed at its labelled width first: its "Install" shows while the pill
+  // has the label tier's room (the same container rule as "Not secure") and every resident chip
+  // fits beside the word (`labelFits` – a word is the first thing the pill gives up, before any
+  // chip hides, and one way: read on the labelled set, so no chip returns into the word's room
+  // only to send it away again); folded, the chip is measured at its glyph alone.
+  const installSpec: PillChipSpec | null = installUp
+    ? { id: 'install', tier: 'install', width: CHIP_WIDTH.small + CHIP_WIDTH.label }
+    : null
+  if (installSpec) chipsPresent.push(installSpec)
+  if (translation) chipsPresent.push({ id: 'translate', tier: 'info', width: CHIP_WIDTH.small })
+  if (tab && (readerUp || isReader)) {
+    chipsPresent.push({ id: 'reader', tier: isReader ? 'state' : 'info', width: CHIP_WIDTH.small })
+  }
+  if (tab && isReader) {
+    chipsPresent.push({ id: 'reader-prefs', tier: 'state', width: CHIP_WIDTH.small })
+  }
+  // The lit Boost is a resident chip of the informational rank – a per-site state the user set
+  // and can undo from the app menu's Boosts – and folds with translate and Reader View.
+  if (boosted) chipsPresent.push({ id: 'boost', tier: 'info', width: CHIP_WIDTH.small })
+  // The hover-only utilities, lowest of all and let in last, in the order they hide from the
+  // end: the translate offer first, then Boost, then Share, and Copy URL the last to go. They
+  // are read against the residents at their LABELLED widths (`fittingUtilities`), whatever the
+  // word does on screen, so the mounted set only shrinks as the pill narrows: the word's fold
+  // (44 px, where a chip's is 26) never hands a utility room back under the pointer – a chip
+  // re-appearing as the sidebar narrows is jitter (the design lead's ruling on #589). (Under
+  // 170 the stylesheet's `zen-pill-extra` rule hides the utilities whatever the room.)
+  const hoverChips: PillChipSpec[] = []
+  if (url) hoverChips.push({ id: 'copy', tier: 'extra', width: CHIP_WIDTH.small })
+  if (shareable) hoverChips.push({ id: 'share', tier: 'extra', width: CHIP_WIDTH.small })
+  if (tab && isWebPage && !isPrivate && !boosted) {
+    hoverChips.push({ id: 'boost', tier: 'extra', width: CHIP_WIDTH.small })
+  }
+  if (tab && isWebPage && translatePinned && state.translate.available && !translation) {
+    hoverChips.push({ id: 'translate-offer', tier: 'extra', width: CHIP_WIDTH.small })
+  }
+  const utilityFits = fittingUtilities(pillInner, chipsPresent, hoverChips)
+  // The words fold first, by the room, one way – the offer's before the state's: the Install
+  // word while the indicator's stands, then the indicator's beside the Install glyph alone.
+  const installLabelUp = installSpec !== null && labelFits(pillInner, chipsPresent)
+  if (installSpec && !installLabelUp) installSpec.width = CHIP_WIDTH.small
+  const indicatorLabelUp = indicatorSpec !== null && labelFits(pillInner, chipsPresent)
+  const residents =
+    indicatorSpec && !indicatorLabelUp
+      ? chipsPresent.filter((c) => c !== indicatorSpec)
+      : chipsPresent
+  const fits = fittingChips(pillInner, residents)
+  // Boost's chip reads the set it belongs to: lit, the residents'; unlit, the utilities'.
+  const boostFits = boosted ? fits.has('boost') : utilityFits.has('boost')
+  // What the width tier hid of the pinned controls, for the Customise toolbar dialog's "Hidden
+  // at this width" (settings-36): Home while its pin shows it and the row has no room for it,
+  // the chips present in the pill that did not fit, the Energy Saver leaf while the mode is on
+  // and the row has no room for it, and the hub's button while media plays and the row has none
+  // for that – never a control the pins folded, and never one the page has no chip for. In the
+  // bar's order, Home first. From the layout phase, as the hub's own word is.
+  const hiddenHome = homePinned && !homeUp
+  const hiddenStar = Boolean(tab && starUp && !fits.has('star'))
+  const hiddenTranslate = Boolean(translation && !fits.has('translate'))
+  const hiddenReader = Boolean(tab && readerUp && !isReader && !fits.has('reader'))
+  const hiddenInstall = installUp && !fits.has('install')
+  const hiddenSaver = saverPinned && !saverUp
+  const hiddenMedia = mediaPinned && mediaHubVisible(state) && !hubUp
+  useLayoutEffect(() => {
+    const hidden: ToolbarControl[] = []
+    if (hiddenHome) hidden.push('home')
+    if (hiddenReader) hidden.push('reader')
+    if (hiddenTranslate) hidden.push('translate')
+    if (hiddenInstall) hidden.push('install')
+    if (hiddenStar) hidden.push('star')
+    if (hiddenSaver) hidden.push('energy-saver')
+    if (hiddenMedia) hidden.push('media')
+    publishToolbarTiering(hidden)
+    return () => publishToolbarTiering([])
+  }, [
+    hiddenHome,
+    hiddenReader,
+    hiddenTranslate,
+    hiddenInstall,
+    hiddenStar,
+    hiddenSaver,
+    hiddenMedia
+  ])
+  // The titlebar's grid (the top toolbar, the horizontal strip's row): the leading controls and
+  // the trailing utilities hold the window's ends, the pill centres in the middle cell, 640 at
+  // the most. Every other row is the flex line – the pill takes the rest between its neighbours,
+  // as the sidebar's width arithmetic assumes.
+  const centeredRow = centered && !compact
+  return (
+    // The row's buttons sit 4 apart (Firefox's 32 pitch: the 28 box plus its 2 px outer
+    // padding each side, `TOOLBAR_GAP`); centered, the grid's cells hold the same run.
+    <div
+      ref={row}
+      className={cn(
+        'zen-no-drag items-center gap-1',
+        centeredRow
+          ? 'grid grid-cols-[minmax(96px,1fr)_minmax(0,640px)_minmax(96px,1fr)]'
+          : 'flex',
+        compact && 'flex-col',
+        className
+      )}
+      // The bar the extension popovers and the downloads bubble hang from (v2 §9.20): flush
+      // under it, aligned by half. (Its token family is the window's, from the `data-surface`
+      // on SidebarTop's root.)
+      data-bar={compact ? undefined : ''}
+      data-zen-nav-row
+      // The toolbar pane of the F6 rotation (lib/panes.ts): F6 lands on the address, Shift+Alt+T
+      // on the first enabled control.
+      data-pane="toolbar"
+      // Chrome's toolbar role for the row (a11y-02); the keyboard stays Tab and F6 (§9.22), as
+      // in Chrome, so the role says what the row is and asks nothing more of the arrows.
+      role="toolbar"
+      aria-label="Toolbar"
+      aria-orientation={compact ? 'vertical' : undefined}
+    >
+      <NavSlot place="leading" centered={centeredRow}>
+        {leading}
+        <NavigationButton
+          tab={tab}
+          title={hint('Back', state, 'nav.back')}
+          enabled={Boolean(tab?.canGoBack)}
+          command="tab.back"
+        >
+          <ArrowLeft className="h-4 w-4" strokeWidth={TOOLBAR_STROKE} />
+        </NavigationButton>
+        {forwardUp && (
+          <NavigationButton
+            tab={tab}
+            title={hint('Forward', state, 'nav.forward')}
+            enabled={Boolean(tab?.canGoForward)}
+            command="tab.forward"
+          >
+            <ArrowRight className="h-4 w-4" strokeWidth={TOOLBAR_STROKE} />
+          </NavigationButton>
+        )}
+        <button
+          type="button"
+          className="zen-toolbar-button"
+          // The name carries the chord, as the tooltip does (a11y-26; the ⋯ below says why).
+          aria-label={tab?.loading ? 'Stop (Esc)' : hint('Reload', state, 'nav.reload')}
+          data-tooltip={tab?.loading ? 'Stop (Esc)' : hint('Reload', state, 'nav.reload')}
+          disabled={!tab}
+          data-zen-menu="reload"
+          data-zen-menu-tab={tab?.id}
+          onClick={() =>
+            tab &&
+            (tab.loading
+              ? run('tab.stop', { tabId: tab.id })
+              : run('tab.reload', { tabId: tab.id }))
+          }
+        >
+          {/*
+            Reload and Stop share one slot, as the phone bar's do (components/phone/BarGlyphs):
+            the glyph that is not current fades out in place, never remounts, so the button
+            holds its box through the load's start and end.
+          */}
+          <span className="zen-glyph-swap relative flex h-4 w-4 items-center justify-center">
+            <RotateCw
+              className="absolute h-4 w-4"
+              data-shown={!tab?.loading}
+              aria-hidden
+              strokeWidth={TOOLBAR_STROKE}
+            />
+            <X
+              className="absolute h-4 w-4"
+              data-shown={Boolean(tab?.loading)}
+              aria-hidden
+              strokeWidth={TOOLBAR_STROKE}
+            />
+          </span>
+        </button>
+        {homeUp && (
+          /*
+            Chrome's Home button (settings-32; `HomeButton`, seated after Reload and before the
+            location bar), shown by Appearance's "Show home button" – the `home` pin – where the
+            row's width tier has room for it (`homeUp`: §9.29's hub-button rule; at the 240
+            sidebar it is folded, back at 298 with the always-there buttons), and running
+            `nav.home`, the one Home with Alt+Home and the menu bar's row: the home page set
+            under Appearance (a page of the user's or the new tab page). Chrome's names: the
+            accessible name "Home", the tooltip "Open the home page" – each carrying the chord,
+            as the row's names and tooltips do (a11y-26). Right-clicked it is one of the pinned
+            controls (`toolbarMenuMarks`: `data-zen-menu="toolbar"` with its control, W8-1's
+            pinned-button menu – Unpin, Customise Toolbar…) as Reader View, Translate and the
+            Install chip are. Desktop layout alone, as the pins are.
+          */
+          <button
+            type="button"
+            className="zen-toolbar-button"
+            aria-label={hint('Home', state, 'nav.home')}
+            data-tooltip={hint('Open the home page', state, 'nav.home')}
+            data-zen-home-button
+            {...toolbarMenuMarks('home', formFactor)}
+            disabled={!tab}
+            onClick={() => run('nav.home', undefined)}
+          >
+            <House className="h-4 w-4" strokeWidth={TOOLBAR_STROKE} />
+          </button>
+        )}
+      </NavSlot>
+      <NavSlot place="center" centered={centeredRow} show={!compact}>
+        {/*
+          The pill is a group, not a button: the address and each chip inside it are buttons of
+          their own, so every one is in the tab order and a screen reader gets a node for each
+          (a button's descendants would collapse into one). A click on the pill itself – its
+          padding, the address – opens the URL bar; the chips stop their clicks. The address
+          comes first in the DOM so Tab reaches the field before its chips (design language v2
+          §9.22); the site icon is drawn ahead of it with `order-first`.
+        */}
+        <div
+          ref={pill}
+          role="group"
+          aria-label="Address"
+          // A window surface's fill (§9.29: `--v2-window-fill`, its hover through the control
+          // roles the row's `data-surface` resolves), 32 tall at Zen's medium radius, 8 of
+          // padding each side (`PILL_PADDING`: the content box the chip tier and the container
+          // queries read). It fills its slot in the row, 2 into the gap either side
+          // (`-mx-0.5`, `PILL_BLEED`): the row's `gap-1` is the buttons' 2 px outer paddings
+          // meeting (§5's 32 pitch), and the pill's slot runs to the neighbours' boxes, so at
+          // the 240 sidebar it is §9.29's 100 (102–202, content 84, the address 58 beside the
+          // site icon) with Back, Forward, Reload and ⋯ on the same 32 slots as before
+          // (8–36, 40–68, 72–100, 204–232). The tablet's toolbar keeps its own margin.
+          // Centered – the top toolbar and the horizontal strip's row – the pill fills the
+          // middle grid cell up to its 640 ceiling, and the sidebar's arithmetic stops there.
+          className={cn(
+            'zen-squircle zen-pill group/pill relative -mx-0.5 flex h-8 min-w-0 items-center gap-1.5 rounded-[10px] bg-[var(--v2-control-fill)] px-2 text-left',
+            // The titlebar's middle cell is the pill's ceiling (640): it fills that cell and
+            // never the rest of the row. The sidebar's flex row gives it the rest.
+            centeredRow ? 'w-full' : 'flex-1',
+            !readOnly && 'hover:bg-[var(--v2-control-fill-hover)]'
+          )}
+          // The tooltip (lib/tooltip.ts; the chips inside carry their own) carries the whole
+          // address – the user-facing `ione://` form for an internal page (§10.1: `zen://`
+          // never shows), the address behind a title, and for an error or Reader View page the
+          // page it stands in for (`fullUrl`), never the `zen://` document. An empty tab offers
+          // the search prompt, as the field does. A masked private tab offers its placeholder,
+          // and no menu: every item of the pill's would tell of the page.
+          data-tooltip={
+            masked
+              ? PRIVATE_TAB_PLACEHOLDER
+              : (tab && fullUrl(tab.url)) || 'Search or enter address'
+          }
+          data-zen-menu={masked ? undefined : 'urlpill'}
+          data-zen-menu-tab={masked ? undefined : tab?.id}
+          data-readonly={readOnly || undefined}
+          data-address-pill
+          data-drop-into={dropInto || undefined}
+          data-drop-invalid={dropInvalid || undefined}
+          onClick={openField}
+        >
+          <button
+            type="button"
+            className={cn(
+              'flex h-full min-w-0 flex-1 items-center gap-1.5 text-left',
+              readOnly && 'cursor-default'
+            )}
+            aria-label={masked ? 'Private tab locked, unlock' : undefined}
+            aria-readonly={readOnly || undefined}
+            onMouseEnter={() => setRevealed(true)}
+            onMouseLeave={() => setRevealed(false)}
+            onFocus={() => setRevealed(true)}
+            onBlur={() => setRevealed(false)}
+            onKeyDown={(e) => {
+              // Ctrl+C on the address copies the full URL, scheme included, as plain text.
+              if (tab && url && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+                e.preventDefault()
+                run('tab.copyUrl', { tabId: tab.id, markdown: false })
+              }
+            }}
+          >
+            {emptyField && (
+              /*
+                A tab with no site has no site-information slot – nothing to tell of, nothing to
+                open (the lead on #406 §G) – and its field leads with §6's glyph instead: the
+                engine's favicon at 16, the slot's glyph size, as the new tab page's resting
+                field carries it at 20 (the magnifier standing in until it arrives, or for an
+                engine without one). The field's own mark, inside its button, so a reader hears
+                one thing – the prompt; drawn in the slot's 24 box pulled the same 4 into the
+                pad, so the prompt starts where any tab's address does.
+              */
+              <span
+                className="-ml-1 flex h-6 w-6 shrink-0 items-center justify-center text-[var(--v2-control-text-deemphasized)]"
+                data-field-glyph="engine"
+                aria-hidden="true"
+              >
+                {engine ? (
+                  <EngineFieldGlyph engine={engine} fallback="magnifier" size={16} />
+                ) : (
+                  <Search className={SLOT_GLYPH} strokeWidth={TOOLBAR_STROKE} />
+                )}
+              </span>
+            )}
+            <span
+              ref={field}
+              // The address at §4's 13 px, the floor of the type scale – the size of the pill's
+              // two words (`.zen-pill-label`) and of every 13 px label in the chrome; 12.5 had
+              // been the one run under the floor (the FIRST LINE's L9 on #589). The probe below
+              // reads the same size, so `useAddressFits` measures the text the field draws.
+              className={cn(
+                'min-w-0 flex-1 truncate text-[13px]',
+                !url && !masked && 'text-[var(--v2-control-text-deemphasized)]'
+              )}
+              data-reads={url ? (text === shown ? 'address' : 'title') : undefined}
+              data-private-locked={masked || undefined}
+            >
+              {url ? (
+                <>
+                  {address.site}
+                  {address.rest && <span className="opacity-70">{address.rest}</span>}
+                </>
+              ) : masked ? (
+                PRIVATE_TAB_PLACEHOLDER
+              ) : (
+                'Search or enter address'
+              )}
+            </span>
+          </button>
+          {/* The address at its natural width, for `useAddressFits`; out of flow, never seen. */}
+          <span
+            ref={probe}
+            aria-hidden="true"
+            className="pointer-events-none invisible absolute left-0 top-0 whitespace-nowrap text-[13px]"
+            data-pill-probe
+          >
+            {shown}
+          </span>
+          {/*
+            The least the hover reveal must fit – the scheme, `www.`, the host's first character
+            and the ellipsis (`revealProbeText`) – for `useRevealKeepsHost`; the same size and
+            font as the field, out of flow, never seen.
+          */}
+          <span
+            ref={revealProbe}
+            aria-hidden="true"
+            className="pointer-events-none invisible absolute left-0 top-0 whitespace-nowrap text-[13px]"
+            data-reveal-probe
+          >
+            {revealText}
+          </span>
+          {/*
+            Chrome's "Not secure" text before the address of an http page (or of a certificate
+            error's page, in the danger ink), drawn between the site icon and the address. The
+            tier counts it (`CHIP_WIDTH.indicatorLabel`) and folds it as it folds the Install
+            word – first, by the room, before any chip hides (`indicatorLabelUp`) – and a narrow
+            pill drops it whatever the room (the container query on `.zen-pill`). Its size is the
+            stylesheet's `.zen-pill-label` – §4's 13 px, one line for this word and the Install
+            chip's.
+          */}
+          {indicatorLabelUp && indicator.label && (
+            <span
+              className={cn(
+                'zen-pill-label order-[-1] shrink-0',
+                indicator.state === 'certificate-error' ? 'text-[var(--v2-danger)]' : 'opacity-70'
+              )}
+              data-indicator={indicator.state}
+            >
+              {indicator.label}
+            </span>
+          )}
+          {/*
+            The chips, in one focus scope of their own (`display: contents`, so they stay flex
+            items of the pill): the hover-only Boost and Copy chips also show while the keyboard
+            is on one of the chips, so Tab can reach them – but not while the address itself is
+            focused, when they would squeeze the address out of a narrow pill. A `:focus-within`
+            scope rather than `:has(:focus-visible)`: Chromium blocks a Tab whose target is
+            unfocusable in the instant between blurring the old chip and focusing the next, and
+            only `:focus-within` on their common ancestor holds through that instant. They stay
+            as well while a chip has a popover up that HANGS FROM THE PILL – the zoom bubble,
+            the share popover, site information, the star's bubble, the Install chip's "Install
+            <app>?" popover: a chip marked `data-zen-anchored` (`PillChip`'s `anchored`) with
+            `aria-expanded` – so the chips do not shift under a surface that was placed on one of
+            them (§9.20); never while a chip has opened a FRAME DIALOG (the Boosts dialog),
+            whose surface stands over the window with nothing hung from the pill – the
+            utilities drawn under its scrim as if hovered were the FIRST LINE's L7 on #589.
+            Every tool after the address – Reader View, Boost, Copy, the zoom, the star – carries
+            `zen-pill-chip`: a pill under 130 px drops them all for the address (the container
+            query on `.zen-pill`). The site icon stays, and so does the blocked pop-ups chip: a
+            notice rather than a tool, and the only word of a pop-up the page tried to open.
+          */}
+          <span className="contents group/chips">
+            {isPrivate && !(url && tab) ? (
+              // A private tab with no page to tell of – under #250's lock (§9.19: "Private tab"
+              // behind the one mask, no chip), or an empty private tab (no site, so no site
+              // information to open; the mask stands in for the field's engine glyph as it
+              // stands in for the favicon in the sidebar row while the tab has no page): the
+              // mask alone, the tab's identity in the slot's 24 box at its one glyph size, in
+              // the slot's rest ink – the window's deemphasised token, once.
+              <span
+                className={cn(
+                  'order-first -ml-1 flex h-6 w-6 shrink-0 items-center justify-center',
+                  'text-[var(--v2-control-text-deemphasized)]'
+                )}
+                data-private-slot=""
+                aria-hidden="true"
+              >
+                <VenetianMask
+                  className={SLOT_GLYPH}
+                  strokeWidth={TOOLBAR_STROKE}
+                  data-private-mark=""
+                />
+              </span>
+            ) : url && tab ? (
+              // The site-information slot (§9.19's 24 box, one 16 glyph in it at every state –
+              // `SLOT_GLYPH`): the site's state at a glance, site information on click. Its
+              // glyph is one state at a time (§9.29): the connection's – the lock, the info
+              // circle, a certificate error's triangle – or, in its place, the camera /
+              // microphone / screen the page is using, or the crossed-out glyph of the first
+              // permission blocked on the site (`slot`). On a private tab the mask is the tab's
+              // identity in this slot (§9.19: "the slot stays the site-information button" –
+              // the lead's ruling on #406 §G; a bare mark that opened nothing was the defect):
+              // it takes the connection glyph's place in the one 16 box, at the connection's
+              // rank in the ruled precedence – a certificate error's triangle (the danger tier),
+              // a live capture and a standing block each take the box over it, and the mask
+              // returns as the state ends; never two glyphs in the box, never a badge on the
+              // mask (§9.19, §9.29). The private window's theme and the sidebar's header still
+              // say private while a state stands. Its name says which state
+              // ("Site information · Camera and microphone blocked") and the tooltip carries the
+              // state's name – "Private tab · " ahead of the connection's while the mask draws
+              // (`PillChip`'s `title` → `data-tooltip`; a11y-26). The ink is the
+              // window's, once: the deemphasised 69 % at rest (the lock, the mask, a block – a
+              // standing decision – and the info circle alike), full ink for a live capture (a
+              // state that must be seen; no coloured mark – the tab row's dot already says
+              // recording), the danger ink for a certificate error, and full ink on the window
+              // fill under the pointer or while the popover it opened is up (the pressed anchor,
+              // §9.20) – no opacity stacked on the token's own alpha. The danger tier holds its
+              // ink under the press (§9.29 as amended on #428: the press changes the fill, never
+              // the message), so its class is merged last – the pressed fill comes on, the
+              // triangle stays in the danger ink; the lock and the mask take the pressed ink.
+              <PillChip
+                label={siteChipName(slot)}
+                title={
+                  slot
+                    ? slot.label
+                    : maskDraws
+                      ? `${PRIVATE_TAB_PLACEHOLDER} · ${indicator.title}`
+                      : indicator.title
+                }
+                popup="dialog"
+                expanded={anchored}
+                anchored
+                data-site-chip=""
+                data-indicator={indicator.state}
+                data-slot-state={slot?.kind ?? (maskDraws ? 'private' : 'connection')}
+                data-slot-glyph={slot?.glyph}
+                draggable={addressDrag ? true : undefined}
+                data-drag-address={addressDrag ? addressDrag.url : undefined}
+                onDragStart={(e) => {
+                  if (!addressDrag) return
+                  writeAddressDrag(e.dataTransfer, addressDrag)
+                  // The card's grip is under the pointer's left edge, as Chrome holds a link.
+                  if (dragGhost.current) e.dataTransfer.setDragImage(dragGhost.current, 12, 14)
+                }}
+                className={cn(
+                  'order-first -ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-[var(--v2-control-text-deemphasized)] hover:bg-[var(--v2-control-fill-hover)] hover:text-[var(--v2-control-text)]',
+                  slot?.kind === 'capture' && 'text-[var(--v2-control-text)]',
+                  anchored && 'bg-[var(--v2-control-fill-hover)] text-[var(--v2-control-text)]',
+                  indicator.state === 'certificate-error' && 'text-[var(--v2-danger)]'
+                )}
+                onActivate={(e) => {
+                  const chip = e.currentTarget
+                  const r = chip.getBoundingClientRect()
+                  // The leaf opens its own bubble (omnibox-40); the anchor's own press closes
+                  // it without reopening (§9.20), which the layer's light dismiss does.
+                  if (slot?.kind === 'memory-saver') {
+                    if (!memorySaverOpen) void openMemorySaverBubble(tab.id)
+                    return
+                  }
+                  // The bell opens the quiet prompt's bubble (NOT-03): the question asked
+                  // only once the user comes to it; the same second press closes it.
+                  if (slot?.kind === 'quiet') {
+                    if (!quietOpen) openQuietPrompt(slot.promptId)
+                    return
+                  }
+                  // A state in the slot leads straight to the Permissions level, where its row
+                  // is changed (omnibox-38); the connection's glyph opens the overview.
+                  void openSiteInfo(
+                    tab,
+                    { x: r.left, y: r.top, width: r.width, height: r.height },
+                    chip,
+                    { level: slot ? 'permissions' : 'overview', by: 'site' }
+                  )
+                }}
+              >
+                {extension ? (
+                  <ExtensionIcon icon={extension.icon} size={16} box={16} />
+                ) : slot ? (
+                  <SlotGlyph glyph={slot.glyph} />
+                ) : maskDraws ? (
+                  <VenetianMask
+                    className={SLOT_GLYPH}
+                    strokeWidth={TOOLBAR_STROKE}
+                    aria-hidden
+                    data-private-mark=""
+                  />
+                ) : (
+                  <IndicatorGlyph state={indicator.state} scheme={tab.url.split(':')[0] ?? ''} />
+                )}
+              </PillChip>
+            ) : null}
+            {tab && addressDrag && (
+              // The link card the address drag carries (§9.4's lifted item: the window's solid
+              // colour, level 2, 90 %): the page's icon and name, off screen until Chromium
+              // snapshots it as the drag image.
+              <div ref={dragGhost} className="zen-link-ghost" aria-hidden>
+                <div className="zen-link-ghost-card" data-surface="window">
+                  <Favicon tab={tab} />
+                  <span className="min-w-0 truncate">{addressDrag.title}</span>
+                </div>
+              </div>
+            )}
+            {tab && isWebPage && state.capabilities.requestBlocking && (
+              <BlockedChip
+                tab={tab}
+                state={state}
+                variant="desktop"
+                collapsed={!fits.has('shield')}
+              />
+            )}
+            {tab && !masked && !extension && (isReader || (readerUp && fits.has('reader'))) && (
+              <PillChip
+                label="Reader View"
+                title={hint(
+                  isReader ? 'Exit Reader View' : 'Enter Reader View',
+                  state,
+                  'page.readerMode'
+                )}
+                pressed={isReader}
+                className={cn(
+                  'flex h-5 w-5 shrink-0 items-center justify-center rounded opacity-70 hover:bg-[var(--v2-control-fill-hover)]',
+                  // The lit exit on the reader tab is never hidden (§9.29; the tier comment
+                  // above); unlit it is a tool and goes with the rest under a 130 px pill.
+                  isReader ? 'text-[var(--v2-control-accent)] opacity-100' : 'zen-pill-chip'
+                )}
+                {...toolbarMenuMarks('reader', formFactor)}
+                onActivate={() => run('reader.toggle', { tabId: tab.id })}
+              >
+                <BookOpenText className="h-3.5 w-3.5" />
+              </PillChip>
+            )}
+            {tab && isReader && (
+              // Edge's Immersive Reader "Text preferences" on its toolbar: a chip beside Reader
+              // View's while an article is open, whose popup is the preferences popover;
+              // `aria-expanded` follows it and `data-reader-prefs-chip` is what it hangs from
+              // and what its Escape hands the keyboard back to (§9.22). The reader document
+              // carries no toolbar of its own (§10.1: this popover is the one home of its
+              // controls), so the chip is never hidden on the reader tab, whatever the pill's
+              // width (§9.29: it joins site information and the lit Reader View exit; the
+              // address gives way instead) – no `zen-pill-extra`, and the app menu's "Text
+              // Preferences…" opens the same popover anchored to this chip.
+              <PillChip
+                label="Text preferences"
+                title="Text preferences"
+                popup="dialog"
+                expanded={readerPrefsOpen}
+                anchored
+                data-reader-prefs-chip=""
+                className={cn(
+                  'flex h-5 w-5 shrink-0 items-center justify-center rounded opacity-70 hover:bg-[var(--v2-control-fill-hover)]',
+                  // The anchor keeps its pressed fill while its popover is up (§9.20).
+                  readerPrefsOpen && 'bg-[var(--v2-control-fill-hover)] opacity-100'
+                )}
+                onActivate={(e) => {
+                  // The chip that put the popover away keeps the keyboard, as the anchor does
+                  // after Escape (§9.22); a pointer press while it is up never gets here (the
+                  // chrome layer consumes it), so this is the keyboard's toggle.
+                  if (readerPrefsOpen) closeReaderPreferences({ keepFocus: true })
+                  else void openReaderPreferences(tab.id, e.currentTarget.getBoundingClientRect())
+                }}
+              >
+                <ALargeSmall className="h-3.5 w-3.5" />
+              </PillChip>
+            )}
+            {tab && blocked.length > 0 && (
+              // A 28 px chip (§9.3) whose popup is the blocked pop-ups list; `aria-expanded`
+              // follows the popover and `data-blocked-popups-chip` is what it hangs from and
+              // what its Escape hands the keyboard back to. A control on the window surface
+              // (§9.29): its fills and the count's pill draw in the window family, which the
+              // pill's `data-surface="window"` resolves.
+              <PillChip
+                label={
+                  blocked.length === 1 ? 'Pop-up blocked' : `${blocked.length} pop-ups blocked`
+                }
+                title={
+                  blocked.length === 1 ? 'Pop-up blocked' : `${blocked.length} pop-ups blocked`
+                }
+                popup="dialog"
+                expanded={blockedOpen}
+                anchored
+                data-blocked-popups-chip=""
+                className={cn(
+                  'zen-animate-pop flex h-7 min-w-7 shrink-0 items-center justify-center gap-1 rounded-md px-1.5 hover:bg-[var(--v2-control-fill)]',
+                  // The anchor keeps its pressed fill while its popover is up (§9.20).
+                  blockedOpen && 'bg-[var(--v2-control-fill-hover)]'
+                )}
+                onActivate={(e) => {
+                  // The chip that put the popover away keeps the keyboard, as the anchor does
+                  // after Escape (§9.22); a pointer press while it is up never gets here (the
+                  // chrome layer consumes it), so this is the keyboard's toggle.
+                  if (blockedOpen) closeBlockedPopups(false)
+                  else void openBlockedPopups(tab.id, e.currentTarget.getBoundingClientRect())
+                }}
+              >
+                <AppWindow className="h-4 w-4" strokeWidth={TOOLBAR_STROKE} />
+                {blocked.length > 1 && (
+                  <span className="rounded-full bg-[var(--v2-control-fill)] px-2 text-[13px] leading-[var(--v2-line-small)] font-semibold text-[var(--v2-control-text-deemphasized)] tabular-nums">
+                    {blocked.length}
+                  </span>
+                )}
+              </PillChip>
+            )}
+            {tab &&
+              isWebPage &&
+              translatePinned &&
+              state.translate.available &&
+              (translation ? fits.has('translate') : utilityFits.has('translate-offer')) && (
+                <PillChip
+                  label={translateBarUp ? 'Hide the translation bar' : 'Translate this page'}
+                  title={translateBarUp ? 'Hide the translation bar' : 'Translate this page'}
+                  className={cn(
+                    'zen-pill-chip h-5 w-5 shrink-0 items-center justify-center rounded opacity-70 hover:bg-[var(--v2-control-fill-hover)]',
+                    translation &&
+                      isTranslating(translation) &&
+                      'text-[var(--v2-control-accent)] opacity-100',
+                    translation
+                      ? 'flex'
+                      : 'hidden group-hover/pill:flex group-focus-within/chips:flex'
+                  )}
+                  {...toolbarMenuMarks('translate', formFactor)}
+                  onActivate={() => {
+                    if (translateBarUp) run('translate.dismiss', { tabId: tab.id })
+                    else run('translate.offer', { tabId: tab.id })
+                  }}
+                >
+                  <Languages className="h-3.5 w-3.5" />
+                </PillChip>
+              )}
+            {tab && isWebPage && !isPrivate && (boostFits || boostsOpen) && (
+              // Lit, a resident chip of the tier's informational rank; unlit, a hover-only
+              // utility let in last. The Boosts dialog it opens is a frame dialog – a centred
+              // card over the content, hung from nothing – so the chip carries no `anchored`
+              // mark: its `aria-expanded` says what is open for the tree and keeps the chip
+              // mounted (`boostsOpen`), but does not hold the hover-only run drawn (L7).
+              <PillChip
+                label={boosted ? 'Edit Boost for this site' : 'Boost this site'}
+                title={boosted ? 'Edit Boost for this site' : 'Boost this site'}
+                popup="dialog"
+                expanded={boostsOpen}
+                className={cn(
+                  'zen-pill-chip h-5 w-5 shrink-0 items-center justify-center rounded opacity-70 hover:bg-[var(--v2-control-fill-hover)]',
+                  boosted
+                    ? 'flex text-[var(--v2-control-accent)] opacity-100'
+                    : 'zen-pill-extra hidden group-hover/pill:flex group-focus-within/chips:flex group-has-[[data-zen-anchored][aria-expanded=true]]/chips:flex'
+                )}
+                onActivate={() => void openOverlay('boosts', tab.id)}
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+              </PillChip>
+            )}
+            {url && utilityFits.has('copy') && (
+              <PillChip
+                label="Copy URL"
+                title={hint('Copy URL', state, 'tab.copyUrl')}
+                className="zen-pill-chip zen-pill-extra hidden h-5 w-5 shrink-0 items-center justify-center rounded opacity-70 hover:bg-[var(--v2-control-fill-hover)] group-hover/pill:flex group-focus-within/chips:flex group-has-[[data-zen-anchored][aria-expanded=true]]/chips:flex"
+                onActivate={() => tab && run('tab.copyUrl', { tabId: tab.id })}
+              >
+                <Copy className="h-3.5 w-3.5" />
+              </PillChip>
+            )}
+            {shareable && (utilityFits.has('share') || shareOpen) && (
+              // Chrome's sharing hub icon (`IDS_SHARING_HUB_TOOLTIP`, "Share this page"; the
+              // Material share glyph its non-Mac icon was), a hover-only utility with Copy URL,
+              // let in by the tier's lowest rank: its popup is the share popover, hung from this
+              // chip while the request it raised is up (`data-share-anchor`; `aria-expanded`
+              // keeps the chip drawn under it and the tier keeps it mounted, §9.20).
+              <PillChip
+                label="Share this page"
+                title="Share this page"
+                popup="dialog"
+                expanded={shareOpen}
+                anchored
+                data-share-chip=""
+                data-share-anchor={shareOpen ? '' : undefined}
+                className={cn(
+                  'zen-pill-chip zen-pill-extra hidden h-5 w-5 shrink-0 items-center justify-center rounded opacity-70 hover:bg-[var(--v2-control-fill-hover)] group-hover/pill:flex group-focus-within/chips:flex group-has-[[data-zen-anchored][aria-expanded=true]]/chips:flex',
+                  // The anchor keeps its pressed fill while its popover is up (§9.20).
+                  shareOpen && 'bg-[var(--v2-control-fill-hover)] opacity-100'
+                )}
+                onActivate={() => {
+                  // A pointer press while the popover is up never gets here (the chrome layer
+                  // consumes it); the keyboard's second press leaves the popover to its Escape.
+                  if (!shareOpen) openShareFromChip(tab.id)
+                }}
+              >
+                <Share2 className="h-3.5 w-3.5" />
+              </PillChip>
+            )}
+            {tab && !masked && <ZoomChip state={state} tab={tab} collapsed={!fits.has('zoom')} />}
+            {installUp && fits.has('install') && (
+              // Chrome's `kActionInstallPwa` page action between Zoom and the star (its
+              // `action_ids.h` order): the install-desktop glyph, the "Install" of its suggestion
+              // chip while the pill has the label's room (`zen-pill-label`, the "Not secure"
+              // tier), named "Install <app>" as its tooltip is (`IDS_OMNIBOX_PWA_INSTALL_ICON_TOOLTIP`).
+              // Its popup is Chrome's form of the install prompt (the Design Lead's ruling on
+              // W8-M3's item 3): the 320 "Install <app>?" popover hung from this chip
+              // (`install/InstallPopover.tsx`), which the core's offer opens of its own accord
+              // once per site and the chip reopens; the chip keeps its pressed fill while the
+              // popover is up and carries the `anchored` mark, so its open state holds the
+              // pill's hover-only run (L7). A page without an installable manifest gets the
+              // "Create shortcut" frame dialog instead, which hangs from nothing. The tier
+              // folds it after Translate and Reader View and before the shield
+              // (`pillChipTiers.ts`); folded or unpinned, the app menu's "Install <app>…" row
+              // runs the same command. A pinnable control, it carries the pinned button's
+              // right-click menu marks (context-menus-112; W8-1's `toolbarMenuMarks` – Unpin,
+              // Customise Toolbar…) as Reader View and Translate do.
+              <PillChip
+                label={`Install ${installName}`}
+                title={`Install ${installName}`}
+                popup="dialog"
+                expanded={installOpen}
+                anchored
+                data-install-chip=""
+                {...toolbarMenuMarks('install', formFactor)}
+                className={cn(
+                  'zen-pill-chip flex h-5 shrink-0 items-center justify-center gap-1 rounded opacity-70 hover:bg-[var(--v2-control-fill-hover)]',
+                  installLabelUp ? 'px-1' : 'w-5',
+                  // The anchor keeps its pressed fill while its popover is up (§9.20).
+                  installOpen && 'bg-[var(--v2-control-fill-hover)] opacity-100'
+                )}
+                onActivate={() => {
+                  if (!installOpen) run('webapp.openInstall', { tabId: tab.id })
+                }}
+              >
+                <MonitorDown className="h-3.5 w-3.5" />
+                {installLabelUp && (
+                  // The word's size is the stylesheet's `.zen-pill-label` (13 px, shared with
+                  // "Not secure"); its weight the button's 500 (§4). Its line box is the pill's
+                  // own (19.5 at 13 px, centred in the chip's 20), the address's line box: a
+                  // `leading-none` line box centred in the chip put the word's baseline 1 px
+                  // under the address's (the FIRST LINE's N4 on #589 – ink row 62 to the
+                  // address's 61; both at 61 now).
+                  <span className="zen-pill-label font-medium" aria-hidden>
+                    Install
+                  </span>
+                )}
+              </PillChip>
+            )}
+            {tab && isWebPage && <AutofillChip state={state} tab={tab} />}
+            {tab && starUp && (
+              <StarChip
+                tab={tab}
+                filled={bookmarked}
+                collapsed={!fits.has('star')}
+                title={hint(
+                  bookmarked ? 'Edit bookmark' : 'Bookmark this tab',
+                  state,
+                  'bookmark.add'
+                )}
+                control={toolbarMenuMarks('star', formFactor)['data-zen-menu-control']}
+              />
+            )}
+          </span>
+        </div>
+      </NavSlot>
+      <NavSlot place="trailing" centered={centeredRow}>
+        {saverUp && (
+          <EnergySaverButton menuMarks={toolbarMenuMarks('energy-saver', formFactor)} />
+        )}
+        {hubUp && (
+          <MediaHubButton state={state} menuMarks={toolbarMenuMarks('media', formFactor)} />
+        )}
+        <DownloadButton state={state} activeTabId={tab?.id ?? null} />
+        <ToolbarActions
+          state={state}
+          rowWidth={compact ? null : rowWidth}
+          // Home, the leaf, the media and the downloads buttons join the fixed set while they
+          // are in the row – the tiered ones only while the tier has them up, not while they
+          // have folded.
+          fixedButtons={
+            fixedButtons +
+            (homeUp ? 1 : 0) +
+            (saverUp ? 1 : 0) +
+            (hubUp ? 1 : 0) +
+            (downloadsUp ? 1 : 0)
+          }
+          compact={compact}
+        />
+        {trailing}
+        {/*
+          The "⋯" carries the media hub's accent dot while something plays and the hub's toolbar
+          button has folded (design language v2 §9.29: at the 240 sidebar the hub folds into the
+          menu's "Media Controls…" row, and the dot on the menu button is Firefox's badge saying
+          so; with the button up, the button wears the dot and ⋯ says nothing twice) – and the
+          same dot while an update is downloaded and waiting (shortcuts-menus-101: Chrome's dot
+          on its ⋮ for its "Update Google Chrome" row; the menu opens on "Update Ione"), which
+          takes the one dot over the hub's. The name says it for the tree, keeping the chord the
+          tooltip shows (a11y-26: the chrome tooltip of lib/tooltip.ts, on hover and on keyboard
+          focus, in place of a native `title`).
+        */}
+        <button
+          ref={menuButton}
+          type="button"
+          data-zen-app-menu-button
+          className="zen-toolbar-button relative"
+          data-tooltip={hint('Menu', state, 'menu.app')}
+          aria-label={
+            updateReady
+              ? `${hint('Menu', state, 'menu.app')}, update ready`
+              : mediaFolded && mediaPlaying(state)
+                ? `${hint('Menu', state, 'menu.app')}, media playing`
+                : hint('Menu', state, 'menu.app')
+          }
+          aria-haspopup="menu"
+          onClick={() => openAppMenu(menuButton.current)}
+        >
+          <MoreHorizontal className="h-4 w-4" strokeWidth={TOOLBAR_STROKE} />
+          {updateReady ? (
+            <span className="zen-mhub-dot" data-testid="update-ready-dot" aria-hidden />
+          ) : (
+            mediaFolded && <MediaLiveDot state={state} />
+          )}
+        </button>
+      </NavSlot>
+    </div>
+  )
+}
+
+/**
+ * Whether the address at its natural width (`probe`) fits the width the pill gives its field
+ * (`field`) – what decides a page tab's title for its address (`pillText`, §10.1): measured
+ * before the first paint and again whenever either changes size – the sidebar resized, a chip
+ * come or gone, the tab moved to another section. Held still while the pointer or the keyboard
+ * is on the pill: the hover-only chips narrow the field for the hover's duration, and the text
+ * must not swap under the pointer – it truncates then, as every address does. The observer's
+ * next delivery after the hover ends measures the rest layout again. `mounted` says the pill is
+ * in the row (the compact sidebar has none): its change rebinds the observer to the pill the row
+ * has now. The field is `flex: 1`, so its width is the room the chips leave, whatever text it
+ * holds – the measurement never feeds on its own result. The address floor (`MIN_ADDRESS_WIDTH`,
+ * §9.29) is the chip tier's number, not this measurement's: under it a site's address still
+ * truncates, and only the chips give way.
+ */
+function useAddressFits(
+  pill: RefObject<HTMLElement | null>,
+  field: RefObject<HTMLElement | null>,
+  probe: RefObject<HTMLElement | null>,
+  mounted: boolean
+): boolean {
+  const [fits, setFits] = useState(true)
+  useLayoutEffect(() => {
+    const slot = field.current
+    const text = probe.current
+    if (!mounted || !slot || !text) return
+    // Fractional widths: a text 0.3 px wider than its box already draws the ellipsis.
+    const measure = (): void => {
+      if (pill.current?.matches(':hover, :focus-within')) return
+      setFits(text.getBoundingClientRect().width <= slot.getBoundingClientRect().width)
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(slot)
+    observer.observe(text)
+    return () => observer.disconnect()
+  }, [pill, field, probe, mounted])
+  return fits
+}
+
+/**
+ * Whether the hover reveal keeps the host in view (the FIRST LINE's L3 on #589: "the reveal
+ * never costs the host"). The reveal puts the scheme and `www.` back before the host, and the
+ * field truncates from the end: near §9.29's 56 floor it read `http://…` – seven characters of
+ * scheme, none of host – where the rest address read `127.0.0.…`. Measured while the reveal is
+ * asked for (`measuring`), before its first paint: the least the reveal must fit
+ * (`revealProbeText`, drawn invisibly at the field's size – `probe`) against the field's box as
+ * the hover leaves it (`field`; the hover-only chips narrow it for the hover's duration), and
+ * again when either changes size. Where it does not fit, the trim stays under the pointer and
+ * the field reads as at rest. Like `useAddressFits`, it never feeds on its own result: the
+ * field is `flex: 1`, its width the room the chips leave, whatever text it holds. With nothing
+ * asking – no reveal, the "Always show full URLs" setting (the user's word, not measured), or a
+ * reveal that adds nothing before the host (an internal page's alias) – the answer is yes.
+ */
+function useRevealKeepsHost(
+  field: RefObject<HTMLElement | null>,
+  probe: RefObject<HTMLElement | null>,
+  measuring: boolean
+): boolean {
+  const [keeps, setKeeps] = useState(true)
+  useLayoutEffect(() => {
+    const slot = field.current
+    const text = probe.current
+    if (!measuring || !slot || !text) return
+    const measure = (): void => {
+      setKeeps(text.getBoundingClientRect().width <= slot.getBoundingClientRect().width)
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(slot)
+    observer.observe(text)
+    return () => observer.disconnect()
+  }, [field, probe, measuring])
+  return !measuring || keeps
+}
+
+/**
+ * The pill's content-box width – what its address and chips share – kept current by a
+ * ResizeObserver; 0 until measured, which the tier reads as "hide nothing yet". (The row's
+ * `useElementWidth` measures a border box; the pill has padding, so it measures its own.)
+ * `mounted` says the pill is in the row (the compact sidebar has none): the observer is bound
+ * to the pill the row has now, and let go with it – left on the pill the icon rail unmounted,
+ * it would report that node's 0 and never see the pill the expanded sidebar brings back, and
+ * the tier would show every chip over a field with no room (the harness's finding at 270).
+ */
+function usePillInnerWidth(ref: RefObject<HTMLDivElement | null>, mounted: boolean): number {
+  const [width, setWidth] = useState(0)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!mounted || !el) return
+    const style = getComputedStyle(el)
+    const pad = (v: string): number => parseFloat(v) || 0
+    setWidth(Math.max(0, el.clientWidth - pad(style.paddingLeft) - pad(style.paddingRight)))
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (entry) setWidth(entry.contentRect.width)
+    })
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [ref, mounted])
+  return width
+}
+
+/**
+ * The slot's state glyphs (omnibox-38; Chrome's location-bar icons): the camera, the microphone
+ * or the sharing glyph while the page captures, the crossed-out camera, microphone, location or
+ * bell for a permission blocked on the site – the same crossed-out bell for a quiet notification
+ * request waiting to be asked (NOT-03; Chrome's quiet chip draws it too) – and Chrome's leaf for
+ * a tab just woken from sleep (omnibox-40). Drawn at the slot's one size (`SLOT_GLYPH`, §9.19's
+ * 16 in the 24 box), at the row's stroke like every 16 px glyph in the row (§9.3); the ink is
+ * the chip's – the bell and the leaf at the slot's rest 69 %, a question and a notice, not a
+ * live state (§9.29).
+ */
+const SLOT_GLYPHS = {
+  camera: Camera,
+  microphone: Mic,
+  display: ScreenShare,
+  'camera-off': CameraOff,
+  'microphone-off': MicOff,
+  'geolocation-off': MapPinOff,
+  'notifications-off': BellOff,
+  leaf: Leaf
+} as const
+
+/**
+ * The clock the slot reads the Memory Saver leaf by (omnibox-40): the wall clock as an external
+ * store, read as the row renders and heard once more as the leaf's ten seconds run out –
+ * nothing ticks in between. The reading is as coarse as the slot's decision: the wake's moment
+ * while the window is open, the window's end once it has closed, so a wake that reaches the
+ * row late (a tab woken in the background and shown later) reads as over at its first render
+ * and no reading is kept from an earlier wake. `wokeAt` is the tab's (`Tab.memorySaver`); a
+ * new wake subscribes the clock again; a tab without a wake reads nothing.
+ */
+function useLeafClock(wokeAt: number | undefined): number {
+  const deadline = wokeAt === undefined ? 0 : wokeAt + MEMORY_SAVER_LEAF_MS
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      const left = deadline - Date.now()
+      if (left <= 0) return () => undefined
+      const timer = window.setTimeout(onChange, left + 1)
+      return () => window.clearTimeout(timer)
+    },
+    [deadline]
+  )
+  return useSyncExternalStore(subscribe, () =>
+    wokeAt === undefined || Date.now() >= deadline ? deadline : wokeAt
+  )
+}
+
+function SlotGlyph({ glyph }: { glyph: SiteSlotState['glyph'] }): JSX.Element {
+  const Glyph = SLOT_GLYPHS[glyph]
+  return <Glyph className={SLOT_GLYPH} strokeWidth={TOOLBAR_STROKE} aria-hidden />
+}
+
+/**
+ * The site icon's glyph for an indicator state (the state itself is derived in the core, see
+ * `securityIndicator`): the lock for https; Chrome's info circle for http, which the "Not
+ * secure" text goes with; the warning triangle for a certificate error; the page glyph for
+ * `file:` and Ione's own pages; the info circle where nothing more is known. The connection's
+ * glyph is the slot's resting one and draws at the slot's one size and stroke (`SLOT_GLYPH`,
+ * §9.19 / §9.29), the same 16 a state glyph takes in its place; the ink is the chip's – the
+ * danger ink for the certificate error's triangle is set on the chip, not here.
+ */
+function IndicatorGlyph({ state, scheme }: { state: IndicatorState; scheme: string }): JSX.Element {
+  const glyph = { className: SLOT_GLYPH, strokeWidth: TOOLBAR_STROKE, 'aria-hidden': true } as const
+  switch (state) {
+    case 'secure':
+      return <Lock {...glyph} />
+    case 'certificate-error':
+      return <TriangleAlert {...glyph} />
+    case 'internal':
+      return <File {...glyph} />
+    case 'local':
+      return scheme === 'file' ? <File {...glyph} /> : <Info {...glyph} />
+    case 'empty':
+      return <Search {...glyph} />
+    default:
+      return <Info {...glyph} />
+  }
+}
+
+/**
+ * Whether the connection's own state outranks a private tab's mask for the slot's one box
+ * (§9.29's precedence as #406 wrote it, the mask at the connection glyph's rank): the danger
+ * tier – a certificate error's triangle, a dangerous site – must be seen; the lock, the info
+ * circle and the page glyph yield to the mask, the tab's identity.
+ */
+function maskYields(state: IndicatorState): boolean {
+  return state === 'certificate-error' || state === 'dangerous'
+}
+
+/**
+ * The engine the empty tab's field leads with (§6, the omnibox's resolution): null while the
+ * state lists no engine – a host's first frame, a test's partial state – when the field falls
+ * back to the magnifier at the slot's size.
+ */
+function fieldEngine(state: UIState): SearchEngine | null {
+  const engines: readonly SearchEngine[] | undefined = state.searchEngines
+  if (!engines || engines.length === 0) return null
+  return defaultSearchEngineOf(engines, state.settings.searchEngineId, state.searchEngineControl)
+}
+
+/**
+ * Back or forward: a click navigates one step; press-and-hold (about 400 ms, released) or a
+ * right click lists the tab's back/forward stack instead, like Firefox's buttons; a middle
+ * click, or a click with Ctrl (⌘ on macOS) held – either is taken on every host, a Ctrl+click
+ * on macOS being the right click that never arrives as a click – opens the step's page in a new
+ * background tab and leaves this tab where it is, like Chrome's (shortcuts-menus-93). `title`
+ * is the button's name and its tooltip's text, chord included (a11y-26).
+ */
+function NavigationButton({
+  tab,
+  title,
+  enabled,
+  command,
+  children
+}: {
+  tab: Tab | null
+  title: string
+  enabled: boolean
+  command: 'tab.back' | 'tab.forward'
+  children: ReactNode
+}): JSX.Element {
+  const press = useLongPress(() => tab && run('tab.navigationMenu', { tabId: tab.id }))
+  const inNewTab = command === 'tab.back' ? 'tab.backInNewTab' : 'tab.forwardInNewTab'
+  return (
+    <button
+      type="button"
+      className="zen-toolbar-button"
+      aria-label={title}
+      data-tooltip={title}
+      disabled={!enabled}
+      {...press.handlers}
+      onClick={(e) => {
+        if (press.swallowsClick() || !tab) return
+        run(e.ctrlKey || e.metaKey ? inNewTab : command, { tabId: tab.id })
+      }}
+      onAuxClick={(e) => {
+        // The middle button alone: the right button is the stack menu's (`onContextMenu`). React
+        // swallows `click` on a disabled button but not `auxclick`, so the guard is ours.
+        if (e.button !== 1 || !tab || !enabled) return
+        e.preventDefault()
+        run(inNewTab, { tabId: tab.id })
+      }}
+    >
+      {children}
+    </button>
+  )
+}

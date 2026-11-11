@@ -1,0 +1,825 @@
+package app.zen.chromium
+
+import android.graphics.Rect
+import android.os.SystemClock
+import android.util.Log
+import android.view.accessibility.AccessibilityNodeInfo
+import android.webkit.WebView
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import org.json.JSONObject
+import org.json.JSONTokener
+import org.junit.Test
+import org.junit.runner.RunWith
+import java.io.File
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+/**
+ * Records the site controls engine on the phone: a page asking for the location and the
+ * in-chrome permission prompt that answers it (Allow remembered for the site, Allow once kept for
+ * the tab), a private tab on its own WebView profile (the normal profile's cookie is not there,
+ * its own cookie is gone once the last private tab closes), Delete browsing data with its count
+ * preview, Safety check and the site-information snapshot; then the chrome on those: the
+ * Settings tab's Privacy and Security rows (Safety check, the Delete browsing data form sheet,
+ * Site settings with a type's sheet and picker) and the menu sheet.
+ *
+ * The page comes from a loopback HTTP server inside this process and reports what it sees
+ * through its title, which the driver reads from the core's state. Command results are written
+ * to `<shotPrefix>-notes.txt` next to the screenshots. See [DemoHarness] for the plumbing.
+ */
+@RunWith(AndroidJUnit4::class)
+class SiteControlsDemo : DemoHarness("site-controls-demo-state.json", "services-site-controls-android", "site-controls-demo") {
+    override val tag = "SiteControlsDemo"
+    private lateinit var server: PageServer
+    private lateinit var notes: File
+    /**
+     * The held navigation's referrer scenes (scene 8): the pages that link out, on a host of
+     * their own, and one destination host per case – the hold is for a site the tab has no
+     * content-settings answer for yet, and the answer is kept per site per tab, so each case
+     * lands on a fresh host. Every destination records what the browser sent it.
+     */
+    private lateinit var referrerSource: DemoServer
+    private val referrerDestinations = HashMap<String, DemoServer>()
+    /** The claims of scene 8 that did not hold; the run fails on them once the recording is done. */
+    private val failures = ArrayList<String>()
+
+    @Test
+    fun record() {
+        server = PageServer(readAsset("site-controls-demo-page.html"), PORT).also { it.start() }
+        referrerSource = DemoServer(REFERRER_PORT, referrerSourcePages(), REFERRER_SOURCE_ADDRESS).also { it.start() }
+        for (case in REFERRER_CASES) {
+            referrerDestinations[case.id] = DemoServer(REFERRER_PORT, mapOf(LANDING_PATH to landingPage()), case.destinationAddress).also { it.start() }
+        }
+        try {
+            runDemo()
+        } finally {
+            server.close()
+            referrerSource.close()
+            referrerDestinations.values.forEach { it.close() }
+        }
+        if (failures.isNotEmpty()) throw AssertionError("${failures.size} claim(s) did not hold:\n" + failures.joinToString("\n"))
+    }
+
+    override fun warmUp() {
+        notes = File(out, "services-site-controls-android-notes.txt")
+        notes.writeText("Ione Android site controls demo\n\n")
+        note("demo server: ${server.selfCheck()}")
+        val webView = runCatching { WebView.getCurrentWebViewPackage()?.let { "${it.packageName} ${it.versionName}" } }.getOrNull()
+        note("webview: ${webView ?: "unknown"}")
+        val s = state()
+        note("capabilities.privateTabs=${s.getJSONObject("capabilities").optBoolean("privateTabs")}")
+        // The seeded tab stores a cookie and a storage key on the default profile as it loads.
+        val tab = waitForTitle("SC|cookie:yes|storage:yes", 20_000)
+        note("seeded tab: ${describeTab(tab)}")
+        Log.i(tag, "warm-up done")
+    }
+
+    override fun demo() {
+        // 1. The normal tab with its data.
+        note("\n1. normal tab, data stored on the default profile")
+        shot("01-normal-tab-with-data")
+        beat()
+
+        // 2. The page asks for the location: the in-chrome prompt, answered with Allow. The chrome
+        //    has painted first: on the runner's software renderer its first frames take seconds
+        //    each while the feeds load alongside, and in run 35385072693 the first request went
+        //    by unprompted in that window (the second, 15 s later, prompted at once).
+        note("\n2. location prompt, Allow")
+        note("  first paint: ${waitForFirstPaint()}")
+        invoke("tab.navigate", """{"tabId":"tab_demo","input":"$DEMO_URL?set=1&ask=1"}""")
+        var prompt = waitForPrompt(30_000)
+        note("  prompt: ${prompt?.toString() ?: "none"}")
+        if (prompt != null) {
+            waitFor("Allow", 8_000)
+            SystemClock.sleep(1_200)
+            shot("02-prompt-location")
+            beat()
+            answer("Allow")
+            val tab = waitForTitle("granted", 15_000, contains = true)
+            note("  after Allow: ${describeTab(tab)}")
+            note("  rules for geolocation: ${invoke("permissions.listForPermission", """{"permission":"geolocation"}""")}")
+            SystemClock.sleep(800)
+            shot("03-location-granted")
+            beat()
+        }
+
+        // 3. Forget the decision; the page asks again and gets Allow once: nothing is stored.
+        note("\n3. decision forgotten, prompt again, Allow once")
+        invoke("permissions.resetOrigin", """{"origin":"$ORIGIN"}""")
+        invoke("tab.navigate", """{"tabId":"tab_demo","input":"$DEMO_URL?ask=1"}""")
+        prompt = waitForPrompt()
+        note("  prompt: ${prompt?.toString() ?: "none"}")
+        if (prompt != null) {
+            waitFor("Allow once", 8_000)
+            SystemClock.sleep(1_000)
+            shot("04-prompt-location-again")
+            answer("Allow once")
+            val tab = waitForTitle("granted", 15_000, contains = true)
+            note("  after Allow once: ${describeTab(tab)}")
+            note("  rules for geolocation: ${invoke("permissions.listForPermission", """{"permission":"geolocation"}""")}")
+            // The same tab asks once more: the once-grant holds, no prompt.
+            invoke("tab.reload", """{"tabId":"tab_demo","skipCache":true}""")
+            SystemClock.sleep(2_500)
+            note("  reload of the tab: prompts=${state().getJSONArray("permissionPrompts").length()} ${describeTab(waitForTitle("granted", 15_000, contains = true))}")
+            beat()
+        }
+
+        // 4. A private tab: the default profile's cookie is not there; its own cookie is, until
+        //    the last private tab closes and the profile is wiped.
+        note("\n4. private tab on its own profile")
+        val privateId = newPrivateTab("$DEMO_URL?peek=1&private=1")
+        if (privateId == null) {
+            note("  tab.newPrivate returned null (capabilities.privateTabs=${state().getJSONObject("capabilities").optBoolean("privateTabs")})")
+        } else {
+            var tab = waitForTitle("SC|cookie:no|storage:no", 20_000, tabId = privateId)
+            note("  fresh private tab: ${describeTab(tab, privateId)}")
+            SystemClock.sleep(800)
+            shot("05-private-tab-isolated")
+            beat()
+            invoke("tab.navigate", """{"tabId":"$privateId","input":"$DEMO_URL?set=1&private=1"}""")
+            tab = waitForTitle("SC|cookie:yes|storage:yes", 20_000, tabId = privateId)
+            note("  private tab after storing: ${describeTab(tab, privateId)}")
+            SystemClock.sleep(800)
+            shot("06-private-tab-own-data")
+            beat()
+            invoke("tab.close", """{"tabId":"$privateId"}""")
+            SystemClock.sleep(3_500)
+            note("  closed; tabs left: ${state().getJSONObject("tabs").length()}")
+            val again = newPrivateTab("$DEMO_URL?peek=1&private=1")
+            if (again != null) {
+                tab = waitForTitle("SC|cookie:", 20_000, tabId = again)
+                note("  new private tab after the wipe: ${describeTab(tab, again)}")
+                SystemClock.sleep(800)
+                shot("07-private-tab-after-wipe")
+                beat()
+                invoke("tab.close", """{"tabId":"$again"}""")
+                SystemClock.sleep(2_500)
+            }
+            // The normal tab kept its data all along.
+            invoke("tab.navigate", """{"tabId":"tab_demo","input":"$DEMO_URL?peek=1"}""")
+            note("  normal tab meanwhile: ${describeTab(waitForTitle("SC|cookie:", 15_000))}")
+        }
+
+        // 5. Delete browsing data: the preview counts, the clearing, the page without its data.
+        note("\n5. clear browsing data")
+        note("  counts (all time): ${invoke("privacy.clearBrowsingDataCounts", """{"range":"all"}""")}")
+        note("  cleared: ${invoke("privacy.clearBrowsingData", """{"range":"all","types":["cookies","cache"]}""")}")
+        invoke("tab.navigate", """{"tabId":"tab_demo","input":"$DEMO_URL?peek=1&cleared=1"}""")
+        val cleared = waitForTitle("SC|cookie:no|storage:no", 20_000)
+        note("  normal tab after clearing: ${describeTab(cleared)}")
+        note("  counts after: ${invoke("privacy.clearBrowsingDataCounts", """{"range":"all"}""")}")
+        SystemClock.sleep(800)
+        shot("08-normal-tab-after-clear")
+        beat()
+
+        // 6. Safety check and the site-information snapshot: engine results for the UI PR.
+        note("\n6. safety check and site-info snapshot")
+        note("  safetyCheck: ${invoke("privacy.safetyCheck")}")
+        note("  siteInfo.snapshot: ${invoke("siteInfo.snapshot", """{"tabId":"tab_demo"}""")}")
+        note("  permissions.defaults: ${invoke("permissions.defaults")}")
+
+        // 7. The chrome on those results: the Settings tab's Privacy and Security category (#134:
+        //    Settings is a tab of the phone chrome, its rows from the builder), where this PR's
+        //    groups sit in Chrome's order – Safety check (the standing, Check now, a row per
+        //    area), Delete browsing data (one row whose sheet is the form: Basic, then Advanced,
+        //    the range picker over it), Site settings (the catalogue, a type's sheet with its
+        //    default and the sites that answered, the §9.13 picker over that, the sites with
+        //    their own settings) – and the menu sheet with New Private Tab. The tab is opened by
+        //    the core's `page.open` (what the menu's Settings row and a `ione://settings/privacy`
+        //    deep link both run; the menu sheet is recorded on its own at the end). Every sheet is
+        //    opened and worked by a real finger and what the finger did is asserted, never that a
+        //    sheet went away (the rule in DemoHarness): Check now by the check's new time, a row by
+        //    the control its sheet shows, Advanced by the rows it reveals.
+        note("\n7. the chrome: the Settings tab's privacy rows, the clear-data sheet, the menu sheet")
+        invoke("permissions.set", """{"origin":"$ORIGIN","permission":"camera","decision":"deny"}""")
+        val settingsTab = openPrivacySettings()
+        if (settingsTab != null) {
+            // Safety check: the standing at the top, Check now under a finger, the rows after it.
+            val checkedBefore = state().optJSONObject("lastSafetyCheck")?.optLong("checkedAt") ?: 0L
+            if (touchRowExpecting("Check now", "the check ran again (lastSafetyCheck.checkedAt moved)", 20_000) {
+                    (state().optJSONObject("lastSafetyCheck")?.optLong("checkedAt") ?: 0L) > checkedBefore
+                }
+            ) {
+                // The results group is rebuilt by the run; its rows come back into the tree one by
+                // one (the run at 8adeb628 read Updates and Site permissions while Passwords, on
+                // screen, was not in the tree yet): the last row of the group is the one waited for.
+                if (!awaitSettingsRow("Extensions", 10_000)) awaitRow("Extensions", 10_000)
+                SystemClock.sleep(1_500)
+                note("  safety check rows: ${rowText("Updates")} | ${rowText("Passwords")} | ${rowText("Site permissions")}")
+                shot("13-safety-check-results")
+                beat()
+            }
+
+            // Delete browsing data (Chrome's words since M124, W8-7): the row's form sheet, Basic;
+            // Advanced reveals its rows; the range picker stacks over the form (§9.24); Cancel closes it.
+            if (touchRowExpecting("Delete browsing data", "the form sheet shows Delete data", 10_000) { sheetPresented(CLEAR_SHEET) || findByLabel("Delete data") != null }) {
+                SystemClock.sleep(SHEET_SETTLE)
+                shot("11-clear-data-basic")
+                beat()
+                if (touchRowExpecting("Advanced", "the Advanced rows show (Download history)", 8_000) { rowListed("Download history") }) {
+                    SystemClock.sleep(SHEET_SETTLE)
+                    shot("12-clear-data-advanced")
+                    beat()
+                }
+                if (touchRowExpecting("Time range", "the range picker shows All time", 8_000) { rowListed("All time") }) {
+                    SystemClock.sleep(SHEET_SETTLE)
+                    shot("12b-clear-data-range")
+                    beat()
+                    backUntil("the range picker is gone and the form's Time range row is back") {
+                        !sheetPresented("Time range") && rowListed("Time range")
+                    }
+                }
+                // The sheet's leave is the document's word (the tree kept the primary's label
+                // listed for 8 s after the sheet had gone in the nightly's run 35737412086).
+                if (!touchRowExpecting("Cancel", "the form sheet closes", 8_000) { !sheetPresented(CLEAR_SHEET) }) {
+                    backUntil("the form sheet is gone") { !sheetPresented(CLEAR_SHEET) }
+                }
+                if (!awaitSettingsRow("Delete browsing data", 8_000)) awaitRow("Delete browsing data", 8_000)
+                SystemClock.sleep(600)
+            }
+
+            // Site settings: the catalogue (Camera among it), Camera's sheet with the default as a
+            // value row and the demo host's answer under it (rows read the origin's host with its
+            // port, `127.0.0.1:18124`), the default's picker over the sheet, then the sites with
+            // settings of their own.
+            if ((if (awaitSettingsRow("Camera", 8_000)) revealSettingsRow("Camera") else awaitRow("Camera", 8_000, show = true)) != null) {
+                SystemClock.sleep(1_200)
+                shot("09-site-settings-catalogue")
+                beat()
+                if (touchRowExpecting("Camera", "the Camera sheet shows its Default behaviour row", 10_000) { rowListed("Default behaviour") }) {
+                    SystemClock.sleep(SHEET_SETTLE)
+                    note("  Camera sheet: ${rowText("Default behaviour")}; $HOST ${if (rowListed(HOST)) "listed" else "NOT listed"} under Sites with their own answer")
+                    shot("10b-site-settings-camera-sheet")
+                    beat()
+                    if (touchRowExpecting("Default behaviour", "the picker shows the Block option", 8_000) { rowListed("Block") }) {
+                        SystemClock.sleep(SHEET_SETTLE)
+                        shot("10c-site-settings-picker")
+                        beat()
+                        // The picker (the sheet titled Default behaviour) gone by the document,
+                        // the Camera sheet's value row listed again under it.
+                        backUntil("the picker is gone and the Camera sheet's Default behaviour row is back") {
+                            !sheetPresented("Default behaviour") && rowListed("Default behaviour")
+                        }
+                    }
+                    // The Camera sheet gone by the document; the catalogue's Camera row listed again.
+                    backUntil("the Camera sheet is gone and the catalogue is back") {
+                        !sheetPresented("Camera") && rowListed("Camera")
+                    }
+                }
+            }
+            if ((revealSettingsRow("Sites with their own settings") ?: reveal("Sites with their own settings")) != null &&
+                (if (awaitSettingsRow(HOST, 8_000)) revealSettingsRow(HOST) else awaitRow(HOST, 8_000, show = true)) != null
+            ) {
+                SystemClock.sleep(1_200)
+                shot("10-site-settings-sites")
+                beat()
+            }
+            note("  site rules: ${invoke("permissions.listForPermission", """{"permission":"camera"}""")}")
+            closeSettingsTab(settingsTab)
+        }
+
+        // 8. The held navigation's referrer follows the page's own policy (W6-S9, the #507
+        //    seam's item C): a tap on a link into a site the tab has no content-settings answer
+        //    for is held for the core's answer and re-issued as the view's own load, whose
+        //    Referer the view computes – under the policy the page's document-start script read
+        //    (`<meta name=referrer>`, the anchor's `rel=noreferrer` / `referrerpolicy`) and told
+        //    the view before the tap's navigation reached the hook. Each case lands on a fresh
+        //    host (the answer is kept per site per tab, so a second hop into the same host would
+        //    not be held); the destination echoes `document.referrer` in its title and its server
+        //    records the Referer and the Sec-Fetch-Site the browser sent – `none` is the
+        //    browser-initiated re-issue, the proof the hop was held at all. The WebView lifts the
+        //    load's Referer into the navigation's referrer under its DEFAULT policy
+        //    (AwContents.loadUrl), so a page policy stricter than the default is followed and a
+        //    looser one is clamped to it (the last case records the clamp).
+        note("\n8. the held navigation's referrer under the page's own policy")
+        for (case in REFERRER_CASES) referrerScene(case)
+
+        tapMenuButton()
+        SystemClock.sleep(SHEET_SETTLE)
+        val privateItem = reveal("New Private Tab") != null
+        note("  menu sheet: 'New Private Tab' ${if (privateItem) "shown" else "absent (capabilities.privateTabs=false)"}")
+        shot("14-menu-sheet")
+        beat()
+        back()
+        SystemClock.sleep(1_500)
+        note("\ndone")
+    }
+
+    // --- the held navigation's referrer ---------------------------------------------------------
+
+    /**
+     * One case of scene 8: the page under `case`'s policy is loaded by the core (no hold: the
+     * answer rides with the core's own load), its link into the case's fresh host is tapped by a
+     * real finger (the page's own click on it when the finger found nothing), and the landing
+     * page's title, the Referer its server saw and the Sec-Fetch-Site of that request are read
+     * against the case's word.
+     */
+    private fun referrerScene(case: ReferrerCase) {
+        note("  ${case.id}: ${case.description}")
+        val destination = referrerDestinations.getValue(case.id)
+        invoke("tab.navigate", """{"tabId":"tab_demo","input":"$REFERRER_SOURCE_ORIGIN/${case.id}.html"}""")
+        waitForTitle("REFSRC|${case.id}", 15_000)
+        SystemClock.sleep(800)
+        val landed = { pageTitle().startsWith("REF|") }
+        if (!touchTapLabelExpecting(LINK_LABEL, "the destination page echoes document.referrer", timeoutMs = 15_000, took = landed) && !landed()) {
+            note("    the finger did not take; the page's own click on the link")
+            pageJs("document.querySelector('a').click()")
+        }
+        val tab = waitForTitle("REF|", 15_000)
+        val title = tab.getJSONObject("tabs").optJSONObject("tab_demo")?.optString("title").orEmpty()
+        val referer = destination.lastHeader(LANDING_PATH, "Referer")
+        val fetchSite = destination.lastHeader(LANDING_PATH, "Sec-Fetch-Site")
+        note("    landed: ${describeTab(tab)}")
+        note("    the request to ${destination.origin}$LANDING_PATH carried Referer=${referer ?: "(none)"} Sec-Fetch-Site=${fetchSite ?: "(none)"}")
+        expect("${case.id}: the hop was held and re-issued as the view's own load (Sec-Fetch-Site: none)", fetchSite == "none")
+        expect("${case.id}: the Referer sent is ${case.expectedReferer ?: "absent"}", referer == case.expectedReferer)
+        expect("${case.id}: the page echoes document.referrer as ${case.expectedEcho}", title == "REF|${case.expectedEcho}")
+        SystemClock.sleep(600)
+        shot("15-referrer-${case.id}")
+        beat()
+    }
+
+    /** A claim of scene 8, in the notes as PASS or FAIL; a FAIL fails the run once the recording is done. */
+    private fun expect(claim: String, held: Boolean) {
+        note("    $claim: ${if (held) "PASS" else "FAIL"}")
+        if (!held) failures += claim
+    }
+
+    /** Evaluate in the shown tab's WebView (the demo page's document); the raw JSON-encoded result, "" when it never answered. */
+    private fun pageJs(code: String): String {
+        var result = ""
+        val latch = CountDownLatch(1)
+        instrumentation.runOnMainSync {
+            val view = (activity as MainActivity).host.tabs.all().firstOrNull { it.isShown }
+            if (view == null) {
+                latch.countDown()
+            } else {
+                view.evaluateJavascript(code) { value ->
+                    result = value ?: ""
+                    latch.countDown()
+                }
+            }
+        }
+        latch.await(5, TimeUnit.SECONDS)
+        return result
+    }
+
+    /** The pages of scene 8's cases, each linking into its own destination host. */
+    private fun referrerSourcePages(): Map<String, Pair<String, ByteArray>> = REFERRER_CASES.associate { case ->
+        "/${case.id}.html" to (
+            "text/html; charset=utf-8" to (
+                "<!doctype html><html><head><meta charset=utf-8>" +
+                    "<meta name=viewport content=\"width=device-width,initial-scale=1\">${case.head}<title>REFSRC|${case.id}</title>" +
+                    "<style>body{margin:0;font-family:sans-serif;color:#15141a}h1{font-size:28px;padding:40px 24px}" +
+                    "p{padding:0 24px 16px;font-size:20px}a{color:#1b4332;font-size:26px}</style></head>" +
+                    "<body><h1>${case.title}</h1><p>${case.description}</p>" +
+                    "<p><a href=\"http://${case.destinationAddress}:$REFERRER_PORT$LANDING_PATH\"${case.anchorAttributes}>$LINK_LABEL</a></p></body></html>"
+                ).toByteArray()
+            )
+    }
+
+    /** The landing page every case arrives on: it shows `document.referrer` and puts it in its title for the driver. */
+    private fun landingPage(): Pair<String, ByteArray> =
+        "text/html; charset=utf-8" to (
+            "<!doctype html><html><head><meta charset=utf-8>" +
+                "<meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Landing</title>" +
+                "<style>body{margin:0;font-family:sans-serif;color:#15141a}h1{font-size:28px;padding:40px 24px}" +
+                "p{padding:0 24px;font-size:20px;word-break:break-all}</style></head>" +
+                "<body><h1>Landed on another site</h1><p id=r></p>" +
+                "<script>var r=document.referrer||'none';document.title='REF|'+r;" +
+                "document.getElementById('r').textContent='document.referrer: '+r</script></body></html>"
+            ).toByteArray()
+
+    /**
+     * A case of scene 8: how the page spells its policy (`head`, the anchor's attributes), the
+     * host it lands on, and the Referer the held hop must carry – as the request's header and as
+     * the landing page's `document.referrer`.
+     */
+    private class ReferrerCase(
+        val id: String,
+        val title: String,
+        val description: String,
+        val destinationAddress: String,
+        val head: String,
+        val anchorAttributes: String,
+        val expectedReferer: String?,
+    ) {
+        val expectedEcho: String get() = expectedReferer ?: "none"
+    }
+
+    // --- the Settings tab -----------------------------------------------------------------------
+
+    /**
+     * The Settings tab at Privacy and Security through the core's `page.open` (the menu's
+     * Settings row and a `ione://settings/privacy` deep link run the same), the section over
+     * its landing; the new tab's id as the core's JSON once its first group's heading is in the
+     * tree, null when it never came. The Settings page is a chunk of its own that loads on its
+     * first open, so the wait is generous.
+     */
+    private fun openPrivacySettings(): String? {
+        val id = invoke("page.open", """{"id":"settings","section":"privacy"}""")
+        note("  page.open settings/privacy -> $id")
+        // The section by the chrome document's `data-section` (the harness's Settings reads),
+        // its Safety check heading the tree's word for it.
+        if (!awaitSettingsSection(PRIVACY_SECTION, 20_000, treeSign = "Safety check")) {
+            note("  settings: the Privacy and Security category never showed (section '${settingsSection()}')")
+            return null
+        }
+        SystemClock.sleep(2_000)
+        return id
+    }
+
+    /**
+     * Back closes the section over the landing (the chrome holds the back for it, on camera);
+     * the tab itself goes through the core, the way the Settings tab demo leaves it, and the
+     * demo page's tab is active again for the menu sheet. The section's first heading is in the
+     * tree only while no sheet stands over it (a surface under a sheet is inert and out of the
+     * tree): it is waited for, and a sheet still up after that is backed out of first.
+     */
+    private fun closeSettingsTab(id: String) {
+        if (sheetsPresented().isNotEmpty()) {
+            backUntil("the sheet left over is gone") { sheetsPresented().isEmpty() }
+        }
+        if (settingsSectionIs(PRIVACY_SECTION, treeSign = "Safety check")) {
+            back()
+            awaitSettingsSection(SETTINGS_LANDING, 4_000)
+            SystemClock.sleep(1_500)
+        }
+        if (activeCoreTab()?.optString("id") != "tab_demo") {
+            invoke("tab.close", """{"tabId":$id}""")
+            SystemClock.sleep(1_500)
+        }
+        if (activeCoreTab()?.optString("id") != "tab_demo") {
+            invoke("tab.activate", """{"tabId":"tab_demo"}""")
+            SystemClock.sleep(1_500)
+        }
+        note("  settings closed; active ${activeCoreTab()?.optString("id")}, tabs ${state().getJSONObject("tabs").length()}")
+    }
+
+    /**
+     * The row (or control) reading `label`: a Settings row is one button whose text runs its
+     * label and description together ("Camera Sites can ask to use your camera"), a group
+     * heading of the same words is a plain node before it in the tree, so the clickable node
+     * reading the label alone or the label and a space wins; any node reading it otherwise.
+     */
+    private fun rowNode(label: String): AccessibilityNodeInfo? {
+        val reads = { node: AccessibilityNodeInfo ->
+            val text = (node.text ?: node.contentDescription)?.toString()
+            text != null && (text == label || text.startsWith("$label "))
+        }
+        return findNodeWhere { node -> node.isClickable && reads(node) } ?: findNodeWhere(reads)
+    }
+
+    /** What the row reading `label` says in full: its label and description by the document first, the tree's text second ("" when there is none). */
+    private fun rowText(label: String): String =
+        settingsRowValue(label)?.let { if (it.isEmpty()) label else "$label $it" }
+            ?: rowNode(label)?.let { (it.text ?: it.contentDescription)?.toString() }.orEmpty()
+
+    /** Whether the row (or picker option) reading `label` is listed: the document first ([settingsRowListed]), the tree second. */
+    private fun rowListed(label: String): Boolean = settingsRowListed(label) || rowNode(label) != null
+
+    /**
+     * Poll up to `timeoutMs` for the row reading `label`, with `show` scrolled onto the screen
+     * (the chrome scrolls its list the least it has to); its bounds then, null when it never came.
+     */
+    private fun awaitRow(label: String, timeoutMs: Long, show: Boolean = false): Rect? {
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            val node = rowNode(label)
+            if (node != null) {
+                if (show) {
+                    node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id)
+                    SystemClock.sleep(1_500)
+                }
+                return (rowNode(label) ?: node).let { n -> Rect().also { n.getBoundsInScreen(it) } }
+            }
+            SystemClock.sleep(200)
+        }
+        note("  no row reads '$label'")
+        return null
+    }
+
+    /**
+     * One system back on a sheet, then up to `timeoutMs` for `took` – what the tree shows once
+     * the sheet has gone and the surface under it is back in it, named by `effect` – to hold.
+     * Never a fixed sleep: the emulator's software renderer paints a dismissal seconds late, and
+     * a second back sent on a sleep lands on the sheet still standing there and is absorbed (the
+     * run at 8adeb628: the Camera sheet stayed and the sites with their own settings went
+     * unrecorded). False and a note when the tree never showed it; the recording goes on.
+     */
+    private fun backUntil(effect: String, timeoutMs: Long = 12_000, took: () -> Boolean): Boolean {
+        back()
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (took()) {
+                SystemClock.sleep(600)
+                return true
+            }
+            SystemClock.sleep(200)
+        }
+        note("  after back: not $effect within $timeoutMs ms")
+        return false
+    }
+
+    /**
+     * A real touch on the row reading `label` (scrolled onto the screen first), then up to
+     * `timeoutMs` for `took` – the claim of the step, named by `effect` – to hold. The shape of a
+     * sheet step under the rule in DemoHarness: false and a touch fault when the touch went in
+     * and nothing came of it; false and a note when there was no such row to touch.
+     */
+    private fun touchRowExpecting(label: String, effect: String, timeoutMs: Long, took: () -> Boolean): Boolean {
+        val rect = settingsRowRect(label)
+        if (rect != null) {
+            val point = touchPoint(rect) ?: run {
+                note("  the row '$label' at $rect is not inside the touchable window")
+                return false
+            }
+            Finger().tap(point.x, point.y)
+        } else {
+            awaitRow(label, 8_000, show = true) ?: return false
+            val node = rowNode(label) ?: return false
+            if (!touchTap(node)) {
+                note("  the row '$label' is not inside the touchable window")
+                return false
+            }
+        }
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (took()) {
+                note("  touch on '$label': $effect")
+                return true
+            }
+            SystemClock.sleep(150)
+        }
+        touchFault("a touch on '$label' did not take: not $effect within $timeoutMs ms")
+        note("  TOUCH FAULT: '$label' did not $effect")
+        return false
+    }
+
+    // --- the chrome's first frames --------------------------------------------------------------
+
+    /**
+     * Two animation frames of the chrome WebView, which the compositor grants only once it
+     * presents frames, up to 30 s: the chrome has painted and the emulator's renderer is
+     * keeping up before the page is asked to prompt. What it took, for the notes.
+     */
+    private fun waitForFirstPaint(timeoutMs: Long = 30_000): String {
+        val started = SystemClock.uptimeMillis()
+        js("window.__painted=0;requestAnimationFrame(function(){requestAnimationFrame(function(){window.__painted=1})})")
+        val deadline = started + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (js("window.__painted") == "1") return "two frames after ${SystemClock.uptimeMillis() - started} ms"
+            SystemClock.sleep(250)
+        }
+        return "no second frame within $timeoutMs ms"
+    }
+
+    // --- the prompt -----------------------------------------------------------------------------
+
+    /** The core's pending prompt for the demo tab, once it is there (null when none comes). */
+    private fun waitForPrompt(timeoutMs: Long = 15_000): JSONObject? {
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            val prompts = state().getJSONArray("permissionPrompts")
+            for (i in 0 until prompts.length()) {
+                val p = prompts.getJSONObject(i)
+                if (p.optString("tabId") == "tab_demo") return p
+            }
+            SystemClock.sleep(300)
+        }
+        Log.w(tag, "no permission prompt showed up")
+        return null
+    }
+
+    /**
+     * A real touch on the prompt's button – the prompt sheet's injected touch (the rule in
+     * DemoHarness), the page's title reporting the grant on it asserted – or the accessibility
+     * click when the tree carries no bounds for it.
+     */
+    private fun answer(label: String) {
+        val granted = { pageTitle().contains("granted") }
+        if (!touchTapLabelExpecting(label, "the page reports the grant", timeoutMs = 15_000, took = granted) && !granted()) {
+            Log.w(tag, "'$label' did not grant under a finger; clicking through the tree so the demo goes on")
+            clickByLabel(label)
+        }
+        SystemClock.sleep(600)
+    }
+
+    /** The demo tab's title as the core has it right now ("" when the tab is gone). */
+    private fun pageTitle(): String = state().getJSONObject("tabs").optJSONObject("tab_demo")?.optString("title").orEmpty()
+
+    // --- private tabs ---------------------------------------------------------------------------
+
+    private fun newPrivateTab(url: String): String? {
+        val result = invoke("tab.newPrivate", """{"url":"$url"}""")
+        if (result == "null") return null
+        val id = (JSONTokener(result).nextValue() as? String) ?: return null
+        val tab = state().getJSONObject("tabs").optJSONObject(id)
+        note("  tab.newPrivate -> $id containerId=${tab?.optString("containerId")}")
+        return id
+    }
+
+    // --- the chrome's bridge --------------------------------------------------------------------
+
+    /** Evaluate in the chrome WebView; the raw JSON-encoded result. */
+    private fun js(code: String): String {
+        var result = ""
+        val latch = CountDownLatch(1)
+        instrumentation.runOnMainSync {
+            (activity as MainActivity).host.chrome.evaluateJavascript(code) { value ->
+                result = value ?: ""
+                latch.countDown()
+            }
+        }
+        latch.await(10, TimeUnit.SECONDS)
+        return result
+    }
+
+    /** Run a core command through `window.zen.invoke` and wait for its promise; the result as JSON. */
+    private fun invoke(name: String, args: String = "null"): String {
+        js(
+            "window.__demo=undefined;window.zen.invoke(${JSONObject.quote(name)},$args)" +
+                ".then(r=>{window.__demo=JSON.stringify(r===undefined?null:r)},e=>{window.__demo='ERR:'+(e&&e.message||e)})"
+        )
+        val deadline = SystemClock.uptimeMillis() + 15_000
+        while (SystemClock.uptimeMillis() < deadline) {
+            val raw = js("window.__demo===undefined?'':window.__demo")
+            val value = (JSONTokener(raw).nextValue() as? String).orEmpty()
+            if (value.startsWith("ERR:")) error("$name failed: ${value.removePrefix("ERR:")}")
+            if (value.isNotEmpty()) return value
+            SystemClock.sleep(100)
+        }
+        error("$name timed out")
+    }
+
+    private fun state(): JSONObject = JSONObject(invoke("app.getState"))
+
+    /** The tab's url and title (the page writes what it sees into its title). */
+    private fun describeTab(s: JSONObject, tabId: String = "tab_demo"): String {
+        val tab = s.getJSONObject("tabs").optJSONObject(tabId) ?: return "tab $tabId gone"
+        return "tab $tabId containerId=${tab.optString("containerId")} url=${tab.optString("url")} title=\"${tab.optString("title")}\""
+    }
+
+    /** Poll the tab's title for `needle` (a prefix, or anywhere with `contains`) and hand back the state then. */
+    private fun waitForTitle(
+        needle: String,
+        timeoutMs: Long = 20_000,
+        tabId: String = "tab_demo",
+        contains: Boolean = false
+    ): JSONObject {
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        var s = state()
+        while (SystemClock.uptimeMillis() < deadline) {
+            val tab = s.getJSONObject("tabs").optJSONObject(tabId)
+            val title = tab?.optString("title").orEmpty()
+            val hit = if (contains) title.contains(needle) else title.startsWith(needle)
+            if (tab != null && hit && !tab.optBoolean("loading")) {
+                SystemClock.sleep(600)
+                return state()
+            }
+            SystemClock.sleep(400)
+            s = state()
+        }
+        Log.w(tag, "title '$needle' never showed up on $tabId")
+        return s
+    }
+
+    private fun note(line: String) {
+        Log.i(tag, line)
+        notes.appendText(line + "\n")
+    }
+
+    // --- the page's server ----------------------------------------------------------------------
+
+    /** Serves the demo page on the loopback interface, whatever the path. */
+    private class PageServer(private val page: String, private val port: Int) : Thread("site-controls-demo-server") {
+        // Android's InetAddress.getLoopbackAddress() is ::1; a socket bound to it alone refuses
+        // the 127.0.0.1 the page's URL names, so bind the IPv4 loopback explicitly.
+        private val socket = ServerSocket(port, 16, InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)))
+        @Volatile private var closed = false
+
+        /** Fetch `/` the way the WebView will and describe the outcome. */
+        fun selfCheck(): String = runCatching {
+            Socket("127.0.0.1", port).use { s ->
+                s.soTimeout = 5_000
+                s.getOutputStream().write("GET / HTTP/1.1\r\nHost: 127.0.0.1:$port\r\n\r\n".toByteArray())
+                s.getOutputStream().flush()
+                val status = s.getInputStream().bufferedReader().readLine()
+                "listening on ${socket.localSocketAddress}, GET / -> $status"
+            }
+        }.getOrElse { e -> "listening on ${socket.localSocketAddress}, GET / failed: $e" }
+
+        override fun run() {
+            while (!closed) {
+                val client = try {
+                    socket.accept()
+                } catch (_: Exception) {
+                    if (closed) return else continue
+                }
+                Thread { serve(client) }.start()
+            }
+        }
+
+        private fun serve(client: Socket) {
+            client.use {
+                val request = it.getInputStream().bufferedReader()
+                request.readLine() ?: return
+                while (true) {
+                    val header = request.readLine()
+                    if (header.isNullOrEmpty()) break
+                }
+                val body = page.toByteArray()
+                val out = it.getOutputStream()
+                out.write(
+                    ("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${body.size}\r\n" +
+                        "Cache-Control: no-store\r\nConnection: close\r\n\r\n").toByteArray()
+                )
+                out.write(body)
+                out.flush()
+            }
+        }
+
+        fun close() {
+            closed = true
+            runCatching { socket.close() }
+        }
+    }
+
+    companion object {
+        /** The Delete browsing data form sheet's title (siteControls/settingsRows.tsx, W8-7). */
+        private const val CLEAR_SHEET = "Delete browsing data"
+        private const val PORT = 18124
+        /** What the Settings rows call the origin (`hostOf`: the URL's host, port included). */
+        private const val HOST = "127.0.0.1:$PORT"
+        private const val ORIGIN = "http://$HOST"
+        private const val DEMO_URL = "$ORIGIN/"
+        /** A sheet's slide, with the margin the software-rendered emulator needs. */
+        private const val SHEET_SETTLE = 2_500L
+
+        /**
+         * Scene 8's servers: the pages that link out on one loopback host, one destination host
+         * per case (any 127.x.y.z is the loopback; a port of its own, since the demo page's server
+         * has [PORT] on 127.0.0.1). Under the default policy the referrer across origins is the
+         * page's origin – `http://127.0.0.5:18125/`.
+         */
+        private const val REFERRER_PORT = 18125
+        private const val REFERRER_SOURCE_ADDRESS = "127.0.0.5"
+        private const val REFERRER_SOURCE_ORIGIN = "http://$REFERRER_SOURCE_ADDRESS:$REFERRER_PORT"
+        private const val LANDING_PATH = "/land.html"
+        /** The link's text, the accessibility tree's word for it. */
+        private const val LINK_LABEL = "Follow the link to another site"
+        private val REFERRER_CASES = listOf(
+            ReferrerCase(
+                id = "meta-no-referrer",
+                title = "Page under <meta name=referrer content=no-referrer>",
+                description = "The document's meta says no referrer: the held hop must carry none.",
+                destinationAddress = "127.0.0.2",
+                head = "<meta name=referrer content=no-referrer>",
+                anchorAttributes = "",
+                expectedReferer = null,
+            ),
+            ReferrerCase(
+                id = "rel-noreferrer",
+                title = "Link with rel=noreferrer",
+                description = "The anchor's rel=noreferrer: the held hop must carry none, whatever the document says.",
+                destinationAddress = "127.0.0.3",
+                head = "",
+                anchorAttributes = " rel=\"noreferrer\"",
+                expectedReferer = null,
+            ),
+            ReferrerCase(
+                id = "anchor-over-meta",
+                title = "Link with referrerpolicy=origin under a no-referrer meta",
+                description = "The anchor's own policy beats the document's: the same meta alone sends none (the first case); " +
+                    "the anchor's referrerpolicy=origin has the held hop carry the page's origin.",
+                destinationAddress = "127.0.0.4",
+                head = "<meta name=referrer content=no-referrer>",
+                anchorAttributes = " referrerpolicy=\"origin\"",
+                expectedReferer = "$REFERRER_SOURCE_ORIGIN/",
+            ),
+            ReferrerCase(
+                id = "default-policy",
+                title = "Page without a policy of its own",
+                description = "No meta, no anchor policy: the default, the page's origin across origins, as before.",
+                destinationAddress = "127.0.0.6",
+                head = "",
+                anchorAttributes = "",
+                expectedReferer = "$REFERRER_SOURCE_ORIGIN/",
+            ),
+            ReferrerCase(
+                id = "unsafe-url-clamped",
+                title = "Link with referrerpolicy=unsafe-url – the WebView's own clamp",
+                description = "A policy looser than Chrome's default asks for the page's full address; the WebView lifts a " +
+                    "loadUrl Referer into the navigation's referrer under its default policy (AwContents.loadUrl), so the " +
+                    "held hop carries the origin – never more than the default's, never more than the page asked.",
+                destinationAddress = "127.0.0.7",
+                head = "",
+                anchorAttributes = " referrerpolicy=\"unsafe-url\"",
+                expectedReferer = "$REFERRER_SOURCE_ORIGIN/",
+            ),
+        )
+    }
+}

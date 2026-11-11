@@ -1,0 +1,387 @@
+import java.util.Properties
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+// The chrome (React + browser core) is built by Vite from the repository root. Gradle runs that
+// build before packaging unless `-PskipWeb` is given (the bun scripts pass it after building).
+val webRoot = rootProject.projectDir.parentFile
+val skipWeb = project.hasProperty("skipWeb")
+val buildWeb = tasks.register<Exec>("buildWeb") {
+    group = "build"
+    description = "Builds the Ione chrome and page script into app/src/main/assets"
+    workingDir = webRoot
+    val bun = if (System.getProperty("os.name").lowercase().contains("win")) "bun.exe" else "bun"
+    commandLine(bun, "run", "build:android:web")
+    inputs.dir(webRoot.resolve("src"))
+    outputs.dir(projectDir.resolve("src/main/assets/www"))
+    outputs.file(projectDir.resolve("src/main/assets/page.js"))
+    outputs.file(projectDir.resolve("src/main/assets/webapp.js"))
+    outputs.file(projectDir.resolve("src/main/assets/ext.js"))
+    outputs.file(projectDir.resolve("src/main/assets/ext-janitor.js"))
+    outputs.dir(projectDir.resolve("src/main/assets/pdf"))
+    onlyIf { !skipWeb }
+}
+
+// The bundled snapshot of the default filter lists (resources/blocking, refreshed with
+// `bun run blocking:snapshot`) ships as assets so the first run blocks ads before any download.
+// The asset merger inflates the `.txt.gz` files and drops the extension on the way into the APK;
+// `Blocking.readBundledText` opens them by either name.
+val copyBlockingSnapshot = tasks.register<Copy>("copyBlockingSnapshot") {
+    group = "build"
+    description = "Copies the bundled filter-list snapshot into app/src/main/assets/blocking"
+    from(webRoot.resolve("resources/blocking"))
+    into(projectDir.resolve("src/main/assets/blocking"))
+}
+
+// The bundled snapshot of the Safe Browsing feeds (resources/safebrowsing, refreshed with
+// `bun run safebrowsing:snapshot`): one prefix-table document per feed, seeded into the profile
+// by the core on first run and read by the Kotlin guard (privacy/Privacy.kt, `bundledFeed`).
+val copySafeBrowsingSnapshot = tasks.register<Copy>("copySafeBrowsingSnapshot") {
+    group = "build"
+    description = "Copies the bundled Safe Browsing snapshot into app/src/main/assets/safebrowsing"
+    from(webRoot.resolve("resources/safebrowsing"))
+    into(projectDir.resolve("src/main/assets/safebrowsing"))
+}
+
+// The lookalike check's tables (resources/lookalikes, refreshed with `bun run lookalikes:snapshot`):
+// the Tranco top list and the Latin-target subset of Unicode's confusables, read by the core
+// through the asset loader (`fetchBundledLookalikeTable`); the asset merger inflates the `.gz`.
+val copyLookalikesSnapshot = tasks.register<Copy>("copyLookalikesSnapshot") {
+    group = "build"
+    description = "Copies the bundled lookalike tables into app/src/main/assets/lookalikes"
+    from(webRoot.resolve("resources/lookalikes"))
+    into(projectDir.resolve("src/main/assets/lookalikes"))
+}
+
+val versionProps = Properties().apply {
+    // Mirror the package version so About shows the same number on every platform.
+    val pkg = webRoot.resolve("package.json").readText()
+    val match = Regex("\"version\"\\s*:\\s*\"([^\"]+)\"").find(pkg)
+    setProperty("version", match?.groupValues?.get(1) ?: "0.0.0")
+}
+val appVersion: String = versionProps.getProperty("version")
+
+/**
+ * Android installs only upgrade when the integer versionCode grows, so derive it from the semver
+ * in package.json instead of bumping it by hand:
+ *
+ *     major * 1_000_000 + minor * 10_000 + patch * 100 + channel
+ *
+ * `channel` orders pre-releases below the final build of the same version: alpha.N → N,
+ * beta.N → 30 + N, rc.N → 60 + N, any other pre-release → 90 + N, final release → 99.
+ * `-PversionCode=…` or ZEN_ANDROID_VERSION_CODE override the derived value.
+ */
+fun versionCodeFor(version: String): Int {
+    val match = Regex("""^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$""").find(version)
+        ?: throw GradleException("package.json version '$version' is not semver (major.minor.patch[-prerelease])")
+    val (major, minor, patch, pre) = match.destructured
+    if (major.toInt() > 2100 || minor.toInt() > 99 || patch.toInt() > 99) {
+        throw GradleException(
+            "Cannot derive an Android versionCode from '$version' (major ≤ 2100, minor ≤ 99, patch ≤ 99); " +
+                "pass -PversionCode=… or set ZEN_ANDROID_VERSION_CODE"
+        )
+    }
+    val channel = if (pre.isEmpty()) {
+        99
+    } else {
+        val number = pre.split('.', '-').lastOrNull { it.isNotEmpty() && it.all(Char::isDigit) }?.toInt() ?: 0
+        when {
+            pre.startsWith("alpha") -> minOf(number, 29)
+            pre.startsWith("beta") -> 30 + minOf(number, 29)
+            pre.startsWith("rc") -> 60 + minOf(number, 29)
+            else -> 90 + minOf(number, 8)
+        }
+    }
+    return major.toInt() * 1_000_000 + minor.toInt() * 10_000 + patch.toInt() * 100 + channel
+}
+
+val appVersionCode: Int =
+    (System.getenv("ZEN_ANDROID_VERSION_CODE") ?: project.findProperty("versionCode")?.toString())
+        ?.takeIf { it.isNotBlank() }?.toInt()
+        ?: versionCodeFor(appVersion)
+
+/**
+ * Release signing comes from the environment (CI secrets) or from Gradle properties, e.g. in
+ * ~/.gradle/gradle.properties. Without a keystore the release build falls back to the CI debug
+ * key below.
+ */
+fun signingSetting(env: String, property: String): String? =
+    (System.getenv(env) ?: project.findProperty(property)?.toString())?.takeIf { it.isNotBlank() }
+
+val releaseKeystore = signingSetting("ZEN_ANDROID_KEYSTORE_FILE", "zen.android.keystoreFile")
+
+/**
+ * `android/ci-debug.keystore` is committed to the repository with a well-known password. It is a
+ * *debug* key – anyone can sign with it, exactly like Android's standard debug keystore – but it
+ * is the *same* key on every machine and every CI run. Android's own debug key is generated per
+ * machine, so every CI runner would sign with a different key and no debug-keyed APK could ever
+ * upgrade another in place. With this key every debug build (CI artifacts, GitHub releases built
+ * without ANDROID_KEYSTORE_*) upgrades the previous one, including through the in-app updater,
+ * which only ever installs an APK whose SHA-256 matches the release manifest. Switching to the
+ * project release keystore later means one final uninstall for users of debug-keyed builds.
+ */
+val ciDebugKeystore = rootProject.file("ci-debug.keystore")
+val ciDebugAlias = "ione-ci-debug"
+val ciDebugPassword = "ione-ci-debug"
+
+android {
+    // The code package (R, BuildConfig, relative class names in the manifest). It moves together
+    // with the Kotlin sources in a later pass; the app's identity on the device is applicationId.
+    namespace = "app.zen.chromium"
+    compileSdk = 35
+
+    defaultConfig {
+        // Ione is a new app to Android: it installs alongside the old app.zen.chromium "Zen"
+        // (v0.2.0 and earlier), which nothing can migrate; the updater says so (src/core/updates.ts).
+        applicationId = "io.github.benitbuhner.ione"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = appVersionCode
+        versionName = appVersion
+        // Instrumentation (the gesture demo driver under src/androidTest); never part of the app.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Point the chrome at the Vite dev server: ./gradlew installDebug -PdevServer=http://10.0.2.2:41734/
+        buildConfigField(
+            "String",
+            "DEV_SERVER_URL",
+            "\"${project.findProperty("devServer") ?: ""}\""
+        )
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            storeFile = ciDebugKeystore
+            storePassword = ciDebugPassword
+            keyAlias = ciDebugAlias
+            keyPassword = ciDebugPassword
+        }
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = rootProject.file(releaseKeystore)
+                storePassword = signingSetting("ZEN_ANDROID_KEYSTORE_PASSWORD", "zen.android.keystorePassword")
+                    ?: throw GradleException("ZEN_ANDROID_KEYSTORE_PASSWORD / zen.android.keystorePassword is required with a release keystore")
+                keyAlias = signingSetting("ZEN_ANDROID_KEY_ALIAS", "zen.android.keyAlias")
+                    ?: throw GradleException("ZEN_ANDROID_KEY_ALIAS / zen.android.keyAlias is required with a release keystore")
+                keyPassword = signingSetting("ZEN_ANDROID_KEY_PASSWORD", "zen.android.keyPassword")
+                    ?: throw GradleException("ZEN_ANDROID_KEY_PASSWORD / zen.android.keyPassword is required with a release keystore")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = if (releaseKeystore != null) {
+                signingConfigs.getByName("release")
+            } else {
+                logger.warn(
+                    "No release keystore configured (ZEN_ANDROID_KEYSTORE_FILE); the release APK is signed " +
+                        "with the committed CI debug key (android/ci-debug.keystore), not a release key."
+                )
+                signingConfigs.getByName("debug")
+            }
+        }
+        debug {
+            applicationIdSuffix = ".debug"
+        }
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    sourceSets["main"].java.srcDirs("src/main/kotlin")
+    // src/sharedTest holds the demo harness's pure decisions (HarnessLogic.kt): one source, run on
+    // the JVM by the unit tests and on the device by the instrumentation, never part of the app.
+    sourceSets["test"].java.srcDirs("src/test/kotlin", "src/sharedTest/kotlin")
+    sourceSets["androidTest"].java.srcDirs("src/androidTest/kotlin", "src/sharedTest/kotlin")
+    // The preview host's demo web app (icon, screenshots) doubles as the Add to Home screen demo's
+    // page assets, served by the driver's own loopback server; one copy, never part of the app.
+    sourceSets["androidTest"].assets.srcDirs("src/androidTest/assets", "../../src/android/preview-assets")
+
+    testOptions {
+        unitTests.all {
+            // The JDK's HttpURLConnection silently drops `Origin` (a "restricted" header) unless told
+            // otherwise; Android's OkHttp-backed one sends it. The CORS proxy tests check the rewrite.
+            it.systemProperty("sun.net.http.allowRestrictedHeaders", "true")
+            // The source-reading tests (ExternalProtocolsNoHandlerTest, CustomTabOpenInAppPromptTest,
+            // CustomTabPermissionPromptTest, ExtensionPromptFallbackTest, PermissionPromptSheetTest,
+            // WebAppDisclosureTest, ScreenClassTest, LockVeilTest, PrivateBrowsingTest, BackupRulesTest,
+            // LocalDocumentsTest, ExternalProtocolsTest, StartupSplashTest, WebAppSplashTest,
+            // PageDialogsTest, PrivateLockTest, NotificationsTest, SyncPeerTest, IndexDifferentialTest,
+            // BlockingTest, SearchWidgetFaceTest, AuthTabTest, ShapeDetectionManifestTest, QuickActionsWidgetFaceTest) read these off the repository as TEXT – the core's and the chrome's
+            // TypeScript, the sync core's fixture, the bundled filter lists, this module's Kotlin,
+            // manifest and resources – none of which is on the task's classpath in a form that changes
+            // with them (a KDoc, a manifest attribute, a resource value). Undeclared, a change to one of
+            // them reused the cached pass (`org.gradle.caching`, and CI restores main's Gradle home):
+            // services' #576 rewrote the shared `intentPackage` and the pin that reads it stayed green
+            // from the cache. Named here, the tests run when what they read changes. Grep
+            // `src/test/kotlin` for `File(root, "`, `repoFile(`, `"src/main/` and `resources/` when
+            // adding a source-reading test, and add what it reads. (What a test reads off its own
+            // classpath – `src/test/resources`, `src/sharedTest/kotlin` – is an input already.)
+            it.inputs.files(
+                webRoot.resolve("src/shared/externalProtocols.ts"),
+                webRoot.resolve("src/core/externalProtocols.ts"),
+                webRoot.resolve("src/shared/url.ts"),
+                webRoot.resolve("src/shared/formFactor.ts"),
+                webRoot.resolve("src/android/extensionHost.ts"),
+                webRoot.resolve("src/renderer/src/assets/extensions.css"),
+                webRoot.resolve("src/renderer/src/components/protocol/ExternalProtocolSheet.tsx"),
+                webRoot.resolve("src/renderer/src/components/extensions/ExtensionIcon.tsx"),
+                webRoot.resolve("src/renderer/src/lib/extensions/warningGlyph.ts"),
+                // SyncPeerTest: the wire's pin (the core's transport) and the legacy device file it decodes.
+                webRoot.resolve("src/core/sync/transport.ts"),
+                webRoot.resolve("src/core/sync/__tests__/fixtures/legacy-device-file.json"),
+                projectDir.resolve("src/main/AndroidManifest.xml")
+            ).withPathSensitivity(PathSensitivity.RELATIVE)
+            // IndexDifferentialTest and BlockingTest (`bundledSnapshotDir`) index the bundled filter
+            // lists off the repository root – `resources/blocking`, not this module's test resources.
+            it.inputs.dir(webRoot.resolve("resources/blocking")).withPathSensitivity(PathSensitivity.RELATIVE)
+            it.inputs.dir(projectDir.resolve("src/main/kotlin")).withPathSensitivity(PathSensitivity.RELATIVE)
+            it.inputs.dir(projectDir.resolve("src/main/shortcuts")).withPathSensitivity(PathSensitivity.RELATIVE)
+            // This module's resources WHOLE, one input: the source-reading tests read them by
+            // configuration – `drawable`, `mipmap-anydpi-v26`, `values`, `values-night`, `anim`, `xml`,
+            // and SearchWidgetFaceTest the widget's `values-v31` / `values-night-v31` / `values-v34` /
+            // `values-night-v34`, `color-v31` / `color-night-v31` / `color-v34` / `color-night-v34` and
+            // `drawable-v31` – and a per-directory list drifts behind the next qualifier (#583's first
+            // read showed two pins served from the cache, the colour they pin changed). Not `src/main`
+            // itself: its assets are the built web bundle.
+            it.inputs.dir(projectDir.resolve("src/main/res")).withPathSensitivity(PathSensitivity.RELATIVE)
+            // V2TokensPinTest reads the chrome's stylesheet, the sheet chassis (its motion module,
+            // its bottom inset) and this module's value and anim resources (covered by the whole
+            // `src/main/res` input above) off the repository, not the classpath (the R class does
+            // not change with a colour's value), so they are the task's inputs: a re-tuned token
+            // re-runs the pin instead of a cached pass standing for it.
+            it.inputs.files(
+                webRoot.resolve("src/renderer/src/assets/main.css"),
+                webRoot.resolve("src/renderer/src/lib/motion/sheet.ts"),
+                webRoot.resolve("src/renderer/src/components/sheet/BottomSheet.tsx"),
+                // The toast card's pin (ToastCardSpec): the shared card numbers, the chrome's clocks, the springs, the swipe's rule.
+                webRoot.resolve("src/shared/toastCard.ts"),
+                webRoot.resolve("src/shared/spring.ts"),
+                webRoot.resolve("src/renderer/src/lib/ui.ts"),
+                webRoot.resolve("src/renderer/src/lib/bookmarkUndo.ts"),
+                webRoot.resolve("src/renderer/src/lib/gestures/swipe.ts"),
+                webRoot.resolve("src/renderer/src/lib/gestures/dismiss.ts"),
+                webRoot.resolve("src/renderer/src/components/messages/ToastCard.tsx"),
+                // The keyboard-shortcut helper's pin (ShortcutHelperTest): Chrome's rows name the core's actions, every core group has a home.
+                webRoot.resolve("src/shared/shortcuts.ts"),
+                webRoot.resolve("src/shared/types.ts")
+            ).withPathSensitivity(PathSensitivity.RELATIVE)
+            // NotificationsTest scans every source set for a deleted channel id, and the drivers
+            // (androidTest) are not on the unit tests' classpath: name them as an input so a
+            // driver-only change re-runs the scan instead of a cached pass standing for it.
+            it.inputs.dir(projectDir.resolve("src/androidTest/kotlin")).withPathSensitivity(PathSensitivity.RELATIVE)
+        }
+    }
+
+    packaging {
+        resources.excludes += setOf("META-INF/*.version", "META-INF/LICENSE*")
+    }
+}
+
+/**
+ * The launcher's static shortcut (src/main/shortcuts/shortcuts.xml) names its target activity by
+ * the build's applicationId, suffix included. The system server parses a shortcut intent's
+ * targetPackage as a plain string with its own resources, so neither a manifest placeholder nor
+ * an @string reference of the app's can carry the id (the shortcut installs pointing at
+ * "@<resource id>/MainActivity" and nothing can start it): the template is written into each
+ * variant's generated res/xml with the id spelt out.
+ */
+abstract class WriteShortcuts : DefaultTask() {
+    @get:InputFile
+    abstract val template: RegularFileProperty
+
+    @get:Input
+    abstract val applicationId: Property<String>
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    @TaskAction
+    fun write() {
+        val file = outputDirectory.get().asFile.resolve("xml/shortcuts.xml")
+        file.parentFile.mkdirs()
+        file.writeText(template.get().asFile.readText().replace("\${applicationId}", applicationId.get()))
+    }
+}
+
+androidComponents {
+    onVariants { variant ->
+        val write = tasks.register<WriteShortcuts>("write${variant.name.replaceFirstChar(Char::uppercase)}Shortcuts") {
+            template.set(layout.projectDirectory.file("src/main/shortcuts/shortcuts.xml"))
+            applicationId.set(variant.applicationId)
+        }
+        variant.sources.res?.addGeneratedSourceDirectory(write, WriteShortcuts::outputDirectory)
+    }
+}
+
+// app/build/outputs/apk/<type>/ione-<version>-<type>.apk instead of app-<type>.apk
+base {
+    archivesName.set("ione-$appVersion")
+}
+
+tasks.named("preBuild") { dependsOn(buildWeb, copyBlockingSnapshot, copySafeBrowsingSnapshot, copyLookalikesSnapshot) }
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.activity:activity-ktx:1.9.3")
+    // The cold start's splash (OS-26, StartupSplash.kt): the platform's starting window on API 31+
+    // and the library's drawing of the same theme attributes below it; the exit is the app's.
+    implementation("androidx.core:core-splashscreen:1.2.0")
+    // 1.13 adds WebStorageCompat.deleteBrowsingDataForSite (the site-information sheet's "clear all site data");
+    // 1.17 adds JS_INJECTION_IN_FRAME_AND_WORLD (isolated worlds for the extension layer, Chromium 146+ WebView)
+    // and names the origin-matched request headers Profile.addCustomHeader (GPC / DNT on every request, privacy/Privacy.kt).
+    implementation("androidx.webkit:webkit:1.17.0")
+    implementation("com.google.android.material:material:1.12.0")
+    // Custom Tabs provider: the service other apps bind and the intent extras they send
+    // (CustomTabsConnectionService.kt, CustomTabConfig.kt). Not 1.9.0: its AAR demands compileSdk
+    // 36 and AGP 8.9.1; the Auth Tab (CCT-13) it adds is honoured on 1.8.0 through the extras'
+    // strings and its two AIDL transactions written by hand (AuthTab.kt, AuthTabSession.kt).
+    implementation("androidx.browser:browser:1.8.0")
+    // The share sheet's "QR code" action draws the link as a code (Share.kt); pure Java, no camera.
+    implementation("com.google.zxing:core:3.5.3")
+    // Password manager re-authentication: the system biometric / device credential sheet.
+    implementation("androidx.biometric:biometric:1.1.0")
+    // The pages' media on the OS controls: MediaSessionCompat behind the media-style notification,
+    // the lock screen and the headset buttons (MediaSessions.kt, MediaPlaybackService.kt).
+    implementation("androidx.media:media:1.7.0")
+    // A foldable's posture for the chrome (Posture.kt, the `posture` host event, OS-11): the
+    // window's FoldingFeature. `window-java` is the callback adapter, so the listener needs no
+    // coroutine code of ours; the library still pulls kotlinx-coroutines in, which R8 trims.
+    implementation("androidx.window:window:1.3.0")
+    implementation("androidx.window:window-java:1.3.0")
+    // The WebDAV sync transport's HTTP verbs (SyncFetch.kt, `sync.fetch` on the bridge): PROPFIND,
+    // MKCOL and MOVE, which the platform's HttpURLConnection refuses. Built on the first sync call,
+    // never at boot. Redirects off, no cookie jar, no cache; the platform's TLS.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // JVM unit tests (src/test): pure logic such as the screenshot stitching geometry and the
+    // vault key wrapping format. The extension and vault tests build org.json documents, which
+    // android.jar only stubs.
+    testImplementation("junit:junit:4.13.2")
+    // The request engine's rule sets are org.json documents; the real library stands in for the
+    // android.jar stubs (which throw) so the blocking tests can parse them on the JVM.
+    testImplementation("org.json:json:20250107")
+    // A loopback WebDAV server for the SyncFetch tests: the request as it went on the wire.
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+
+    // On-device driver for the gesture demo recording (.github/workflows/android-gesture-demo.yml).
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("junit:junit:4.13.2")
+}

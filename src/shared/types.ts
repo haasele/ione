@@ -1,0 +1,8389 @@
+/**
+ * Types shared between the main process, the preload script and the renderer.
+ * Everything here must be JSON-serialisable (it crosses the IPC boundary).
+ */
+import type { AppIconId } from './appIcon'
+import type { AppProxySettings } from './appProxy'
+import type { SiteInfo, SiteInfoSnapshot } from './siteInfo'
+import type {
+  TranslateModelInfo,
+  TranslatePreferences,
+  TranslateSelectionResult,
+  TranslateUIState
+} from './translate'
+import type { EngineRelayRequest, EngineRelayResponse } from './translateEngine'
+import type { UpdateSettings, UpdateStatus } from './updates'
+import type { ManagedStatus } from './managed'
+import type { UpdateDotRecord } from '../core/updateDot'
+import type { SafetyHubCardMemories } from './safetyHubCard'
+import type { EducationalTipMemory } from './educationalTips'
+import type { ToolbarPins } from './toolbarPins'
+import type { OverviewChromeCommand, OverviewView } from './overviewMenu'
+import type { BlockingSettings, BlockingStatus } from './blocking'
+import type { BookmarkRowDisplay, BookmarkRowSortOrder } from './bookmarkRows'
+import type {
+  PreloadPagesLevel,
+  PrivacySettings,
+  PrivacyStatus,
+  PrivateThirdPartyCookieStatus,
+  ProtectionCheck,
+  ThirdPartyCookiePrivateMode
+} from './privacy'
+import type {
+  SiteDataAddResult,
+  SiteDataDefault,
+  SiteDataList,
+  SiteDataListing,
+  SiteDataStatus
+} from './siteData'
+import type { InternalPageId, InternalPageQuery } from './internalPages'
+import type { InstallSurface, InstalledWebApp, WebAppInfo } from './webApp'
+import type { ShareChooser } from './shareTarget'
+import type { ContentDefault } from './contentSettings'
+import type { VoiceEvent, VoiceStartOutcome } from './voice'
+import type { QrCodeRequest, QrEvent, QrStartOutcome } from './qrScan'
+import type { MediaPositionInfo, MediaSessionAction, MediaSessionSourceKind } from './mediaSession'
+import type { SpellcheckSettings, SpellcheckStatus } from './spellcheck'
+import type { ReaderPreferences } from './reader'
+import type { PageFontSettings } from './fonts'
+import type {
+  ReadAloudHighlightMode,
+  ReadAloudSettings,
+  ReadAloudStartFrom,
+  ReadAloudState,
+  ReadAloudVoicesResult
+} from './readAloud'
+import type { PrintPreviewResult, PrintRunResult, PrintSessionInfo, PrintSettings } from './print'
+import type { TabAlert, TabCapture } from './captureState'
+import type { PdfViewerCommand, PdfViewerReport } from './pdfViewerProtocol'
+import type { ShareFile, ShareFileInfo } from './share'
+import type { PageCaptureRequest, PageCaptureResult, PageViewport } from './capture'
+
+export type Platform = 'linux' | 'win32' | 'darwin' | 'android'
+
+/**
+ * How the chrome lays itself out, decided by the renderer from the window and its pointer (see
+ * `lib/formFactor.ts`) and reported to the core, which builds menus and command lists for it.
+ *
+ *  - `phone`   – bottom bar, sidebar in a drawer, sheets instead of popovers.
+ *  - `tablet`  – desktop layout with touch-sized controls.
+ *  - `desktop` – everything else.
+ */
+export type FormFactor = 'phone' | 'tablet' | 'desktop'
+
+/**
+ * A foldable's posture as the Android host reports it (`androidx.window`'s `FoldingFeature` of
+ * the window's layout, `Posture.kt`; OS-11): the device is `flat` (or has no fold in this
+ * window), or `halfOpened` with the hinge across the window – a laptop / tabletop or a book
+ * pose. The chrome lays itself out by the window's width, not the posture (`FormFactor`; no
+ * tabletop layout): the pose is logged and marked on the root (`lib/posture.ts`) for what reads
+ * it – a driver, a later surface that keeps clear of the hinge.
+ */
+export type PostureKind = 'flat' | 'halfOpened'
+
+export interface FoldHinge {
+  /** The hinge's bounds in CSS px, in the window's coordinates. */
+  left: number
+  top: number
+  right: number
+  bottom: number
+  /** A `horizontal` hinge splits the window top / bottom (tabletop); a `vertical` one left / right (book). */
+  orientation: 'horizontal' | 'vertical'
+  /** A hinge with a width or height (`FoldingFeature.isSeparating`): the two halves are separate. */
+  separating: boolean
+}
+
+export interface DevicePosture {
+  kind: PostureKind
+  /** The fold, when the window has one; a slab or a window off the fold has none. */
+  hinge: FoldHinge | null
+}
+
+/**
+ * A surface of the chrome that answers a page's request the core would otherwise hold open for
+ * it: the install prompt (`webapp.install`), the screen picker (`screenCaptureRequests`), the
+ * share sheet (`shareRequests`). The renderer registers each as its component mounts
+ * (`ui.surface`) and takes it back as it unmounts; while a window has none, the core answers the
+ * page at once the way a cancel would (Chrome's picker refused, its share cancelled, its install
+ * dialog dismissed) instead of waiting on a chrome that is not there – no call hangs behind a
+ * surface that has yet to land.
+ */
+export type ChromeSurface = 'install' | 'screenCapture' | 'share'
+
+/**
+ * What the host can do for the chrome. The renderer adapts its UI to these rather than to the
+ * platform name (e.g. a DeX desktop session is still `android`, but has a mouse and keyboard).
+ */
+export interface HostCapabilities {
+  /** Host draws its own window frame – no minimise / maximise / close buttons in the chrome. */
+  windowControls: boolean
+  /**
+   * The OS draws native minimise / maximise / close buttons over the chrome's top corner
+   * (Windows 11's Window Controls Overlay, which is what gives the maximise button Snap
+   * Layouts). The chrome keeps that region clear and draws no buttons of its own.
+   */
+  windowControlsOverlay: boolean
+  /** Windows can be backed by a system material (Windows 11 Mica) behind a translucent chrome. */
+  windowMaterial: boolean
+  /** The host can draw a window with the desktop's native frame (`Settings.nativeWindowControls`). */
+  nativeWindowControls: boolean
+  /**
+   * New windows can be opened see-through (`transparent: true` over a cleared background), so a
+   * compositor – Hyprland, niri, KWin – can blur or dim what is behind the frame (Settings ›
+   * Appearance › Window transparency).
+   */
+  windowTransparency: boolean
+  /** Context menus are native popups; when false the renderer renders `menu.show` events. */
+  nativeMenus: boolean
+  /** The chrome can be dragged by `-webkit-app-region: drag` regions. */
+  windowDrag: boolean
+  /** Developer tools can be opened for pages. */
+  devtools: boolean
+  /** Compact-mode edge reveal works (the host tracks the pointer). */
+  compactReveal: boolean
+  /** Pages can be opened in Picture-in-Picture. */
+  pictureInPicture: boolean
+  /** The host can show a `view-source:` document. */
+  viewSource: boolean
+  /** More than one window can be open (new / blank / private windows). */
+  windows: boolean
+  /** Chromium extensions can be installed. */
+  extensions: boolean
+  /** The resource governor (budgets, freezing, process profile) runs on this host. */
+  resourceGovernor: boolean
+  /** Cross-device sync through a shared folder is available. */
+  sync: boolean
+  /** Pages can be printed. */
+  print: boolean
+  /**
+   * The host renders pages to PDF with the preview's options and lists the system's printers
+   * (`TabView.printToPDF`, `Platform.printing`), so Ctrl+P opens Ione's print preview – the
+   * `zen://print` page (`shared/print.ts`, `core/print.ts`). Off, printing goes to the system
+   * dialog (`TabView.print`), as Android's print flow does.
+   */
+  printPreview: boolean
+  /**
+   * The host saves a page in Chrome's three formats – complete, HTML only, single file
+   * (Electron's `webContents.savePage`), so Save Page As is a submenu of the three and Ctrl+S
+   * saves in the last one used. Off, the host writes its one archive (Android's
+   * `WebView.saveWebArchive`, an MHTML file into Downloads) and the menu keeps one row.
+   */
+  savePageFormats: boolean
+  /**
+   * The host shows PDF documents inline in a tab through Ione's own viewer, the `zen://pdf`
+   * page (Android, whose WebView cannot draw a PDF: a PDF the page navigates to is downloaded
+   * and opened there instead of the system chooser). Desktop hosts draw PDFs with Chromium's
+   * viewer and leave this off.
+   */
+  pdfViewer: boolean
+  /**
+   * The host prints a PDF the inline viewer shows through the system's print flow
+   * (`Platform.printPdf`; Android's `PrintManager`): the viewer's Print row. Off on a host
+   * without the verb, and on the desktop, where Chromium's viewer prints its own document.
+   */
+  pdfPrint: boolean
+  /** The host can run the MCP server that lets AI agents control the browser. */
+  agents: boolean
+  /**
+   * The host can install the `ione-browser` Agent Skill into the coding harnesses' global
+   * skills directories on this machine (Settings › AI Agents › Agent skill): the desktop, where
+   * Claude Code, Cursor, Codex, OpenCode, Gemini CLI and GitHub Copilot run beside the browser.
+   * A phone has no harness to install into.
+   */
+  agentSkills: boolean
+  /** The host checks GitHub Releases for new versions and can fetch / apply them. */
+  updates: boolean
+  /** The host has a system share sheet (`app.share`); menus offer Share items when true. */
+  share: boolean
+  /**
+   * The browser's own share panel stands in for the system sheet (Android below 14, SH-03): a
+   * share the menu starts comes back to the chrome as `share.panel`, so the menu's Share row
+   * holds its sheet for the panel to take over (§9.38's hand-off) instead of leaving first.
+   * False wherever the share sheet is the system's alone.
+   */
+  sharePanel: boolean
+  /**
+   * The OS itself confirms copies with a clipboard chip (Android 13+); the chrome then stays
+   * quiet instead of toasting "Link copied" a second time.
+   */
+  clipboardChip: boolean
+  /** The host has a system screen for which links open in this app (Android's Open by default). */
+  appLinkSettings: boolean
+  /** Touch hosts: dragging down from the top of a page can reload it (Settings → Look and Feel). */
+  pullToRefresh: boolean
+  /** The host can protect the password vault's key (OS keystore) – the password manager is on. */
+  passwords: boolean
+  /**
+   * The host can tell whether this app is the system's default browser and ask the system to make
+   * it one (Android's browser role). Desktop hosts leave this to the platform's own settings.
+   */
+  defaultBrowser: boolean
+  /** The host runs a request engine that blocks ads and trackers (Settings → Privacy and security). */
+  requestBlocking: boolean
+  /**
+   * Pages follow the page controls (desktop site, dark theme for sites, page zoom and its
+   * sheet); hosts without them keep the plain zoom menu.
+   */
+  pageControls: boolean
+  /**
+   * Pages can be darkened algorithmically (Chrome Android's "Auto-darken web content", CT-18):
+   * the WebView's algorithmic darkening; Chromium's auto dark mode over the DevTools protocol on
+   * Electron. Both act only while the chrome itself is dark and leave pages with a dark style of
+   * their own to it. Settings › Look shows "Apply dark theme to sites" and the per-site list.
+   */
+  darkenSites: boolean
+  /**
+   * Extensions run, but their content scripts share the page's world (an Android WebView below
+   * Chromium 146 has no isolated worlds; the emulation layer falls back to a scope proxy). Pages
+   * can then observe the scripts' DOM work; the extensions UI says so.
+   */
+  reducedExtensionIsolation: boolean
+  /**
+   * Private browsing as tabs inside the one window (`tab.newPrivate`): hosts without separate
+   * windows. Desktop hosts offer private windows instead (`windows`).
+   */
+  privateTabs: boolean
+  /**
+   * Chrome for Android's Inactive tabs (TAB-20): idle tabs leave the grid for the archive the
+   * overview lists, and the Tabs settings screen carries the threshold. Off, no pass runs and
+   * nothing is archived (the desktop, whose Chrome has no archive).
+   */
+  inactiveTabs: boolean
+  /** The host can point the resolver at DNS-over-HTTPS servers (desktop); Android uses the system's Private DNS. */
+  secureDns: boolean
+  /**
+   * The host's request engine asks the core's lookalike check before a main-frame request goes
+   * out and holds the navigation on its word (desktop's `webRequest` handler, PS-18). Where it
+   * cannot (Android's Kotlin engine), the core asks at `navigate` and at the commit instead.
+   */
+  lookalikeHolds: boolean
+  /**
+   * Every quit of the app runs through the core (`Browser.requestQuit`, the desktop), so what
+   * Settings clears on exit is cleared at quit. Where the process ends unannounced (Android) the
+   * on-exit clear runs at the next launch instead (`SiteDataStatus.clearsAtNextLaunch`).
+   */
+  quitsThroughCore: boolean
+  /**
+   * The host renders `zen://newtab` as a live page (theme bridge, shortcuts, customize panel).
+   * Without it new tabs stay blank and the URL bar alone stands in for a new tab page.
+   */
+  newTabPage: boolean
+  /**
+   * The chrome can draw an internal page inside the content area, so chrome-rendered pages
+   * (Settings) open as tabs of their own rather than as an overlay above the current tab
+   * (`shared/internalPages.ts`, `render: 'chrome'`). Android has this; the desktop keeps its
+   * overlay until its program adopts the page model. Document pages are tabs on every host.
+   */
+  pageTabs: boolean
+  /** Pages can be pinned to the launcher / Home screen ("Add to Home screen"). */
+  pinShortcuts: boolean
+  /**
+   * The host runs the offline translation engine (a `TranslateHost`: the model store and the
+   * chrome-side engine worker), so pages and selections can be translated and Settings has its
+   * Languages section. Every desktop and Android build; a host without it shows neither.
+   */
+  translate: boolean
+  /**
+   * The device has a speech recogniser (`SpeechRecognizer.isRecognitionAvailable`): the mic
+   * buttons in the omnibox, on the new tab page's field and in the bar start voice search
+   * (`voice.start`, `shared/voice.ts`). Off, no mic button shows anywhere.
+   */
+  voiceSearch: boolean
+  /**
+   * Selected page text gets the system's floating toolbar (Android's action mode) rather than
+   * the page context menu; the host asks the core for Ione's items in it and dispatches the
+   * one touched (`Menus.selectionToolbar` / `runSelectionAction`). Desktop hosts show the menu.
+   */
+  selectionToolbar: boolean
+  /**
+   * Selected page text gets the chrome's mini menu over it (CT-39; Edge's mini menu: Copy,
+   * Search, Define, Translate, Read aloud): the page script reports the settled selection
+   * (`shared/selectionScript`), the core publishes `UIState.selectionMenu` and the chrome draws
+   * the pill. Desktop hosts declare it; a host without it – the phone, whose system toolbar is
+   * its selection menu – leaves it out, and the core drops a `selection` report unread. The one
+   * capability a host may leave out: a desktop-only surface must not write a `false` into the
+   * phone's boot path for its sake.
+   */
+  selectionMenu?: boolean
+  /**
+   * The host can float a second chrome document above the page views (`WindowHost.setPopupSurface`):
+   * the autofill picker hangs from a page field there, over a page the user keeps typing into.
+   * Hosts without it (phones) draw the picker in the chrome's own document beside the page.
+   */
+  popupSurface: boolean
+  /**
+   * The device has a back camera the app may scan with: the camera buttons on the new tab
+   * page's field and in the omnibox's empty field open the scan sheet (`qr.start`,
+   * `shared/qrScan.ts`). Off, no camera button shows anywhere.
+   */
+  qrScan: boolean
+  /**
+   * Pages may capture the screen (`getDisplayMedia`): the host asks the core's picker for the
+   * screen, window or tab to share (`ScreenCaptureRequest`). Desktop only; the mobile WebView
+   * has no `getDisplayMedia`.
+   */
+  screenCapture: boolean
+  /**
+   * The chrome draws Ione's own share sheet (copy link, QR code, email, the system's sheet
+   * where the OS has one) for `navigator.share` and the menus' Share items – desktops, which
+   * have no share target of the OS's own. Hosts with `share` use the system sheet instead.
+   */
+  shareSheet: boolean
+  /**
+   * The host has a speech engine (`Platform.speech`): pages and reader articles can be read
+   * aloud sentence by sentence (`readAloud.*`, `shared/readAloud.ts`). Off, the UIs hide their
+   * Listen / Read aloud entry points.
+   */
+  readAloud: boolean
+  /**
+   * Pages receive the preferred languages (`Settings.languages`, CT-41): the desktop host sets
+   * every session's `Accept-Language` from the list. Off on Android, whose WebView sends the
+   * system's languages and cannot be told otherwise; the list still drives translate and
+   * spellcheck there, and Settings says pages receive the system languages.
+   */
+  pageLanguages: boolean
+  /**
+   * The engine honours the generic-family slots of `Settings.fonts` (`serif`, `sansSerif`,
+   * `fixed`, CT-25) for text a page styles with the generic keywords. On the desktop it does;
+   * off on Android, where Blink's font selection never consults the generic-family settings
+   * (`FontSelector::FamilyNameFromSettings`, its Android branch) – `WebSettings.serifFontFamily`
+   * and its siblings are inert there – so only the standard family (the initial `font-family`)
+   * and the sizes take effect, and the phone's Settings rows are those three.
+   */
+  genericFontFamilies: boolean
+  /**
+   * The host can switch Chromium's caret browsing on for a page (`TabView.setCaretBrowsingEnabled`,
+   * Electron's `webContents.setCaretBrowsingEnabled`, CT-34): a text cursor in the page that the
+   * arrow keys move and Shift selects with, F7's toggle in Chrome and Edge. Off on the Android
+   * host, whose WebView has no such call: F7 does nothing there and Settings hides the row.
+   */
+  caretBrowsing: boolean
+  /**
+   * The host answers a placement (Q1, the observable landing – the §11 stand-in rule): after
+   * the batch that places a page view and brings it back (`view.setBounds`, `view.setRadius`,
+   * `view.setVisible`), the platform asks `view.shown` and the host replies once the placement
+   * is applied AND the frame showing the view is drawn (`WebView.postVisualStateCallback`, the
+   * READY form of `view.drawn`); `false` at once for a view it does not have or does not show,
+   * `false` after its bound when no frame comes. The chrome keeps every stand-in for the live
+   * page at a landing – the cover under a sheet's close, the gesture stage's card where a swipe
+   * or the overview lands – until that answer (`Events['view.shown']`; `lib/cover.ts`
+   * `awaitingShow`), never dropping it on a clock of its own. On the Android host, whose chrome
+   * lies under the page views. Off on the desktop hosts, where the page view composites above
+   * the chrome and the main process places it synchronously: a stand-in there leaves as it does
+   * today.
+   */
+  placementAnswered: boolean
+  /**
+   * Page dialogs (alert, confirm, prompt, "Leave site?") on an AI agent's tabs reach the core's
+   * PageDialogService, so the agent answers them (`browser_handle_dialog` is listed). Off where
+   * the host's own dialog handling never hands them over (Android's WebChromeClient today).
+   */
+  agentDialogs: boolean
+  /**
+   * An AI agent may say AHEAD of an action how page dialogs on its tabs are to be answered
+   * (`browser_dialog_policy` is listed): the host answers a dialog a rule covers at once from
+   * that `AgentDialogPolicy` and reports it (`PageDialogAnswered` → the agent's next result).
+   * On hosts with `agentDialogs` the core answers before holding the dialog for
+   * `browser_handle_dialog`; a host that answers dialogs itself (Android's WebChromeClient)
+   * takes the policy through `TabView.setDialogPolicy` and reports through
+   * `TabViewEvents.onPageDialogAnswered`. Off until a host does one of the two.
+   */
+  agentDialogPolicy: boolean
+  /**
+   * The browser-level prompts this host hands to an AI agent's tab's agent instead of showing
+   * them (`AgentPromptKind`; listed by `browser_prompts`). A kind the host leaves out keeps
+   * its usual UI on agents' tabs too, and agents are told it is not routed here. Absent: none.
+   */
+  agentPrompts?: readonly AgentPromptKind[]
+}
+
+/**
+ * The native and browser-level prompts a page can raise that an AI agent answers for its own
+ * tabs through MCP (`browser_prompts`, `browser_respond_prompt`, `browser_file_upload`), never
+ * the OS's own UI: a file chooser (`<input type=file>`, `showOpenFilePicker`), the download
+ * "Save as" dialog, HTTP authentication, client-certificate selection, a permission request
+ * (camera, microphone, location, notifications, clipboard, MIDI, opening another app…), the
+ * screen-share picker, a Bluetooth / USB / serial / HID device chooser and a Bluetooth
+ * pairing, a link that opens another app, and `window.print()`.
+ */
+export type AgentPromptKind =
+  | 'file-chooser'
+  | 'download'
+  | 'http-auth'
+  | 'client-certificate'
+  | 'permission'
+  | 'screen-capture'
+  | 'device-chooser'
+  | 'device-pairing'
+  | 'external-protocol'
+  | 'print'
+
+// ---------------------------------------------------------------------------
+// The mini menu over a text selection, and Define (CT-39)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the mini menu offers, by id, in its order (Edge's: Copy, Search, Define, then the two
+ * the services core adds): each runs the page context menu's own selection action
+ * (`Menus.selectionActions`); `copy` is the engine's copy of the selection.
+ */
+export type SelectionMenuActionId = 'copy' | 'search' | 'define' | 'translate' | 'readAloud'
+
+/** One chip of the mini menu: the id handed back to `selectionMenu.run` and the action's short title. */
+export interface SelectionMenuAction {
+  id: SelectionMenuActionId
+  title: string
+}
+
+/**
+ * `UIState.selectionMenu`: the settled selection the chrome draws the mini menu for, from the
+ * page script's report (`shared/selectionScript`); null while nothing is selected, once the
+ * selection collapses or an action ran, and on hosts without `capabilities.selectionMenu`.
+ */
+export interface SelectionMenuState {
+  tabId: string
+  /** The selected text, whitespace folded, cut at the page script's cap. */
+  text: string
+  /** Where the selection is, in CSS pixels of the page view; null when the page could not say. */
+  rect: Rect | null
+  /** The chips, in order; never empty (an empty list clears the state instead). */
+  actions: SelectionMenuAction[]
+  /**
+   * Whether the pill is folded to its glyphs: the page view is narrower than the pill at full
+   * width plus its margins, so the whole row is 28 px glyph buttons with the titles as tooltips
+   * (`SelectionMenuService`, `miniMenuFolds`). One fold for the row, never chip by chip.
+   */
+  folded: boolean
+}
+
+/**
+ * The room a popup surface's document asks of the surface beyond its content's padded box, for
+ * its controls' tooltips (the chrome's `Tooltip`, hosted in the surface's document, §9.31: the
+ * folded pill's glyph buttons, `selectionMenu.surfaceSize`; the autofill picker's edge controls,
+ * `autofill.surfaceSize`): `below`, the pixels the surface reaches under the box so a tooltip
+ * 8 under a control stays 8 inside the document, and `width`, the least width of the surface
+ * for the widest title's tooltip and its margins. CSS pixels, whole; the core adds them around
+ * the box (`placeMiniMenuSurface`, `placePickerSurface`), never moving the content for them.
+ * Asked for the tooltip's moment alone – while one is on its way or up – and given back the
+ * instant it is over: at rest the surface is the content's padded box, and nothing under it
+ * eats the page's pointer.
+ */
+export interface PopupSurfaceRoom {
+  below: number
+  width: number
+}
+
+/** The pill's room (`MiniMenu`, `selectionMenu.surfaceSize`): a `PopupSurfaceRoom`. */
+export type MiniMenuRoom = PopupSurfaceRoom
+
+/**
+ * The core's word back to a surface-size report (`selectionMenu.surfaceSize`,
+ * `autofill.surfaceSize`): the popup surface's size as the core set it for the report – window
+ * CSS pixels, whole: the content's padded box, with the room while the report asked one – or
+ * null when the report placed no surface (another tab's pill, a picker gone, a nonsensical
+ * report, the box off the view). The document holds a tooltip's show on the room until this
+ * word has come and its own frame is at the size (`awaitTooltipRoom` – §11's paint handshake,
+ * the reader cover's: the word, or the ceiling for one that never comes), so no first frame of
+ * a tooltip is clipped by the surface's old bounds.
+ */
+export interface PopupSurfaceSize {
+  width: number
+  height: number
+}
+
+/** The pill's word back (`selectionMenu.surfaceSize`): a `PopupSurfaceSize`. */
+export type MiniMenuSurfaceSize = PopupSurfaceSize
+
+/**
+ * Why a definition could not be had: the text is not a term to define (`invalid-term`: more
+ * than three words, no letters, an address), Wiktionary has no page for it (`not-found`), the
+ * network did not answer (`offline`), it answered with an error (`unavailable`) or with
+ * something that is not its definition JSON (`malformed`).
+ */
+export type DefineRefusal = 'invalid-term' | 'not-found' | 'offline' | 'unavailable' | 'malformed'
+
+export interface DefineDefinition {
+  /** The sense, as plain text (Wiktionary's HTML stripped). */
+  text: string
+  /** Up to two usage examples, plain text. */
+  examples: string[]
+}
+
+export interface DefineEntry {
+  /** Wiktionary's part of speech heading: `Noun`, `Verb`, `Adjective`, … */
+  partOfSpeech: string
+  /** The language the entry defines the term in, as Wiktionary names it (`English`). */
+  language: string
+  definitions: DefineDefinition[]
+}
+
+/** A definition from Wiktionary (`core/define.ts`); the attribution its licence asks for rides with it. */
+export interface DefineResult {
+  /** The term as looked up (whitespace folded, trimmed). */
+  term: string
+  /** The language code of the section shown (`en`), the reader's when Wiktionary has it. */
+  lang: string
+  entries: DefineEntry[]
+  attribution: {
+    source: 'Wiktionary'
+    licence: 'CC BY-SA 4.0'
+    /** The term's page on Wiktionary, for "See more". */
+    url: string
+  }
+}
+
+export type DefineLookup = { ok: true; result: DefineResult } | { ok: false; reason: DefineRefusal }
+
+export interface Rect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface Point {
+  x: number
+  y: number
+}
+
+// ---------------------------------------------------------------------------
+// Containers (Firefox "Multi-Account Containers" → Chromium session partitions)
+// ---------------------------------------------------------------------------
+
+export type ContainerColor =
+  'blue' | 'turquoise' | 'green' | 'yellow' | 'orange' | 'red' | 'pink' | 'purple' | 'toolbar'
+
+export type ContainerIcon =
+  | 'fingerprint'
+  | 'briefcase'
+  | 'dollar'
+  | 'cart'
+  | 'circle'
+  | 'gift'
+  | 'vacation'
+  | 'food'
+  | 'fruit'
+  | 'pet'
+  | 'tree'
+  | 'chill'
+  | 'fence'
+
+export interface Container {
+  id: string
+  name: string
+  color: ContainerColor
+  icon: ContainerIcon
+}
+
+/** Id used for tabs that are not in any container ("No Container"). */
+export const DEFAULT_CONTAINER_ID = 'default'
+/** Pseudo container backing private windows: an in-memory session that is wiped when the last private window closes. */
+export const PRIVATE_CONTAINER_ID = 'private'
+
+/**
+ * Private browsing's device-local choices (`BrowserState.privateDevice`, the shape of
+ * `newTabDevice`: persisted with the profile, never synced). One so far: the phone host's
+ * "Lock private tabs when you leave Ione" (INC-05 / SET-17), Chrome's "Lock Incognito tabs
+ * when you leave Chrome", which is per device there too – it names this device's screen lock.
+ */
+export interface PrivateDeviceState {
+  /** Private tabs are covered when the app returns from the background, until the device's screen lock is passed. */
+  lockOnLeave: boolean
+}
+
+export function emptyPrivateDevice(): PrivateDeviceState {
+  return { lockOnLeave: false }
+}
+
+/** `raw` as a `PrivateDeviceState`: whatever it lacks or misspells falls back to the defaults. */
+export function sanitizePrivateDevice(raw: unknown): PrivateDeviceState {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  return { lockOnLeave: source.lockOnLeave === true }
+}
+
+// ---------------------------------------------------------------------------
+// Windows (Zen's window sync)
+// ---------------------------------------------------------------------------
+
+/**
+ * `synced` windows mirror the shared tabs/spaces (Zen's window sync). `unsynced` ("blank")
+ * windows and `private` windows own a temporary tab list that is never restored.
+ */
+export type WindowKind = 'synced' | 'unsynced' | 'private'
+/** Which tabs new synced windows share: everything, pinned/essential only, or nothing. */
+export type WindowSyncMode = 'all' | 'pinned' | 'off'
+/**
+ * What a window's chrome shows: the sidebar with spaces and tabs; for the sized windows pages
+ * open with `window.open(url, name, 'width=…')` a single toolbar row above the page; for a web
+ * app launched standalone (`ione --app=<url>`, an installed app's launcher) no browser chrome
+ * at all, only the app's own title bar (Chrome's app window); for a utility window holding one
+ * of the chrome's own pages (the task manager on Shift+Esc, as Chrome's and Edge's task manager
+ * is a window of its own) no browser chrome and no title row of the chrome's either – the OS
+ * frame and the page alone (`page`).
+ */
+export type WindowChrome = 'full' | 'popup' | 'app' | 'page'
+
+/**
+ * The web app a standalone window (`WindowChrome` `app`) is showing: its name and icon for the
+ * window's title bar, and the scope its pages stay within (a navigation out of it opens in a
+ * browser tab instead, as Chrome's app windows keep their app).
+ */
+export interface AppWindowInfo {
+  /** The installed app's name, or the launch URL's host when no record matches. */
+  name: string
+  /** The app's icon (a data or file URL), or null to show the page's favicon. */
+  icon: string | null
+  /** Absolute scope URL: the app's pages are those whose URL starts with it. */
+  scope: string
+  /** The installed app's id when the window belongs to one (`webapp.launch`), else null. */
+  appId: string | null
+  /** The URL a launcher of this app opens (`--app=<startUrl>`): the record's, else the page's. */
+  startUrl: string
+}
+/** System-drawn material behind a translucent chrome (Windows 11). */
+export type WindowMaterial = 'none' | 'mica'
+/**
+ * How much of what is behind the window the chrome lets through: `off` paints the space
+ * gradient opaquely, `translucent` leaves it a denser tint over the desktop, and `transparent`
+ * a lighter one, so the compositor can blur or dim it (`--zen-window-alpha`, `useTheme`). The
+ * native see-through window is made when a window is created, so a change applies to new
+ * windows; the chrome's alpha follows at once in the window that is open.
+ */
+export type WindowTransparency = 'off' | 'translucent' | 'transparent'
+
+/**
+ * Where a page's utility window (`WindowChrome` `page`) last stood: its normal bounds and the
+ * display they were on, so the task manager comes back where it was left, as Chrome's does.
+ */
+export interface PageWindowPlacement {
+  bounds: Rect
+  displayId: number | null
+}
+
+/**
+ * The page windows' device-local placements by page id (`BrowserState.pageWindowsDevice`, the
+ * shape of `newTabDevice`): never synced – a window's place is this screen's.
+ */
+export type PageWindowsDeviceState = Record<string, PageWindowPlacement>
+
+export function emptyPageWindows(): PageWindowsDeviceState {
+  return {}
+}
+
+/** `raw` as a `PageWindowsDeviceState`: every entry that is not a whole placement is dropped. */
+export function sanitizePageWindows(raw: unknown): PageWindowsDeviceState {
+  const out: PageWindowsDeviceState = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') continue
+    const entry = value as { bounds?: unknown; displayId?: unknown }
+    const b = entry.bounds as Partial<Record<keyof Rect, unknown>> | null | undefined
+    if (
+      !b ||
+      typeof b !== 'object' ||
+      typeof b.x !== 'number' ||
+      typeof b.y !== 'number' ||
+      typeof b.width !== 'number' ||
+      typeof b.height !== 'number' ||
+      ![b.x, b.y, b.width, b.height].every(Number.isFinite)
+    )
+      continue
+    out[id] = {
+      bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
+      displayId: typeof entry.displayId === 'number' ? entry.displayId : null
+    }
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Themes (Zen's gradient theme picker)
+// ---------------------------------------------------------------------------
+
+export type ThemeAlgorithm =
+  'floating' | 'complementary' | 'analogous' | 'splitComplementary' | 'triadic'
+
+export interface ThemeColor {
+  /** sRGB channels 0..255 */
+  c: [number, number, number]
+  /** Position inside the colour wheel, normalised 0..1 on both axes. */
+  x: number
+  y: number
+  isPrimary?: boolean
+}
+
+export interface SpaceTheme {
+  type: 'gradient'
+  colors: ThemeColor[]
+  /** 0..1 – how strongly the gradient tints the browser background. */
+  opacity: number
+  /** 0..1 – grain/noise texture intensity. */
+  texture: number
+  algorithm: ThemeAlgorithm
+  monochrome: boolean
+  /** Gradient rotation in degrees. */
+  rotation: number
+  /**
+   * A theme muted for one scheme whatever the OS uses: the private window's purple stays dark
+   * under a light scheme, the way an Incognito window does, so its light ink keeps reading on it.
+   */
+  scheme?: 'light' | 'dark'
+  /**
+   * The colours follow the new tab page's background picture (NTP-14; Settings' "Use the
+   * picture's colour" switch): seeded from the picture's colour when the switch went on, and
+   * again from each new picture picked on a device while it stays on. The switch's own state –
+   * the space's, kept with its theme wherever the space goes; absent reads off. Colours the user
+   * picks on the theme editor's wheel end the following (`editedTheme`): a picture does not
+   * overrule the user's colour unasked.
+   */
+  fromImage?: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Tabs, spaces, split views, folders
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the rule that blocked a request came from: a filter list (`tracker` – the lists match as
+ * one set, so no finer word is known), the user's own filters, an extension's rules, or Safe
+ * Browsing refusing an unsafe frame.
+ */
+export type BlockedSiteCategory = 'tracker' | 'user' | 'extension' | 'unsafe'
+
+/** One site the blocking engine stopped requests from on a tab's current document. */
+export interface BlockedSite {
+  /** Registrable domain of the blocked requests (`doubleclick.net`). */
+  domain: string
+  category: BlockedSiteCategory
+  /** Requests blocked from `domain` on the document so far. */
+  count: number
+}
+
+export interface Tab {
+  id: string
+  /** Space the tab belongs to. Essentials are global (per container) and have `spaceId: null`. */
+  spaceId: string | null
+  containerId: string
+  url: string
+  title: string
+  favicon: string | null
+  pinned: boolean
+  essential: boolean
+  /** URL a pinned/essential tab was pinned with ("reset pinned tab" restores this). */
+  pinnedUrl: string | null
+  /** User-provided title (rename). */
+  customTitle: string | null
+  /** User-picked emoji shown instead of the favicon ("Change Icon…"). */
+  customIcon: string | null
+  /**
+   * Window the tab is local to. `null` for tabs shared by every synced window; set for tabs of
+   * blank/private windows and, with "sync only pinned tabs", for unpinned tabs.
+   */
+  windowId: string | null
+  folderId: string | null
+  loading: boolean
+  /**
+   * The load is still waiting for the server's first response (tabs-41): true from the start of
+   * a load until its document commits, when the row's throbber turns from Chrome's muted
+   * "waiting" spin to the accent "loading" spin; false outside a load. A session's own (not
+   * persisted). Absent on records older than the field.
+   */
+  waiting?: boolean
+  /**
+   * How far the current load has come, 0…1, for the progress bar. Hosts that measure it
+   * (Android's `onProgressChanged`) report it as it grows; others only mark 0 at the start and
+   * 1 at the end.
+   */
+  progress: number
+  canGoBack: boolean
+  canGoForward: boolean
+  audible: boolean
+  muted: boolean
+  /**
+   * The tab's alert indicator above audio (tabs-43, Chrome's priority): the page uses the camera
+   * or microphone (`recording`), shares a screen, window or tab (`capturing`), holds a device
+   * session – a connected Bluetooth device (`bluetooth`), a USB device (`usb`), a HID device
+   * (`hid`), a serial port (`serial`) – plays picture-in-picture (`pip`), or presents to a VR
+   * headset (`vr`). Folded from every frame's `capture-state` report; a session's own (not
+   * persisted, cleared on load). Absent on records older than the field.
+   */
+  alert?: TabAlert | null
+  /**
+   * The kinds behind a `recording` / `capturing` alert (omnibox-38): which of the camera, the
+   * microphone and the screen the page holds, for the URL pill's site-information slot, whose
+   * glyph and name say which. Folded with `alert` from the same reports; null while nothing is
+   * captured.
+   */
+  capture?: TabCapture | null
+  /**
+   * The developer toolbox open on the tab (design language v2 §9.29), while one is: where it
+   * stands, as the host reports it – the dock it opened at (`TabViewEvents.onDevtoolsOpened`),
+   * then every move the toolbox's own buttons or the app menu's rows make
+   * (`onDevtoolsDockChanged`). Each tab's toolbox stands where it was put – tab A docked at the
+   * bottom, tab B undocked by its own button – and the frame's radius and the page's cover read
+   * the tab in front, not the one setting for every toolbox (`settings.devtoolsDock` is the
+   * default for the next opening). A session's own (not persisted); null or absent while no
+   * toolbox is up, and absent on hosts without one (Android: `capabilities.devtools` false).
+   */
+  devtools?: TabDevtools | null
+  /**
+   * A pinned or essential tab whose page changed its title while the tab was not in front
+   * (tabs-11, Chrome's attention indicator on a pinned tab – a mail count, a new message): the
+   * row's favicon wears an accent dot until the tab is activated. Set by the core on the page's
+   * title update (`TabViewEvents.onTitleUpdated`), cleared by `activateTab`; a session's own
+   * (not persisted). Absent on regular tabs and on records older than the field. The desktop's
+   * pinned row and Essentials tile draw it; the phone's chrome reads it or not as it likes.
+   */
+  attention?: true
+  /**
+   * The page's renderer stopped answering (tabs-45, Chrome's "Page unresponsive"): the host's
+   * hang monitor said so (`TabViewEvents.onUnresponsive`), and the chrome asks whether to wait
+   * for it or exit the page. Cleared when the page answers again (`onResponsive`), when the user
+   * chooses to wait (`tab.waitUnresponsive` – the next report asks again), when a navigation
+   * commits, and when the renderer goes. A session's own (not persisted); absent on hosts
+   * without a hang monitor (Android's WebView) and on records older than the field.
+   */
+  unresponsive?: true
+  /**
+   * The hang monitor's own reading of the renderer, kept apart from the prompt's mark above
+   * (session-08's C4 on #486, the first line's R3): set with `unresponsive` when the host
+   * reports the page hung, and standing until the renderer answers again (`onResponsive`), a
+   * navigation commits, or the renderer goes – NOT cleared by the prompt's Wait, which takes the
+   * prompt down and nothing else: the page is as hung as it was until the host reports it again.
+   * Read where the chrome must know whether the page can paint what is posted to it: "Hold ⌘Q to
+   * quit" over a hung page is the chrome's own to draw (`lib/quitHoldRoute.ts`), and the page's
+   * view gives way to its picture for the hold. A session's own (not persisted); absent on hosts
+   * without a hang monitor and on records older than the field.
+   */
+  hung?: true
+  /**
+   * The user typed into a form field of the current document (OS-37; Chrome's
+   * `kHasFormInteraction` protection): the sleep policies leave the page loaded, timer and
+   * memory pressure alike – a discard would lose what was typed. Set by the page script's
+   * first trusted `input` on the top document (the `formEdited` page message,
+   * `Tabs.noteFormEdited`), cleared when a navigation commits. A session's own (not
+   * persisted); absent on hosts that do not report it (the desktop today) and on records
+   * older than the field.
+   */
+  formEdited?: true
+  /** True when the tab has no live WebContents (Zen calls these "pending"/unloaded tabs). */
+  discarded: boolean
+  /**
+   * Memory (MB) the page held when it was put to sleep, for the sleeping tab's tooltip; absent
+   * when the host could not tell (or the tab was never loaded this session).
+   */
+  sleepSavedMb?: number
+  /**
+   * The tab woke from the sleep the unload pass put it into (omnibox-40, Chrome's Memory Saver
+   * chip): the memory (MB) its page held at the discard – `sleepSavedMb`'s number, carried past
+   * the wake – and when it was loaded again. The pill's site-information slot shows the leaf
+   * for a while from `wokeAt` and the leaf's bubble names the number. Set by `Tabs.load` for a
+   * tab `discard` slept this session with a number; gone at the next discard; a session's own
+   * (never persisted – a tab restored asleep from disk carries no number, and its first load
+   * says nothing: the saving was another session's). Absent on hosts and records older than
+   * the field.
+   */
+  memorySaver?: { savedMb: number; wokeAt: number } | null
+  /** Page lifecycle frozen by the resource governor (no timers, no script) – Chromium tab freezing. */
+  frozen: boolean
+  /** CPU throttling factor the governor applied to the renderer (1 = none, 4 = four times slower). */
+  cpuThrottle: number
+  zoom: number
+  splitGroupId: string | null
+  createdAt: number
+  lastActiveAt: number
+  /**
+   * When the tab's main frame last committed a navigation (ms since the epoch): a document, or
+   * a same-document move – a `pushState`, a fragment – as Chrome Android stamps its tab on
+   * every committed navigation (`TabImpl.handleDidFinishNavigation`, the tab's
+   * `lastNavigationCommittedTimestampMillis`, which `TabWebContentsObserver` calls for any
+   * commit of the primary main frame). Quick Delete's tab half reads it (HB-07, `'tabs'`): a
+   * tab is in a range when this stands at or after the range's start. `lastActiveAt` is the
+   * tab's activation, not its navigation. Set by the core at the commit (`Tabs.onNavigated`),
+   * persisted with the tab so a restart keeps it (Chrome's `TabState` keeps its stamp too),
+   * DEVICE-LOCAL: never part of the `open-tabs` sync record. Null on a tab that never committed
+   * this way; absent on records older than the field and read as null – in no bounded range.
+   */
+  lastNavigatedAt?: number | null
+  /**
+   * The tab's document generation: counts up at every committed navigation of a NEW document
+   * in the main frame – a load, a reload, a link followed, back to another page, an error page
+   * committing – as the host reports the commit (`TabViewEvents.onNavigated` with `inPage`
+   * false), and never at a same-document navigation – a `pushState`, a `replaceState`, a
+   * fragment – which moves the URL and `lastNavigatedAt` but keeps the document. The page-edge
+   * band reads it for its dismissal on navigation (motion spec §3.2; the Design Lead's ruling on
+   * #740: a same-document navigation does not dismiss the band, a new document does), since the
+   * URL alone cannot tell a `pushState` to another path from a document. A session's own (not
+   * persisted, never synced); absent on a tab that committed no document this session and on
+   * records older than the field, and read as 0.
+   */
+  documentGeneration?: number
+  /** Set when a navigation failed – rendered by the zen://error page. */
+  errorCode: number | null
+  /**
+   * The page's certificate failed verification: the tab shows the certificate interstitial for
+   * `certificateError.url`, or (`bypassed`) the page itself after the user proceeded past it.
+   * Absent or null on every other page.
+   */
+  certificateError?: CertificateError | null
+  /** Whether the current URL is bookmarked (denormalised for the UI). */
+  bookmarked: boolean
+  /** The page looks like an article Reader View can render (Firefox's "reader mode" icon). */
+  readerable: boolean
+  /** Requests the blocking engine stopped for the current document (resets on navigation). */
+  blockedCount: number
+  /**
+   * The sites those requests went to, in the order the engine first saw them, at most
+   * `BLOCKED_SITES_CAP` of them (the tracker report behind the count). Absent until the first
+   * block of the document; resets with `blockedCount`. A session's own: not persisted.
+   */
+  blockedSites?: BlockedSite[]
+  /**
+   * Tab whose page opened this one (a link into a new tab, `window.open`; the tab an internal
+   * page such as Settings was opened from). Mobile system back at the tab's first page closes it
+   * and returns there, as Chrome does for a child tab. A session's own: not persisted.
+   */
+  openerTabId: string | null
+  /** Opened by another app's intent or share; system back at its first page returns to that app. */
+  fromIntent: boolean
+  /** The web app manifest of the current page, once its page script has posted it; not persisted. */
+  webApp: WebAppInfo | null
+  /**
+   * Per-tab proxy override (`shared/appProxy.ts`): a profile id, `direct`, or `system`.
+   * Absent or empty follows the default connection and the routing rules. Persisted.
+   */
+  proxyId?: string | null
+}
+
+/** Colours a tab group (folder) can wear; the phone chrome paints group cards with them. */
+export type FolderColor =
+  'grey' | 'blue' | 'red' | 'yellow' | 'green' | 'pink' | 'purple' | 'cyan' | 'orange'
+
+/**
+ * The scheme a group colour is drawn for (design language v2 §9.14: one set a scheme): the
+ * chrome's resolved theme – the root's `data-theme` – never the setting's 'system'.
+ */
+export type FolderColorScheme = Exclude<ColorScheme, 'system'>
+
+/** A page of a saved (closed) group: what "Open" brings back (Chrome's saved tab groups). */
+export interface SavedGroupTab {
+  url: string
+  title: string
+  favicon?: string | null
+}
+
+/**
+ * The mark an MCP agent's group carries (`Folder.agent`): whose it is, and since when. `name` is
+ * the display name of the session that made the group, kept current while that session lives
+ * (`ione_session rename`) and replaced when another session adopts the group; an empty string
+ * says the maker is unknown (a group stamped by the one-time upgrade of state written before
+ * the mark existed, when its name did not carry the agent's). `createdAt` is ms since the epoch.
+ */
+export interface FolderAgentMark {
+  name: string
+  createdAt: number
+}
+
+/**
+ * The mark a space of the agents' carries (`Space.agent`): the one shared `Agents` space every
+ * agent's home group is made in (`shared`), or a space one agent made for itself (`own`, with
+ * that session's display name at the time and when).
+ */
+export type SpaceAgentMark = { kind: 'shared' } | { kind: 'own'; name: string; createdAt: number }
+
+export interface Folder {
+  id: string
+  spaceId: string
+  name: string
+  icon: string
+  collapsed: boolean
+  /** Group colour; folders made before groups had colours (or on desktop) carry none. */
+  color?: FolderColor | null
+  /**
+   * The group is an MCP agent's (S3 of the MCP program): stamped when the agent service makes
+   * or adopts it, so the group stays recognisable as an agent's – and, without a live owner
+   * session, as orphaned and adoptable – across restarts, wherever it sits. Read by the agent
+   * service alone; the chrome draws nothing for it. Additive: a folder without it is the user's,
+   * as every folder was before the field. Travels with the folder's sync record when set.
+   */
+  agent?: FolderAgentMark | null
+  /**
+   * Chrome's saved tab groups (Android's Tab groups pane, TAB-16): the group's pages as they
+   * were when its last live member closed – the whole group on "Close group" (`folder.close`),
+   * the last member alone when the members were closed one by one, as Chrome's saved group
+   * mirrors its live tabs – so the group stays listed as SAVED with its pages, and "Open"
+   * (`folder.open`) brings them back into it, in order. Meaningful only while the group has no
+   * live member: a group with members is open, and this is cleared as it opens or a tab joins
+   * it. Additive and local: a folder without it is as before, and the sync record ignores it.
+   */
+  savedTabs?: SavedGroupTab[] | null
+  /**
+   * When the group was last used – a member activated, a tab joining, the group closed or
+   * opened – as ms since the epoch; the Tab groups pane's "last used". Local, never synced.
+   */
+  lastUsedAt?: number | null
+}
+
+export interface Space {
+  id: string
+  name: string
+  /** Emoji (or empty string for the default monochrome icon). */
+  icon: string
+  containerId: string
+  theme: SpaceTheme | null
+  /** Ordered tab ids (pinned tabs always precede regular tabs). */
+  tabIds: string[]
+  /** Most recently selected tab in this space (each window keeps its own selection on top). */
+  activeTabId: string | null
+  pinnedCollapsed: boolean
+  /** Set for the private space of a blank / private window (never persisted). */
+  windowId?: string
+  /**
+   * The space is the agents' (S3 of the MCP program): the shared `Agents` space, found by this
+   * mark and never by its name – a space the user calls "Agents" is theirs – or a space one
+   * agent made for itself. Stamped by the agent service when it makes the space; read by it
+   * alone. Additive: a space without it is the user's. Travels with the space's sync record
+   * when set.
+   */
+  agent?: SpaceAgentMark | null
+}
+
+export type SplitLayout = 'grid' | 'vertical' | 'horizontal'
+
+export interface SplitGroup {
+  id: string
+  spaceId: string
+  tabIds: string[]
+  layout: SplitLayout
+  /** Normalised sizes (fractions summing to 1) for the panes – one per tab. */
+  sizes: number[]
+  /**
+   * This split's link rule (split-13, Edge's "Open links from the left pane in the right
+   * pane"; v2 §9.35): true, a plain click on a link in the first pane of a side-by-side split
+   * (vertical or grid) loads the link in the pane to its right, the left pane staying where it
+   * is – search results on the left, the article on the right. The rule is the arrangement's,
+   * not a habit of the browser's: the pane header's ⋯ menu writes it for this split alone, a new
+   * split starts without it, and it is kept with the split – layout and sizes alike – so a
+   * restored session keeps it. Absent reads off; a stacked (horizontal) split has no left and
+   * right and keeps its links whatever this says.
+   */
+  linksToRight?: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Boosts (Zen 1.20): per-site look customisation
+// ---------------------------------------------------------------------------
+
+export interface Boost {
+  /** Registrable domain the boost applies to (e.g. `github.com`). */
+  domain: string
+  enabled: boolean
+  /** Hex colour tinted over the page, `null` for none. */
+  tint: string | null
+  /** 0..1 strength of the tint. */
+  tintIntensity: number
+  /** Font family override, `null` keeps the site's fonts. */
+  font: string | null
+  /** Root font size in percent (100 = site default). */
+  fontSize: number
+  /** Force a dark rendering of light-only sites. */
+  darkMode: boolean
+  /** CSS selectors hidden with "Zap element". */
+  zapped: string[]
+  /** Additional user CSS for the site. */
+  css: string
+  updatedAt: number
+}
+
+// ---------------------------------------------------------------------------
+// Live Folders (Zen 1.19): folders filled from GitHub / RSS / REST sources
+// ---------------------------------------------------------------------------
+
+export type LiveFolderProvider = 'github-pulls' | 'github-issues' | 'rss' | 'rest'
+
+export interface LiveFolderMapping {
+  /** Dot path to the array of items (empty = the response itself). */
+  items: string
+  id: string
+  title: string
+  url: string
+}
+
+export interface LiveFolderConfig {
+  folderId: string
+  provider: LiveFolderProvider
+  /** GitHub: username (or a full search query); RSS: feed URL; REST: endpoint URL. */
+  source: string
+  /** GitHub: include draft pull requests (Zen 1.21.11 lets you filter them out). */
+  includeDrafts: boolean
+  /** GitHub: optional personal access token (private repositories, higher rate limits). */
+  token: string
+  /** REST: how to read items out of the JSON response. */
+  mapping: LiveFolderMapping | null
+  intervalMinutes: number
+  maxItems: number
+  lastFetched: number | null
+  lastError: string | null
+  /** Item ids the user closed or ungrouped – they never come back. */
+  dismissed: string[]
+  /** Item id → tab id currently representing it. */
+  items: Record<string, string>
+}
+
+// ---------------------------------------------------------------------------
+// Extensions (unpacked Chrome extensions) and Mods (custom chrome CSS)
+// ---------------------------------------------------------------------------
+
+/** Where an extension came from; store installs update through their store. */
+export type ExtensionSource = 'chrome-web-store' | 'edge-add-ons' | 'crx' | 'zip' | 'unpacked'
+
+/** What the last update check found for an extension (`unknown` until one ran or when it cannot update). */
+export type ExtensionUpdateState = 'unknown' | 'up-to-date' | 'available' | 'updating' | 'error'
+
+export interface ExtensionInfo {
+  id: string
+  name: string
+  version: string
+  description: string
+  path: string
+  enabled: boolean
+  /** Data URL of the largest icon, when the manifest declares one. */
+  icon: string | null
+  /** `action.default_popup` (or the MV2 `browser_action` equivalent) if present. */
+  popup: string | null
+  /** Set when the extension could not be loaded (unsupported manifest, missing files…). */
+  error: string | null
+  source: ExtensionSource
+  /** Who signed the package: a store, or `unknown` for other signed CRX files; null when unsigned. */
+  publisher: 'chrome-web-store' | 'edge-add-ons' | 'unknown' | null
+  /** Where updates come from (the store endpoint or `manifest.update_url`); null when it cannot update. */
+  updateUrl: string | null
+  installedAt: number
+  updatedAt: number
+  /** Pinned extensions are left out of update checks. */
+  pinned: boolean
+  /** Shown as a toolbar button; other extensions live in the puzzle-piece panel. */
+  toolbarPinned: boolean
+  /**
+   * When `enabled` and `toolbarPinned` were last written on this device (ms), each switch's own
+   * clock for the sync merge (ID-44: a peer's record lands a switch only when its clock for that
+   * switch is the later one). Written by every flip made on the device (the desktop's and the
+   * phone's alike); absent on a record from before the clocks and on a switch never flipped
+   * here, which the merge reads as written at 0 – older than any clocked switch.
+   */
+  enabledAt?: number
+  toolbarPinnedAt?: number
+  /** Chrome's "Allow access to file URLs"; off by default. */
+  allowFileAccess: boolean
+  /**
+   * Chrome's "Allow in Incognito": whether the extension's request rules (declarativeNetRequest,
+   * webRequest listeners) apply in private windows. Off by default.
+   */
+  allowPrivate: boolean
+  /**
+   * Chrome's "Allow user scripts": whether `chrome.userScripts` is available to the extension and
+   * its registered user scripts run in pages. Off by default; only shown for an extension whose
+   * manifest asks for the `userScripts` permission.
+   */
+  allowUserScripts: boolean
+  manifestVersion: number
+  permissions: string[]
+  hostPermissions: string[]
+  /** `options_ui.page` or `options_page`, relative to the extension root. */
+  optionsPage: string | null
+  /** `chrome_url_overrides.newtab`, relative to the extension root; null when not declared. */
+  newTabPage: string | null
+  /** New tabs open `newTabPage` (`extension.setNewTabOverride`); off by default, one at most. */
+  newTabOverride: boolean
+  /** The install prompt's warning lines Chrome would show for this manifest. */
+  warnings: string[]
+  /** Warning lines an update added; the extension stays disabled until they are approved. */
+  pendingWarnings: string[] | null
+  /**
+   * Installed here by sync from another device's record (ID-44) and not yet approved: it landed
+   * turned off, and enabling it opens the install prompt with its permission warnings first.
+   * Absent on a host that applies no synced extension (the phone) and on an extension the user
+   * installed here.
+   */
+  pendingApproval?: boolean
+  updateState: ExtensionUpdateState
+  /** The version the last check offered, while `updateState` is `available` or `updating`. */
+  availableVersion: string | null
+  /** Why the last update check or install failed, while `updateState` is `error`. */
+  updateError: string | null
+  /** When this extension was last checked for updates, or null when never. */
+  updateCheckedAt: number | null
+  /** Effective `chrome.action` state for the active tab; absent while the extension is not loaded. */
+  action?: ExtensionAction
+  /** The manifest's `commands` with the shortcut each one is bound to; absent while not loaded. */
+  commands?: ExtensionCommandInfo[]
+  /** Why some commands stayed unbound (an Ione shortcut or another extension holds the key). */
+  commandConflicts?: string[]
+  /**
+   * API permissions the manifest declares that the host keeps out of the manifest the engine
+   * loads, because the engine's own implementation would crash the browser rather than answer
+   * (`core/extensions/withheldPermissions.ts`); the browser layer answers those APIs instead.
+   * Absent on hosts that withhold nothing.
+   */
+  withheld?: WithheldPermissions
+  /**
+   * The extension's error console (Chrome's "Errors" on the details page): the last hundred
+   * load failures, uncaught exceptions, unhandled rejections and `console.error` / `console.warn`
+   * lines from its worker, its pages and its content scripts, oldest first, repeats collapsed
+   * (`count`). `extension.clearErrors` empties it.
+   */
+  errors: ExtensionErrorEntry[]
+}
+
+/**
+ * The withheld entries of a manifest's permission lists, by the list they were declared in: a
+ * required one counts as granted (Chrome grants required permissions at install), an optional one
+ * is never granted (`permissions.request` answers false for it).
+ */
+export interface WithheldPermissions {
+  required: string[]
+  optional: string[]
+}
+
+export type ExtensionErrorLevel = 'warning' | 'error'
+
+/**
+ * Where an error console line came from: `load` (the extension could not be loaded), `worker`
+ * (the MV3 service worker), `page` (an extension page: popup, options, background page, side
+ * panel, offscreen document), `content` (a content script or user script of the extension
+ * running in a tab page).
+ */
+export type ExtensionErrorSource = 'load' | 'worker' | 'page' | 'content'
+
+/** One line of an extension's error console (`ExtensionInfo.errors`). */
+export interface ExtensionErrorEntry {
+  /** Increasing within the extension's console; a cleared console starts over. */
+  id: number
+  level: ExtensionErrorLevel
+  source: ExtensionErrorSource
+  message: string
+  /** The script the line came from, or null when unknown (the extension's own files keep their `chrome-extension://` URL). */
+  url: string | null
+  /** 1-based line in `url`, or null. */
+  line: number | null
+  /**
+   * The context it happened in: the extension page's URL, the worker's script URL, or the tab
+   * page a content script ran in; null when unknown.
+   */
+  context: string | null
+  /** First occurrence, ms since epoch. */
+  at: number
+  /** Latest occurrence; equals `at` until the line repeats. */
+  lastAt: number
+  /** How many times the same line was seen (identical level, source, message, url, line, context). */
+  count: number
+}
+
+/** The extension side panel a window is showing (`chrome.sidePanel`), beside the page. */
+export interface SidePanelInfo {
+  extensionId: string
+  name: string
+  /** Data URL of the extension's icon, when it has one. */
+  icon: string | null
+}
+
+/** One `chrome.commands` entry as the extensions page shows it. */
+export interface ExtensionCommandInfo {
+  name: string
+  description: string
+  /** The bound key in the user's shortcut label form, or null when unbound. */
+  shortcut: string | null
+  /** The `_execute_action` family: the key opens the toolbar action instead of `onCommand`. */
+  executesAction: boolean
+}
+
+/** What an extension's toolbar button should show: `chrome.action` state for the active tab. */
+export interface ExtensionAction {
+  badgeText: string
+  /** CSS colour, or null for the host's default badge colour. */
+  badgeBackgroundColor: string | null
+  badgeTextColor: string | null
+  title: string
+  /** Data URL set through `action.setIcon`, or null for the manifest icon. */
+  icon: string | null
+  /** Full popup URL, or null when a click fires `action.onClicked` instead. */
+  popup: string | null
+  enabled: boolean
+}
+
+/**
+ * A question main puts to the user through the chrome's dialog: the store service's
+ * `InstallConfirmation` plus the id the renderer answers with (`extension.confirmInstall` or
+ * `extension.respondPermissionRequest`).
+ */
+export interface ExtensionPromptRequest {
+  requestId: string
+  /**
+   * `install`: a fresh install or a reinstall; `update`: an update that added permissions;
+   * `permissions`: approving those before an updated extension is enabled again; `request`: a
+   * running extension's `permissions.request` (raised by the API layer).
+   */
+  kind: 'install' | 'update' | 'permissions' | 'request'
+  name: string
+  icon: string | null
+  warnings: string[]
+  source?: ExtensionSource
+}
+
+/** Update checks across all extensions, for the caption on the management page. */
+export interface ExtensionUpdateCheck {
+  lastCheckedAt: number | null
+  checking: boolean
+}
+
+export interface Mod {
+  id: string
+  name: string
+  /** Where the CSS was imported from (URL or file path) – informational. */
+  source: string | null
+  css: string
+  enabled: boolean
+  updatedAt: number
+}
+
+// ---------------------------------------------------------------------------
+// Cross-device sync (Zen 1.22: "Sync your Spaces across devices")
+// ---------------------------------------------------------------------------
+
+/** What gets synced; mirrors Zen's Sync engines. */
+export interface SyncScope {
+  spaces: boolean
+  folders: boolean
+  pinnedTabs: boolean
+  essentials: boolean
+  /** Unpinned tabs too (they arrive unloaded on other devices). */
+  openTabs: boolean
+  containers: boolean
+  bookmarks: boolean
+  settings: boolean
+  shortcuts: boolean
+  boosts: boolean
+  /**
+   * Saved logins and the passkeys' public records (ID-09), under the same end-to-end key as
+   * everything else; on by default as Chrome's password sync is. The vault's addresses and
+   * payment cards have keys of their own below, as Chrome's types do.
+   */
+  passwords: boolean
+  /**
+   * The vault's saved addresses (`AddressEntry`, one `address` record per entry under the
+   * entry's own id; services pass 16, ID-45 – Chrome's "Addresses and more" type, a toggle of
+   * its own beside Passwords), under the same end-to-end key as the logins; on by default, as
+   * Chrome's is under "Sync everything" and as Passwords is here. While off, the device neither
+   * publishes the type nor takes it in, and its metadata for the type is frozen, as with every
+   * scoped type; while the vault is locked the type is held with the logins. Absent on a
+   * `sync.json` older than the key, where the engine completes it with the default; a scope
+   * object from an older build says nothing for it, so `collectLocal` under one publishes no
+   * address (`__tests__/compat.test.ts`).
+   */
+  addresses: boolean
+  /**
+   * The vault's saved payment cards (`PaymentCard`, one `payment-method` record per entry under
+   * the entry's own id; ID-45 – Chrome's "Payment methods" type): the card as the vault keeps it
+   * (the number's digits, no security code), under the same end-to-end key as a login's
+   * password; on by default as `addresses`, held, frozen and completed the same way.
+   */
+  paymentMethods: boolean
+  /**
+   * Browsing history (ID-13 / HB-48): the device's visits and deletions as a stream the other
+   * devices import into their own history, on by default as Chrome's is. Off, a device neither
+   * publishes its visits nor takes the others' in. Absent on a `sync.json` older than the key.
+   */
+  history: boolean
+  /**
+   * The reading list (Chrome's "Reading list" type; W6-1's model, one `reading-list-entry`
+   * record per entry carrying every field but `favicon`), on by default as the bookmarks are.
+   * While off, the device neither publishes the type nor takes it in, and its metadata for the
+   * type is FROZEN (`frozenRecords`): a removal made while off tombstones the peers' copies when
+   * the scope returns, and an edit made while off is stamped at the return, not at the edit –
+   * as with every scoped type. Absent on a `sync.json` older than the key, where the engine
+   * completes it with the default; a scope object from an older build says nothing for it, so
+   * `collectLocal` under one publishes no entry (`__tests__/compat.test.ts`).
+   */
+  readingList: boolean
+  /**
+   * The Mods (`Mod`: the browser chrome's CSS mods, Settings › Mods), one `mod` record per Mod
+   * under the Mod's own id (services pass 15, ID-43); on by default, as Chrome's Themes type is
+   * a toggle of its own among what you sync (`UserSelectableType::kThemes`,
+   * `components/sync/base/user_selectable_type.h`; the one theme per profile travels through
+   * `ThemeSyncableService`, `syncer::THEMES`) and Edge carries appearance inside Settings. The
+   * look settings themselves travel as they did – the colour scheme and the app icon on the
+   * settings record key by key, each space's gradient theme (`SpaceTheme`, its colours among
+   * it) on its space record – and `useSystemAccent` stays each device's own
+   * (`DEVICE_LOCAL_SETTINGS`): this key toggles the Mod list alone.
+   * While off, the device neither publishes the type nor takes it in, and its metadata for the
+   * type is frozen, as with every scoped type. Absent on a `sync.json` older than the key, where
+   * the engine completes it with the default; a scope object from an older build says nothing
+   * for it, so `collectLocal` under one publishes no Mod (`__tests__/compat.test.ts`).
+   */
+  mods: boolean
+  /**
+   * The extensions installed from a store (Chrome's "Extensions" type, `syncer::EXTENSIONS`;
+   * services pass 16, ID-44): one `extension` record per extension whose `source` is a store id
+   * – `chrome-web-store` or `edge-add-ons` – under the extension's own id, carrying the store,
+   * whether it is enabled and whether it is pinned to the toolbar (`ExtensionRecordData`); on
+   * by default, as Chrome's is. An extension installed from a `.crx` or `.zip` file or loaded
+   * unpacked stays on its device, as Chrome keeps its unpacked ones out of sync, and so does
+   * every per-device grant (file access, private windows, user scripts). Every host whose
+   * registry holds store installs publishes the type; a device that applies it (the desktop)
+   * installs a synced extension from its store and lands it TURNED OFF, waiting for the user's
+   * approval of its permissions (`ExtensionInfo.pendingApproval`) – nothing is granted by sync.
+   * While off, the device neither publishes the type nor takes it in, and its metadata for the
+   * type is frozen, as with every scoped type. Absent on a `sync.json` older than the key, where
+   * the engine completes it with the default; a scope object from an older build says nothing
+   * for it, so `collectLocal` under one publishes no extension (`__tests__/compat.test.ts`).
+   */
+  extensions: boolean
+}
+
+/** One open tab of another device, as its `open-tabs` record carries it (ID-28). */
+export interface SyncRemoteTab {
+  /** The tab's id on its own device. */
+  tabId: string
+  url: string
+  title: string
+  favicon: string | null
+  /** When the tab was last in front on its device (epoch ms). */
+  lastActive: number
+  /** The window the tab is local to on its device, when it is not shared by every window. */
+  windowId: string | null
+}
+
+/**
+ * What a synced device is, as its own platform reports it – Chrome's `DeviceFormFactor`
+ * (`sync_enums.proto`: desktop, phone, tablet; the older `DeviceType` names an OS, and every
+ * desktop OS draws one computer glyph). Android tells a phone from a tablet by its form factor
+ * (the 600 dp line); a desktop reports `desktop` unless its platform has a reliable signal that
+ * it is a laptop – Electron has none, so today no desktop says `laptop`, and the two kinds draw
+ * one glyph (`DeviceGlyph`). Absent from an older device's announcement: its rows show a
+ * stand-in glyph beside devices that announced one, and none where no device did.
+ */
+export type SyncDeviceKind = 'desktop' | 'laptop' | 'phone' | 'tablet'
+
+/** Another device seen in the sync folder, as its announcement names it. */
+export interface SyncDevice {
+  id: string
+  name: string
+  lastSeen: number
+  kind?: SyncDeviceKind
+}
+
+/** Another device's open tabs, newest activity first ("Tabs from other devices"). */
+export interface SyncDeviceTabs {
+  deviceId: string
+  deviceName: string
+  /** The device's kind, when its announcement carried one. */
+  deviceKind?: SyncDeviceKind
+  /** When the device last published its list (epoch ms). */
+  updatedAt: number
+  tabs: SyncRemoteTab[]
+}
+
+export interface SyncStatus {
+  /** Sync is configured (folder + key) and enabled. */
+  enabled: boolean
+  /**
+   * Folder every device writes its encrypted records to (any cloud-drive / Syncthing folder):
+   * the path on desktop, the document tree's URI on Android. Opaque to the chrome; show `folderName`.
+   */
+  folder: string | null
+  /** The folder as the user knows it: the path on desktop, the tree's display name on Android. */
+  folderName: string | null
+  /**
+   * The folder cannot be reached any more (an unmounted drive; on Android the tree's permission
+   * was revoked or the folder deleted). Sync stays configured and waits for `sync.setFolder`.
+   */
+  folderLost: boolean
+  deviceId: string
+  deviceName: string
+  scope: SyncScope
+  lastSyncAt: number | null
+  lastError: string | null
+  /**
+   * The class of `lastError` when the WebDAV or the account transport raised it (ID-32), for the
+   * chrome to say in its own words (§9.33: no method or status in a sentence) – read as a
+   * `WebDavErrorKind` or an `AccountErrorKind` by `transport`; null for the folder transport's
+   * sentences and when there is no error.
+   */
+  lastErrorKind: WebDavErrorKind | AccountErrorKind | null
+  syncing: boolean
+  /** Other devices seen in the sync folder. */
+  devices: SyncDevice[]
+  /** Set while the first sync waits for the user to confirm merging with existing cloud data. */
+  pendingMerge: boolean
+  /**
+   * Bumped whenever another device's open tabs changed (`sync.tabsFromDevices` has a new
+   * answer); the list itself stays out of the status, it can run to hundreds of tabs.
+   */
+  remoteTabsVersion: number
+  /** Where the folder lives (ID-32): a folder of this host's, or a WebDAV server. */
+  transport: SyncTransportKind
+  /** The WebDAV server in use, never its app password; null with the folder transport. */
+  webdav: WebDavSyncSettings | null
+  /**
+   * The host can reach a WebDAV server with any method and keep its app password (a fetch and a
+   * secret store): the setup may offer the choice. False on a host without either.
+   */
+  webdavAvailable: boolean
+  /**
+   * The WebDAV server refused the sign-in (401) on the last round: sync stays configured, no
+   * request leaves with the dead app password (the poll and the push stop – a server's
+   * brute-force protection throttles the whole address after a few refusals) and the engine
+   * waits for a new one (`sync.setWebDavPassword`). Never set by the folder transport.
+   */
+  authRefused: boolean
+  /**
+   * The host can reach the Ione account service and keep the device's sign-in (a fetch and a
+   * secret store, as for a WebDAV server): the setup may offer the account.
+   */
+  accountAvailable: boolean
+  /**
+   * The Ione account this device is signed in to: before setup once the sign-in in the browser
+   * was approved (the passphrase step follows), and while sync runs through it. Kept while the
+   * service has signed the device out (`accountSignedOut`), so the chrome can name it; null
+   * otherwise.
+   */
+  account: { email: string } | null
+  /**
+   * A sign-in under way (`sync.accountSignIn`): the code the new tab shows for the user to check,
+   * the page it opened, and when the code stops working. Null when none runs.
+   */
+  accountLink: SyncAccountLink | null
+  /** Why the last sign-in did not finish (the code expired, the service could not be reached…); null after a new one starts. */
+  accountLinkFailure: SyncAccountLinkFailure | null
+  /**
+   * The account service ended this device's sign-in (signed out from the website, the account
+   * deleted, a refresh refused): sync stays configured, nothing more is sent, and the engine
+   * waits for the user to sign in again (`sync.accountSignIn`) – the account's `authRefused`.
+   */
+  accountSignedOut: boolean
+}
+
+/**
+ * How a device reaches the shared folder: a folder of the host's (`folder`), a WebDAV server
+ * (`webdav`), or the user's Ione account (`account`).
+ */
+export type SyncTransportKind = 'account' | 'folder' | 'webdav'
+
+/** A sign-in to the Ione account under way: the code to check against the new tab, its page, its expiry (ms). */
+export interface SyncAccountLink {
+  userCode: string
+  verificationUrl: string
+  expiresAt: number
+}
+
+/**
+ * Why a sign-in did not finish: the code `expired` before it was approved, the service was
+ * `unavailable` or `rate-limited`, or the host's secret store could not keep the sign-in (`secrets`).
+ */
+export type SyncAccountLinkFailure = 'expired' | 'unavailable' | 'rate-limited' | 'secrets'
+
+/**
+ * How the Ione account service answered, as the account transport classes it
+ * (`core/sync/account.ts`): `signed-out` (the device's sign-in is gone – revoked, the account
+ * deleted, a refresh refused), `quota` (the account's sync storage is full), `too-large` (one
+ * document past the service's size), `rate-limited` (too many requests for now), `unavailable`
+ * (a network failure, a timeout, a 5xx), `refused` (any other refusal).
+ */
+export type AccountErrorKind =
+  'signed-out' | 'quota' | 'too-large' | 'rate-limited' | 'unavailable' | 'refused'
+
+/**
+ * A WebDAV server as the sync folder's home (ID-32): the DAV root the account's files live under
+ * (Nextcloud's `https://cloud.example.com/remote.php/dav/files/<user>/`), the account, and the
+ * folder under that root the `ione-sync` directory is made in. Never the app password: the
+ * host's secret store keeps it (`Platform.secrets`), the status and the stores only ever hold these.
+ */
+export interface WebDavSyncSettings {
+  url: string
+  username: string
+  folder: string
+}
+
+/** The settings with the app password, as the setup and a test connection carry them once. */
+export interface WebDavSyncCredentials extends WebDavSyncSettings {
+  password: string
+}
+
+/**
+ * How a WebDAV server answered, as the transport classes it (`core/sync/webdav.ts`): `auth`
+ * (401: the sign-in refused – a new app password is the way out), `forbidden` (403: signed in,
+ * but the server does not allow the folder to be written or read), `missing` (404 where
+ * something had to be there), `conflict` (412 / 423: a precondition failed or the resource is
+ * locked – the round is run again), `redirect` (3xx: the address sends elsewhere; the transport
+ * follows none, so the `Authorization` header never crosses to another origin), `unavailable`
+ * (5xx, a network failure, a timeout), `refused` (any other refusal, and a 200 or an empty 207
+ * where a multistatus had to come – a web page, not a WebDAV server).
+ */
+export type WebDavErrorKind =
+  'auth' | 'forbidden' | 'missing' | 'conflict' | 'redirect' | 'unavailable' | 'refused'
+
+/** A test connection's answer: reached and signed in, or the refusal and the status behind it (0: no response). */
+export type WebDavProbe = { ok: true } | { ok: false; kind: WebDavErrorKind; status: number }
+
+/**
+ * Why `sync.setup` or `sync.setWebDavPassword` did not do what was asked with a WebDAV server or
+ * the Ione account, for the chrome to say in its own words (§9.33): the server's answer as the
+ * transport classed it, the account service's, or the host's secret store not keeping the app
+ * password. Null when it did. The folder transport's refusals are as before ID-32: a toast the
+ * setup form takes as its line.
+ */
+export type SyncSetupRefusal =
+  | { reason: 'server'; kind: WebDavErrorKind; status: number }
+  | { reason: 'account'; kind: AccountErrorKind }
+  | { reason: 'secrets' }
+
+// ---------------------------------------------------------------------------
+// Passwords (the encrypted credential vault)
+// ---------------------------------------------------------------------------
+
+export interface PasswordSettings {
+  /** Offer to save logins submitted in pages (the save / update prompt after a sign-in). */
+  offerToSave: boolean
+  /**
+   * Seconds a successful re-authentication keeps covering reveals, copies and exports before the
+   * user is asked again (Chrome uses about a minute); 0 asks every time.
+   */
+  reauthGraceSeconds: number
+  /** Fill the one saved login of a site without showing the account picker first (off by default). */
+  autoSignIn: boolean
+  /**
+   * Android only: who saves and fills passwords in pages when a system autofill service is set.
+   * `system` leaves the WebView to the Android Autofill Framework; `ione` keeps the framework
+   * off the pages and uses Ione's own prompts.
+   */
+  androidProvider: 'system' | 'ione'
+  /**
+   * Seconds after which a copied password or card number is cleared from the clipboard again
+   * (only when it is still there); 0 leaves it.
+   */
+  clipboardClearSeconds: number
+  /**
+   * Chrome's "Warn you if passwords are exposed in a data breach": a password submitted in a
+   * sign-in form is looked up in the breach corpus (the k-anonymity range check of the checkup)
+   * and a warning is raised when it is known breached (ID-31). On by default, as in Chrome.
+   */
+  leakDetection: boolean
+}
+
+/** Chrome's limit for a saved password's note (ID-34): the field clips at this many characters. */
+export const NOTE_MAX_LENGTH = 1000
+
+/**
+ * A saved login. The password only ever leaves the core through the re-authenticated commands
+ * (`passwords.reveal`, `passwords.copy`, `passwords.export`).
+ */
+export interface Credential {
+  id: string
+  /** Origin the login belongs to, e.g. `https://accounts.example.com`. */
+  origin: string
+  /** Page the login was saved from when known (fill and "change password" links), else ''. */
+  url: string
+  username: string
+  password: string
+  /** HTTP authentication realm (Basic / Digest prompts); `null` for form logins. */
+  realm: string | null
+  /**
+   * The user's note on the login (ID-34), up to `NOTE_MAX_LENGTH` characters when written here;
+   * encrypted with the rest of the entry and synced with it. '' when there is none.
+   */
+  notes: string
+  createdAt: number
+  updatedAt: number
+  lastUsedAt: number | null
+  /**
+   * How often this password appears in the breach corpus, as of `checkedAt`: 0 for a clean one,
+   * null while it has never been looked up. Written by the sign-in leak check and by Password
+   * Checkup; reset whenever the password changes (the four fields below describe one value).
+   */
+  breached: number | null
+  /** When the breach lookup last ran for this password value; null when never. */
+  checkedAt: number | null
+  /** When a sign-in leak warning was last shown for this password value (shown once); null when never. */
+  leakWarnedAt: number | null
+  /**
+   * The user chose Ignore on a leak warning for this password value (Chrome's dismissed
+   * warning): no warning again until the password changes, and Safety Check leaves it out of the
+   * compromised count. Null otherwise.
+   */
+  leakIgnoredAt: number | null
+}
+
+/**
+ * The fields of a login that describe its breach state for one password value
+ * (`Credential.breached` and the three timestamps); they reset together when the value changes.
+ */
+export type CredentialLeakFields = Pick<
+  Credential,
+  'breached' | 'checkedAt' | 'leakWarnedAt' | 'leakIgnoredAt'
+>
+
+export function emptyLeakFields(): CredentialLeakFields {
+  return { breached: null, checkedAt: null, leakWarnedAt: null, leakIgnoredAt: null }
+}
+
+/**
+ * A sign-in leak warning waiting for the user (ID-31): the password just submitted in a tab is
+ * known breached. One per tab at most; the chrome shows its active tab's as Chrome's "Change
+ * your password" dialog (a sheet on the phone) and answers it with `passwords.leakRespond`.
+ */
+export interface CredentialLeakWarning {
+  id: string
+  tabId: string
+  /** The site's origin and its label ("example.com"). */
+  origin: string
+  site: string
+  /** The username the form submitted; '' when the form had none. */
+  username: string
+  /** How many times the password appears in known breaches (at least 1). */
+  breachCount: number
+  /**
+   * The saved login the warning is about, when the submitted credentials are saved and the tab
+   * is not private (Ignore is remembered on it); null for an unsaved sign-in or a private tab,
+   * where nothing is remembered.
+   */
+  credentialId: string | null
+  /** The tab is private: the check ran and warns, but no memory is kept (Chrome does the same). */
+  private: boolean
+}
+
+/**
+ * What the user chose on a leak warning: open the site's change-password page (its
+ * `/.well-known/change-password` when the site serves one, else the site itself) in the warning's
+ * tab; remember the warning as ignored for this password value; open the password manager; or
+ * just close it (nothing remembered beyond the warning having been shown once).
+ */
+export type CredentialLeakAction = 'changePassword' | 'ignore' | 'openManager' | 'dismiss'
+
+/**
+ * The last Password Checkup's counts and time, kept on this device (with the profile, outside
+ * the vault, so Safety Check reads it while the vault is locked). `compromised` is kept live
+ * from the logins' `breached` flags while the vault is open: a sign-in leak warning raises it,
+ * an Ignore or a changed password lowers it. `weak` and `reused` are the last checkup's.
+ */
+export interface CheckupSummary {
+  compromised: number
+  weak: number
+  reused: number
+  /** When the last full checkup finished; null when it never ran (Safety Check offers to run it). */
+  checkedAt: number | null
+}
+
+export function emptyCheckupSummary(): CheckupSummary {
+  return { compromised: 0, weak: 0, reused: 0, checkedAt: null }
+}
+
+/** `raw` as a `CheckupSummary`: whatever it lacks or misspells falls back to the empty summary. */
+export function sanitizeCheckupSummary(raw: unknown): CheckupSummary {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const count = (key: 'compromised' | 'weak' | 'reused'): number => {
+    const value = source[key]
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+  }
+  const at = source.checkedAt
+  return {
+    compromised: count('compromised'),
+    weak: count('weak'),
+    reused: count('reused'),
+    checkedAt: typeof at === 'number' && Number.isFinite(at) && at > 0 ? at : null
+  }
+}
+
+/**
+ * The password manager's device-local state (`BrowserState.passwordsDevice`, the shape of
+ * `newTabDevice`: persisted with the profile, never synced): the last checkup's summary, which
+ * Safety Check reads without opening the vault.
+ */
+export interface PasswordsDeviceState {
+  checkupSummary: CheckupSummary
+}
+
+export function emptyPasswordsDevice(): PasswordsDeviceState {
+  return { checkupSummary: emptyCheckupSummary() }
+}
+
+export function sanitizePasswordsDevice(raw: unknown): PasswordsDeviceState {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  return { checkupSummary: sanitizeCheckupSummary(source.checkupSummary) }
+}
+
+/** What the chrome lists: a credential without its secret. */
+export interface CredentialSummary extends Omit<Credential, 'password'> {
+  /** Registrable domain (`example.com`) used for grouping and matching. */
+  domain: string
+  favicon: string | null
+}
+
+/** Password checkup: which entries are compromised, weak or reused (ids only, no secrets). */
+export interface CheckupState {
+  running: boolean
+  /** Entries processed so far and the total, while running. */
+  checked: number
+  total: number
+  finishedAt: number | null
+  error: string | null
+  compromised: string[]
+  weak: string[]
+  /** Groups of entries sharing one password; each group has at least two members. */
+  reused: string[][]
+  /** Entries the breach lookup could not check (network); neither safe nor compromised. */
+  unchecked: string[]
+}
+
+export interface PasswordsStatus {
+  /** The data key is not in memory; `passwords.unlock` (with the passphrase where needed) opens the vault. */
+  locked: boolean
+  /** How the data key is protected: by the OS keystore, by a passphrase, or both. */
+  protection: { os: boolean; passphrase: boolean }
+  /** The OS keystore is usable on this device right now. */
+  osKeystore: boolean
+  /** The OS can verify the user (Touch ID, Windows Hello, Android biometrics or device credential). */
+  osReauth: boolean
+  count: number
+  /** Registrable domains the user never wants to save logins for. */
+  neverSave: string[]
+  /** Increments on every change so the chrome re-fetches its lists. */
+  revision: number
+  /** The vault file could not be read; the manager offers to start over. */
+  error: string | null
+  checkup: CheckupState
+  /** The last checkup's counts and time, kept on this device; what Safety Check's Passwords row reads. */
+  checkupSummary: CheckupSummary
+  /** Sign-in leak warnings waiting for the user, oldest first (one per tab at most). */
+  leaks: CredentialLeakWarning[]
+  /**
+   * Tabs whose sign-in leak check is still running (one per tab at most): a phone save sheet
+   * that has not risen yet holds a moment for the verdict, so a warning goes first as Chrome's.
+   */
+  leakChecks: string[]
+}
+
+/** Outcome of a command that needs the user to re-authenticate first. */
+export type ReauthOutcome<T> =
+  | { status: 'ok'; value: T }
+  /** Ask for the vault passphrase and call again with it. */
+  | { status: 'passphrase' }
+  /** The OS cannot verify the user here: a vault passphrase must be set first. */
+  | { status: 'setup-passphrase' }
+  /**
+   * The user cancelled, the OS refused or the passphrase was wrong; `reason` carries the host's
+   * explanation when it gave one ("Authentication was cancelled").
+   */
+  | { status: 'denied'; reason?: string }
+
+export interface GeneratorOptions {
+  mode: 'password' | 'passphrase'
+  /** Password mode: characters (clamped to the site's rules when a domain is given). */
+  length: number
+  upper: boolean
+  lower: boolean
+  digits: boolean
+  symbols: boolean
+  /** Passphrase mode: number of words and how they are joined. */
+  words: number
+  separator: string
+  capitalize: boolean
+  includeDigit: boolean
+}
+
+export type ImportConflict = 'skip' | 'replace' | 'keep-both'
+
+export interface ImportResult {
+  /** Which export the file looked like (`chrome`, `firefox`, `bitwarden`…); null when unrecognised. */
+  format: string | null
+  total: number
+  added: number
+  replaced: number
+  skipped: number
+  invalid: number
+}
+
+// ---------------------------------------------------------------------------
+// Autofill (addresses, payment cards, passkey records; in-page prompts and pickers)
+// ---------------------------------------------------------------------------
+
+export interface AutofillSettings {
+  /** Offer to save addresses typed into forms and fill them back. */
+  addresses: boolean
+  /** Offer to save payment cards and fill them back (behind re-authentication). */
+  cards: boolean
+}
+
+/**
+ * A postal address in the vault. Field names follow libaddressinput (name, organization, address
+ * lines, locality = city, region = state / province, postal code, sorting code); which of them a
+ * country uses, and in which order, comes from the bundled address metadata.
+ */
+export interface AddressEntry {
+  id: string
+  /** ISO 3166-1 alpha-2 country code, upper case. */
+  country: string
+  name: string
+  organization: string
+  /** Street address; several lines are separated by `\n`. */
+  streetAddress: string
+  locality: string
+  /** Region as the country writes it (a key such as `CA` where the metadata has keys). */
+  region: string
+  postalCode: string
+  sortingCode: string
+  phone: string
+  email: string
+  createdAt: number
+  updatedAt: number
+  lastUsedAt: number | null
+}
+
+export type AddressInput = Omit<AddressEntry, 'id' | 'createdAt' | 'updatedAt' | 'lastUsedAt'>
+
+/** One line of a country's address form, in display order. */
+export interface AddressFieldSpec {
+  field: keyof AddressInput
+  label: string
+  required: boolean
+  /** Choices for a region field where the country has a fixed list (key and display name). */
+  options?: { key: string; name: string }[]
+}
+
+/** Everything the manager and the fill need to know about a country's addresses. */
+export interface AddressFormat {
+  country: string
+  countryName: string
+  fields: AddressFieldSpec[]
+  /** Example postal codes, when the country uses them. */
+  postalCodeExamples: string[]
+}
+
+export type CardNetwork =
+  | 'visa'
+  | 'mastercard'
+  | 'amex'
+  | 'discover'
+  | 'diners'
+  | 'jcb'
+  | 'unionpay'
+  | 'maestro'
+  | 'unknown'
+
+/** A payment card in the vault. The security code is never stored, as in every browser. */
+export interface PaymentCard {
+  id: string
+  /** Digits only. */
+  number: string
+  /** 1-12. */
+  expMonth: number
+  /** Four digits. */
+  expYear: number
+  /** Cardholder name. */
+  name: string
+  /** A name the user gave the card ("Work Visa"); '' when none. */
+  nickname: string
+  createdAt: number
+  updatedAt: number
+  lastUsedAt: number | null
+}
+
+export type PaymentCardInput = Omit<PaymentCard, 'id' | 'createdAt' | 'updatedAt' | 'lastUsedAt'>
+
+/** What the chrome lists: a card without its number. */
+export interface PaymentCardSummary extends Omit<PaymentCard, 'number'> {
+  last4: string
+  network: CardNetwork
+  /** The card's expiry lies in the past. */
+  expired: boolean
+}
+
+/**
+ * A passkey the user created in a page while Ione was the browser. The private key lives with
+ * the platform authenticator (Windows Hello, Touch ID, Google Password Manager); this row lets
+ * the manager list where passkeys exist and when they were last used.
+ */
+export interface PasskeyEntry {
+  id: string
+  /** Relying party id (`example.com`). */
+  rpId: string
+  rpName: string
+  /** The account's user name and display name as the site handed them to the authenticator. */
+  userName: string
+  userDisplayName: string
+  /** Base64url credential id when the site exposed it; '' otherwise. */
+  credentialId: string
+  /** Page origin of the creation. */
+  origin: string
+  createdAt: number
+  lastUsedAt: number | null
+}
+
+/** Kinds of field the in-page forms script recognises. */
+export type FormFieldKind =
+  | 'username'
+  | 'password'
+  | 'new-password'
+  | 'one-time-code'
+  | 'name'
+  | 'given-name'
+  | 'family-name'
+  | 'organization'
+  | 'street-address'
+  | 'address-line1'
+  | 'address-line2'
+  | 'address-level1'
+  | 'address-level2'
+  | 'postal-code'
+  | 'country'
+  | 'tel'
+  | 'email'
+  | 'cc-name'
+  | 'cc-number'
+  | 'cc-exp'
+  | 'cc-exp-month'
+  | 'cc-exp-year'
+  | 'cc-csc'
+
+/** Which vault section a form belongs to. */
+export type FormGroup = 'login' | 'address' | 'card'
+
+/** A saved login submitted from a page: what the save / update prompt shows. */
+export interface SaveLoginPrompt {
+  id: string
+  kind: 'save-login' | 'update-login'
+  tabId: string
+  origin: string
+  /** Hostname without `www.` for the title. */
+  site: string
+  username: string
+  /** `update-login`: the saved login whose password changed. */
+  existingId: string | null
+}
+
+export interface SaveAddressPrompt {
+  id: string
+  kind: 'save-address'
+  tabId: string
+  origin: string
+  site: string
+  address: AddressInput
+  /** One-line rendering for the prompt. */
+  preview: string
+}
+
+export interface SaveCardPrompt {
+  id: string
+  kind: 'save-card'
+  tabId: string
+  origin: string
+  site: string
+  last4: string
+  network: CardNetwork
+  expMonth: number
+  expYear: number
+  name: string
+}
+
+/** Several passkeys match a sign-in: the user chooses the account (Electron's `select-webauthn-account`). */
+export interface PasskeyAccountPrompt {
+  id: string
+  kind: 'passkey-account'
+  tabId: string | null
+  rpId: string
+  accounts: { credentialId: string; userName: string }[]
+}
+
+export type AutofillPrompt =
+  SaveLoginPrompt | SaveAddressPrompt | SaveCardPrompt | PasskeyAccountPrompt
+
+/** The user's answer to an autofill prompt; dismissing sends null instead. */
+export type AutofillPromptResponse =
+  /** Save / update; `username` lets the user correct it in the prompt. */
+  | { action: 'save'; username?: string }
+  /** Never offer to save logins for this site again. */
+  | { action: 'never' }
+  | { action: 'pick'; credentialId: string }
+
+export interface AutofillPickerItem {
+  id: string
+  /** First line: the username, the address's name or the card's nickname. */
+  title: string
+  /** Second line: the site of a login from another subdomain, the address, the masked card. */
+  subtitle: string
+  favicon: string | null
+  /** Filling this item needs the vault passphrase (the picker asks before `autofill.pick`). */
+  needsPassphrase?: boolean
+}
+
+/** Matching entries for the focused field, anchored to it (window CSS pixels). */
+export interface AutofillPicker {
+  id: string
+  tabId: string
+  group: FormGroup
+  field: FormFieldKind
+  /** The field's rectangle in the chrome's coordinate space (view offset plus zoom applied). */
+  anchor: Rect
+  items: AutofillPickerItem[]
+  /** Manage entries opens Settings; the picker shows the shortcut when true. */
+  manageLabel: string
+}
+
+export interface AutofillUIState {
+  /** Pending save / update / account prompts, oldest first. */
+  prompts: AutofillPrompt[]
+  /** The picker for the focused field, or null. */
+  picker: AutofillPicker | null
+  addressCount: number
+  cardCount: number
+  passkeyCount: number
+  /**
+   * Android: a system autofill service (Google, Bitwarden, …) is set for the device and, under
+   * the `system` provider setting, owns saving and filling in pages. null on other hosts.
+   */
+  systemAutofill: { enabled: boolean; service: string | null } | null
+  /** Increments on every change to addresses, cards or passkeys. */
+  revision: number
+}
+
+// ---------------------------------------------------------------------------
+// History, bookmarks, downloads
+// ---------------------------------------------------------------------------
+
+/** Per-URL aggregate (the "place"): what the omnibox ranks and the top-sites tiles read. */
+export interface HistoryEntry {
+  url: string
+  title: string
+  visitCount: number
+  lastVisit: number
+  favicon: string | null
+  firstVisit?: number
+  /** Visits that started from typed input (weigh more in frecency). */
+  typedCount?: number
+}
+
+export type HistoryTransition = 'link' | 'typed' | 'reload' | 'redirect' | 'restored' | 'other'
+
+/** One visit of a page (the history page lists these, newest first, grouped by day). */
+export interface HistoryVisit {
+  /** Stable and unique per visit. */
+  id: string
+  url: string
+  title: string
+  favicon: string | null
+  /** Milliseconds since the epoch. */
+  visitTime: number
+  transition: HistoryTransition
+  tabId?: string
+  /**
+   * A hop of a redirect chain the navigation passed through, not the page it landed on (Chrome's
+   * visit without `PAGE_TRANSITION_CHAIN_END`, history-23): recorded at the landing's time,
+   * counted as visited, hidden from the history page's lists and searches. Absent on a landing
+   * and on every visit an older store wrote.
+   */
+  redirectSource?: true
+  /**
+   * On a landing reached through redirects: the chain's earlier addresses, first hop to last
+   * (each stored as a `redirectSource` visit at the same time) – where the user landed from.
+   */
+  redirectedFrom?: string[]
+}
+
+export interface HistoryQuery {
+  /**
+   * Every whitespace-separated term must start a word in the title or URL (case-folded; the
+   * scheme and `www.` do not count), as Chrome's history search reads a query (`wordMatch.ts`).
+   */
+  text?: string
+  /** Inclusive lower bound of `visitTime`. */
+  fromMs?: number
+  /** Exclusive upper bound of `visitTime`. */
+  toMs?: number
+  /** Only visits of this host (or its subdomains). */
+  host?: string
+  /**
+   * List the redirect chains' hops too (`HistoryVisit.redirectSource`). Off by default: the
+   * history page shows where the user landed, as Chrome's `QueryHistory` does; `chrome.history`'s
+   * `getVisits` and `onVisited` read every visit of a page, as Chrome's do.
+   */
+  includeRedirectSources?: boolean
+  limit: number
+  offset?: number
+}
+
+export interface HistoryDayGroup {
+  /** Local calendar day, `YYYY-MM-DD`. */
+  dayKey: string
+  visits: HistoryVisit[]
+}
+
+export interface TopSite {
+  url: string
+  title: string
+  favicon: string | null
+  score: number
+}
+
+/** Legacy flat bookmark (state.json v1–v2); migrated into the tree on load. */
+export interface Bookmark {
+  id: string
+  url: string
+  title: string
+  favicon: string | null
+  createdAt: number
+}
+
+export type BookmarkNodeType = 'url' | 'folder'
+
+/**
+ * One page saved for later (Chrome's reading list, bookmarks-33; W6-1). Kept in the profile's
+ * state as `readingList` (`BrowserState.readingList`, `shared/readingList.ts` for the pure
+ * helpers, `core/readingList.ts` for the writes), one entry per URL: re-adding a page marks it
+ * unread and brings it to the top. Local to the profile until the services slice replicates it
+ * as one `reading-list-entry` record per entry carrying every field but `favicon`
+ * (`internal/desktop-parity/reading-list-interface.md`, services' read beside it). The shape is
+ * frozen: the field order below is the normal form every write and `sanitizeReadingEntry`
+ * produce, so a load rewrites nothing the sync engine could take for an edit.
+ */
+export interface ReadingListEntry {
+  /** `rl_<uuid>`, stable across renames and read/unread flips; the sync record's key. */
+  id: string
+  /** The page's address as it was added; the dedupe key (exact string, as `chrome.readingList`). */
+  url: string
+  /** The page's title at the time it was added (the URL's host when the page had none). */
+  title: string
+  /** When the page was added, or added again (an add of a page already in the list refreshes it). */
+  addedAt: number
+  /**
+   * The last write to the entry of any kind: information for the chrome and the record's
+   * payload. The conflict clock is the sync engine's own `modified` stamp, set at the same
+   * commit (the two agree to the millisecond); nothing reads this field to resolve a conflict.
+   */
+  updatedAt: number
+  /**
+   * The page's favicon (a data URL or an address) when the tab had one. This device's alone,
+   * never in the sync record: a data URL is bytes across the boundary and an address may be
+   * host-local; the receiving side resolves the icon from its favicon cache by `url`.
+   */
+  favicon?: string
+  /** When the entry was last marked read; absent while it is unread. */
+  readAt?: number
+}
+
+/** When the bookmarks bar shows above the content frame (Edge's "Show favorites bar"). */
+export type BookmarksBarMode = 'always' | 'newtab' | 'never'
+
+/** Where a bookmark opens: the current tab, a new tab (foreground), a new window or a private window. */
+export type BookmarkOpenTarget = 'current' | 'tab' | 'window' | 'private'
+
+/**
+ * One node of the bookmark tree, shaped like `chrome.bookmarks.BookmarkTreeNode`. The three
+ * roots (Bookmarks bar, Other bookmarks, Mobile bookmarks) have fixed ids and `parentId: null`;
+ * every other node sits at a contiguous `index` among its parent's children.
+ */
+export interface BookmarkNode {
+  id: string
+  parentId: string | null
+  index: number
+  type: BookmarkNodeType
+  title: string
+  /** Bookmarks only. */
+  url?: string
+  /** Bookmarks only: favicon URL or data URI, when known. */
+  favicon?: string
+  dateAdded: number
+  /** Folders: last time a direct child was added, removed or moved. */
+  dateGroupModified?: number
+  /** Bookmarks: last time the user opened it. */
+  dateLastUsed?: number
+}
+
+/** The persisted bookmark tree (`state.json` v3 and the export/import programs). */
+export interface BookmarkTreeData {
+  schemaVersion: 1
+  nodes: BookmarkNode[]
+}
+
+/** Result of a Netscape HTML import (shown in a toast and returned to the caller). */
+export interface BookmarkImportResult {
+  bookmarks: number
+  folders: number
+  /** Folder the import landed in. */
+  folderId: string
+}
+
+// ---------------------------------------------------------------------------
+// Import from other browsers (Chrome's "Import bookmarks and settings", ID-23)
+// ---------------------------------------------------------------------------
+
+/** `addresses` (ID-57): the saved addresses of a Chromium browser's `Web Data`, into the vault. */
+export type ImportKind = 'bookmarks' | 'history' | 'passwords' | 'addresses'
+
+/** `file`: a Netscape bookmarks HTML or a passwords CSV the user picks (every host). */
+export type ImportBrowser = 'chrome' | 'chromium' | 'edge' | 'firefox' | 'safari' | 'file'
+
+/**
+ * A browser profile on this machine (or a file source) the import dialog lists. Discovered by the
+ * desktop host's `ImportHost`; Android has no other browser's data to read and offers files only.
+ */
+export interface ImportSource {
+  /** `<browser>:<profileId>`, or `file:bookmarks` / `file:passwords`. */
+  id: string
+  browser: ImportBrowser
+  /** "Google Chrome", "Microsoft Edge", "Firefox", "Safari", "Bookmarks HTML file". */
+  browserName: string
+  /** The profile directory's name (`Default`, `Profile 2`, `abcd1234.default-release`). */
+  profileId: string
+  /** The profile's display name ("Person 1"); the browser's name when it has a single profile. */
+  name: string
+  /** The account signed into the profile, when the browser records one. */
+  email?: string
+  /** The profile directory (empty for a file source). */
+  path: string
+  /**
+   * The browser holds its profile lock right now (`SingletonLock`, Firefox's `lock`). Chrome and
+   * Edge still read fine from a copy; Firefox's places database is refused while it runs.
+   */
+  running: boolean
+  /** What this source can provide, in the dialog's order. */
+  kinds: ImportKind[]
+  /** Kinds this source cannot provide here, each with the way round (Chrome's CSV export…). */
+  limits: Partial<Record<ImportKind, string>>
+}
+
+/** What one kind of an import did; the counts are items, never bytes. */
+export interface ImportKindOutcome {
+  /** Items written into Ione. */
+  imported: number
+  /** Skipped: already saved, or seen twice in the same import. */
+  duplicates: number
+  /** Skipped: could not be decrypted or decoded (Chrome's v11 logins without the keyring secret). */
+  unreadable: number
+  /** Skipped: no usable URL or value. */
+  invalid: number
+  /** The failure that stopped this kind (a lock refusal names the browser); null when it ran. */
+  error: string | null
+  /** Where the data came from when not the browser's live store (Firefox's bookmark backup). */
+  note?: string
+}
+
+export type ImportStatus = 'running' | 'done' | 'failed' | 'cancelled'
+
+/** The running or last finished import (`UIState.import`; `import.dismiss` clears it). */
+export interface ImportProgress {
+  source: ImportSource
+  kinds: ImportKind[]
+  status: ImportStatus
+  /** The kind being read or written right now. */
+  current: ImportKind | null
+  results: Partial<Record<ImportKind, ImportKindOutcome>>
+  /** A failure of the whole run (the profile vanished, the file could not be read); null otherwise. */
+  error: string | null
+  /** The folder the bookmarks landed in (the result's "Show" target); null when none were imported. */
+  folderId: string | null
+  startedAt: number
+  finishedAt: number | null
+}
+
+/**
+ * `insecure-blocked` is Chrome's mixed-content rule (HB-44): a transfer whose URL – or any hop
+ * of its redirect chain – is plain `http:` while the page that started it is secure is refused
+ * before a byte is written; the row waits for "Keep anyway" (`download.acceptDanger`, offered
+ * unless the file type is `dangerous`) or Discard.
+ */
+export type DownloadState =
+  'progressing' | 'paused' | 'completed' | 'cancelled' | 'interrupted' | 'insecure-blocked'
+
+/**
+ * Chrome's two warning tiers over the file-type policy (`download_file_types.asciipb`) and the
+ * Safe Browsing verdicts: `dangerous` (executables, installers, scripts; any URL Safe Browsing
+ * lists as malware or phishing) and `suspicious` (disk images, macro-bearing documents, the rest
+ * of Chromium's list; a Safe Browsing verdict short of dangerous).
+ */
+export type DownloadDangerLevel = 'safe' | 'suspicious' | 'dangerous'
+
+/**
+ * Machine reason behind a danger level. File-type reasons follow Chromium's download_file_types
+ * categories (`executable`, `script`, `archive`, `office-macro`, `file-type` for the rest of the
+ * list); `insecure-download` is an http transfer started from an https page; `url-verdict` came
+ * from a `DangerVerdictProvider` (Safe Browsing and friends). `none` while `level` is `safe`.
+ */
+export type DownloadDangerReason =
+  | 'none'
+  | 'executable'
+  | 'script'
+  | 'archive'
+  | 'office-macro'
+  | 'file-type'
+  | 'insecure-download'
+  | 'url-verdict'
+
+export interface DownloadDanger {
+  level: DownloadDangerLevel
+  reason: DownloadDangerReason
+  /** One sentence for the row ("This file type can harm your device."); empty when safe. */
+  message: string
+}
+
+/**
+ * Why an interrupted download stopped: Chromium's `download_interrupt_reasons` in kebab case,
+ * grouped as Chromium groups them. `network-*` failures of a resumable transfer are retried by
+ * the hosts on their own before they reach the row; `user-shutdown` is a transfer the browser
+ * quit over (Resume continues from the kept bytes); `crash` is one the browser did not get to
+ * shut down. The hosts map their engine's errors onto this set (Electron: the item's state and
+ * the `net::` error or HTTP status its request ended with; Android: the downloader's
+ * exceptions and HTTP statuses); `interruptMessage` in `shared/downloads.ts` words each for
+ * the row and `DownloadItem.errorMessage` carries that wording.
+ */
+export type DownloadInterruptReason =
+  | 'network-failed'
+  | 'network-timeout'
+  | 'network-disconnected'
+  | 'network-server-down'
+  | 'server-failed'
+  | 'server-no-range'
+  | 'server-bad-content'
+  | 'server-unauthorized'
+  | 'server-forbidden'
+  | 'server-unreachable'
+  | 'file-failed'
+  | 'file-access-denied'
+  | 'file-no-space'
+  | 'file-name-too-long'
+  | 'file-too-large'
+  | 'file-virus-infected'
+  | 'file-blocked'
+  | 'file-security-check-failed'
+  | 'file-same-as-source'
+  | 'user-canceled'
+  | 'user-shutdown'
+  | 'crash'
+
+/**
+ * What `download.deleteFile` did: the file is gone now, was gone already (`missing`, the row is
+ * marked `fileMissing` either way), could not be removed (`failed`: locked, a folder, no
+ * permission), or the row has no completed file to delete (`not-completed`: unknown id, in
+ * flight, cancelled, interrupted or still quarantined behind a danger warning).
+ */
+export type DownloadDeleteFileResult = 'deleted' | 'missing' | 'failed' | 'not-completed'
+
+export interface DownloadItem {
+  id: string
+  url: string
+  /** Page the download came from (empty when unknown); a retry sends it as the Referer again. */
+  referrer: string
+  /** Name the server suggested (or the `download` attribute / URL gave), before uniquifying. */
+  filename: string
+  /** Name the file ends up under: `filename` made unique (`report(1).pdf`) or the one the user typed. */
+  finalName: string
+  /**
+   * Where the bytes are right now: the partial file while in progress, the final file once
+   * completed. On Android this can be a `content:` URI.
+   */
+  savePath: string
+  totalBytes: number
+  receivedBytes: number
+  state: DownloadState
+  startedAt: number
+  /** When the file was complete on disk (still set while a flagged file waits for Keep / Discard). */
+  completedAt?: number
+  /** When the transfer stopped for any reason: completed, cancelled or interrupted. */
+  endedAt?: number
+  mimeType: string
+  /** The server honours Range requests, so paused and interrupted transfers can continue. */
+  canResume: boolean
+  /** Why an interrupted download stopped; set exactly while `state` is `interrupted`. */
+  error?: DownloadInterruptReason
+  /** `error` in the words of Chrome's download bubble ("Check internet connection"), for the row. */
+  errorMessage?: string
+  /**
+   * The completed file is no longer where `savePath` says: deleted through `download.deleteFile`
+   * or found missing by an existence check (when the list loads, when the row is opened or
+   * revealed, on `download.exists`). Chrome greys such a row "Deleted" and offers Retry, which
+   * downloads the file again into the same row.
+   */
+  fileMissing?: boolean
+  danger: DownloadDanger
+  /** The user chose "Keep" for a flagged file: it left quarantine and may be opened. */
+  dangerAccepted: boolean
+  /**
+   * The user chose "Keep anyway" on an `insecure-blocked` row: the transfer that follows runs
+   * over the plaintext hop without being blocked again (the file-type warning still applies).
+   */
+  insecureAccepted?: boolean
+  /**
+   * An automatic resume is scheduled for this moment (epoch ms): the row is `interrupted` by a
+   * transient network failure, the server can resume, and the engine retries with backoff
+   * (2 / 4 / 8 s, three times, once the host says the network is back). Absent otherwise;
+   * never persisted.
+   */
+  autoResumeAt?: number
+  /** Open the file as soon as the download completes (Chrome's "Open when done"). */
+  openWhenDone: boolean
+  /** Recent transfer rate; 0 while paused or unknown. */
+  bytesPerSecond: number
+  /** Estimated time to completion; null without a size or a rate. */
+  etaMs: number | null
+  /** Set on the copy that rides the `removed` event: the row left the list, the file stays. */
+  removed?: boolean
+  /** Started from a private window or the Android private profile; never written to disk. */
+  private: boolean
+  /** Container the download belongs to (`PRIVATE_CONTAINER_ID` when `private`). */
+  containerId: string
+  /** HTTP validators the host uses for `If-Range` on resume (empty when the server sent none). */
+  etag: string
+  lastModified: string
+}
+
+export type DownloadChangeKind = 'started' | 'progress' | 'done' | 'removed'
+
+/** Aggregate of the in-flight downloads a window sees (its toolbar indicator, the OS progress bar). */
+export interface DownloadsProgress {
+  received: number
+  total: number
+  /** A transfer without a known size is running, so `received / total` says nothing. */
+  indeterminate: boolean
+  /** In-flight downloads, paused ones included; 0 clears the indicator. */
+  active: number
+}
+
+export interface DownloadSettings {
+  /** Folder new downloads go to; null means the platform's Downloads folder. */
+  directory: string | null
+  /** Firefox's "Always ask you where to save files" (mirrors `Settings.askWhereToSave`). */
+  askWhereToSave: boolean
+  /** Completion notifications (desktop: the system notification centre; Android: the downloader's). */
+  notifyOnComplete: boolean
+  /** Open the downloads panel whenever a download starts; off shows the toolbar indicator only. */
+  openPanelOnStart: boolean
+  /** Open the downloads panel when a download finishes (Chrome 112+). */
+  openPanelOnComplete: boolean
+  /**
+   * Lower-case extensions opened automatically once downloaded (Chrome's "Open certain file
+   * types automatically"); dangerous types never auto-open.
+   */
+  autoOpenTypes: string[]
+  /**
+   * Desktop toolbar (the desktop program's additive key): keep the downloads button in the toolbar
+   * when nothing is downloading, like Chrome's pinned button or Edge's default.
+   */
+  alwaysShowButton: boolean
+  /**
+   * The format Save Page As used last, which Ctrl+S saves in again (Edge remembers the dialog's
+   * last format; Chrome's dialog opens on "Webpage, Complete" every time). Written by a pick in
+   * the Save Page As submenu on a host with `capabilities.savePageFormats`; a host with one
+   * archive format (Android) has no row that changes it and writes its archive whatever it says.
+   */
+  savePageFormat: SavePageFormat
+}
+
+/**
+ * Chrome's Save Page As formats (`shared/savePage.ts` names them): the page with its resources
+ * in a folder beside it (`complete`, Chrome's default), the document alone (`htmlOnly`), or one
+ * MHTML file (`singleFile`, Edge's default; Chrome's behind a flag).
+ */
+export type SavePageFormat = 'complete' | 'htmlOnly' | 'singleFile'
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+/**
+ * Where an engine came from: shipped with Ione (`DEFAULT_SEARCH_ENGINES`), added by hand in
+ * Settings > Search ("Add search engine"), discovered on a visited page through its OpenSearch
+ * description (Chrome's "Recently visited" engines), or declared by an installed extension
+ * (`chrome_settings_overrides.search_provider`; lives with the extension, never in the settings,
+ * and cannot be picked by the user, as in Chrome).
+ */
+export type SearchEngineSource = 'default' | 'custom' | 'discovered' | 'extension'
+
+/**
+ * An extension holding the default search engine (`chrome_settings_overrides.search_provider`
+ * with `is_default`): Chrome's "An extension is controlling this setting". The user's own pick
+ * (`settings.searchEngineId`) is kept underneath and returns when the extension goes.
+ */
+export interface SearchEngineControl {
+  engineId: string
+  extensionId: string
+  extensionName: string
+}
+
+/**
+ * The extension holding a setting (`UIState.extensionControls`): Chrome's "An extension is
+ * controlling this setting" as the Settings page draws it – the row's control disabled, the
+ * indicator line "Controlled by <name>" and a Disable button under the row (`RowBase.
+ * controlled`). The user's own value is kept underneath and stands again when the extension
+ * lets go, is disabled or is uninstalled; the extension host publishes the map from the layers
+ * its APIs keep over the settings (`chrome.fontSettings` today; `privacy.*`, `proxy` as they
+ * take the primitive).
+ */
+export interface ExtensionControl {
+  extensionId: string
+  /** The extension's name as the Extensions page shows it. */
+  name: string
+  /**
+   * The extension's value, the one in effect: the disabled control shows it, as Chrome's
+   * shows the preference's effective value (a family's name, a size in px, a toggle's state),
+   * over the user's own kept in the setting. Absent, the row keeps to the setting's value. A
+   * list for a setting that is one (an extension's `startup_pages`).
+   */
+  value?: string | number | boolean | string[]
+}
+
+export interface SearchEngine {
+  id: string
+  name: string
+  /** `%s` is replaced with the encoded query. */
+  searchUrl: string
+  suggestUrl: string | null
+  /**
+   * The engine's shortcut (Chrome's Shortcut column, omnibox-09): `@` and one lower-case word
+   * (`@wiki`), typed before a space or Tab to search with the engine. Derived from the name when
+   * an engine is added or discovered (`uniqueEngineKeyword`); the user's to edit on their own
+   * engines (Settings › Search › Edit, `editedSearchEngine`).
+   */
+  keyword: string
+  /** Simple glyph shown in the URL bar. */
+  glyph: string
+  /**
+   * Whether the omnibox offers the engine (settings-43, Chrome's Activate / Deactivate in Site
+   * search): absent or true, its shortcut and tab-to-search work; `false`, the engine is kept
+   * in the list under an Inactive heading and offered nowhere until activated. The user's own
+   * engines carry it; a shipped engine is always active.
+   */
+  active?: boolean
+  /** Absent on the shipped engines (read as `default`). */
+  source?: SearchEngineSource
+  /** The site's icon, for the engine picker's rows; null when the site offered none. */
+  favicon?: string | null
+  /** A discovered engine: when its site was last visited (orders "Recently visited"). */
+  visitedAt?: number
+  /**
+   * The engine's reverse image search (Chrome's `image_url`, CT-32): the product the image
+   * menu's "Search Image with <name>" row names and its template. Absent on an engine without
+   * one – DuckDuckGo, Ecosia, Wikipedia, a hand-added or discovered engine (OpenSearch declares
+   * none) – and the menu has no row. Additive: a build from before it ignores the field, a
+   * record from before it gets no row.
+   */
+  imageSearch?: ImageSearchTemplate
+}
+
+/**
+ * An engine's reverse image search: the product's name and the URL template (`%s` takes the
+ * image's encoded address), plus – additive – where the image's BYTES go when the engine takes
+ * an upload (`post`, Chrome's `image_url` + `image_url_post_params`). With `post` the row
+ * uploads the bytes as Chrome does (a `data:`/`blob:` or cookie-gated image searches too);
+ * without it the row searches by address (`url`), as before.
+ */
+export interface ImageSearchTemplate {
+  name: string
+  url: string
+  post?: ImageSearchPost
+}
+
+/**
+ * Chrome's `image_url` + `image_url_post_params`, spelled for Ione: the upload endpoint and
+ * the body's fields, `name={placeholder}` pairs separated by commas – `{imageThumbnail}` (the
+ * downscaled JPEG's bytes, a file part), `{imageThumbnailBase64}`, `{imageURL}` (the image's
+ * http(s) address; empty for a `data:`/`blob:` image), `{imageOriginalWidth}` /
+ * `{imageOriginalHeight}` (the image's natural size), `{processedImageDimensions}` (the
+ * thumbnail's, `w,h`) and `{imageSearchSource}` (a constant naming Ione); a placeholder may
+ * carry Chrome's `google:` prefix (`{google:imageThumbnail}`, as `prepopulated_engines.json`
+ * spells them); a value without braces travels as written. `encoding` is the body's:
+ * `multipart/form-data` (Chrome's `UploadRawData` body with a boundary) or
+ * `application/x-www-form-urlencoded`. `url` is `https:` (or `http:` on a loopback host).
+ * `thumbnail` is the engine's bounds for the downscale (`ImageThumbnailBounds`): Chrome's
+ * differ between its Lens path and any other engine, so the engine's definition carries them,
+ * as it carries the post form.
+ */
+export interface ImageSearchPost {
+  url: string
+  params: string
+  encoding: 'multipart' | 'urlencoded'
+  thumbnail: ImageThumbnailBounds
+}
+
+/**
+ * The bounds Chrome downscales an upload's image within, per engine
+ * (`CoreTabHelper::SearchByImageImpl`'s `thumbnail_min_area`, `thumbnail_max_width` /
+ * `thumbnail_max_height`, `chrome/browser/ui/tab_contents/core_tab_helper.cc`): an image
+ * whose area is at most `minArea` pixels travels at its own size, whatever its sides; a larger
+ * one has each side over `maxSide` brought to it, the other scaled with it (Chrome's max width
+ * and height are equal on both paths, so one `maxSide` stands for them). Google Lens:
+ * `lens::kMaxPixelsForImageSearch` = 1000 (`components/lens/lens_constants.h`); any other
+ * engine: `kImageSearchThumbnailMaxWidth` / `Height` = 600; the trigger
+ * `kImageSearchThumbnailMinSize` = 300 × 300 on both (`LENS_IMAGE_THUMBNAIL`,
+ * `GENERIC_IMAGE_THUMBNAIL` in `imageUpload.ts`). The thumbnail is then always re-encoded as
+ * a JPEG at Chrome's `kEncodingQualityJpeg` = 40 (`IMAGE_THUMBNAIL_JPEG_QUALITY`).
+ */
+export interface ImageThumbnailBounds {
+  maxSide: number
+  minArea: number
+}
+
+/**
+ * The search-engine choice screen's record (W6-2; DMA Art. 6(3), Chrome's choice screen): the
+ * engine the user set as the default on this device's screen, the OS region the screen was shown
+ * for (ISO 3166-1 alpha-2, `''` when the OS did not say), when, and the screen's version (the
+ * eligible list's revision). Device-local, never synced (`DEVICE_LOCAL_SETTINGS`): as Chrome's,
+ * the screen is each device's to show once; a synced default engine does not stand in for it.
+ */
+export interface SearchChoiceRecord {
+  engineId: string
+  region: string
+  madeAt: number
+  version: number
+}
+
+/**
+ * What the chrome reads to show the choice screen (`core/searchChoice.ts`): the region the host
+ * reported, whether it is in the EEA, whether the screen is owed right now – EEA and no record,
+ * not skipped this run; or Settings' "Choose your search engine again" asked for it – and the
+ * run's shuffle seed, one per session, so the list keeps its order while the app is open.
+ */
+export interface SearchChoiceState {
+  region: string | null
+  eea: boolean
+  required: boolean
+  seed: number
+}
+
+/** What the clipboard holds, read from its description only (never its content). */
+export type ClipboardPeekKind = 'url' | 'text' | 'image' | 'none'
+
+/** The clipboard's content, read on the user's reveal tap; `kind` says what the text is. */
+export interface ClipboardContent {
+  kind: 'url' | 'text' | 'none'
+  text: string
+}
+
+/**
+ * An image read off the clipboard for a page's `navigator.clipboard.read()` (MW-38): its bytes
+ * as PNG, base64. The HOST bounds it – the longer edge at most 2048 px, the PNG at most 8 MiB, a
+ * bigger clip scaled down rather than dropped (`ClipboardPeek.kt`) – and says the encoded
+ * bitmap's size when it knows it.
+ */
+export interface ClipboardImage {
+  png: string
+  width?: number
+  height?: number
+}
+
+/**
+ * The host's whole clipboard read for a page's `read()` (`ClipboardHost.readItems`; on Android
+ * the `clipboard.read` bridge verb with `image: true`): the text as `read` / `readText` have it
+ * ('' for none) and, when the clip's first item carries an image, the image. A host answering
+ * text alone leaves `image` out; a reader takes a missing field as no image.
+ */
+export interface ClipboardReadItems {
+  text: string
+  image?: ClipboardImage
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcuts
+// ---------------------------------------------------------------------------
+
+export type ShortcutGroup =
+  | 'zen-compact-mode'
+  | 'zen-workspace'
+  | 'zen-split-view'
+  | 'zen-other'
+  | 'windowAndTabManagement'
+  | 'navigation'
+  | 'searchAndFind'
+  | 'pageOperations'
+  | 'historyAndBookmarks'
+  | 'mediaAndDisplay'
+  | 'devTools'
+
+export interface KeyBinding {
+  ctrl: boolean
+  alt: boolean
+  shift: boolean
+  meta: boolean
+  /** Normalised key: single lowercase character or a KeyboardEvent.key name (e.g. `ArrowLeft`, `F5`, `Tab`). */
+  key: string
+}
+
+/**
+ * Which default binding table the shortcuts start from: Chrome's and Edge's chords (`chrome`,
+ * the default) or the Zen Browser set Ione grew up with (`zen`). User overrides sit on top
+ * of either.
+ */
+export type ShortcutPreset = 'chrome' | 'zen'
+
+/**
+ * The chrome's keyboard panes, in F6 order (Chrome's tab strip → toolbar → bookmarks bar → side
+ * panel → web contents). `page` is the active tab's view; the others are regions of the chrome
+ * document, marked `data-pane` on their root.
+ */
+export type PaneId = 'tabs' | 'toolbar' | 'bookmarks' | 'sidepanel' | 'page'
+
+/**
+ * What a pane shortcut asked for: the next / previous pane, or a named one. `from` is where the
+ * key was pressed – a page's view or the chrome document – which the core knows and the chrome
+ * cannot tell (its document reports itself focused while a sibling page view holds the keyboard).
+ */
+export type FocusPaneRequest =
+  { move: 'next' | 'prev'; from: 'chrome' | 'page' } | { pane: 'toolbar' | 'bookmarks' }
+
+export type ShortcutAction =
+  | 'compact.toggle'
+  | 'compact.toggleSidebar'
+  | 'space.next'
+  | 'space.prev'
+  | 'space.switch1'
+  | 'space.switch2'
+  | 'space.switch3'
+  | 'space.switch4'
+  | 'space.switch5'
+  | 'space.switch6'
+  | 'space.switch7'
+  | 'space.switch8'
+  | 'space.switch9'
+  | 'space.switch10'
+  | 'space.closeUnpinned'
+  | 'split.grid'
+  | 'split.vertical'
+  | 'split.horizontal'
+  | 'split.unsplit'
+  | 'split.newEmpty'
+  | 'split.nextPane'
+  | 'split.prevPane'
+  | 'split.swap'
+  | 'tab.copyUrl'
+  | 'tab.copyUrlMarkdown'
+  | 'tab.togglePin'
+  | 'tab.resetPinned'
+  | 'tab.duplicate'
+  /** Chrome's tab search (Ctrl+Shift+A); reserved, does nothing until the tab search ships. */
+  | 'tab.search'
+  | 'sidebar.toggle'
+  | 'glance.expand'
+  | 'space.new'
+  | 'tab.new'
+  | 'tab.close'
+  | 'tab.reopenClosed'
+  | 'window.new'
+  | 'window.newUnsynced'
+  | 'window.newPrivate'
+  | 'window.close'
+  | 'window.minimize'
+  /**
+   * Chrome's More tools › Name window…: the chrome opens the prompt that gives the window a
+   * name of the user's (`ZenWindow.name`). Unbound in both presets, as in Chrome.
+   */
+  | 'window.name'
+  /**
+   * Duplicate Window (session-19): a second window like this one – its kind, its space, its
+   * tabs (a blank or private window's as copies: the addresses in their order, pinned as they
+   * are) – cascaded from it. Unbound in both presets; the row is in the table so Settings can
+   * bind one and the palette lists it.
+   */
+  | 'window.duplicate'
+  | 'app.quit'
+  /** Open the application menu from the keyboard (Alt+F / F10 on Windows and Linux). */
+  | 'menu.app'
+  | 'tab.next'
+  | 'tab.prev'
+  | 'tab.select1'
+  | 'tab.select2'
+  | 'tab.select3'
+  | 'tab.select4'
+  | 'tab.select5'
+  | 'tab.select6'
+  | 'tab.select7'
+  | 'tab.select8'
+  | 'tab.selectLast'
+  | 'tab.moveBackward'
+  | 'tab.moveForward'
+  | 'tab.moveToStart'
+  | 'tab.moveToEnd'
+  | 'nav.back'
+  | 'nav.forward'
+  | 'nav.reload'
+  | 'nav.reloadSkipCache'
+  | 'nav.home'
+  | 'nav.stop'
+  /**
+   * Keyboard panes (Chrome's F6 rotation, `BrowserView::GetAccessiblePanes`): the keyboard moves
+   * to the next or previous pane of the chrome that is on screen – tab strip, toolbar, bookmarks
+   * bar, side panel, page – or straight to the toolbar's first control (Shift+Alt+T) or the
+   * bookmarks bar (Shift+Alt+B). The renderer decides where the keyboard is and where it goes
+   * (`focus.pane`); see `renderer/lib/panes.ts`.
+   */
+  | 'focus.nextPane'
+  | 'focus.prevPane'
+  | 'focus.toolbar'
+  | 'focus.bookmarksBar'
+  | 'urlbar.focus'
+  | 'urlbar.search'
+  | 'urlbar.pasteAndGo'
+  | 'urlbar.pasteAndSearch'
+  | 'find.open'
+  | 'find.next'
+  | 'find.prev'
+  /** macOS "Use Selection for Find" (Cmd+E): the page's selection becomes the find query. */
+  | 'find.useSelection'
+  | 'page.savePage'
+  | 'page.openFile'
+  | 'page.emailLink'
+  | 'page.print'
+  /** Ione's print preview (`zen://print`); the system dialog on a host without one. */
+  | 'page.printPreview'
+  | 'page.viewSource'
+  | 'page.fullscreen'
+  | 'page.readerMode'
+  | 'page.pip'
+  /**
+   * Chrome's and Edge's F7 (CT-34): caret browsing on for every page after the one-time
+   * "Turn on caret browsing?" confirm, off again silently. Hosts without the engine call
+   * (`HostCapabilities.caretBrowsing`) ignore it.
+   */
+  | 'page.caretBrowsing'
+  | 'page.screenshot'
+  /** Edge's "Capture full page": the whole page, beyond the viewport, saved like a screenshot. */
+  | 'page.captureFullPage'
+  /**
+   * Edge's Web capture (Ctrl+Shift+S there): the desktop chrome dims the page and the user drags
+   * a region, or takes the visible area or the full page, then copies or saves the picture
+   * (`shared/capture.ts` is the engine; the overlay is the chrome's). Hosts without the desktop
+   * chrome take the visible page the way Take Screenshot does.
+   */
+  | 'capture.start'
+  | 'page.toggleMute'
+  | 'zoom.in'
+  | 'zoom.out'
+  | 'zoom.reset'
+  | 'bookmark.add'
+  | 'bookmark.sidebar'
+  | 'bookmark.library'
+  | 'bookmark.allTabs'
+  | 'bookmark.toggleBar'
+  | 'history.sidebar'
+  /**
+   * Chrome's Delete browsing data (Ctrl+Shift+Delete, Firefox's Clear Recent History chord): the
+   * chrome opens the dialog (`siteControls/ClearBrowsingDataDialog`) over the page.
+   */
+  | 'privacy.clearBrowsingData'
+  | 'downloads.open'
+  | 'devtools.toggle'
+  | 'devtools.inspector'
+  | 'devtools.console'
+  | 'devtools.browserConsole'
+  /**
+   * Chrome's task manager (Shift+Esc; More Tools › Task Manager): the `zen://tasks` page – every
+   * process with its memory and CPU, End process (`core/tasks.ts`) – in a window of its own on a
+   * host with windows (`WindowChrome` `page`, one per profile, focused when open;
+   * `Browser.openTaskManager`), as a page tab on a host with one window; desktop layouts only.
+   */
+  | 'tasks.open'
+  | 'settings.open'
+  | 'addons.open'
+  /**
+   * Chrome's Help › Report an issue… (`IDC_FEEDBACK`, ⌥⇧⌘I on macOS, Alt+Shift+I on Windows
+   * and Linux): Ione's issue tracker in the system browser (`ISSUES_URL`), the Help rows'
+   * command. Desktop layouts only – the touch shells' listings leave the row out.
+   */
+  | 'help.reportIssue'
+  | 'boost.new'
+
+export interface Shortcut {
+  /** Zen's shortcut id (e.g. `zen-compact-mode-toggle`, `key_newNavigatorTab`). */
+  id: string
+  action: ShortcutAction
+  group: ShortcutGroup
+  label: string
+  /** Primary binding – `null` when unbound. */
+  binding: KeyBinding | null
+  /** Secondary built-in bindings that are not user editable (e.g. F5 for reload). */
+  extraBindings: KeyBinding[]
+  /**
+   * The row's words on the system's keyboard-shortcut helper (Android's Meta + / sheet), in the
+   * sentence form Chrome's rows there use ('Duplicate tab', 'Move tab to start'; a coined sense
+   * keeps its capital – 'Create new Space'). The string table's sentence face of the action
+   * (§9.1: the derived face, or the entry's own `sentence`), carried where it differs from
+   * `label`; a second register, read by the helper alone: `label` stays the Settings page's
+   * Title Case and is what every other listing prints. Left out, the helper prints `label` –
+   * or, for a row Chrome's helper has too, Chrome's own words from its table.
+   */
+  helperLabel?: string
+  /**
+   * Actions this build cannot perform yet (kept so the list matches Zen 1:1): the chord routes
+   * and says so (`Keys.handle`'s toast), the Settings row is disabled, and the system's helper
+   * leaves the row out. Per platform when a host lacks the surface (DevTools on Android).
+   */
+  unsupported?: boolean
+  /** Reserved for a feature that has not shipped: bound (a no-op) but left out of the list. */
+  hidden?: boolean
+  /**
+   * The chrome layouts whose listings show the row, when the action is one shell's alone
+   * (Web Capture is the desktop's; the phone's chord takes its screenshot); left out, every
+   * layout lists it. The binding itself is untouched – a layout that hides the row keeps the key.
+   */
+  layouts?: FormFactor[]
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the desktop chrome puts its tabs and its navigation (Settings › Look and Feel › Layout,
+ * design language v2 §9.37, §10.4; Zen 1.22's Browser layout): `single` – the sidebar holds
+ * everything; `multiple` – a top toolbar holds navigation over the sidebar; `collapsed` – the
+ * sidebar starts as its icon rail; `horizontal` – the tab row runs along the caption band, the
+ * toolbar row under it, and the sidebar is the 56 rail beside the frame.
+ */
+export type ToolbarLayout = 'single' | 'multiple' | 'collapsed' | 'horizontal'
+export type UrlbarBehavior = 'float-typing' | 'always-float' | 'normal'
+export type GlanceTrigger = 'alt' | 'ctrl' | 'shift'
+export type PinnedCloseBehavior =
+  'reset-unload-switch' | 'reset-unload' | 'reset' | 'unload' | 'unload-switch' | 'switch' | 'close'
+export type ThirdPartyPinnedBehavior = 'new-tab' | 'glance' | 'same-tab'
+/**
+ * When Energy Saver is on (`Settings.energySaver`): Chrome's `BatterySaverModeState` less
+ * `kEnabled` (always on), which its page never offers – `kDisabled` → `off`,
+ * `kEnabledBelowThreshold` → `low-battery`, `kEnabledOnBattery` → `on-battery`.
+ */
+export type EnergySaverMode = 'off' | 'low-battery' | 'on-battery'
+/**
+ * Chrome's `BatterySaverModeManager::kLowBatteryThresholdPercent`: Energy Saver's
+ * `low-battery` mode turns on at this charge or lower (Chrome's row: "Turn on only when your
+ * battery is at 20% or lower").
+ */
+export const ENERGY_SAVER_LOW_BATTERY_PERCENT = 20
+export type ColorScheme = 'system' | 'light' | 'dark'
+export type SidebarSide = 'left' | 'right'
+/**
+ * Where the developer tools stand (design language v2 §9.29; Chrome's and Zen's dock side):
+ * docked in the frame's box under the page (`bottom`) or beside it (`right`, `left`), or in a
+ * window of their own (`undocked`). The menu offers all four – the toolbox's own – so a choice
+ * made inside the toolbox always has its row.
+ */
+export type DevtoolsDock = 'bottom' | 'right' | 'left' | 'undocked'
+/**
+ * A tab's open toolbox (`Tab.devtools`): where it stands now. Present only while the toolbox is
+ * up; the dock is the live one – the frontend's own reading through the host – and may differ
+ * from `Settings.devtoolsDock` once the user moves this toolbox alone or moves the setting for
+ * the next opening.
+ */
+export interface TabDevtools {
+  dock: DevtoolsDock
+}
+export type NewTabPosition = 'end' | 'after-current'
+/**
+ * Settings › On startup, Chrome's three choices: "Open the New Tab page", "Continue where you
+ * left off", "Open a specific page or set of pages".
+ */
+export type StartupMode = 'newTab' | 'continue' | 'pages'
+export interface StartupSettings {
+  mode: StartupMode
+  /**
+   * "Open a specific page or set of pages": the web (http(s)) addresses opened as the first
+   * window's tabs, in this order, the first active. Kept whatever `mode` says – Chrome keeps the
+   * list under the other two choices, so switching back finds it – deduplicated and capped at
+   * `MAX_STARTUP_PAGES` (`core/startup.ts`). An empty list under `pages` starts as `newTab`.
+   */
+  pages: string[]
+}
+/** Screen edge the phone layout docks its address bar to. */
+export type PhoneBarPosition = 'top' | 'bottom'
+/**
+ * Where a Home action goes (Settings › Homepage, SET-36 / NTP-30; Chrome's and Edge's homepage):
+ * nowhere – the Home controls hide (`off`) –, the new tab page (`newtab`), or a page of the
+ * user's (`url`).
+ */
+export type HomepageMode = 'off' | 'newtab' | 'url'
+export interface HomepageSettings {
+  mode: HomepageMode
+  /**
+   * The page a `url` homepage opens: an absolute web address (`shared/homepage.ts` normalises
+   * what was typed), or empty while none has been entered – a `url` homepage without one opens
+   * the new tab page. Kept across mode changes, so a way back to "Specific page" finds it.
+   */
+  url: string
+}
+/**
+ * A control the phone's bar can host (see `shared/phoneBar.ts` for the catalogue). The address
+ * pill is not one of them: it is always there, in the flexible slot between the two sides.
+ */
+export type PhoneBarItemId =
+  | 'back'
+  | 'forward'
+  | 'reload'
+  | 'home'
+  | 'share'
+  | 'bookmark'
+  | 'bookmarks'
+  | 'history'
+  | 'downloads'
+  | 'tabs'
+  | 'new-tab'
+  | 'menu'
+  | 'spaces'
+  | 'find'
+  | 'voice'
+/** Which controls sit on either side of the address pill; both sides read left to right as drawn. */
+export interface PhoneBarLayout {
+  left: PhoneBarItemId[]
+  right: PhoneBarItemId[]
+}
+/** Haptic feedback the chrome asks the host for (mobile hosts; no-op elsewhere). */
+export type HapticKind = 'lift' | 'tick' | 'dock'
+
+export interface CompactModeSettings {
+  enabled: boolean
+  hideSidebar: boolean
+  hideToolbar: boolean
+  /** Ctrl+Alt+S – keep the sidebar visible until toggled again. */
+  sidebarPersistent: boolean
+}
+
+// ---------------------------------------------------------------------------
+// New tab page: one model for `zen://newtab` (desktop) and the phone's page (`shared/newTab.ts`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Which sites the tiles show: the user's shortcuts ahead of history's most visited sites, or
+ * only the shortcuts.
+ */
+export type NewTabMode = 'most-visited' | 'my-shortcuts'
+/** What the grid of a page shows: its mode, or nothing when the shortcuts section is off. */
+export type NewTabShortcutsMode = NewTabMode | 'hidden'
+/**
+ * The wallpaper's source: colours derived from the space theme, a solid colour (the phone paints
+ * it as `space` until it has one), or an image picked on this device.
+ */
+export type NewTabBackgroundKind = 'space' | 'solid' | 'image'
+
+/**
+ * Layout presets. `focused` is the search field and the tiles on the bare space gradient;
+ * `inspirational` adds a wallpaper and a greeting; `informational` would add a feed on top of
+ * that (no feed core exists, so it is offered as "not available" and renders like
+ * `inspirational`); `custom` shows exactly the `modules` the user toggled.
+ */
+export type NewTabPreset = 'focused' | 'inspirational' | 'informational' | 'custom'
+
+/** The sections of the page; a preset is a fixed set of them, `custom` reads the user's. */
+export interface NewTabModules {
+  searchBox: boolean
+  shortcuts: boolean
+  /** Whether a wallpaper is painted at all (`NewTabSettings.background` says which). */
+  wallpaper: boolean
+  /** Reserved for a feed core; nothing renders it yet. */
+  feed: boolean
+  /** A "Good morning" line above the search box (the desktop page draws it; the phone's not yet). */
+  greeting: boolean
+}
+
+/** New tab page preferences, synced with the other settings; both pages read this one model. */
+export interface NewTabSettings {
+  /**
+   * Open `zen://newtab` for new tabs; off keeps the URL-bar-only behaviour. Desktop only in
+   * effect: the phone always shows its page.
+   */
+  enabled: boolean
+  mode: NewTabMode
+  preset: NewTabPreset
+  /** Sections the `custom` preset shows; the named presets ignore them (`newTabSections`). */
+  modules: NewTabModules
+  background: NewTabBackgroundKind
+}
+
+/** A shortcut tile: one of the user's own sites on the grid. Kept per device (never synced). */
+export interface NewTabShortcut {
+  id: string
+  title: string
+  url: string
+}
+
+/** The device-local half of the new tab page: the sets that never sync. */
+export interface NewTabDeviceState {
+  /**
+   * The user's shortcuts in grid order: the whole grid under "my shortcuts", the leading tiles
+   * ahead of the most visited sites under "most visited".
+   */
+  shortcuts: NewTabShortcut[]
+  /** Hosts removed from the most-visited tiles (lower-case, no `www.`). */
+  hiddenHosts: string[]
+  /**
+   * The Magic Stack's modules the user hid on this device (NTP-16; the phone's page): a card's
+   * "Hide this" or the Customise sheet's switch, per device as Chrome's `home_modules_*` prefs
+   * are. Ids from `MAGIC_STACK_MODULE_IDS` (`shared/newTab.ts`).
+   */
+  hiddenModules: MagicStackModuleId[]
+  /**
+   * The Safety check card's memory (NTP-19; `shared/safetyHubCard.ts`): per type, the run being
+   * shown and its impressions, the runs so far, when it may show again – Chrome's
+   * `safety_hub.menu_notifications` pref, per device as that is.
+   */
+  safetyHubCard: SafetyHubCardMemories
+  /**
+   * The tip card's memory (NTP-20; `shared/educationalTips.ts`): per card, its impressions, when
+   * it was last shown and whether its button was tapped; when any tip was last shown; when
+   * browsing data was last deleted on this device (the Quick Delete tip's signal) – Chrome's
+   * `educational_tip_module_*` prefs and the histograms its rules read, per device as those are.
+   */
+  educationalTips: EducationalTipMemory
+}
+
+/**
+ * The Magic Stack's modules (NTP-16): the contextual cards the phone's new tab page pages
+ * through under its tiles. `continue` is the recently closed tab (Chrome's local tab
+ * resumption), `downloads` the last completed download, `bookmarks` the newest bookmark,
+ * `safety-hub` the Safety check card (NTP-19: revoked permissions, Safe Browsing off, compromised
+ * passwords – one at a time), `tips` the tip card (NTP-20: Chrome's educational tip module – the
+ * theme, the default browser (DEF-04's promo, W6-4's `default-browser` module folded in), tab
+ * groups, Quick Delete – one at a time).
+ */
+export type MagicStackModuleId = 'continue' | 'downloads' | 'bookmarks' | 'safety-hub' | 'tips'
+
+/** A custom shortcut as the page shows it: with the favicon history knows for its site, if any. */
+export interface NewTabPageShortcut extends NewTabShortcut {
+  favicon: string | null
+}
+
+/** The chrome's theme variables (`themeCssVariables`) for one colour scheme. */
+export interface NewTabThemeVariant {
+  /** `--zen-bg`, `--zen-fg`, `--zen-accent` … exactly as the chrome sets them on its root. */
+  vars: Record<string, string>
+  /** Whether the resolved gradient reads as dark (the chrome's `data-theme`). */
+  isDark: boolean
+}
+
+/**
+ * Everything `zen://newtab` renders. The host hands the initial state to the page before its
+ * first paint and pushes a fresh one whenever a space theme, a setting or the grid changes.
+ * The page does no colour maths: both schemes arrive resolved and the page picks one, following
+ * the system when the setting says so.
+ */
+export interface NewTabPageState {
+  light: NewTabThemeVariant
+  dark: NewTabThemeVariant
+  colorScheme: ColorScheme
+  /** Private window: the private accent and a "Private" label. */
+  isPrivate: boolean
+  /** What the grid shows, the settings' mode and sections resolved (`newTabSections`). */
+  shortcutsMode: NewTabShortcutsMode
+  /** What to paint: the settings' background while its wallpaper section is on, else `space`. */
+  background: NewTabBackgroundKind
+  greeting: boolean
+  /** The user's shortcuts: the grid under "my shortcuts", its leading tiles under "most visited". */
+  shortcuts: NewTabPageShortcut[]
+  /** The most visited sites that follow the shortcuts (other hosts only; empty under "my shortcuts"). */
+  topSites: TopSite[]
+  /** Address of the custom background image (`zen://newtab-background?v=…`), when one is set. */
+  backgroundImage: string | null
+  /** The host can open an image file picker. */
+  canPickImage: boolean
+  /**
+   * The default search engine's favicon (`engineFieldFavicon` of `defaultSearchEngine()`, the
+   * source the pill's empty tab reads): the field's leading glyph at 16 (design language v2 §6,
+   * §9.29); null for an engine without one, and the field keeps its magnifier.
+   */
+  engineFavicon: string | null
+  /**
+   * A private window's page only: the "Block third-party cookies" switch (Chrome's Incognito
+   * new-tab toggle), `PrivacyStatus.privateThirdPartyCookies` – `blocked` is its position,
+   * `locked` that it is disabled: on under Settings' block in every window, and at either pole
+   * under the extension holding `chrome.privacy`'s `thirdPartyCookiesAllowed`
+   * (`lockedByExtension`, its name – empty when it has none – so the locked line names it).
+   * Absent on a regular page; inert for anything else that reads the state.
+   */
+  privateThirdPartyCookies?: PrivateThirdPartyCookieStatus
+}
+
+/**
+ * Actions the new tab page asks the browser for (one-way; the browser answers with state).
+ * Tiles are plain links, so opening one needs no action: the page navigates like any page.
+ * The page draws no popover or dialog of its own: a tile's menu, the add / edit dialog and the
+ * Customise surface are the chrome's (design language v2 §9.20–9.23), asked for here.
+ */
+export type NewTabPageAction =
+  | { type: 'ready' }
+  /**
+   * Text from the page's search box. Without `submit`, open the omnibox over this tab with it
+   * (a tap, or a key typed on the page). With `submit`, navigate or search this tab immediately
+   * — Enter in the field, so a query does not sit in the omnibox waiting for a second Enter.
+   */
+  | { type: 'search'; text: string; submit?: boolean }
+  | { type: 'add-shortcut'; title: string; url: string }
+  | { type: 'update-shortcut'; id: string; title: string; url: string }
+  | { type: 'remove-shortcut'; id: string }
+  | { type: 'restore-shortcut'; id: string; title: string; url: string; index: number }
+  | { type: 'reorder-shortcuts'; ids: string[] }
+  /** "Most visited": remove a site's tile (its host goes on a local block list) and undo that. */
+  | { type: 'hide-site'; url: string }
+  | { type: 'unhide-site'; url: string }
+  /**
+   * The Undo of the page menu's "Restore Default Shortcuts" (`defaults-restored`, NTP-22): the
+   * pinned shortcuts, the removed sites and the mode back as they were before the restore.
+   */
+  | { type: 'undo-restore-default-shortcuts' }
+  /** The Undo of a section the chrome's menu hid (`section-hidden`): it comes back as it was. */
+  | { type: 'show-section'; section: NewTabHideableSection }
+  /** Open the chrome's add (`id` null) or edit shortcut dialog over the page. */
+  | { type: 'edit-shortcut'; id: string | null }
+  /**
+   * A tile's menu (right-click, its ⋮ button, Shift+F10): the host's context menu at `x`, `y`
+   * in the page's CSS pixels; `keyboard` starts it with the first item selected. `rect` is the
+   * tile's box – the square and its caption – in the page's CSS pixels: the touch layouts hang
+   * the menu from it, flush under the tile and start-aligned with it (NTP-35), not at the finger.
+   */
+  | {
+      type: 'tile-menu'
+      id: string
+      url: string
+      title: string
+      x: number
+      y: number
+      keyboard: boolean
+      rect?: Rect
+    }
+  /** The Customise button: Settings opens on its New Tab section. */
+  | { type: 'customize' }
+  /**
+   * The private page's "Block third-party cookies" switch was flipped: `privacy.thirdPartyCookiesPrivate`
+   * becomes `block` (on) or `allow` (off) – never `default` – and changes private windows only.
+   */
+  | { type: 'set-private-third-party-cookies'; blocked: boolean }
+
+/**
+ * What the browser tells a new tab page besides its state: a menu item picked in the chrome
+ * that the page carries out itself, so its Undo toast works the same as for the Delete key;
+ * a section the chrome's menu hid (NTP-18) – the state push takes it off the page, and the
+ * command raises the page's toast ("Greeting hidden" / "Shortcuts hidden") with Undo, which
+ * asks for `show-section`; and the grid put back to its defaults by the menu's "Restore Default
+ * Shortcuts" (NTP-22) – the push already redrew the grid, the command raises "Default shortcuts
+ * restored" with Undo, which asks for `undo-restore-default-shortcuts`. Every toast carries
+ * Undo alone (v2 §9.33: one action).
+ */
+export type NewTabPageCommand =
+  | { type: 'remove-tile'; id: string }
+  | { type: 'section-hidden'; section: NewTabHideableSection }
+  | { type: 'defaults-restored' }
+
+/** The sections the page's menu hides with Undo (NTP-18): the greeting and the tile grid. */
+export type NewTabHideableSection = 'greeting' | 'shortcuts'
+
+export interface Settings {
+  colorScheme: ColorScheme
+  /**
+   * Desktop: the chrome's accent follows the OS accent colour where a space has no theme of its
+   * own (Settings › Appearance › Use system accent colour, settings-116; Chrome's
+   * `browser.theme.follows_system_colors`, off by default on Windows as here). The colour
+   * itself is the host's reading (`UIState.systemAccent`, Electron's
+   * `systemPreferences.getAccentColor`); a host that reads none (Linux) holds the row at .4.
+   * Device-local (`core/sync/records.ts`): Chrome's pref is not in its syncable database –
+   * each device's accent is its own. Absent in profiles from before it existed (read as off).
+   */
+  useSystemAccent: boolean
+  /** Colour of the app icon (launcher alias on Android, window / Dock icon on desktop). */
+  appIcon: AppIconId
+  toolbarLayout: ToolbarLayout
+  /**
+   * The desktop toolbar's optional controls that depart from the default bar (Look and Feel ›
+   * Customise toolbar, `shared/toolbarPins.ts`): a key absent reads the control's default –
+   * pinned for every control but Home, which `home: true` shows (Settings › Appearance › Show
+   * home button, settings-32; Chrome's synced `browser.show_home_button`). Read by the desktop
+   * chrome's toolbar row and the desktop app menu; inert on the phone and the tablet, which
+   * keep their own bars. Absent in profiles from before it existed.
+   */
+  toolbarPins?: ToolbarPins
+  sidebarSide: SidebarSide
+  /**
+   * Desktop: where the developer tools open – the last dock chosen, from the app menu's rows or
+   * inside the toolbox itself (its dock buttons, read back). Absent in profiles from before it
+   * existed (read as `bottom`); inert where the host has no developer tools (Android).
+   */
+  devtoolsDock: DevtoolsDock
+  sidebarWidth: number
+  /** Expanded (titles shown) vs collapsed (favicons only). */
+  sidebarExpanded: boolean
+  sidebarExpandOnHover: boolean
+  /** Remove the browser padding / rounded content area. */
+  borderless: boolean
+  /** Windows 11: draw new windows on the system's Mica material behind a translucent chrome. */
+  windowMaterial: WindowMaterial
+  /**
+   * Desktop: draw new windows with the desktop's own frame and window buttons instead of the
+   * chrome's custom buttons. On Wayland compositors without server-side decorations (niri,
+   * Hyprland) this leaves no buttons at all; the compositor's own bindings manage the window.
+   * Device-local; the frame is fixed at creation, so the row applies to new windows.
+   */
+  nativeWindowControls: boolean
+  /**
+   * Desktop: let the compositor show what is behind the window, as a translucent or clear frame
+   * over this space's gradient. The host opens NEW windows see-through (`HostCapabilities.
+   * windowTransparency`); the chrome's alpha follows the setting live in a window already open
+   * (`--zen-window-alpha`). Device-local (`core/sync/records.ts`): each machine's compositor,
+   * and whether it blurs, is its own. Absent in profiles from before it existed (read as off).
+   */
+  windowTransparency: WindowTransparency
+  compactMode: CompactModeSettings
+  urlbarBehavior: UrlbarBehavior
+  /** Phone layout: where the address bar (and its gestures) live. Long-press the pill to move it. */
+  phoneBarPosition: PhoneBarPosition
+  /** Phone layout: the controls either side of the address pill (Settings › Navigation bar). */
+  phoneBar: PhoneBarLayout
+  /**
+   * Phone layout: the app menu's items in the user's order (Edge's Change menu, TB-22) – the
+   * items' stable keys (`MenuItemDescriptor.key`; `shared/menuOrder.ts` reads it against the
+   * build's default: named items first in this order, the rest after them in the default order,
+   * a key the build has no item for dropped). Absent until the user reorders; the Reset row
+   * writes the EMPTY list, which is kept and synced as a value – both read as the default order,
+   * but the empty list says so to the other devices where an absent key says nothing
+   * (`core/sync/records.ts` sends the settings' keys as they are and never one they lack). The
+   * desktop's menus never read it.
+   */
+  menuOrder?: string[]
+  /**
+   * The homepage (SET-36 / NTP-30): what the phone's Home button – the bar's optional item, the
+   * app menu's icon-row glyph otherwise – opens, or that there is none. Absent in profiles from
+   * before it existed (`sanitizeHomepage` reads the new tab page, Chrome's default). Synced
+   * with the settings, as Chrome syncs `homepage` and `homepage_is_newtabpage`. The desktop's
+   * Home – the toolbar's Home button (`toolbarPins.home`, settings-32), Alt+Home and the menu
+   * bar's Home (`nav.home`) – reads the same setting for its destination (`NewTabService.
+   * homeDestination`): a `url` homepage's page, else the new tab page; the phone's `off` is the
+   * phone's Home button gone and reads as the new tab page on the desktop, whose button has a
+   * pin of its own – Chrome's `show_home_button` – and whose Alt+Home has a destination whatever
+   * the button's state, as Chrome's IDC_HOME does.
+   */
+  homepage: HomepageSettings
+  /** Touch hosts: drag down from the top of a page to reload it. */
+  pullToRefresh: boolean
+  /**
+   * Android: a touchpad's two-finger swipe across a page goes back or forward (GN-23 / A11Y-14;
+   * Settings › Accessibility › "Swipe between pages using a touchpad"). Chrome's
+   * `settings.a11y.touchpad_overscroll_history_navigation`: on by default, Android-only, kept
+   * on the device (not a synced pref) – so a device-local setting here (`core/sync/records.ts`).
+   * The finger's edge drag is not this switch's. Absent in profiles from before it existed
+   * (read as true). The desktop has no such setting and no row for it.
+   */
+  touchpadSwipeToNavigate: boolean
+  /**
+   * Phone layout: the bar slides off its edge as the page scrolls down and back as it scrolls
+   * up (`lib/barHide.ts`). Absent in profiles from before it existed (read as true).
+   */
+  hideToolbarOnScroll: boolean
+  glanceEnabled: boolean
+  glanceTrigger: GlanceTrigger
+  /**
+   * Split view drag and drop (split-12): a tab dragged to an edge of the page opens in a split
+   * view there – the four edge zones over the page. Off, the edges are plain page (the drag
+   * tears the tab off there, as it does past the zones); the panes of a split on screen stay
+   * targets. Absent in profiles from before it existed (read as true).
+   */
+  splitEdgeZones: boolean
+  pinnedCloseBehavior: PinnedCloseBehavior
+  pinnedResetOnStartup: boolean
+  thirdPartyOnPinned: ThirdPartyPinnedBehavior
+  /**
+   * Memory Saver's switch and timer (settings-69; the phone's sleeping-tabs rows read the same
+   * two keys): a tab hidden for `unloadTimeoutMinutes` is unloaded while `unloadEnabled`.
+   * Chrome's twins (`performance_tuning.high_efficiency_mode.state` / `.aggressiveness`) are
+   * local-state prefs it never syncs – device-local here too (`DEVICE_LOCAL_SETTINGS`, W8-2):
+   * each device keeps its own value, the phone's ladder and the desktop's tiers apart. The
+   * keep-active hosts (`unloadExcludedDomains`) sync, as Chrome's exceptions list does.
+   */
+  unloadEnabled: boolean
+  unloadTimeoutMinutes: number
+  unloadExcludedDomains: string[]
+  /**
+   * Energy Saver (settings-26; Chrome's `performance_tuning.battery_saver_mode.state`, a
+   * local-state pref Chrome never syncs – device-local here too, `DEVICE_LOCAL_SETTINGS`):
+   * when the resource governor tightens its budgets by `resources.batteryFactor`. `on-battery`
+   * whenever the computer runs on its battery (Electron's `powerMonitor`); `low-battery` only
+   * once the battery is at `ENERGY_SAVER_LOW_BATTERY_PERCENT` or lower – Chrome's
+   * `kLowBatteryThresholdPercent`, 20 – where the host can read the level (Linux's sysfs,
+   * macOS's `pmset`; Windows exposes it to a native module alone, so there the mode waits and
+   * the row says so); `off` never. A fresh desktop profile takes Chrome's default, the
+   * threshold – `on-battery` on Windows, where the level cannot be read
+   * (`freshPerformanceDefaults`); the shipped default stays `on-battery`, Ione's behaviour
+   * before the mode had a name, for every existing profile and the phone. Absent in profiles
+   * from before it existed (read as `on-battery`).
+   */
+  energySaver: EnergySaverMode
+  /**
+   * Whether the tab hover card says how much memory the page is using (settings-29; Chrome's
+   * `browser.hovercard.memory_usage_enabled`, "Show tab memory usage"): the card's last line,
+   * "Memory usage: 123 MB", read from the governor's snapshot (`ResourceSnapshot.tabs`). Off by
+   * default – Chrome 152's effective default after `MigrateHoverCardMemoryPref` (M131+): the pref
+   * registers true (`RegisterBrowserPrefs`, `browser_ui_prefs.cc`) and the one-time migration
+   * (`tab_strip_prefs.cc`) flips it to false under Tab Declutter, which every desktop platform
+   * has – on by an explicit switch. Off, a page past Chrome's high-usage threshold still gets its
+   * line ("High memory usage: 1.2 GB" – `TabResourceUsage::kHighMemoryUsageThresholdBytes`,
+   * 800 MiB), as Chrome's does; a sleeping tab's card says what it gave back instead
+   * (`sleepSavedMb`). Chrome registers the pref in local state, never synced – device-local here
+   * too (`DEVICE_LOCAL_SETTINGS`). The desktop's alone: the tablet chrome mounts no card. Absent
+   * in profiles from before it existed (read as false, as is anything but `true`).
+   */
+  hoverCardMemoryUsage: boolean
+  /**
+   * Inactive tabs (TAB-20, SET-34; Chrome's archive): a tab nobody has looked at for this many
+   * days leaves the grid for the Inactive tabs list, its page kept as a recently-closed entry
+   * keeps one (`InactiveTabsService`). Chrome's ladder: 0 (Never), 7, 14 or 21, 21 by default
+   * (`TabArchiveSettings.DEFAULT_ARCHIVE_TIME_HOURS`). Distinct from the sleeping-tabs timeout
+   * above, which only unloads a page and leaves its card where it is. Absent in profiles from
+   * before it existed (read as the default).
+   */
+  inactiveTabsArchiveDays: InactiveTabsArchiveDays
+  /**
+   * Inactive tabs the user never came back for are closed for good after `INACTIVE_TAB_AUTO_CLOSE_DAYS`
+   * (Chrome's `DEFAULT_AUTODELETE_TIME_HOURS`, worded as months). Absent in older profiles
+   * (read as on: Chrome's steady state once its promo has been answered).
+   */
+  inactiveTabsAutoClose: boolean
+  /**
+   * @deprecated Where "Mute Site" kept its hosts (lower-case hostnames without `www.`) before
+   * the `sound` content setting became the one source of a site's mute. Migrated into `sound`
+   * blocks on load (`TabManager.migrateMutedHosts`) and empty from then on; kept so an older
+   * profile or device still reads and syncs.
+   */
+  mutedHosts: string[]
+  searchEngineId: string
+  /**
+   * The engines the user added (Settings > Search) or that visited pages offered through
+   * OpenSearch (`source: 'discovered'`, ordered by `visitedAt`), on top of the shipped ones;
+   * synced with the settings. Absent in profiles from before it existed (read as none).
+   */
+  searchEngines?: SearchEngine[]
+  /**
+   * The EEA's search-engine choice screen's record (W6-2): the engine set as the default on it,
+   * or null while the screen has not been answered on this device (it is shown at the first run
+   * in the EEA and re-asked each run until answered; "Skip for now" records nothing). Absent in
+   * profiles from before it existed (read as null). Device-local, never synced.
+   */
+  searchChoice: SearchChoiceRecord | null
+  searchSuggestions: boolean
+  /**
+   * Suggestion privacy (omnibox-45, Chrome's "Autocomplete searches and URLs", Edge's per-source
+   * switches): rows from the browsing history (and the inline address completion), and rows
+   * from the bookmarks. Absent in profiles from before they existed (read as on). Private
+   * windows show neither whatever these say.
+   */
+  historySuggestions?: boolean
+  bookmarkSuggestions?: boolean
+  /**
+   * Chrome's "Always show full URLs": the address pill keeps the scheme and `www.` instead of
+   * eliding them at rest. Absent in profiles from before it existed (read as false).
+   */
+  showFullUrls?: boolean
+  containerSpecificEssentials: boolean
+  essentialsMax: number
+  newTabPosition: NewTabPosition
+  /**
+   * Chrome's Settings › On startup (settings-47): what the first window of a run opens on – the
+   * New Tab page, the last session's pages ("Continue where you left off"), or a fixed set of
+   * pages. Replaces the 0.4.x `restoreSession` switch, folded in on load (`applyPersisted`:
+   * true → `continue`, false → `newTab`). Sanitised by `core/startup.ts`.
+   */
+  startup: StartupSettings
+  /** Ask before a window with more than one tab closes (Firefox's warning; Edge has the setting). */
+  warnOnCloseWindow: boolean
+  /**
+   * Chrome's "Warn Before Quitting (⌘Q)" (session-08), the macOS menu bar's checkbox: the quit
+   * chord asks to be held for a moment – "Hold ⌘Q to Quit" over the front window – and quits
+   * only once it was (`QuitHoldService`); off, the chord quits at once. On by default, as
+   * Chrome's is. Read by the macOS host alone (the menu bar is its; other hosts' quit chords
+   * never hold); absent in profiles from before it existed (read as true).
+   */
+  warnBeforeQuitting: boolean
+  /**
+   * Caret browsing is on (CT-34): every page shows a text cursor the arrow keys move, as Chrome's
+   * `settings.a11y.enable_caret_browsing` – one state for the profile, kept across runs, F7
+   * toggling it. Absent in profiles from before it existed (read as false).
+   */
+  caretBrowsing?: boolean
+  /**
+   * F7 asks "Turn on caret browsing?" before it turns caret browsing on (Chrome's one-time
+   * dialog); the dialog's "Don't ask again" turns this off. Absent in profiles from before it
+   * existed (read as true).
+   */
+  caretBrowsingConfirm?: boolean
+  /**
+   * The mini menu comes up over text selected in a page (CT-39; Edge's Appearance › "Show mini
+   * menu when selecting text"): Copy, Search, Define, Translate, Listen as chips over the
+   * selection (`UIState.selectionMenu`). Hosts with `capabilities.selectionMenu` alone read it;
+   * absent in profiles from before it existed (read as true).
+   */
+  showSelectionMenu?: boolean
+  /** After an unclean exit: offer the last session's pages, bring them back, or start fresh. */
+  crashRestore: CrashRestoreMode
+  /** Firefox's "Always ask you where to save files"; off saves straight into the Downloads folder. */
+  askWhereToSave: boolean
+  /**
+   * Downloads folder, panel behaviour, auto-open types and notifications; absent in profiles from
+   * before it existed (`resolveDownloadSettings` fills the defaults). `askWhereToSave` above is
+   * the older sibling and stays the source of truth for that switch.
+   */
+  downloads?: Partial<DownloadSettings>
+  onboardingDone: boolean
+  showTabSeparator: boolean
+  ctrlTabCyclesWithinSection: boolean
+  spaceRouting: Record<string, string>
+  /** Zen's window sync: mirror all tabs across windows, only pinned tabs, or keep windows independent. */
+  windowSync: WindowSyncMode
+  resources: ResourceSettings
+  agents: AgentSettings
+  updates: UpdateSettings
+  /**
+   * Non-web schemes (`mailto`, `tel`, `sms`, `market`, …) the user chose "Always allow" for in the
+   * external-protocol sheet: pages may hand links of that scheme to the app without asking again.
+   */
+  externalProtocols: Record<string, boolean>
+  passwords: PasswordSettings
+  /** Addresses and payment cards: whether Ione offers to save and fill them. */
+  autofill: AutofillSettings
+  /** Session counter and cooldowns of the "make Ione your default browser" prompts. */
+  defaultBrowserPromo: DefaultBrowserPromoState
+  /**
+   * Desktop: the app version in which the user answered "Not now" to the "Make Ione your
+   * default browser" strip; it stays away until the next feature release (`major.minor`).
+   */
+  defaultBrowserPromptDismissed: string | null
+  /** Ad and tracker blocking (Settings → Privacy and security). */
+  blocking: BlockingSettings
+  /** How pages are presented: desktop site, dark theme for sites, page zoom (Chrome's page controls). */
+  pageControls: PageControlsSettings
+  /** The bookmarks bar above the content frame: always, only on the new tab page, or never. */
+  bookmarksBar: BookmarksBarMode
+  /**
+   * The phone's bookmarks panel (HB-13, `shared/bookmarkRows.ts`): how a folder's rows and
+   * search results are ordered (Chrome's `BookmarkRowSortOrder`, `manual` by default) and
+   * whether a row is an image tile or the favicon (Chrome's `BookmarkRowDisplayPref`; Chrome's
+   * default is Visual, Ione seeds `compact` – the lead's stated deviation, recorded on the
+   * HB-13 row). Device-local, as Chrome keeps both in SharedPreferences.
+   */
+  bookmarkRowSortOrder: BookmarkRowSortOrder
+  bookmarkRowDisplay: BookmarkRowDisplay
+  /**
+   * Which built-in key table the user's overrides sit on. New profiles follow Chrome; a profile
+   * from before the setting existed keeps the Zen set when it had customised bindings.
+   */
+  shortcutPreset: ShortcutPreset
+  /** Safe Browsing, HTTPS-only, secure DNS, cookies, GPC / DNT (Settings → Privacy and security). */
+  privacy: PrivacySettings
+  /**
+   * Chrome's "Preload pages" (PS-43): `standard` (default) lets the speculative loads pages ask
+   * for go out, `none` refuses them (`shared/privacy.ts`). Its own synced key, as Chrome's pref;
+   * a profile from before it reads `standard` (`sanitizePreloadPages`).
+   */
+  preloadPages: PreloadPagesLevel
+  /**
+   * Chrome's "Automatically remove permissions from unused sites" (PS-41,
+   * `safety_hub.unused_site_permissions_revocation.enabled`, on by default): the daily sweep
+   * takes the ask-default permissions a site was allowed but not visited for 60 days, into a
+   * 30-day revoked list the Safety check reviews. Off: no sweep; the visit clock keeps running
+   * and the list already made stays. Its own synced key, as Chrome's pref; a profile from before
+   * it reads on (`applyPersisted`), and a peer's record without it says nothing about it.
+   */
+  autoRevokeUnusedPermissions: boolean
+  /**
+   * The time range the Delete browsing data dialog opens on: the one the user last deleted
+   * with, as Chrome's desktop dialog remembers its `browser.clear_data.time_period`
+   * (`clear_browsing_data_time_picker.ts` mirrors the pref into the picker and `sendPrefChange`
+   * writes it when Delete is pressed, `clear_browsing_data_dialog.ts` `onDeleteBrowsingDataClick_`).
+   * One key over Basic and Advanced, which share the range row – Chrome kept one too since its
+   * dialog lost the tabs (CL 7857508 retired `time_period_basic`). The last hour until then
+   * (`DEFAULT_CLEAR_BROWSING_DATA_RANGE`; an unknown value reads so, `sanitizeClearBrowsingDataRange`).
+   * Device-local (`DEVICE_LOCAL_SETTINGS`): Chrome stopped syncing the dialog's choices in
+   * CL 5398105 ("[CBD] Make options not syncable"). The phone's Quick Delete form opens on its
+   * own 15 minutes and neither reads nor writes it (`QUICK_DELETE_FORM`).
+   */
+  clearBrowsingDataRange: BrowsingDataRange
+  /**
+   * The new tab page, both platforms' (`shared/newTab.ts`): whether it opens (desktop), its
+   * layout preset and sections, what its grid shows, what it paints behind. The user's shortcuts
+   * and removed hosts are device-local (`NewTabDeviceState`), not here.
+   */
+  newTab: NewTabSettings
+  /** The one-time gesture hint (a toast after the first page) has been shown (phones). */
+  gestureHintDone: boolean
+  /** The one-time exit hint for a video in fullscreen (GN-20) has been shown (phones). */
+  fullscreenHintDone: boolean
+  /**
+   * The phone's in-product help bubbles (TB-19, `shared/iph.ts`): one record per bubble Chrome
+   * Android shows on its toolbar or in its tab switcher. Device-local (`DEVICE_LOCAL_SETTINGS`),
+   * as Chrome's feature engagement store is the profile's own; a profile from before it reads
+   * the defaults (`sanitizeIphState`).
+   */
+  iph: IphState
+  /**
+   * Spell checking of text fields: on / off and the dictionary languages (Settings › Languages).
+   * Absent in profiles from before it existed (`sanitizeSpellcheck` fills the defaults).
+   */
+  spellcheck: SpellcheckSettings
+  /** Reader View's text size, font, colour theme and column width (`zen://reader`). */
+  reader: ReaderPreferences
+  /**
+   * Read aloud: the speed, the voice per language and the highlight mode (`shared/readAloud.ts`).
+   * Absent in profiles from before it existed (`sanitizeReadAloudSettings` fills the defaults).
+   */
+  readAloud: ReadAloudSettings
+  /**
+   * Page fonts (Settings › Appearance › Customize fonts, CT-25): the families for text a page
+   * leaves to the engine and for its generic families, the default size, the minimum size
+   * (`shared/fonts.ts`). Absent in profiles from before it existed (`sanitizeFontSettings`
+   * fills the platform defaults). Synced with the settings.
+   */
+  fonts: PageFontSettings
+  /**
+   * The preferred languages (Settings › Languages, CT-41): BCP 47 tags, most preferred first.
+   * Drives the `Accept-Language` every desktop session sends (Android's WebView follows the
+   * system locales and takes no list), translate's default target and its never-translate
+   * defaults, and the dictionary a profile that chose no spellcheck language checks in. Absent
+   * in profiles from before it existed: filled from the OS locales (`defaultLanguages`). Synced.
+   */
+  languages: string[]
+  /**
+   * Roll's best score (ERR-03, design language v2 §9.17): the profile's, host-kept and synced
+   * like Chrome's `net.easter_egg_high_score` – one number across the no-connection page and
+   * `zen://game` on every device – never a document origin's storage. A whole number in the
+   * meter's range (0 to 99999; `sanitizeGameBestScore`), 0 in profiles from before it existed.
+   * The core's `GameService` answers the pages and only ever raises it.
+   */
+  gameBestScore: number
+  /**
+   * In-app proxies (Settings › System): named servers, domain routing, and which proxies
+   * agents may use (`shared/appProxy.ts`). Absent in profiles from before it existed (the
+   * computer's proxy, no rules). Device-local: servers and passwords stay on this machine.
+   */
+  proxy: AppProxySettings
+}
+
+// ---------------------------------------------------------------------------
+// Sharing and external protocols
+// ---------------------------------------------------------------------------
+
+/** What `app.share` hands to the system share sheet. */
+export interface SharePayload {
+  /** Shown as the preview's title (the page title, or the link text). */
+  title?: string
+  /** Plain text to share when there is no URL. */
+  text?: string
+  url?: string
+  /**
+   * An image to share as a file: the host fetches it (with the tab's cookies) and shares the
+   * bytes rather than the address.
+   */
+  imageUrl?: string
+  /** The tab the share started from (the sheet's own actions – screenshot, print – work on it). */
+  tabId?: string
+  /** The page's favicon (a `data:` or `http(s)` URL) for the preview thumbnail. */
+  favicon?: string
+  /**
+   * Files to share (a page's `navigator.share({ files })`, SH-14), as the host holds them by
+   * then (`ShareFile.uri`: its own copies behind its FileProvider). The sheet offers the files;
+   * `text` and `url` ride along as the message beside them.
+   */
+  files?: ShareFile[]
+  /**
+   * Hold the answer until the sheet has closed and say how it ended: `shared` once a target took
+   * the share, `aborted` when the sheet was dismissed – a page's `navigator.share` promise hangs
+   * on it. Without it the host answers as soon as the sheet is up (the browser's own shares).
+   */
+  awaitOutcome?: boolean
+}
+
+/**
+ * One of the browser's own buttons in the system share sheet (Android 14's action row): the
+ * host reports the tap, the core carries it out on the tab the share started from.
+ */
+export interface ShareAction {
+  kind: 'copy' | 'screenshot' | 'print'
+  url: string
+  tabId: string | null
+}
+
+/**
+ * One app in the browser's own share panel (Android below 14, SH-03): the host's row of where
+ * the user shares, ranked by Ione's own record of past shares.
+ */
+export interface SharePanelTarget {
+  /** The activity's flattened `ComponentName`: the row's key, and where a tap sends the share. */
+  component: string
+  label: string
+  /** The app's launcher icon at the row's 40 dp, a `data:` URL. */
+  icon: string
+}
+
+/**
+ * The browser's own share panel (Android below 14, where the system sheet has no row for the
+ * sharing app's actions; SH-03): what is being shared, for the preview and the chips, and the
+ * apps the host found for it. The host holds the share's intent under `id` until the chrome
+ * answers with `share.panelAction`. Hosts whose share sheet is the system's alone never send it.
+ */
+export interface SharePanelRequest {
+  id: string
+  /** A page or a link (`link`), a selection's text (`text`), or an image shared as a file (`image`). */
+  kind: 'link' | 'text' | 'image'
+  /** The page's title (or the link's text) for the preview's first line; null when the share has none. */
+  title: string | null
+  url: string | null
+  text: string | null
+  /** The page's favicon for the preview (a `data:` or `http(s)` URL); null for an image or a bare link. */
+  favicon: string | null
+  /** The shared image, small, for the preview (a `data:` URL); null unless `kind` is `image`. */
+  image: string | null
+  /** The tab the share started from (Long screenshot and Print work on it); null for none. */
+  tabId: string | null
+  /** A private tab's share: the host records nothing of where it went. */
+  private: boolean
+  /**
+   * Where the share came from: the browser's own menu (`menu`), or a page's `navigator.share`
+   * (`page`, Android below 14 – Chrome's hub takes a Web Share the same way). A page's share is
+   * of what the page handed over, not of the page: its chips follow the payload (Copy text for
+   * text, Copy link and QR for a link), never Long screenshot or Print. The host holds the
+   * page's promise until the panel is answered.
+   */
+  source: 'menu' | 'page'
+  targets: SharePanelTarget[]
+}
+
+/** How the share panel was answered, for the host holding the share's intent (`share.panelAction`). */
+export interface SharePanelAction {
+  id: string
+  /**
+   * `target`: send to `component`; `more`: the system sheet; `qr`: the link as a QR code;
+   * `copyImage`: the image onto the clipboard; `chip`: one of the chrome's own chips (Copy link,
+   * Copy text, Long screenshot, Print) ran in the chrome – the share is done (a page's promise
+   * resolves, as Chrome's does on a first-party tap); `dismiss`: nothing more – the intent is
+   * released (a page's promise rejects).
+   */
+  kind: 'target' | 'more' | 'qr' | 'copyImage' | 'chip' | 'dismiss'
+  component?: string
+  /** The chip that ran, for `chip`. */
+  chip?: string
+}
+
+// ---------------------------------------------------------------------------
+// Screenshots to the gallery (Android; SH-07, SH-08)
+// ---------------------------------------------------------------------------
+
+/**
+ * A screenshot the host has put in the device's gallery (`MediaStore.Images`, Pictures/Ione):
+ * what the preview card shows and what its Share, Delete and the viewer address.
+ */
+export interface ScreenshotSaved {
+  /** The gallery's row (a `content:` URI). */
+  uri: string
+  /** A small picture of it for the card's thumbnail, a `data:` URL (JPEG). */
+  thumbnail: string
+  /** The picture's size in pixels. */
+  width: number
+  height: number
+  /** The file's size in bytes. */
+  bytes: number
+}
+
+/**
+ * A full-page capture held by the host for the long-screenshot editor (SH-08): the page from its
+ * top, cut at the capture's height limit (about ten screens), as a picture the editor can show
+ * (`preview`, a `data:` URL scaled down to a phone's width) with the full picture's size, and the
+ * viewport's height in it (the first screen, which the viewport screenshot already showed).
+ * `saveLong` crops the full-resolution picture the host kept under `id`.
+ */
+export interface LongCapture {
+  id: string
+  preview: string
+  width: number
+  height: number
+  viewportHeight: number
+}
+
+/** What the editor keeps of the long capture: rows from the top and the bottom, in picture pixels. */
+export interface LongCaptureCrop {
+  top: number
+  bottom: number
+}
+
+/**
+ * A page wants to leave the web (`mailto:`, `tel:`, `intent://`, a custom scheme) or a site's
+ * native app could open the link: the chrome shows a confirm sheet and answers through
+ * `externalProtocol.respond`.
+ */
+export interface ExternalProtocolRequest {
+  requestId: string
+  /** The address the page wants to open, as the page gave it. */
+  url: string
+  /** Its scheme, lower-case (`mailto`, `tel`, `intent`, `https` for an app link). */
+  scheme: string
+  /** Name of the app that would open it, when the host could tell; null for "another app". */
+  appName: string | null
+  /** Host of the page that asked; empty when unknown. */
+  site: string
+  /** Whether the sheet offers to remember the choice for this scheme. */
+  canRemember: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Default browser (Android's browser role)
+// ---------------------------------------------------------------------------
+
+/**
+ * Persisted bookkeeping of the default-browser prompts. Sessions are counted from the end of
+ * onboarding; the sheet comes up after a few of them and again after a cooldown, the banner fills
+ * the sessions in between. Pure rules over this state live in `shared/defaultBrowser.ts`.
+ */
+export interface DefaultBrowserPromoState {
+  /** Sessions (app starts) since onboarding finished. */
+  sessions: number
+  /** Session in which the promo sheet last came up (null = never). */
+  promptedAt: number | null
+  /** How often the sheet was answered with "Not now". */
+  dismissals: number
+  /** "Set as default" was chosen from a prompt: never ask again. */
+  done: boolean
+  /** Session in which the banner last came up (null = never). */
+  bannerAt: number | null
+}
+
+/** What the chrome should show for the default-browser prompts right now. */
+export type DefaultBrowserPrompt = 'sheet' | 'banner' | null
+
+// ---------------------------------------------------------------------------
+// In-product help (the phone's hint bubbles, TB-19)
+// ---------------------------------------------------------------------------
+
+/**
+ * One hint bubble's record (`shared/iph.ts`), device-local. Chrome's feature engagement tracker
+ * keeps the same two things per IPH feature: the day it became available, and whether it has
+ * been triggered or its subject used.
+ */
+export interface IphBubbleState {
+  /**
+   * When the bubble became available on this device (ms since the epoch): stamped by the first
+   * deferred arm of a build that has the bubble; Chrome's `availability` clock starts the same
+   * day. `null` until then.
+   */
+  availableAt: number | null
+  /**
+   * The bubble has been shown – or the user did what it teaches before it was due (Chrome's
+   * `used` event: `tab_switcher_button_clicked` holds the tab switcher bubble back). Either way
+   * it is spent and never shows.
+   */
+  shown: boolean
+}
+
+/** The bubbles, one record each, named after the Chrome Android 152 IPH feature each mirrors. */
+export interface IphState {
+  /** Chrome's `IPH_TabSwitcherButton`: the bubble on the bar's Tabs button. */
+  tabSwitcher: IphBubbleState
+  /**
+   * Chrome's `IPH_TabGroupsDragAndDrop`: the drag-to-group teaching in the tab overview, shown
+   * once when the overview opens from the Ione tips card's tab-groups tip (TB-19; Chrome's
+   * `TabGridIphDialogCoordinator` opened by `openTabGroupIphDialog`). `shown` is spent as the
+   * bubble goes up (a drag that groups does not spend it: Chrome's dialog opens on the tip's tap
+   * whatever its tracker holds); `availableAt` is stamped as the record is spent – Chrome's
+   * `availability` is ANY for this feature, so no clock runs ahead of it and the stamp gates
+   * nothing.
+   */
+  tabGroupsDragAndDrop: IphBubbleState
+}
+
+/**
+ * A `settings.update` patch: any of the settings, and the phone's bubble records one at a time
+ * – `updateSettings`' `iph` branch merges a one-bubble patch over the others' records, so the
+ * renderer's writes (`lib/iph.ts`) need not carry a copy of a record they did not read.
+ */
+export type SettingsPatch = Omit<Partial<Settings>, 'iph'> & { iph?: Partial<IphState> }
+
+export interface DefaultBrowserStatus {
+  /** Whether this app holds the browser role; null until the host answered (or when it cannot tell). */
+  isDefault: boolean | null
+  prompt: DefaultBrowserPrompt
+  /**
+   * Whether the system lets this app open web links from other apps (DEF-06, Android's "Open by
+   * default" screen): the link-handling switch on Android 12+, the default handler of a plain
+   * `http://` link before it. Absent until the host answered, and on hosts without the screen.
+   */
+  appLinks?: AppLinkState
+}
+
+/** `allowed`: the system hands web links to this app; `disallowed`: it is set not to; `unknown`: it could not say. */
+export type AppLinkState = 'allowed' | 'disallowed' | 'unknown'
+
+/**
+ * Where a request to become the default browser was made from; `newtab` is the phone's new tab
+ * page card (NTP-16), its own name so the card's explicit tap is never read under the banner's
+ * memory rules.
+ */
+export type DefaultBrowserRequestSource = 'onboarding' | 'sheet' | 'banner' | 'settings' | 'newtab'
+
+/**
+ * What came of asking the host for the computer's proxy settings panel (Settings › System):
+ * `opened` – the OS panel is up (or the desktop's settings tool was launched); `unsupported` –
+ * the host has no door to it, as Chrome has none on a Linux desktop outside its table or whose
+ * tool is not on the PATH, and the page says so.
+ */
+export type ProxySettingsDoor = 'opened' | 'unsupported'
+
+// ---------------------------------------------------------------------------
+// Page controls (desktop site, dark theme for sites, page zoom)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether sites get the desktop layout by default. `auto` is Chrome's rule: on large screens
+ * (tablets, foldables open) or with a keyboard and mouse attached.
+ */
+export type DesktopSiteDefault = 'auto' | 'on' | 'off'
+
+/**
+ * The per-site keys are registrable domains (`getDomain`), the way Chrome remembers "desktop
+ * site" and zoom per site. A site is listed only when it differs from the default.
+ */
+export interface PageControlsSettings {
+  desktopSite: DesktopSiteDefault
+  /** Desktop-site exceptions: domain → on / off. */
+  desktopSites: Record<string, boolean>
+  /** Apply a dark theme to sites without one while Ione itself is dark (algorithmic darkening). */
+  darkenSites: boolean
+  /** Darkening exceptions: domain → on / off ("Turn off for this site"). */
+  darkenSiteExceptions: Record<string, boolean>
+  /** Default page zoom (1 = 100 %). */
+  zoom: number
+  /** Multiply the system font size (Android `fontScale`) into the default zoom. */
+  zoomIncludesOsFontSize: boolean
+  /** Per-site zoom: host → factor (Chrome's zoom levels are per host, `zoomSiteKey`). */
+  siteZooms: Record<string, number>
+  /** Override `user-scalable=no` and `maximum-scale` so pinch zoom works everywhere. */
+  forceZoom: boolean
+}
+
+/**
+ * The page-controls policy a host keeps a copy of, so a navigation gets its user agent and its
+ * viewport before the request leaves and before the document starts: the defaults already
+ * resolved for this device, plus the sites that differ. Desktop-site and darkening sites are
+ * registrable domains (`siteKey`); a host matches a URL's host against them by suffix
+ * (`siteValue`). Zoom sites are hosts (`zoomSiteKey`), matched exactly (`zoomValue`).
+ */
+export interface PageRules {
+  desktop: { default: boolean; sites: Record<string, boolean> }
+  darken: { default: boolean; sites: Record<string, boolean> }
+  /** A site's factor (or the default) times `scale` – the system font size when included. */
+  zoom: { default: number; sites: Record<string, number>; scale: number }
+  forceZoom: boolean
+}
+
+/**
+ * What the host knows about the device that the settings alone do not: `auto` desktop mode
+ * follows the screen and the peripherals, the default zoom may follow the system font size.
+ */
+export interface PageEnvironment {
+  /** The smallest width of the screen is 600 dp or more (a tablet, an open foldable, DeX). */
+  largeScreen: boolean
+  /** A hardware keyboard and a mouse are attached. */
+  pointerAndKeyboard: boolean
+  /** The system font scale (Android `Configuration.fontScale`); 1 on hosts without one. */
+  fontScale: number
+  /**
+   * The factor the host draws the chrome's own text at (Android: the chrome WebView's `textZoom`,
+   * `ChromeTextScale.kt`: what the system does to 15 sp, non-linear on Android 14). The chrome
+   * grows its line boxes by it (`lib/textScale.ts`); absent (1) on hosts that scale no text.
+   */
+  textZoom?: number
+  /**
+   * The system's bold-text setting as a weight adjustment (Android 12+
+   * `Configuration.fontWeightAdjustment`: 300 when on); 0 or absent when off.
+   */
+  fontWeightAdjustment?: number
+}
+
+// ---------------------------------------------------------------------------
+// AI agents (the built-in MCP server)
+// ---------------------------------------------------------------------------
+
+/**
+ * How an agent works in the browser. In `foreground` its tab is brought to the front before every
+ * action so the user watches it work; in `background` it drives its tabs without ever changing
+ * what the user is looking at.
+ */
+export type AgentMode = 'foreground' | 'background'
+
+export interface AgentSettings {
+  /** Run the MCP server so AI agents can control the browser. */
+  enabled: boolean
+  /** TCP port of the Streamable HTTP endpoint (`http://127.0.0.1:<port>/mcp`). */
+  port: number
+  /** Also listen on the local network (lets an agent on another device drive this browser). */
+  lan: boolean
+  /** Ask before an unknown agent may connect; agents presenting the token are let in directly. */
+  approveNewAgents: boolean
+  /** Agent names the user has allowed (matched against the MCP client name). */
+  approvedNames: string[]
+  /** Mode agents start in. */
+  defaultMode: AgentMode
+  /** Allow `browser_evaluate` (arbitrary JavaScript in pages). */
+  allowScripts: boolean
+  /** Draw the agent's cursor and name tag in the pages it drives. */
+  showCursor: boolean
+}
+
+/** One connected agent (an MCP session). */
+export interface AgentInfo {
+  id: string
+  name: string
+  version: string
+  /** Accent colour used for its cursor and tab indicators. */
+  color: string
+  mode: AgentMode
+  transport: 'http' | 'stdio'
+  connectedAt: number
+  lastActiveAt: number
+  /** Tabs this agent drives (indicated in the sidebar): the members of its groups. */
+  tabIds: string[]
+  /** Tab groups (folders) this agent owns; a tab belongs to the agent whose group holds it. */
+  groupIds: string[]
+  /** Waiting for the user to allow it. */
+  pending: boolean
+  /** Tool calls handled so far. */
+  calls: number
+}
+
+/**
+ * A named agent that is not connected but still holds its tab groups (a durable session from
+ * `ione_session start`): they stay its own until it resumes or ends, or the user releases them.
+ */
+export interface AwayAgentInfo {
+  claimId: string
+  name: string
+  color: string
+  /** Its groups that still exist. */
+  groupIds: string[]
+  /** The tabs in those groups. */
+  tabIds: string[]
+  lastSeenAt: number
+}
+
+export interface AgentServerStatus {
+  running: boolean
+  /** Loopback endpoint, e.g. `http://127.0.0.1:41735/mcp`. */
+  url: string | null
+  /** Endpoints reachable from other devices (only when `lan` is on). */
+  lanUrls: string[]
+  /** Bearer token that lets an agent skip the approval prompt. */
+  token: string
+  error: string | null
+}
+
+/**
+ * One coding harness the `ione-browser` Agent Skill can be installed for (Settings › AI
+ * Agents › Agent skill): its user-level skills directory and whether Ione's copy is in it.
+ */
+export interface AgentSkillTarget {
+  /** `claude`, `cursor`, `codex`, `opencode`, `gemini`, `copilot` or `agents` (the shared `~/.agents/skills` folder). */
+  id: string
+  /** The harness's name as the row's label ("Claude Code"). */
+  label: string
+  /** The skill's directory as the row shows it (`~/.claude/skills/ione-browser`). */
+  dir: string
+  /** The harness's configuration directory exists on this machine. */
+  detected: boolean
+  /** Ione's copy is there (recorded in the manifest and present on disk). */
+  installed: boolean
+  /** The `metadata.version` of the installed copy; null when not installed. */
+  installedVersion: string | null
+  /** What the last operation left to say about this target (an edited copy kept, an error). */
+  note: string | null
+}
+
+/** The Agent Skill's install state across the harnesses (`Platform.agentSkills`). */
+export interface AgentSkillStatus {
+  /** The skill version this app installs (the app's version). */
+  version: string
+  targets: AgentSkillTarget[]
+  /**
+   * The last operation's first failure – a target's (the same sentence as its `note`) or the
+   * whole operation's (its record could not be saved) – as the status line shows it.
+   */
+  error: string | null
+}
+
+// ---------------------------------------------------------------------------
+// Resource governor (memory / CPU / GPU budgets)
+// ---------------------------------------------------------------------------
+
+/**
+ * How far the governor may go to stay under budget.
+ * - `balanced`: only hidden tabs are purged, throttled, frozen or discarded.
+ * - `strict`: hidden tabs as above; visible split panes may be throttled and purged, the active
+ *   tab may be purged.
+ * - `extreme`: everything in `strict`, plus the active tab is CPU-throttled under CPU pressure
+ *   and reloaded when it alone keeps the browser over the memory budget.
+ */
+export type ResourceEnforcement = 'balanced' | 'strict' | 'extreme'
+
+/**
+ * GPU usage profile (restart required).
+ * - `auto`: hardware acceleration as Chromium decides.
+ * - `low`: hardware compositing stays on, GPU rasterization / video decode / 2D canvas go to CPU.
+ * - `off`: hardware acceleration disabled entirely (software compositing).
+ */
+export type GpuMode = 'auto' | 'low' | 'off'
+
+/** Chromium / V8 switches applied at startup; changing them needs a relaunch. */
+export interface ResourceProcessProfile {
+  /** Maximum number of renderer processes Chromium may keep alive (0 = Chromium default). */
+  rendererProcessLimit: number
+  /** V8 old-space heap cap per renderer in MB (0 = default); pages exceeding it are unloaded. */
+  rendererHeapMb: number
+  /** Chromium's low-end-device mode: smaller caches and tile budgets everywhere. */
+  lowEndDeviceMode: boolean
+  /** Do not keep a warm spare renderer process waiting for the next navigation. */
+  disableSpareRenderer: boolean
+  /** Do not keep previous documents alive in the back/forward cache. */
+  disableBackForwardCache: boolean
+  /**
+   * Folded into `Settings.preloadPages` (PS-43: `none` refuses every speculative request in the
+   * request engine, the prerender's own first fetch among them – no `Prerender2` switch at
+   * startup on either account). Nothing reads it any more; it stays in the persisted shape
+   * because sync's composite `resources` group and a peer on an older build carry it.
+   */
+  disablePrerender: boolean
+  /** Raster worker threads per renderer (0 = default). */
+  rasterThreads: number
+  /** V8: favour a small memory footprint over peak speed. */
+  v8OptimizeForSize: boolean
+}
+
+export interface ResourceSettings {
+  enabled: boolean
+  enforcement: ResourceEnforcement
+  /** Memory budget for the whole browser (every Chromium process) in MB; 0 = use `memoryPercent`. */
+  memoryMb: number
+  /** Percentage of installed RAM used as the memory budget when `memoryMb` is 0. */
+  memoryPercent: number
+  /** CPU budget as a percentage of the whole machine (all cores together = 100). */
+  cpuPercent: number
+  /** GPU process memory budget in MB (0 = unlimited). */
+  gpuMemoryMb: number
+  gpuMode: GpuMode
+  /** Freeze hidden tabs this many minutes after they were last shown (0 = immediately). */
+  freezeAfterMinutes: number
+  /** Freeze every hidden tab once the system has been idle this long (minutes, 0 = off). */
+  idleFreezeMinutes: number
+  /** Hard cap on live pages (WebContents); 0 = unlimited. */
+  maxLoadedTabs: number
+  /** Background page loads allowed at the same time; the rest wait in a queue. */
+  maxConcurrentLoads: number
+  /** Budgets are multiplied by this factor while on battery power (0.25..1). */
+  batteryFactor: number
+  protectPinned: boolean
+  protectEssentials: boolean
+  protectAudible: boolean
+  process: ResourceProcessProfile
+}
+
+export type ResourceKind = 'memory' | 'cpu' | 'gpu'
+
+export interface ResourceGauge {
+  /** Current usage: MB for memory / GPU, percent of the whole machine for CPU. */
+  used: number
+  /** Effective budget after battery tightening (0 = unlimited). */
+  budget: number
+  /** Budget as configured, before battery tightening (0 = unlimited). */
+  configured: number
+}
+
+export interface TabResourceUsage {
+  tabId: string
+  memoryMb: number
+  /** Percent of the whole machine. */
+  cpuPercent: number
+  /** OS processes attributed to the tab (main renderer plus out-of-process iframes). */
+  processes: number
+}
+
+export type GovernorActionKind =
+  | 'purge'
+  | 'throttle'
+  | 'unthrottle'
+  | 'freeze'
+  | 'thaw'
+  | 'discard'
+  | 'reload'
+  | 'pause-media'
+  | 'defer'
+
+export interface GovernorAction {
+  at: number
+  kind: GovernorActionKind
+  tabId: string | null
+  /** Tab title at the time of the action (tabs may be gone by the time the UI renders it). */
+  title: string
+  reason: string
+}
+
+// ---------------------------------------------------------------------------
+// The task manager (`zen://tasks`, Chrome's Shift+Esc; `core/tasks.ts`)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a process in the task manager runs, as Chrome's task manager tells its tasks apart and
+ * as Electron's `ProcessMetric.type` lets a host tell them: the browser process itself; a tab's
+ * renderer – one process per tab, or one for several tabs when the engine puts same-site
+ * documents together; an extension's host (its background page or service worker, its popups
+ * and pages); a DevTools frontend (the toolbox of one tab); the GPU process; a utility process
+ * (the network service, audio, storage – Electron names the service); a renderer the browser
+ * attributes to none of its tabs (a chrome window's own document, a new tab page loading ahead
+ * of its tab); and anything else Electron reports (a zygote, a sandbox helper).
+ */
+export type TaskKind =
+  'browser' | 'tab' | 'extension' | 'devtools' | 'gpu' | 'utility' | 'renderer' | 'other'
+
+/** One task-manager row: a process and what it runs, as of the list's `sampledAt`. */
+export interface TaskInfo {
+  /** The OS process id: the row's key, and what `tasks.end` names. */
+  pid: number
+  kind: TaskKind
+  /**
+   * The row's title, the core's words: the tab's title (the titles joined when tabs share the
+   * process), the extension's name, the utility's service ("Network service"), "GPU process",
+   * "Browser"; the description under it is the kind and the pid, drawn by the page.
+   */
+  title: string
+  /** The row's picture: the tab's favicon, the extension's icon; null for the kind's glyph. */
+  icon: string | null
+  /** The tabs the process serves (kind `tab`), or the one a `devtools` frontend inspects. */
+  tabIds: readonly string[]
+  /** The extension the process hosts (kind `extension`), by its id. */
+  extensionId: string | null
+  /** The process's working set in bytes (Chrome's "Memory footprint"). */
+  memoryBytes: number
+  /** Private (unshared) bytes where the platform reports them (Windows); null elsewhere. */
+  privateBytes: number | null
+  /** CPU use since the last sample as a percentage of one core (Chrome's CPU column; may pass 100). */
+  cpuPercent: number
+  /** Bytes received per second since the last sample, where the host counts them; null where it does not. */
+  networkBytesPerSecond: number | null
+  /** Whether End process may act on it: never the browser process. */
+  endable: boolean
+}
+
+/** The task manager's list: every process, sampled at `sampledAt` (`Date.now()` on the host). */
+export interface TaskList {
+  sampledAt: number
+  tasks: TaskInfo[]
+}
+
+export interface ResourceSnapshot {
+  /** 0 until the governor has taken its first sample. */
+  sampledAt: number
+  memory: ResourceGauge
+  cpu: ResourceGauge
+  gpu: ResourceGauge
+  system: {
+    totalMemoryMb: number
+    cpuCount: number
+    onBattery: boolean
+    /**
+     * The battery's charge, 0–100, where the host can read it (Linux's sysfs, macOS's `pmset`);
+     * null on a computer without a battery and on a host that cannot read the level (Windows
+     * without a native module) – Energy Saver's `low-battery` mode waits on it.
+     */
+    batteryPercent: number | null
+    /**
+     * Whether the computer has a battery to save: true / false where the host can tell (Linux's
+     * sysfs lists a `Battery` supply of the computer's own; macOS's `pmset` lists an
+     * InternalBattery), null where it cannot (Windows without a native module; a host before its
+     * first reading; the phone and tablet shells, which never sample). Chrome hides its Battery
+     * Saver section on a computer without one (`performance_page_index.ts`'s
+     * `showBatterySettings_`, off `BatterySaverModeManager::DeviceHasBattery`); Settings hides
+     * the Energy Saver group on `false` alone – a host that cannot tell shows it.
+     */
+    hasBattery: boolean | null
+    /**
+     * Energy Saver is on now – `Settings.energySaver` met by the power state – and the budgets
+     * are tightened by `batteryFactor` (Chrome's `BatterySaverModeManager::IsBatterySaverActive`,
+     * what its toolbar leaf shows).
+     */
+    energySaver: boolean
+    /** System idle long enough for the idle-freeze rule to apply. */
+    idle: boolean
+  }
+  tabs: TabResourceUsage[]
+  /** Memory (MB) of processes that are not attributable to a tab: browser, GPU, network, utility. */
+  overheadMb: number
+  loadedTabs: number
+  frozenTabs: number
+  throttledTabs: number
+  /** Background loads waiting for a free slot. */
+  queuedLoads: number
+  pressure: ResourceKind[]
+  recentActions: GovernorAction[]
+  /**
+   * The process profile's startup switches derived from the current settings differ from the
+   * ones this process runs with (Resources › Process profile's relaunch notice).
+   */
+  restartRequired: boolean
+  /**
+   * The switches that differ, by name (`pendingStartupSwitches`: `js-flags`,
+   * `disable-features`, `gpu` for hardware acceleration…), for a notice or a log that names what
+   * the relaunch is for. Empty while none does – always on a host without startup switches (the
+   * phone).
+   */
+  pendingSwitches: string[]
+}
+
+// ---------------------------------------------------------------------------
+// Glance, overlays, layout
+// ---------------------------------------------------------------------------
+
+export interface GlanceState {
+  tabId: string
+  parentTabId: string
+  /** Where the click happened (content-area relative, normalised 0..1) – drives the open animation. */
+  originX: number
+  originY: number
+}
+
+export type OverlayKind =
+  | 'none'
+  | 'urlbar'
+  | 'settings'
+  | 'history'
+  | 'bookmarks'
+  | 'downloads'
+  /** The reading list (`zen://reading-list`) as the phone's panel (HB-20). */
+  | 'reading-list'
+  | 'theme'
+  | 'onboarding'
+  | 'shortcuts'
+  | 'space-editor'
+  | 'boosts'
+  | 'addons'
+  | 'live-folder'
+  | 'sync'
+  | 'passwords'
+  /** The print preview (`zen://print`) on a host without page tabs: a tab-modal dialog over the page. */
+  | 'print'
+
+/**
+ * A quit chord held down (`QuitHoldService`): when the hold began (the host's clock, epoch ms),
+ * how long it must last before the app quits, and the chord as the platform spells it ("⌘Q";
+ * the key cap in "Hold ⌘Q to quit"). The panel draws the hold's progress from the first two;
+ * the hold ends – the state goes null – when a key comes up or the time is reached.
+ */
+export interface QuitHoldState {
+  startedAt: number
+  durationMs: number
+  chord: string
+}
+
+export interface WindowState {
+  id: string
+  kind: WindowKind
+  chrome: WindowChrome
+  /** The material this window was created with (windows keep it for their lifetime). */
+  material: WindowMaterial
+  /** The desktop's native frame was used at creation (Settings › Appearance). */
+  nativeFrame: boolean
+  maximized: boolean
+  fullscreen: boolean
+  focused: boolean
+  /** Tab id currently in HTML (element) fullscreen – its view covers the whole window. */
+  htmlFullscreenTabId: string | null
+  /** A window-modal question waiting for an answer ("Close N tabs?"), if any. */
+  prompt: WindowPrompt | null
+  /**
+   * The quit chord being held in this window (session-08, the macOS hold): the chrome shows
+   * "Hold ⌘Q to Quit" with the hold's progress; null while no hold runs. Desktop hosts alone
+   * ever set it (the phone has no quit chord).
+   */
+  quitHold: QuitHoldState | null
+  /** The web app a standalone window shows (`chrome` `app`); null for browser windows. */
+  app: AppWindowInfo | null
+  /**
+   * The name the user gave the window (Chrome's Name window…), trimmed; null while it has none.
+   * The OS title bar reads `<name> — Ione` instead of the active tab's title, and tab search
+   * names the window by it. A host with one window (Android) carries the field inert.
+   */
+  name: string | null
+}
+
+/**
+ * A tab with media: on every host the tab, whether it is audible and whether the tab is muted;
+ * on hosts whose page script reports the Media Session (Android) also what the OS controls
+ * show – the page's metadata (or the tab's title and site), the artwork, the position as of
+ * `positionAt` (epoch ms; the chrome extrapolates from it at `playbackRate`), the actions the
+ * page handles, and whether the window is in picture-in-picture for its video. A chrome player
+ * on the tab (the read-aloud player, `source: 'chrome'`) is the tab's entry while its page has
+ * no media of its own.
+ */
+export interface MediaState {
+  tabId: string
+  playing: boolean
+  /**
+   * The tab's sound is off (`Tab.muted`, W8-8): the desktop host's `webContents.isAudioMuted()`,
+   * the Android host's WebView mute – the tab's mute, not the element's own (`MediaReport.muted`
+   * is the page's). Read with `playing`, so the hub tells a playing tab that is muted (Pause,
+   * the crossed speaker) from a paused one (Play, the speaker); a host's field arrives
+   * null-safe, false where the tab carries none.
+   */
+  muted: boolean
+  title?: string
+  artist?: string
+  album?: string
+  artwork?: string | null
+  video?: boolean
+  position?: MediaPositionInfo | null
+  positionAt?: number
+  actions?: MediaSessionAction[]
+  pictureInPicture?: boolean
+  /**
+   * A private tab's media: title, artist, album and artwork are blank on every surface, and
+   * picture-in-picture is withheld (Chrome withholds it from Incognito; the private tab lock
+   * never arms on a window that left for PiP – ruled 2026-09-21).
+   */
+  private?: boolean
+  /** The media session's tab: the one the OS controls show (the in-app player leads with it). */
+  session?: boolean
+  /** Whose media: the tab's page (absent or `page`), or a chrome player's on that tab (`chrome`: no seek without a position, no PiP). */
+  source?: MediaSessionSourceKind
+}
+
+// ---------------------------------------------------------------------------
+// Screen capture picker, share sheet
+// ---------------------------------------------------------------------------
+
+/** One thing a page may capture, as the picker shows it. */
+export interface ScreenCaptureSource {
+  /** The host's id (`screen:…`, `window:…`), or `tab:<tabId>` for an Ione tab. */
+  id: string
+  name: string
+  kind: 'screen' | 'window' | 'tab'
+  /** A small still of the source (`data:` PNG), null when the host has none. */
+  thumbnail: string | null
+  /** The owning application's icon for windows, the favicon for tabs; null otherwise. */
+  icon: string | null
+}
+
+/** The picker's panes, in its order (Chrome's tab pane leads). */
+export type ScreenCaptureKind = ScreenCaptureSource['kind']
+
+/**
+ * A page's `getDisplayMedia` call, or an extension's `chrome.desktopCapture` call, waiting on
+ * the picker (Chrome's "Choose what to share"): the chrome shows the sources by kind and
+ * answers with `screenCapture.respond`. One per tab.
+ */
+export interface ScreenCaptureRequest {
+  id: string
+  tabId: string
+  /**
+   * The site asking, as a display origin. For an extension's call, the site of the tab it
+   * captures for (`targetTab`), or empty when the extension's own page consumes the stream.
+   */
+  origin: string
+  /**
+   * An extension asking (`chrome.desktopCapture.chooseDesktopMedia`): named in the site's place
+   * with its icon, as Chrome's picker names it. Null for a page's own call.
+   */
+  extension: { name: string; icon: string | null } | null
+  /**
+   * The panes on offer, in the picker's order: an extension asks for some kinds (Chrome hides
+   * the others); a page's call has all three.
+   */
+  kinds: ScreenCaptureKind[]
+  /** The page asked for audio as well. */
+  audio: boolean
+  /** The OS can hand a screen's sound along with its picture (the "Also share system audio" box). */
+  systemAudio: boolean
+  /** Still fetching the OS's list. */
+  loading: boolean
+  sources: ScreenCaptureSource[]
+  requestedAt: number
+}
+
+/** What a page or the browser asked to share, shown by the chrome's share sheet. */
+export interface ShareRequest {
+  id: string
+  /** The tab the share came from (`navigator.share`, or the menu's Share… on a page); null for a chrome share without one. */
+  tabId: string | null
+  windowId: string
+  /** The site whose page called `navigator.share`; null for the browser's own shares. */
+  origin: string | null
+  title: string
+  text: string
+  url: string
+  files: ShareFileInfo[]
+  /** An image a menu shares as a file (the host fetches it); null otherwise. */
+  imageUrl: string | null
+  /** The OS has a share sheet of its own to offer as a row (macOS). */
+  system: boolean
+  requestedAt: number
+}
+
+/** How the user answered the share sheet. */
+export type ShareAnswer = 'copy' | 'email' | 'save' | 'system' | 'dismiss'
+
+/** A tab from another window being dragged over this one (`tab.dragOver`). */
+export interface TabDragOver {
+  tabId: string
+  title: string
+  favicon: string | null
+  /** Pointer position in this window's chrome (CSS px). */
+  x: number
+  y: number
+}
+
+/**
+ * Where a tab landed after the keyboard moved it one place (tabs-34: Ctrl+Shift+PgUp / PgDn,
+ * `tab.moved`). The chrome's live region says it – "Moved to position 2 of 5", with the group
+ * it entered or left – and puts the keyboard back on the row when the move was the strip's.
+ */
+export interface TabMoveResult {
+  tabId: string
+  /** One-based place in the tab's run of rows – the pinned rows, its group's, or the loose rows. */
+  position: number
+  /** How many tabs that run holds. */
+  count: number
+  /** The group the tab was in before the move; null for none (a pinned or loose tab). */
+  from: { folderId: string; name: string } | null
+  /** The group the tab is in after the move; null for none. */
+  to: { folderId: string; name: string } | null
+  /** The move was the focused strip row's (`strip.focus`), not the active tab's. */
+  focused: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Security: blocked pop-ups, site rules, HTTP authentication, client certificates
+// ---------------------------------------------------------------------------
+
+/**
+ * A window a page tried to open without the user asking for it, or (Android) a link to another
+ * application it tried to launch without a gesture.
+ */
+export interface BlockedPopup {
+  url: string
+  at: number
+  kind: 'popup' | 'external'
+}
+
+/** One remembered per-site answer (`permission` may carry a qualifier: `openExternal:zoommtg`). */
+export interface PermissionRule {
+  origin: string
+  permission: string
+  decision: 'allow' | 'deny'
+  /**
+   * The unused-sites clock of an `allow` the sweep can reach (PS-41; Chrome's `last_visited`):
+   * set when the user allows, refreshed by every page visit to the site, floored to the week
+   * (`coarseVisitTime`) so the file keeps no visit log. Absent on a refusal, on a row the sweep
+   * never touches, and on an allow from before the clock that no visit has stamped since.
+   */
+  lastVisitedAt?: number
+  /**
+   * The user allowed the site again after the sweep took the permission (Chrome's
+   * `autorevocation_bypassed_by_user`): no later sweep touches this rule.
+   */
+  keepGranted?: true
+}
+
+/**
+ * Permissions the unused-sites sweep took from one site (PS-41; Chrome's
+ * `REVOKED_UNUSED_SITE_PERMISSIONS`): one record per site, kept 30 days for the Safety check's
+ * review, gone at `expiresAt` or when the user changes any of the site's answers.
+ */
+export interface RevokedSitePermissions {
+  origin: string
+  /** The stored, qualified names (`openExternal:zoommtg`), so an "Allow again" restores each as it was. */
+  permissions: string[]
+  /** Unix milliseconds. */
+  revokedAt: number
+  /** `revokedAt` + 30 days. */
+  expiresAt: number
+}
+
+/** The user's answer to a permission prompt; `dismiss` refuses this request without remembering. */
+export type PermissionPromptAnswer = 'allow' | 'block' | 'allow-once' | 'dismiss'
+
+/**
+ * A pending permission question the chrome shows over a tab, non-modal, one at a time per tab:
+ * "Allow example.com to use your camera?" with Allow / Block / Allow once, answered by
+ * `permissions.respond`. Withdrawn when the page navigates or the tab closes.
+ */
+export interface PermissionPrompt {
+  id: string
+  /** Tab whose page asked; null when the host could not say (the focused window shows it). */
+  tabId: string | null
+  origin: string
+  /** Base permission name (`camera`, `media`, `geolocation`), for the prompt's glyph. */
+  permission: string
+  message: string
+  detail: string
+  allowLabel: string
+  blockLabel: string
+  /** Whether "Allow once" (until the tab leaves the site) is offered. */
+  allowOnce: boolean
+  requestedAt: number
+  /**
+   * A quiet request (Chrome's quiet notification permission UI, NOT-03): a site the user
+   * dismissed before, or a request made without a gesture, asks through the bell-off glyph in
+   * the pill's slot instead of a sheet; the sheet opens from the bell. Not counted as a
+   * dismissal when it goes unanswered.
+   */
+  quiet?: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Device choosers: Web Bluetooth, WebUSB, Web Serial, WebHID
+// ---------------------------------------------------------------------------
+
+/** The device kinds a page may ask to connect to: the `bluetooth`, `usb`, `serial`, `hid` rows. */
+export type DeviceKind = 'bluetooth' | 'usb' | 'serial' | 'hid'
+
+/** One device the engine enumerated for a chooser. */
+export interface DeviceCandidate {
+  /**
+   * The engine's id for this request (`deviceId`, a serial `portId`, a Bluetooth address):
+   * opaque, and stable while the chooser is open.
+   */
+  id: string
+  /** The row's title: the engine's name for the device, else "Unknown device (vendor:product)". */
+  name: string
+  /** A second line where there is one (a serial number, a port's path); '' otherwise. */
+  detail: string
+}
+
+/**
+ * A page called `navigator.<kind>.requestDevice()` (`requestPort()` for serial): the chrome
+ * shows one modal list per request, as Chrome's chooser bubble does, and the list stays live –
+ * the host adds and removes candidates while the request is open. Answered by `devices.respond`
+ * with the picked candidate (Connect) or null (Cancel: the page's promise rejects with
+ * `NotFoundError`, as in Chrome). Withdrawn when the page navigates or the tab closes.
+ */
+export interface DeviceChooser {
+  id: string
+  /** Tab whose page asks; the chooser is tab-modal. Null when the host could not say. */
+  tabId: string | null
+  /** The requesting frame's site (`permissionSite`), shown through `displayOrigin`. */
+  origin: string
+  kind: DeviceKind
+  candidates: DeviceCandidate[]
+  /** Bluetooth: the adapter is still scanning and the list may still grow. */
+  scanning: boolean
+  /**
+   * What the empty state can say about the platform: nothing, or that Linux hands USB and HID
+   * devices to a browser only through a udev rule (Chrome's own empty state says the same).
+   */
+  hint: 'none' | 'linux-udev'
+  requestedAt: number
+}
+
+/**
+ * A device a site was connected to through a chooser: the DATA of its `usb` / `serial` / `hid`
+ * / `bluetooth` setting, never a plain allow – the setting stays `ask` (the chooser is the
+ * prompt) and `block` refuses the site every device without one. `deviceId` is the engine's id
+ * of the session the grant was made in; the identity fields find the device again in a later
+ * session, as Chrome persists only the devices it can recognise by serial number.
+ */
+export interface DeviceGrant {
+  origin: string
+  kind: DeviceKind
+  deviceId: string
+  name: string
+  vendorId: number | null
+  productId: number | null
+  serialNumber: string | null
+  /** Unix milliseconds. */
+  grantedAt: number
+}
+
+/**
+ * Bluetooth pairing while a site connects a device: the OS wants a confirmation, a PIN compared
+ * or a PIN typed. Shown by the chrome as a second dialog over the chooser's tab; answered by
+ * `devices.respondPairing`.
+ */
+export interface DevicePairingPrompt {
+  id: string
+  tabId: string | null
+  deviceId: string
+  /** The device's name where the chooser knew it; else its id. */
+  deviceName: string
+  kind: 'confirm' | 'confirmPin' | 'providePin'
+  /** `confirmPin`: the PIN the device shows, for the user to compare; '' otherwise. */
+  pin: string
+}
+
+/** The user's answer to a pairing prompt; cancelling sends null instead. */
+export interface DevicePairingResponse {
+  confirmed: boolean
+  /** `providePin`: what the user typed. */
+  pin?: string
+}
+
+// ---------------------------------------------------------------------------
+// Clear browsing data and Safety check
+// ---------------------------------------------------------------------------
+
+/**
+ * Chrome's time ranges: the last 15 minutes, hour, 24 hours, 7 days, 4 weeks, or everything
+ * (`browsing_data::TimePeriod`, `components/browsing_data/core/browsing_data_utils.h`:
+ * `LAST_15_MINUTES` beside `LAST_HOUR` … `ALL_TIME`; both hosts' dialogs offer the 15 minutes –
+ * `IDS_SETTINGS_CLEAR_PERIOD_15_MINUTES` on the desktop, `IDS_CLEAR_BROWSING_DATA_TAB_PERIOD_
+ * 15_MINUTES` on Android, where it is Quick Delete's default).
+ */
+export type BrowsingDataRange = '15min' | 'hour' | 'day' | 'week' | 'month' | 'all'
+
+/**
+ * What "Clear browsing data" can remove. `history`, `cookies` and `cache` are Chrome's Basic
+ * set; the rest of the dialog's list is Advanced. `cookies` covers cookies and every other kind
+ * of site data. `tabs` is the phone's alone (Chrome Android's Quick Delete, HB-07 – its Tabs
+ * row; Chrome's desktop dialog closes no tabs, so it is in neither set): the tabs whose last
+ * committed navigation falls in the range close, with no undo and no "Recently closed" entry.
+ */
+export type BrowsingDataType =
+  | 'history'
+  | 'cookies'
+  | 'cache'
+  | 'downloads'
+  | 'passwords'
+  | 'autofill'
+  | 'sitePermissions'
+  | 'recentlyClosed'
+  | 'tabs'
+
+export const BROWSING_DATA_BASIC: readonly BrowsingDataType[] = ['history', 'cookies', 'cache']
+export const BROWSING_DATA_ADVANCED: readonly BrowsingDataType[] = [
+  'history',
+  'cookies',
+  'cache',
+  'downloads',
+  'passwords',
+  'autofill',
+  'sitePermissions',
+  'recentlyClosed'
+]
+
+/** The preview line of one type in the dialog: how much would go. */
+export interface BrowsingDataCount {
+  type: BrowsingDataType
+  /** Items of `unit` in the range; null when the engine cannot count this type. */
+  count: number | null
+  unit: 'visits' | 'sites' | 'bytes' | 'downloads' | 'logins' | 'entries' | 'permissions' | 'tabs'
+  /** False when the engine cannot limit this type to the range: clearing removes all of it. */
+  rangeApplies: boolean
+  /** Why the type cannot be cleared right now (the vault is locked), or null. */
+  unavailable: string | null
+}
+
+export interface ClearBrowsingDataResult {
+  /** Types that were cleared. */
+  cleared: BrowsingDataType[]
+}
+
+export type SafetyState = 'safe' | 'info' | 'warning' | 'unavailable'
+
+/** One row of Safety check: a state for the glyph and a sentence for the row. */
+export interface SafetyCheckRow {
+  state: SafetyState
+  summary: string
+}
+
+export interface SafetyCheckResult {
+  checkedAt: number
+  updates: SafetyCheckRow & { currentVersion: string; latestVersion: string | null }
+  safeBrowsing: SafetyCheckRow & { configured: boolean; enabled: boolean | null }
+  passwords: SafetyCheckRow & {
+    compromised: number
+    weak: number
+    reused: number
+    /** The counts are known: the checkup ran on this device, or a sign-in leak check flagged a login. */
+    known: boolean
+    /** When the last full checkup finished on this device; null when it never ran. */
+    checkedAt: number | null
+  }
+  /**
+   * Sites holding several granted permissions, or granted ones whose site was not visited for
+   * weeks (the rules' own `lastVisitedAt`), and the permissions the unused-sites sweep took
+   * (PS-41): the revoked list as it stands after the sweep this check ran first.
+   */
+  permissions: SafetyCheckRow & {
+    grantedSites: number
+    review: Array<{ origin: string; permissions: string[]; reason: 'many' | 'unused' }>
+    revoked: Array<{ origin: string; permissions: string[]; revokedAt: number }>
+  }
+  /** Sites allowed to send notifications, busiest first (`shown` counts this session). */
+  notifications: SafetyCheckRow & { sites: Array<{ origin: string; shown: number }> }
+  extensions: SafetyCheckRow & {
+    flagged: Array<{ id: string; name: string; reasons: string[] }>
+  }
+}
+
+export interface ClientCertificateInfo {
+  fingerprint: string
+  subject: string
+  issuer: string
+  serialNumber: string
+  /** Unix milliseconds. */
+  validFrom: number
+  validTo: number
+}
+
+/** A server or proxy asked for credentials (Basic, Digest, NTLM, Negotiate). */
+export interface HttpAuthPrompt {
+  id: string
+  kind: 'http-auth'
+  /** Tab whose page triggered it; null for proxy challenges outside any page. */
+  tabId: string | null
+  host: string
+  port: number
+  realm: string
+  /** Lower-case challenge scheme ('basic', 'digest', 'ntlm', 'negotiate'); '' when unknown. */
+  scheme: string
+  isProxy: boolean
+  /** Whether the credentials travel over TLS. */
+  secure: boolean
+  /** The previous answer for this realm was refused. */
+  failedBefore: boolean
+  /** The username of that refused answer, so only the password needs retyping; '' otherwise. */
+  username: string
+}
+
+export interface ClientCertificatePrompt {
+  id: string
+  kind: 'client-certificate'
+  tabId: string | null
+  host: string
+  certificates: ClientCertificateInfo[]
+}
+
+export type SecurityPrompt = HttpAuthPrompt | ClientCertificatePrompt
+
+/** The user's answer; cancelling a prompt sends null instead. */
+export type SecurityPromptResponse =
+  | { kind: 'http-auth'; username: string; password: string; remember: boolean }
+  | { kind: 'client-certificate'; index: number }
+
+/** What the interstitial and site information show of a server certificate Ione refused. */
+export interface CertificateDetails {
+  subjectName: string
+  issuerName: string
+  /** Unix milliseconds; 0 when the host does not know. */
+  validStart: number
+  validExpiry: number
+  /** `sha256/…` as Chromium prints it; the session's exceptions are keyed by it. */
+  fingerprint: string
+}
+
+/**
+ * A main-frame https load whose certificate failed verification (`ERR_CERT_*`). Until the user
+ * proceeds the tab shows the certificate interstitial for `url`; once `bypassed`, the page is
+ * shown over the broken certificate and the connection reports as not secure, as in Chrome.
+ */
+export interface CertificateError {
+  /** The Chromium `net::` error code (-200 … -299). */
+  code: number
+  url: string
+  /** Null when the host could not describe the certificate. */
+  certificate: CertificateDetails | null
+  bypassed: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Page dialogs: alert / confirm / prompt and "Leave site?"
+// ---------------------------------------------------------------------------
+
+export type PageDialogKind = 'alert' | 'confirm' | 'prompt' | 'beforeunload'
+
+/**
+ * A dialog a page opened (`alert`, `confirm`, `prompt`) or the "Leave site?" question its
+ * `beforeunload` handler raised. The chrome shows it tab-modal, as Chrome does; the page waits
+ * for the answer.
+ */
+export interface PageDialog {
+  id: string
+  kind: PageDialogKind
+  tabId: string
+  /** The site that opened it, the way Chrome titles the dialog ("example.com says"); '' when unknown. */
+  site: string
+  /** A frame of another site opened it ("An embedded page at example.com says"). */
+  embedded: boolean
+  message: string
+  /** `prompt`: the field's initial text. */
+  defaultValue: string
+}
+
+/** The user's answer; `value` carries the prompt's text when accepted. */
+export interface PageDialogResponse {
+  accepted: boolean
+  value: string | null
+}
+
+/**
+ * How an AI agent wants the page dialogs on its tabs answered, said ahead of an action through
+ * `browser_dialog_policy` (`HostCapabilities.agentDialogPolicy`): the rules of one `set`, for
+ * one tab or for every tab the agent owns. Each kind is a rule of its own; a kind left out
+ * keeps the default answer (confirm Cancel, prompt Cancel, "Leave site?" leave). Alerts have
+ * no rule: OK is their only answer, and they are reported like the rest. A tab's own rules
+ * stand over the session-wide ones kind by kind; the result, resolved, is the tab's
+ * `AgentDialogPolicy`.
+ */
+export interface AgentDialogRules {
+  /** `confirm()`: OK (`accept`) or Cancel (`dismiss`). */
+  confirm?: 'accept' | 'dismiss'
+  /**
+   * `prompt()`: OK with the page's default text (`accept`), Cancel (`dismiss`), or OK with
+   * the agent's own text.
+   */
+  prompt?: 'accept' | 'dismiss' | { text: string }
+  /**
+   * "Leave site?" (`beforeunload`) on a tab the user is not looking at: let the navigation go
+   * (`leave`) or cancel it (`stay`). Governs the agent's own navigations and the page's there;
+   * a close the USER makes on the tab, and every "Leave site?" of a tab in front of the user,
+   * follows the user's rules and is never held by `stay`.
+   */
+  beforeunload?: 'leave' | 'stay'
+}
+
+/**
+ * Which rule of the agent's dialog policy answers a kind, or answered a dialog: the tab's own
+ * (`tab`), the session-wide one (`session`), or none – the default answer (`default`).
+ */
+export type AgentDialogRuleScope = 'tab' | 'session' | 'default'
+
+/**
+ * The EFFECTIVE dialog policy of one tab of an agent – its own rules over the session-wide
+ * ones, each kind resolved to its answer and to the rule that supplies it – as the core hands
+ * it to a host that answers page dialogs itself (`TabView.setDialogPolicy`; `null` when no
+ * rule covers the tab). The host answers a kind from its entry at once, the default for a kind
+ * left out (confirm Cancel, prompt Cancel, "Leave site?" leave; an alert always OK), and
+ * reports every answer through `TabViewEvents.onPageDialogAnswered` with the entry's `rule`
+ * (`default` for a kind left out). The host never spends a rule itself: the core spends a
+ * `once` rule on receiving the report – `rule` says which – and hands the view the policy
+ * that is left (or `null`).
+ */
+export interface AgentDialogPolicy {
+  confirm?: { answer: 'accept' | 'dismiss'; rule: 'tab' | 'session' }
+  prompt?: { answer: 'accept' | 'dismiss' | { text: string }; rule: 'tab' | 'session' }
+  beforeunload?: { answer: 'leave' | 'stay'; rule: 'tab' | 'session' }
+}
+
+/**
+ * The answer a page dialog on an agent's tab got: `accept` (OK) / `dismiss` (Cancel) for
+ * alert, confirm and a prompt answered without text; `{ text }` for a prompt answered OK with
+ * that text (the page's default or the agent's); `leave` / `stay` for "Leave site?".
+ */
+export type AgentDialogAnswer = 'accept' | 'dismiss' | { text: string } | 'leave' | 'stay'
+
+/**
+ * A page dialog on an agent's tab that was answered without the agent – by a rule of its
+ * dialog policy or by the default answer. The core turns it into the `Notice:` line of the
+ * agent's next result, the same words on every host, and spends the `once` rule `rule` names.
+ * A host that answers dialogs itself reports through `TabViewEvents.onPageDialogAnswered`
+ * (Android's WebChromeClient); on hosts whose dialogs reach the core
+ * (`HostCapabilities.agentDialogs`) the core builds the same report for what it answered.
+ */
+export interface PageDialogAnswered {
+  kind: PageDialogKind
+  /** The URL of the document that opened the dialog (the site is derived from it). */
+  url: string
+  /**
+   * The dialog's message, which the core quotes capped at 500 characters (a host may cap it
+   * there too). For `beforeunload` Chrome shows its own line – "Changes you made may not be
+   * saved." – whatever the page set, and that line is what a host reports.
+   */
+  message: string
+  /** `prompt`: the field's initial text, quoted beside the message; left out for the other kinds. */
+  defaultValue?: string
+  answer: AgentDialogAnswer
+  /**
+   * Which rule answered: the entry's `rule` in the tab's `AgentDialogPolicy` (`tab` or
+   * `session`), `default` for a kind the policy left out or when no policy was handed. An
+   * alert has no rule: it carries `tab` when the policy handed to the view has a kind from the
+   * tab's own rules, else `session` when it has any kind, else `default` – the Notice's tag.
+   */
+  rule: AgentDialogRuleScope
+}
+
+/**
+ * A question the chrome asks about a window as a whole (window-modal): whether to close the
+ * window with its tabs, to quit Ione with every open tab, to open a bookmark folder's many
+ * pages at once (`open-bookmarks`: the desktop's form of Chrome's "Open all bookmarks?"), or to
+ * turn caret browsing on (`caret-browsing`: Chrome's one-time F7 confirm, CT-34; `count` is 0).
+ */
+export interface WindowPrompt {
+  id: string
+  kind: 'close-tabs' | 'quit' | 'open-bookmarks' | 'caret-browsing'
+  /**
+   * How many tabs close, for the warning about them ("You are about to quit with N tabs open");
+   * 0 when that warning is not part of the question – a single tab, or the setting off – and the
+   * downloads alone are asked about. For `open-bookmarks`, how many tabs would open.
+   */
+  count: number
+  /**
+   * The downloads in progress the answer ends (downloads-35): every one when Ione quits – the
+   * quit itself, or the last window closing where that quits – the private ones when the last
+   * private window closes. Null when none is running. One prompt carries both questions.
+   */
+  downloads: WindowPromptDownloads | null
+}
+
+/** The downloads a window prompt asks about, and what ends them. */
+export interface WindowPromptDownloads {
+  count: number
+  end: 'quit' | 'private-window'
+}
+
+/** The last run ended without a clean shutdown; the chrome offers to bring its pages back. */
+export interface CrashRestoreOffer {
+  tabCount: number
+  windowCount: number
+}
+
+/** What Ione does with the previous session's pages after an unclean exit. */
+export type CrashRestoreMode = 'ask' | 'always' | 'never'
+
+/**
+ * The device's connectivity as the chrome shows it (`core/connectivity.ts`): the host's raw
+ * word, debounced, so a network switch never flashes the offline banner.
+ */
+export interface NetworkStatus {
+  /**
+   * False while the device has had no validated route to the internet for the debounce window:
+   * the phone chrome shows "No internet connection" (v2 §9.33) and the error pages that mean
+   * offline reload themselves once it turns true again.
+   */
+  online: boolean
+}
+
+// ---------------------------------------------------------------------------
+// The full UI state snapshot broadcast to the renderer
+// ---------------------------------------------------------------------------
+
+export interface UIState {
+  platform: Platform
+  capabilities: HostCapabilities
+  version: string
+  /**
+   * Whether the host resolves the OS colour scheme to dark (the `system` choice); null when the
+   * host has no say and the chrome reads `prefers-color-scheme` itself.
+   */
+  systemDark: boolean | null
+  /**
+   * The OS accent colour as the host reads it, `#rrggbb` (Electron's `systemPreferences.
+   * getAccentColor` on Windows and macOS, followed as it changes); null where the OS has none
+   * the host can read (Linux) or the host has no reading at all (Android). What Settings ›
+   * Appearance › Use system accent colour (`Settings.useSystemAccent`, settings-116) puts in
+   * the chrome's accent for a space without a theme of its own (`hooks/useTheme.ts`).
+   */
+  systemAccent: string | null
+  tabs: Record<string, Tab>
+  /** Ordered essential tab ids (all containers – the UI filters by container). */
+  essentialTabIds: string[]
+  spaces: Space[]
+  activeSpaceId: string
+  containers: Container[]
+  folders: Record<string, Folder>
+  splitGroups: Record<string, SplitGroup>
+  settings: Settings
+  shortcuts: Shortcut[]
+  searchEngines: SearchEngine[]
+  /** The extension holding the default search engine, if one does (`defaultSearchEngineOf`). */
+  searchEngineControl: SearchEngineControl | null
+  /** The EEA's search-engine choice screen: whether it is owed, and the run's list order (W6-2). */
+  searchChoice: SearchChoiceState
+  /**
+   * The settings an extension holds, keyed by the setting's path in `Settings` (`fonts.
+   * standard`, `fonts.size`, `fonts.minimumSize`) or by a name for a setting kept elsewhere
+   * (`proxy`), each the controlling extension; empty when none is. A Settings row whose key is
+   * in the map draws Chrome's extension-controlled indicator (`ExtensionControl`).
+   */
+  extensionControls: Record<string, ExtensionControl>
+  glance: GlanceState | null
+  compactSidebarRevealed: boolean
+  window: WindowState
+  /** Newest first; private windows also see their private downloads, other windows never do. */
+  downloads: DownloadItem[]
+  downloadsProgress: DownloadsProgress
+  /** Every bookmark node (roots included), ordered parent-first, then by index. */
+  bookmarks: BookmarkNode[]
+  /**
+   * The reading list (W6-1, bookmarks-33), unread first and newest first within each half
+   * (`sortReadingList`): the `zen://reading-list` page's rows and the bookmarks bar control's
+   * unread count (`unreadReadingCount`). At most `READING_LIST_CAP` of the entries are READ
+   * (`trimReadingList` drops the oldest by `readAt` past it); the unread half is unbounded – an
+   * unread entry is never trimmed.
+   */
+  readingList: ReadingListEntry[]
+  /** The new tab page's shortcuts on this device, in grid order (Settings and the phone's page). */
+  newTabShortcuts: NewTabShortcut[]
+  /** Hosts removed from the new tab page's most-visited tiles on this device (the phone filters). */
+  newTabHiddenHosts: string[]
+  /** The Magic Stack's modules hidden on this device (NTP-16; the phone's page and its Customise sheet). */
+  newTabHiddenModules: MagicStackModuleId[]
+  /** The Safety check card's memory on this device (NTP-19; `NewTabDeviceState.safetyHubCard`). */
+  newTabSafetyHubCard: SafetyHubCardMemories
+  /** The tip card's memory on this device (NTP-20; `NewTabDeviceState.educationalTips`). */
+  newTabEducationalTips: EducationalTipMemory
+  /**
+   * Settings › Privacy and Security › Lock private tabs when you leave Ione, this device's
+   * (`BrowserState.privateDevice`; the phone host's row). The lock itself is the host's, in
+   * memory (`lib/privateLock.ts`); the core only keeps the switch.
+   */
+  privateLockOnLeave: boolean
+  /**
+   * The update dot's per-version 'seen' record, this device's (`BrowserState.updateDot`,
+   * `core/updateDot.ts`; TB-12): the waiting update's version the app menu was last opened for.
+   * Every layout's menu button – the phone bar's ⋮, the tablet toolbar's, the desktop's ⋯ (W8-F3)
+   * – reads `updateDotShows(updates, updateDot)`: the dot clears on the menu's first open for a
+   * version and returns for another version's `ready`.
+   */
+  updateDot: UpdateDotRecord
+  /**
+   * The new tab page's custom background: whether one is set, whether the host can open a file
+   * picker for one (the phone's page reads the file itself and stores it through `set`), and
+   * the colour the picture suggests for the space's accent (NTP-14; `#rrggbb`, fitted to read on
+   * both panels) – null with no image, while it is still being read, or on a host that cannot
+   * decode the file. Settings' "Use the picture's colour" switch arms on it.
+   */
+  newTabBackground: { image: boolean; canPick: boolean; accent: string | null }
+  recentlyClosedCount: number
+  /** Newest first, at most 10 – enough for menus to render without a round trip. */
+  recentlyClosed: ClosedEntrySummary[]
+  /**
+   * How many tabs the Inactive tabs archive holds (TAB-20): the count on the overview's entry
+   * row. The rows themselves come through `inactiveTabs.list`, read again on `inactiveTabs.changed`.
+   */
+  archivedTabCount: number
+  media: MediaState[]
+  findResult: FindResult | null
+  /** Tab id whose devtools are open (for the toolbar indicator). */
+  devtoolsOpenFor: string[]
+  resources: ResourceSnapshot
+  /**
+   * Visible tabs whose live page is currently shown in another window. Zen renders a dimmed
+   * preview for them; focusing this window moves the page here.
+   */
+  foreignTabIds: string[]
+  /** Number of open windows (Zen shows "Move to…" helpers only when it matters). */
+  windowCount: number
+  boosts: Boost[]
+  /** Tab whose page is in "zap element" mode, if any. */
+  zappingTabId: string | null
+  liveFolders: Record<string, LiveFolderConfig>
+  extensions: ExtensionInfo[]
+  /** The last update check across all extensions, for the management page's caption. */
+  extensionUpdates: ExtensionUpdateCheck
+  /** The extension side panel this window shows beside the page, if one is open for its tab. */
+  sidePanel: SidePanelInfo | null
+  mods: Mod[]
+  /**
+   * The web apps installed on this host (`WebAppService.installed`), in the order they were
+   * installed, each with how many of its windows stand open: Settings › Apps lists, opens and
+   * uninstalls them (shortcuts-menus-138), asking first when a window would close (§9.23; #435).
+   */
+  webApps: InstalledWebApp[]
+  sync: SyncStatus
+  /** Connected AI agents (MCP sessions) and the tabs they drive. */
+  agents: AgentInfo[]
+  /** Named agents that are not connected but still hold their tab groups. */
+  awayAgents: AwayAgentInfo[]
+  agentServer: AgentServerStatus
+  /** The `ione-browser` Agent Skill's install state per harness (`capabilities.agentSkills`). */
+  agentSkills: AgentSkillStatus
+  /** Automatic updates: what the browser knows about the latest release and how far it got. */
+  updates: UpdateStatus
+  /** The password vault: lock state, protection, counts and the last checkup (never secrets). */
+  passwords: PasswordsStatus
+  /** Default-browser role: whether Ione holds it and which prompt (if any) is due. */
+  defaultBrowser: DefaultBrowserStatus
+  /** The device's connectivity, debounced; hosts without a monitor are online for good. */
+  network: NetworkStatus
+  /** Pop-ups the blocker refused, per tab (the URL bar shows an indicator). */
+  blockedPopups: Record<string, BlockedPopup[]>
+  /** Every remembered per-site permission answer (Settings lists and revokes them). */
+  permissionRules: PermissionRule[]
+  /**
+   * Permissions the unused-sites sweep took (PS-41), the newest revocation first: the Safety
+   * check's review reads it, and every change of the list is pushed.
+   */
+  revokedUnusedPermissions: RevokedSitePermissions[]
+  /**
+   * The effective default of every content-settings catalogue row (Settings › Site settings):
+   * the user's choice where there is one, else the catalogue's. Keyed by the row's id.
+   */
+  permissionDefaults: Record<string, ContentDefault>
+  /** The last Safety check's result, kept until the next run; null before the first. */
+  lastSafetyCheck: SafetyCheckResult | null
+  /** Pending permission prompts, oldest first; the chrome shows its active tab's first one. */
+  permissionPrompts: PermissionPrompt[]
+  /** Pending HTTP authentication and client-certificate prompts, oldest first. */
+  securityPrompts: SecurityPrompt[]
+  /** Open device choosers (a page's `requestDevice()`), oldest first; one shows per tab. */
+  deviceChoosers: DeviceChooser[]
+  /** Pending Bluetooth pairing prompts, oldest first. */
+  devicePairings: DevicePairingPrompt[]
+  /** Every device a site is connected to (Settings › Site settings and the site-information rows). */
+  deviceGrants: DeviceGrant[]
+  /** Pending `alert` / `confirm` / `prompt` and "Leave site?" dialogs of pages, oldest first. */
+  pageDialogs: PageDialog[]
+  /**
+   * Tabs the user has told to close whose close is still in flight (`tab.close`,
+   * `tab.closeMany`): their pages' `beforeunload` handlers are being run, one that objects
+   * asking "Leave site?" – on a host that draws that question itself (Android) the chrome hears
+   * of it only here. The phone overview holds a card's exit while its tab is listed.
+   */
+  closingTabIds: string[]
+  /** Pages waiting on the screen-capture picker, oldest first (one per tab). */
+  screenCaptureRequests: ScreenCaptureRequest[]
+  /** Shares waiting on this window's share sheet, oldest first. */
+  shareRequests: ShareRequest[]
+  /**
+   * The share another app sent that waits on this window's chooser (MW-63): an installed web
+   * app declares a target for it, so the chrome draws the chooser and answers with
+   * `share.chooserPick` or `share.chooserCancel`. Part of the snapshot, not an event: a share
+   * that cold-starts the app reaches the core before the chrome has subscribed to anything, and
+   * the chooser must still be up once the chrome draws. One at a time – a newer share takes it
+   * over – and null while none waits (always null on hosts without a share intake).
+   */
+  shareChooser: ShareChooser | null
+  /** The pages of an unclean exit the chrome should offer to restore; null when there are none. */
+  crashRestore: CrashRestoreOffer | null
+  /** In-page autofill: save prompts, the account / address / card picker, entry counts. */
+  autofill: AutofillUIState
+  /** Ad and tracker blocking: lists, their freshness and the session counter. */
+  blocking: BlockingStatus
+  /** Safe Browsing feeds, HTTPS-only exceptions and the resolver's secure DNS state. */
+  privacy: PrivacyStatus
+  /**
+   * Per-site cookie and site-data exceptions (the default and Chrome's three lists), what is
+   * cleared on exit and whether that happens at quit or at the next launch on this host.
+   */
+  siteData: SiteDataStatus
+  /** Page translation: preferences, models on the device and the per-tab translation state. */
+  translate: TranslateUIState
+  /** The device facts the page controls resolve against (screen class, peripherals, font scale). */
+  pageEnvironment: PageEnvironment
+  /** Spell check on this host: its dictionaries and their state, or the Android limit. */
+  spellcheck: SpellcheckStatus
+  /**
+   * Read aloud's one session (Chrome reads one page at a time): its tab, status, sentence and
+   * word, speed and voice (`shared/readAloud.ts`); null without a session.
+   */
+  readAloud: ReadAloudState | null
+  /** The import from another browser or file that is running or just finished; null otherwise. */
+  import: ImportProgress | null
+  /**
+   * The settled text selection the chrome's mini menu stands over (CT-39): its tab, text, box
+   * and chips; null while nothing is selected. Desktop hosts with `capabilities.selectionMenu`.
+   */
+  selectionMenu: SelectionMenuState | null
+}
+
+export interface FindResult {
+  tabId: string
+  activeMatchOrdinal: number
+  matches: number
+}
+
+// ---------------------------------------------------------------------------
+// URL bar suggestions
+// ---------------------------------------------------------------------------
+
+/**
+ * `answer`: a calculator, unit, currency, weather, time or dictionary row (the answer is the
+ * title, the question the subtitle). `entity`: a Wikipedia summary row (name, description,
+ * thumbnail). Both open their `url` on Enter, never inline-complete.
+ */
+export type SuggestionKind =
+  | 'url'
+  | 'search'
+  | 'history'
+  | 'bookmark'
+  | 'tab'
+  | 'space'
+  | 'command'
+  | 'engine'
+  | 'answer'
+  | 'entity'
+  /** A `chrome.omnibox` row: the input belongs to an extension whose keyword starts it. */
+  | 'omnibox'
+  /**
+   * What the clipboard holds, offered on an empty field (Chrome's "Link you copied" / "Text
+   * you copied"): the row names the kind only, read from the clip's description; the content is
+   * read once, on the reveal or the pick (`clipboard.read`). `targetId` is the kind.
+   */
+  | 'clipboard'
+  /**
+   * A tab group whose name (or a member page's address) the typing starts a word of (OMN-15;
+   * Chrome's `TabGroupProvider`, `AutocompleteMatchType::TAB_GROUP`): the title is the group's
+   * name, the subtitle its pages' hosts, `targetId` the folder – the pick is `folder.open`.
+   */
+  | 'folder'
+
+export interface Suggestion {
+  id: string
+  kind: SuggestionKind
+  title: string
+  subtitle: string
+  /** URL to navigate to (or search URL). */
+  url: string | null
+  favicon: string | null
+  /**
+   * For kind = tab: the tab to switch to. For kind = space: the space id. For command: the
+   * action. For kind = folder: the group (folder) to open.
+   */
+  targetId: string | null
+  /** Text to place in the input when the suggestion is highlighted (for inline completion). */
+  fill: string
+  /**
+   * Set on the first row when it is the default match to complete inline: `fill` starts with
+   * what was typed and the row outranks the verbatim query (Chrome's rule), so the field shows
+   * the remainder selected and Enter accepts it.
+   */
+  inline?: boolean
+  /** Chromium-style relevance the rows were ordered by (1300 is the verbatim query). */
+  relevance?: number
+  /**
+   * The row can be removed by the user (Shift+Delete, the hover X; omnibox-22): a history row,
+   * a remembered search, an omnibox row its extension marked deletable
+   * (`omnibox.onDeleteSuggestion`). Bookmarks and open tabs are not, as in Chrome.
+   */
+  deletable?: boolean
+  /**
+   * The section the row is listed under (zero-suggest's "Recent searches", omnibox-20): the
+   * popup draws a heading where a new group starts. Rows without one are in no section.
+   */
+  group?: string
+}
+
+export interface CommandDescriptor {
+  id: string
+  label: string
+  keywords: string[]
+  action:
+    | ShortcutAction
+    | 'settings.open'
+    | 'theme.open'
+    | 'space.new'
+    | 'history.open'
+    | 'bookmarks.open'
+    | 'readingList.add'
+    | 'readingList.open'
+    | 'downloads.open'
+    | 'tab.freezeOthers'
+    | 'tab.wakeAll'
+    | 'tab.moveToNewWindow'
+    | 'page.toggleMuteSite'
+    | 'resources.trim'
+    | 'resources.open'
+    | 'passwords.open'
+    | 'translate.open'
+    | 'search.manageEngines'
+  /** The host capability the command needs; not offered where it is false. */
+  requires?: keyof HostCapabilities
+  /** The layouts the command does something in; absent means all of them. */
+  layouts?: FormFactor[]
+}
+
+// ---------------------------------------------------------------------------
+// Renderer-hosted menus (hosts without native popup menus)
+// ---------------------------------------------------------------------------
+
+/**
+ * The glyph an icon-row item draws. The phone app menu's first group is Chrome's row of icon
+ * buttons (Forward, Home while a homepage is set, the bookmark star, Download page, Page info,
+ * Reload / Stop): the core names the glyph, the chrome draws it, and the item's label is the
+ * button's accessible name. A menu whose items carry no glyph is rows of text, as before.
+ */
+export type MenuGlyph = 'forward' | 'home' | 'star' | 'download' | 'info' | 'reload' | 'stop'
+
+/**
+ * A tab group's mark before a row's label (the app menu's Tab Folders submenu, where every row
+ * is a saved group; shortcuts-menus-111): the one group glyph (`GroupGlyph`, design language
+ * v2 §9.37) drawn from the group's colour and its own icon – the 10 ring at a 2 stroke for a
+ * SAVED group, the 10 dot for an open one – in the favicon's 16 box, so the row reads as the
+ * sidebar's header and the strip's chip do. A native menu host has no such glyph and draws
+ * the row as text.
+ */
+export interface MenuGroupMark {
+  color: FolderColor | null
+  icon: string
+  saved: boolean
+}
+
+/**
+ * Another device's mark before a row's label (the app menu's Send to Your Devices submenu;
+ * services pass 4): the device's kind glyph (`DeviceGlyph`, the one every device row draws) –
+ * the kind its announcement carried, or `null` for a device whose build announced none, drawn
+ * as the 69 % stand-in – so every row of the submenu has the glyph and the labels share one
+ * edge while any device of the submenu announced a kind; a submenu in which none did draws no
+ * glyph column at all (the renderer's `anyDeviceKind`, §10.4's condition – the mark carries the
+ * fact, the renderer the rule). A native menu host has no glyph in the platform's menu ink and
+ * draws the row as text.
+ */
+export interface MenuDeviceMark {
+  kind: SyncDeviceKind | null
+}
+
+export interface MenuItemDescriptor {
+  id: string
+  /**
+   * The item's stable name across openings (the phone app menu's items: `icon.forward`,
+   * `row.settings`, `sep.3`), what the sheet's edit mode (Change Menu, TB-22) reorders and
+   * saves as `settings.menuOrder`. `id` is numbered per opening and names the click alone.
+   */
+  key?: string
+  type: 'normal' | 'separator' | 'checkbox' | 'radio'
+  label: string
+  enabled: boolean
+  checked: boolean
+  /** A favicon (`data:` or remote URL) the renderer may show before the label. */
+  icon?: string | null
+  /** A tab group's mark in the glyph slot (the Tab Folders submenu's rows). */
+  group?: MenuGroupMark
+  /** Another device's kind in the glyph slot (the Send to Your Devices submenu's rows). */
+  device?: MenuDeviceMark
+  submenu: MenuItemDescriptor[] | null
+  /** A destructive row ("Delete"), drawn in the danger ink. */
+  danger?: boolean
+  /**
+   * An icon-row item: the chrome draws a group whose items all carry a glyph as a row of icon
+   * buttons (design language v2 §9.3) rather than rows of text, the label as each button's name.
+   */
+  glyph?: MenuGlyph
+  /**
+   * The chord that runs the item, as the user reads it (`Ctrl+Shift+N`, `⌘⇧N` on macOS): the
+   * mouse popover draws it after the label in the deemphasised ink (§6 menus); the touch sheet
+   * has no keyboard to speak of and leaves it out.
+   */
+  hint?: string
+  /**
+   * A plain sentence, not a command: a menu's empty state (§9.17, "No recently closed tabs").
+   * Drawn in the deemphasised ink on a row that is neither focused nor picked.
+   */
+  note?: boolean
+  /**
+   * The item's action mounts a chrome field (Rename Group…): its pick keeps the keyboard in the
+   * chrome rather than returning the focus to the page, so the field it mounts is not blurred
+   * away by the host's focus move.
+   */
+  keepsKeyboard?: boolean
+  /**
+   * The shortcut action the item stands for, when its template named one: the chrome can then
+   * recognise a row by what it does rather than by its label – the phone's Reader View crossing
+   * takes the page under its picture before the core's toggle runs (`lib/readerTransition.ts`).
+   */
+  action?: ShortcutAction
+  /**
+   * A mark the row carries after its label, in the trailing slot – the sheet's state seat, the
+   * one its secondary ink and the popover's hint take: `managed` is Chrome's `ic_domain` on the
+   * "Managed Browser" row (TB-13; `shared/managed.ts`), the building glyph the row keeps on the
+   * phone's sheet and the tablet's popover alike. A native menu host has no glyph in its ink and
+   * draws the text.
+   */
+  mark?: 'managed'
+}
+
+/**
+ * Where a chrome element's context menu opens, from the `contextmenu` event that asked for it
+ * (Chrome's rule): a right-click opens it at the pointer; Shift+F10 and the Menu key open it at
+ * the focused element – Chromium raises the event at the element's middle – in keyboard mode,
+ * so its first item starts selected and the arrow keys take over at once. Chrome CSS pixels.
+ *
+ * `rect` is the box of the element the menu belongs to – the focused element for Shift+F10 and
+ * the Menu key, the control for a "⋯" button's press – in chrome CSS pixels, window
+ * coordinates. A host with native menus hangs the menu from it (its bottom-left; §9.23) rather
+ * than at the point; the phone, whose menus are sheets, reads no position at all.
+ */
+export interface MenuAnchor {
+  x?: number
+  y?: number
+  keyboard?: boolean
+  rect?: Rect
+}
+
+/**
+ * What the phone's link and image menus open on (Chrome for Android's context-menu header,
+ * PUI-18): the address the hold landed on, a title over it – the link's text, the address's host
+ * for a link without text – and the site's favicon or, for an image, the picture itself as the
+ * thumbnail. The sheet draws it as a two-line row in the §9.16 header's place; a tap expands the
+ * address to its full length, a long-press copies it.
+ */
+/**
+ * The chrome's word to `app.menu` while the tab overview stands (tab overview cleanup spec §4):
+ * which VIEW the overview shows – the space's tabs, or the private session's under the mask –
+ * and, in the select-tabs mode (§5), how many cards are picked of how many, so the menu is the
+ * selection's three rows. The counts the rows carry (the view's tabs, the inactive and recently
+ * closed lists, the spaces) are the core's own.
+ */
+export interface OverviewMenuRequest {
+  view: OverviewView
+  selection?: { selected: number; total: number }
+}
+
+export interface MenuHeader {
+  /** The address the header names; what a long-press copies. */
+  url: string
+  /** The toast's word for the copy ("Link copied", "Phone number copied"). */
+  copied: string
+  /** The line over the address: the link's text, or the address's host. */
+  title: string
+  /** The site's favicon (`data:` or remote URL); null draws the globe, or the scheme's glyph. */
+  favicon: string | null
+  /** An image's own source, drawn as the header's thumbnail in the favicon's place. */
+  thumbnail: string | null
+  /**
+   * The scheme of an address that names no site – a number, an email address – for the glyph
+   * that stands where a favicon would (§9.31: the phone for `tel:`, the envelope for `mailto:`,
+   * a kind and not a stand-in); null for a page's or an image's address.
+   */
+  scheme: 'tel' | 'mailto' | null
+}
+
+export interface MenuDescriptor {
+  id: string
+  items: MenuItemDescriptor[]
+  /** The link's or image's header on the phone's sheet (PUI-18); absent, the sheet opens on its title. */
+  header?: MenuHeader
+  source:
+    | 'page'
+    | 'tab'
+    | 'selection'
+    | 'space'
+    | 'folder'
+    | 'newtab'
+    | 'topsite'
+    | 'app'
+    | 'extension'
+    | 'bookmark'
+    | 'history'
+    | 'download'
+    | 'readingList'
+    | 'urlbar'
+    | 'translate'
+  /** What the phone sheet calls the menu (a bookmark's name, "3 selected"); the source's generic name when absent. */
+  title?: string
+  /**
+   * The phone app menu's item keys in the build's default order (`shared/menuOrder.ts`), for its
+   * edit mode's Reset row (TB-22): the order the items are shown in is `settings.menuOrder`'s,
+   * applied by the core; this is what the default would put them back to. Absent on every other
+   * menu.
+   */
+  defaultOrder?: string[]
+  /** Anchor in chrome CSS pixels, when known. */
+  x: number | null
+  y: number | null
+  /**
+   * The box the menu hangs from (chrome CSS pixels, window coordinates), when the opener has one
+   * the renderer cannot read itself – the served new tab page's tile under a finger (NTP-35):
+   * the tablet menu stands flush under it, start-aligned, flipping per §9.20. Absent, the menu
+   * opens at `x`,`y` or at the control that meets the point (`resolveMenuAnchor`).
+   */
+  rect?: Rect
+  /**
+   * Opened by the keyboard (a shortcut, Shift+F10, the Menu key): a popover menu starts with its
+   * first item focused so the arrow keys take over at once (v2 draft §9.22). Absent, the
+   * renderer reads it off the focused control (`openedFromKeyboard`).
+   */
+  keyboard?: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Layout reports (renderer → main)
+// ---------------------------------------------------------------------------
+
+/**
+ * The message strips: strips along a view's top and bottom edges (CSS px) that chrome messages –
+ * toasts, banners – draw over. Hosts that layer pages above the chrome clip the page out of them
+ * and let touches there through to the chrome (see `TabView.setCover`). Not the reader's cover
+ * over a tab's page (`TabManager.cover`, where the tree's "covers" are told apart).
+ */
+export interface ContentCover {
+  top: number
+  bottom: number
+}
+
+export interface ViewPlacement {
+  tabId: string
+  rect: Rect
+  radius: number
+  /** Set while chrome messages cover the view's edges. */
+  cover?: ContentCover
+}
+
+/**
+ * The page-edge band's word in a layout (motion spec §3.4, the desktop's mechanics): `seat` is
+ * the band's seated height these placements were laid out under – the page's laid-out top is
+ * the frame's edge plus it – and `offset` is where the page is right now, its offset from the
+ * frame's edge, which differs from the seat while the band travels. The host places the views
+ * `offset - seat` below their laid-out rects; a `layout.pageOffset` between reports moves them
+ * by a new offset against this report's seat, so the page is never placed against a seat its
+ * rects were not laid out with. Absent (both 0) where no band stands or the host moves the
+ * page another way (Android's pull channel).
+ */
+export interface LayoutBand {
+  seat: number
+  offset: number
+}
+
+export interface LayoutReport {
+  placements: ViewPlacement[]
+  glance: { tabId: string; rect: Rect; radius: number; cover?: ContentCover } | null
+  /** When true no tab views should be visible (a chrome overlay covers the content area). */
+  contentHidden: boolean
+  /**
+   * Set with `contentHidden` when what covers the pages is the tab overview, open or on its way
+   * open (the gesture stage's `overviewInteractive`, on the phone and on the tablet): the hide
+   * is a switch away from the pages under it, not a sheet or a field over them, and the host
+   * tells those pages so (OS-39, the Android op `view.setVisible { tabId, visible, switched?:
+   * true }` → `BackgroundTabRule`). Absent otherwise – on every desktop report, where no
+   * overview exists.
+   */
+  switchedAway?: boolean
+  /** Where the extension side panel's view goes (`UIState.sidePanel`), or null when none shows. */
+  sidePanel?: Rect | null
+  /** The page-edge band's seat and the page's present offset (`LayoutBand`). */
+  band?: LayoutBand
+}
+
+// ---------------------------------------------------------------------------
+// IPC: commands (renderer → main) and events (main → renderer)
+// ---------------------------------------------------------------------------
+
+export type TabSection = 'essential' | 'pinned' | 'regular'
+
+export interface Commands {
+  'app.getState': { args: void; result: UIState }
+  /** Real spaces (blank / private windows only see their own space in the snapshot). */
+  'app.listSpaces': { args: void; result: Array<{ id: string; name: string; icon: string }> }
+  'app.openExternal': { args: { url: string }; result: void }
+  'app.quit': { args: void; result: void }
+  /** System share sheet (`capabilities.share`); hosts without one copy the link and toast. */
+  'app.share': { args: SharePayload; result: void }
+  /**
+   * The chrome's answer to the host's share panel (Android below 14, SH-03; after a
+   * `share.panel` event): where the held share goes. Nothing on hosts without the panel.
+   */
+  'share.panelAction': { args: SharePanelAction; result: void }
+  /**
+   * The share chooser's pick (MW-63; the chooser is `UIState.shareChooser`): the installed app
+   * the share goes to, or null for the house route – a new tab for a link, a search for text.
+   */
+  'share.chooserPick': { args: { requestId: string; appId: string | null }; result: void }
+  /** The share chooser was dismissed: the share goes nowhere. */
+  'share.chooserCancel': { args: { requestId: string }; result: void }
+  /** Android's "Open by default" screen for this app (`capabilities.appLinkSettings`). */
+  'app.openAppLinkSettings': { args: void; result: void }
+  /**
+   * The system's notification settings for this app (Android; Settings › Security ›
+   * Notifications); a toast on hosts without one.
+   */
+  'app.openNotificationSettings': { args: void; result: void }
+  /**
+   * Voice search (`capabilities.voiceSearch`): ask for the microphone – the runtime permission
+   * prompt may show – and start the device's recogniser in the user's language. The outcome
+   * says whether it is listening; `voice.event`s then carry the levels, the transcripts and the
+   * end (`shared/voice.ts`).
+   */
+  'voice.start': { args: void; result: VoiceStartOutcome }
+  /** Stop the recogniser without a result (Cancel, the sheet dismissed, the app paused). */
+  'voice.cancel': { args: void; result: void }
+  /** The app's system settings screen, where a permanently refused microphone is turned back on. */
+  'voice.openSettings': { args: void; result: void }
+  /**
+   * QR scanning (`capabilities.qrScan`): ask for the camera – the runtime permission prompt may
+   * show – and open the back camera into the scan sheet's preview. The outcome says whether it
+   * is scanning; `qr.event`s then carry `ready`, the stills, the decode and the end
+   * (`shared/qrScan.ts`).
+   */
+  'qr.start': { args: void; result: QrStartOutcome }
+  /** Close the camera without a result (Cancel, the sheet dismissed, the app paused). */
+  'qr.cancel': { args: void; result: void }
+  /**
+   * Where the sheet's preview slot is, in CSS px of the chrome's viewport, and whether the
+   * native preview shows there now (hidden while the sheet moves, the slot showing the last
+   * still instead). `radius` is the slot's corner radius, for the preview's clip.
+   */
+  'qr.layout': { args: { rect: Rect; radius: number; visible: boolean }; result: void }
+  /** Turn the camera's torch on or off (`ready` said whether there is one). */
+  'qr.setTorch': { args: { on: boolean }; result: void }
+  /** The app's system settings screen, where a permanently refused camera is turned back on. */
+  'qr.openSettings': { args: void; result: void }
+  /**
+   * The QR code sheet's Download (SH-06; the host sent `qr.code`): the host keeps the link's
+   * code as a picture in Downloads – the link written above the code, as Chrome's
+   * `QrCodeShareMediator.addUrlToBitmap` composes it – and says so through its toast.
+   */
+  'qr.download': { args: { url: string }; result: void }
+  /** The external-protocol sheet's answer (`always` remembers the scheme in settings). */
+  'externalProtocol.respond': {
+    args: { requestId: string; allow: boolean; always: boolean }
+    result: void
+  }
+  'layout.report': { args: LayoutReport; result: void }
+  /**
+   * The page-edge band's frame (motion spec §3.4, §6): the page's offset from the frame's top
+   * edge right now. The host moves the placed views by it against the last report's seat
+   * (`LayoutBand`) – a move of their bounds, never a resize – per frame of the band's travel.
+   */
+  'layout.pageOffset': { args: { offset: number }; result: void }
+
+  /**
+   * The user asked for a new tab: the URL bar in new-tab mode, or the page an extension
+   * overrides new tabs with (`chrome_url_overrides.newtab`, opted in per extension).
+   */
+  'tab.new': { args: void; result: void }
+  'tab.create': {
+    args: {
+      url?: string
+      spaceId?: string
+      active?: boolean
+      containerId?: string
+      pinned?: boolean
+      essential?: boolean
+      afterTabId?: string
+      /** The folder (tab group) the new tab belongs to; one of the space's folders. */
+      folderId?: string
+    }
+    result: string
+  }
+  /**
+   * `keepFocus`: the keyboard stays where it is – the tab strip, when a row was activated or
+   * closed with Enter, Space or Delete there (Chrome keeps the strip focused until Escape) –
+   * instead of moving into the page as it does for a click.
+   */
+  'tab.activate': { args: { tabId: string; keepFocus?: boolean }; result: void }
+  'tab.close': { args: { tabId: string; force?: boolean; keepFocus?: boolean }; result: void }
+  /**
+   * Close several tabs the way the user asks for them, one after the other: a page whose
+   * `beforeunload` handler objects asks "Leave site?" in its turn, and a "Cancel" keeps that tab
+   * alone, the run going on (the desktop's Close N Tabs loop; the phone overview's Close, Close
+   * other tabs and Close all). `activate` names the tab to end on once the closes are through,
+   * if it is still open.
+   */
+  'tab.closeMany': { args: { tabIds: string[]; activate?: string }; result: void }
+  /**
+   * A private tab in this window (`capabilities.privateTabs`): the in-memory private container,
+   * no history, no persisted downloads; its session is wiped when the last private tab closes.
+   * Resolves with the tab id, or null on hosts that offer private windows instead.
+   */
+  'tab.newPrivate': { args: { url?: string }; result: string | null }
+  /** Close every private tab (and so end the private session). */
+  'tab.closePrivate': { args: void; result: void }
+  /**
+   * Settings › Privacy and Security › Lock private tabs when you leave Ione (INC-05 / SET-17):
+   * this device's choice (`UIState.privateLockOnLeave`, `BrowserState.privateDevice`). The lock
+   * itself is the phone host's, in memory.
+   */
+  'private.setLockOnLeave': { args: { enabled: boolean }; result: void }
+  'tab.closeOthers': { args: { tabId: string }; result: void }
+  'tab.closeBelow': { args: { tabId: string }; result: void }
+  'tab.closeAbove': { args: { tabId: string }; result: void }
+  'tab.navigate': { args: { tabId: string; input: string }; result: void }
+  /**
+   * A Home control (TB-15): `tabId` goes to the homepage (Settings › Homepage) – the user's
+   * page, or the new tab page at rest. Nothing with the homepage off.
+   */
+  'tab.home': { args: { tabId: string }; result: void }
+  /**
+   * The desktop toolbar's Home button (settings-32; Chrome's IDC_HOME): the window's active
+   * tab goes where Alt+Home and the menu bar's Home go – the `nav.home` action, whose
+   * destination is the homepage setting's (`NewTabService.homeDestination`).
+   */
+  'nav.home': { args: void; result: void }
+  'tab.back': { args: { tabId: string }; result: void }
+  'tab.forward': { args: { tabId: string }; result: void }
+  /**
+   * Chrome's middle-click / Ctrl+click (⌘+click on macOS) on Back or Forward (shortcuts-menus-93):
+   * the page one step back or forward opens in a new background tab beside `tabId`, which
+   * stays where it is.
+   */
+  'tab.backInNewTab': { args: { tabId: string }; result: void }
+  'tab.forwardInNewTab': { args: { tabId: string }; result: void }
+  'tab.reload': { args: { tabId: string; skipCache?: boolean }; result: void }
+  'tab.stop': { args: { tabId: string }; result: void }
+  'tab.toggleMute': { args: { tabId: string }; result: void }
+  /** "Mute Site" / "Unmute Site": every tab of the site, remembered as its `sound` content setting. */
+  'tab.toggleMuteSite': { args: { tabId: string }; result: void }
+  'tab.togglePin': { args: { tabId: string }; result: void }
+  'tab.toggleEssential': { args: { tabId: string }; result: void }
+  'tab.resetPinned': { args: { tabId: string }; result: void }
+  'tab.editPinnedUrl': { args: { tabId: string; url: string }; result: void }
+  /**
+   * The "Page unresponsive" prompt's answers (tabs-45): exit the pages – their renderer is ended
+   * and each shows the crash page for a page ended for not responding – or wait, which takes the
+   * prompt down until the host reports the hang again.
+   */
+  'tab.exitUnresponsive': { args: { tabIds: string[] }; result: void }
+  'tab.waitUnresponsive': { args: { tabIds: string[] }; result: void }
+  'tab.rename': { args: { tabId: string; title: string | null }; result: void }
+  'tab.duplicate': { args: { tabId: string }; result: void }
+  /**
+   * Per-tab proxy (Settings › System): `null` follows the default and the routing rules;
+   * `direct`, `system`, or a configured profile id overrides them for this tab.
+   */
+  'tab.setProxy': { args: { tabId: string; proxyId: string | null }; result: void }
+  'tab.unload': { args: { tabId: string }; result: void }
+  'tab.freeze': { args: { tabId: string }; result: void }
+  'tab.wake': { args: { tabId: string }; result: void }
+  'tab.move': {
+    args: { tabId: string; spaceId?: string; section: TabSection; index: number }
+    result: void
+  }
+  'tab.moveToSpace': { args: { tabId: string; spaceId: string }; result: void }
+  'tab.moveToFolder': { args: { tabId: string; folderId: string | null }; result: void }
+  /**
+   * A sidebar drag let go over a drop target of this window. `key` is the target's `data-drop`
+   * (`tab:<id>:before|after`, `section:<section>:<spaceId>`, `folder:<id>`, `space:<id>`,
+   * `split:<side>`, `bookmark:<folderId>:<index>`); the core resolves it against the model.
+   */
+  'tab.drop': { args: { tabId: string; key: string }; result: void }
+  /** A sidebar tab drag began in this window (the core tracks it across windows from here on). */
+  'tab.dragStart': { args: { tabId: string }; result: void }
+  /**
+   * The pointer moved during a tab drag. `x`/`y` are chrome coordinates of this window (they run
+   * past its edges while the pointer is outside it); `inSidebar` is true while the pointer is
+   * over this window's own sidebar, where no other window can be the target.
+   */
+  'tab.dragMove': {
+    args: { tabId: string; x: number; y: number; inSidebar: boolean }
+    result: void
+  }
+  /** The window a drag from another window hovers reports the drop target under the pointer. */
+  'tab.dragTarget': { args: { tabId: string; key: string | null }; result: void }
+  /**
+   * The drag ended outside this window's drop targets (chrome coordinates as for `tab.dragMove`):
+   * `release` moves the tab into the other Ione window under the pointer or tears it off into
+   * a new window there; `cancel` (Escape) just ends the drag.
+   */
+  'tab.dragEnd': {
+    args: { tabId: string; x: number; y: number; outcome: 'release' | 'cancel' }
+    result: void
+  }
+  /**
+   * Addresses or text dropped on this window's chrome (a link or a selection from a page, files
+   * from the OS as `file:` URLs): every input goes where typed text would – an address loads,
+   * anything else is searched with the default engine. `key` names the target in the grammar of
+   * `tab.drop` plus `tab:<id>:into`: the first input navigates that tab (Chrome's drop onto a
+   * tab), the rest open after it; a slot, a section, a folder or a space takes new tabs. Tabs
+   * that land in the window's active space show the first of them (Chrome's foreground drop).
+   */
+  'drop.open': { args: { inputs: string[]; key: string }; result: void }
+  /** "Move Tab to New Window" from the tab menu: the new window opens beside this one. */
+  'tab.moveToNewWindow': { args: { tabId: string }; result: void }
+  /** Restore the newest recently closed entry (a window entry as a whole window). */
+  'tab.reopenClosed': { args: void; result: void }
+  /**
+   * The tabs this window's tab search (Ctrl+Shift+A) lists: every tab of every window that
+   * shares the window's privacy, most recently active first. The renderer matches and ranks them.
+   */
+  'tab.searchCandidates': { args: void; result: TabSearchCandidate[] }
+  /**
+   * Switch to a tab from tab search: in this window when it can show it, else in the window that
+   * does (a blank or private window's own tab), which is brought to the front.
+   */
+  'tab.switchTo': { args: { tabId: string }; result: void }
+  /** The tab's back/forward stack for the long-press list on the back / forward buttons. */
+  'tab.navigationEntries': { args: { tabId: string }; result: NavigationSnapshot }
+  /**
+   * The entries behind (or ahead of) the tab's current one, nearest first, at most `limit`, each
+   * with the favicon history knows for its URL: the phone's Back-hold popup (Chrome's
+   * `getDirectedNavigationHistory`).
+   */
+  'tab.navigationHistory': {
+    args: { tabId: string; direction: NavigationDirection; limit: number }
+    result: NavigationHistoryEntry[]
+  }
+  'tab.goToIndex': { args: { tabId: string; index: number }; result: void }
+  /** The back/forward list as a menu (long press / right click on the back and forward buttons). */
+  'tab.navigationMenu': { args: { tabId: string }; result: void }
+  /** Zoom in (`delta` 1) or out (-1) one step, or back to the default zoom (`delta` null). */
+  'tab.setZoom': { args: { tabId: string; delta: number | null }; result: void }
+  /**
+   * Set the tab's site to an exact zoom factor (remembered per site; other pages zoom per tab).
+   * The desktop zoom bubble and the phone zoom sheet both drive this.
+   */
+  'tab.setZoomFactor': { args: { tabId: string; factor: number }; result: void }
+  /** "Desktop site" for the tab's site (remembered per site; null clears the exception). */
+  'tab.setDesktopSite': { args: { tabId: string; on: boolean | null }; result: void }
+  /** "Dark theme for this site" (remembered per site; null clears the exception). */
+  'tab.setDarkenSite': { args: { tabId: string; on: boolean | null }; result: void }
+  /** Per-site lists in Settings: drop one site's exception (`kind` picks the map). */
+  'pageControls.forgetSite': {
+    args: { kind: 'desktop' | 'darken' | 'zoom'; domain: string }
+    result: void
+  }
+  'tab.contextMenu': { args: { tabId: string } & MenuAnchor; result: void }
+  'tab.toggleDevtools': { args: { tabId: string }; result: void }
+  'tab.copyUrl': { args: { tabId: string; markdown?: boolean }; result: void }
+  'tab.setIcon': { args: { tabId: string; icon: string | null }; result: void }
+  /** Zen's "Add Route for Domain": route the tab's domain to a space. */
+  'tab.addRoute': { args: { tabId: string; spaceId: string }; result: void }
+  /** Alt+click on a sidebar tab: split it with (or separate it from) the active tab. */
+  'tab.altClick': { args: { tabId: string }; result: void }
+  /** Context menu for several selected tabs (Ctrl / Shift+click in the sidebar). */
+  'tab.selectionContextMenu': { args: { tabIds: string[] } & MenuAnchor; result: void }
+
+  'space.create': {
+    args: { name: string; icon: string; containerId: string; theme: SpaceTheme | null }
+    result: string
+  }
+  'space.update': {
+    args: {
+      spaceId: string
+      patch: Partial<Pick<Space, 'name' | 'icon' | 'containerId' | 'theme'>>
+    }
+    result: void
+  }
+  'space.delete': { args: { spaceId: string }; result: void }
+  'space.activate': { args: { spaceId: string }; result: void }
+  'space.next': { args: void; result: void }
+  'space.prev': { args: void; result: void }
+  'space.reorder': { args: { spaceId: string; index: number }; result: void }
+  'space.unload': { args: { spaceId: string }; result: void }
+  'space.unloadOthers': { args: void; result: void }
+  'space.togglePinnedCollapsed': { args: { spaceId: string }; result: void }
+  'space.closeUnpinned': { args: { spaceId?: string }; result: void }
+  'space.contextMenu': { args: { spaceId: string } & MenuAnchor; result: void }
+
+  'folder.create': {
+    args: {
+      spaceId: string
+      name: string
+      icon: string
+      color?: FolderColor
+      /** Start an inline rename of the new folder (default); off for folders made by a gesture. */
+      rename?: boolean
+    }
+    result: string
+  }
+  'folder.update': {
+    args: {
+      folderId: string
+      patch: Partial<Pick<Folder, 'name' | 'icon' | 'collapsed' | 'color'>>
+    }
+    result: void
+  }
+  'folder.delete': { args: { folderId: string; unpack: boolean }; result: void }
+  /**
+   * Chrome's "Close group" on a host with saved groups (Android, TAB-16): the group's tabs close
+   * (to the recently closed list, so the close has an undo) and the group stays as a saved one
+   * holding their pages (`Folder.savedTabs`). Nothing happens to a group with no live member.
+   */
+  'folder.close': { args: { folderId: string }; result: void }
+  /**
+   * "Open" a saved group: its pages come back as tabs of the group, in their order, at the end
+   * of the space's tabs, the first one active; an open group is expanded and its first tab
+   * activated instead. Resolves with the tab made active, or null when there was nothing to
+   * open.
+   */
+  'folder.open': { args: { folderId: string }; result: string | null }
+  'folder.contextMenu': { args: { folderId: string } & MenuAnchor; result: void }
+  /**
+   * Chrome's "New tab in group" (tabs-13): a new tab at the end of the folder, active, in the
+   * folder's space and the container of its last member. A SAVED folder opens first – its pages
+   * back as its tabs, as `folder.open` brings them – and the new tab joins behind them.
+   * Resolves with the new tab's id.
+   */
+  'folder.newTab': { args: { folderId: string }; result: string }
+  'newtab.contextMenu': { args: MenuAnchor | void; result: void }
+  /**
+   * Long-press on a phone new tab page tile: pin / unpin, remove, open in a new tab and, for a
+   * shortcut, Edit Shortcut… – its edit sheet over the page in `tabId` (the active tab without).
+   */
+  'newtab.tileContextMenu': { args: { url: string; title: string; tabId?: string }; result: void }
+  /**
+   * The "⋯" application menu. `anchor` is the menu button in chrome CSS pixels: the menu opens
+   * along its bottom edge; without it the menu opens at the pointer. `keyboard` marks a menu
+   * opened by a shortcut, whose first item starts selected. `mediaHubFolded` says the media
+   * hub's toolbar button is not on screen (design language v2 §9.29: the sidebar's width tier
+   * folds it at 240): the menu then heads with the "Media Controls…" row in its stead. The chrome
+   * reads the fold from the button's box; the core builds the menu without the toolbar's width.
+   */
+  'app.menu': {
+    args: {
+      anchor?: Rect
+      keyboard?: boolean
+      mediaHubFolded?: boolean
+      /**
+       * The tab overview stands (tab overview cleanup spec §1, §4): the bar's ⋯ opens the
+       * overview's menu – the chrome's word on its view and its selection, the core's on the
+       * counts – in place of the app menu; absent, the app menu.
+       */
+      overview?: OverviewMenuRequest
+    }
+    result: void
+  }
+  /** Renderer-hosted menus: an item was picked / the menu was dismissed. */
+  'menu.click': { args: { menuId: string; itemId: string }; result: void }
+  'menu.close': { args: { menuId: string }; result: void }
+  /** Renderer → main: chrome UI closed, give keyboard focus back to the active page. */
+  'focus.content': { args: void; result: void }
+  /** Renderer → main: chrome UI opened, take keyboard focus. */
+  'focus.chrome': { args: void; result: void }
+  /** Renderer → host: a gesture reached a landmark (pick-up, midpoint, dock); vibrate briefly. */
+  haptic: { args: { kind: HapticKind }; result: void }
+  /** The media hub's one button: pause a playing entry, play a paused one. */
+  'media.toggle': { args: { tabId: string }; result: void }
+  /**
+   * The in-app player's controls: a Media Session action for the tab's page (its handler when it
+   * registered one, the element otherwise), `seekto` with `seekTime` in seconds.
+   */
+  'media.action': {
+    args: {
+      tabId: string
+      action: MediaSessionAction | 'toggle'
+      seekTime?: number
+      /** `seekbackward` / `seekforward`: how far, in seconds (the page's default when absent). */
+      seekOffset?: number
+    }
+    result: void
+  }
+  /** Picture-in-picture of the tab's video through the OS (`capabilities.pictureInPicture`); false when refused. */
+  'media.pictureInPicture': { args: { tabId: string }; result: boolean }
+  /**
+   * "Turn off for this site", the first automatic picture-in-picture toast's action (MW-28): the
+   * site of the tab's page gets `auto-picture-in-picture` = deny (the site card's own write) and
+   * the video the desktop just put in the small window comes back to its tab, playing on.
+   */
+  'media.autoPipOptOut': { args: { tabId: string }; result: void }
+  /** The screen-capture picker's answer: the picked source (null cancels) and whether to add system audio. */
+  'screenCapture.respond': {
+    args: { id: string; sourceId: string | null; audio?: boolean }
+    result: void
+  }
+  /** The share sheet's answer. */
+  'share.respond': { args: { id: string; answer: ShareAnswer }; result: void }
+  /** Open the share sheet for a tab's page (its title and address), or for `payload`. */
+  'share.open': { args: { tabId?: string; payload?: SharePayload }; result: void }
+  // ---- Screenshots to the gallery (`platform.screenshots`; SH-07, SH-08) ---------------------
+  /** The preview card's Share: the system share sheet with the saved picture. */
+  'screenshot.share': { args: { uri: string }; result: void }
+  /** The preview card's Delete: the picture goes from the gallery. False when it could not. */
+  'screenshot.delete': { args: { uri: string }; result: boolean }
+  /** A tap on the card's thumbnail: the picture in the system's viewer. */
+  'screenshot.open': { args: { uri: string }; result: void }
+  /**
+   * The card's Capture more (Chrome's long screenshot): the whole page from the top, cut at
+   * about ten screens, held by the host for the editor. Null when the page could not be drawn.
+   */
+  'screenshot.captureLong': { args: { tabId: string }; result: LongCapture | null }
+  /**
+   * The editor's Save (or Share): the long capture cropped to `crop`, saved to the gallery – and
+   * with `share`, the system share sheet with it. Null when the capture is gone or the write failed.
+   */
+  'screenshot.saveLong': {
+    args: { id: string; crop: LongCaptureCrop; share?: boolean }
+    result: ScreenshotSaved | null
+  }
+  /** The editor closed without saving: the host lets the capture go. */
+  'screenshot.discardLong': { args: { id: string }; result: void }
+
+  'split.create': { args: { tabIds: string[]; layout: SplitLayout }; result: void }
+  'split.toggleLayout': { args: { layout: SplitLayout }; result: void }
+  'split.setLayout': { args: { groupId: string; layout: SplitLayout }; result: void }
+  'split.unsplit': { args: { groupId?: string; tabId?: string }; result: void }
+  'split.removeTab': { args: { tabId: string; focus: boolean }; result: void }
+  'split.resize': { args: { groupId: string; sizes: number[] }; result: void }
+  'split.newEmpty': { args: void; result: void }
+  'split.addTab': { args: { groupId: string; tabId: string }; result: void }
+  /**
+   * Swap Panes (split-07): the pane of `tabId` – the active pane when omitted – trades places
+   * with the pane after it in the split's order (the last with the one before it), so a
+   * two-pane split reverses as Chrome's "Reverse position" does. Each tab keeps its size.
+   */
+  'split.swap': { args: { tabId?: string }; result: void }
+  /** The ⋯ menu of a pane's header: Swap Panes, the left pane's link rule, Un-split Tab. */
+  'split.paneMenu': { args: { tabId: string } & MenuAnchor; result: void }
+  /**
+   * "Choose a tab" in an empty pane (split-04): `tabId` takes the pane over from the blank tab
+   * `paneTabId` shown there, which closes. False when nothing changed.
+   */
+  'split.pickTab': { args: { paneTabId: string; tabId: string }; result: boolean }
+
+  'glance.open': {
+    args: { url: string; parentTabId: string; originX: number; originY: number }
+    result: void
+  }
+  'glance.close': { args: void; result: void }
+  'glance.expand': { args: void; result: void }
+  'glance.split': { args: void; result: void }
+
+  'compact.toggle': { args: void; result: void }
+  /** The chrome's word on a hidden piece it shows or put away (the sidebar unless `edge` says). */
+  'compact.setRevealed': { args: { revealed: boolean; edge?: 'sidebar' | 'toolbar' }; result: void }
+  'compact.toggleSidebarPersistent': { args: void; result: void }
+  'compact.setOptions': {
+    args: Partial<Pick<CompactModeSettings, 'hideSidebar' | 'hideToolbar'>>
+    result: void
+  }
+
+  'urlbar.suggest': {
+    args: {
+      query: string
+      tabId: string | null
+      /**
+       * The bar is in keyword or search mode for this engine (tab-to-search, Ctrl+K, the `?`
+       * prefix; omnibox-08, -26): `query` is what to search, never an address, and the rows are
+       * that engine's – no address, history, bookmark or tab rows.
+       */
+      engineId?: string
+      /**
+       * The phone card's sectioned order (OMN-18): the rows under their group headings in
+       * Chrome for Android's order, the default match alone at the field's end.
+       */
+      grouped?: boolean
+    }
+    result: Suggestion[]
+  }
+  'urlbar.submit': {
+    args: {
+      input: string
+      newTab: boolean
+      tabId: string | null
+      /** Alt+Shift+Enter, Ctrl+click, a middle click: a tab behind the current one. */
+      background?: boolean
+      /** Shift+Enter, Ctrl+Shift+Enter, Shift+click: a new window of this window's kind. */
+      newWindow?: boolean
+      /**
+       * What the user typed before choosing this destination, for the shortcuts provider
+       * (omnibox-03): the next typing of it boosts the destination. Absent when nothing was
+       * typed (a zero-suggest pick) or the pick is not one to learn from.
+       */
+      learn?: {
+        typed: string
+        /** The row's title, shown on the boosted row; the query for a search. */
+        title: string
+        /** A search or an address; left to the core for the verbatim text. */
+        kind?: 'url' | 'search'
+      }
+    }
+    result: void
+  }
+  /** The X on a remembered search (a shortcut row, omnibox-22): forget every shortcut to `url`. */
+  'urlbar.forgetShortcut': { args: { url: string }; result: void }
+  'urlbar.runCommand': { args: { action: string }; result: void }
+  /**
+   * Chrome's URL-bar menu items: the clipboard's text goes where typed text would (a URL
+   * navigates, anything else searches), or is always searched with the default engine. Nothing
+   * happens when the clipboard holds no text or the host cannot read it.
+   */
+  'urlbar.pasteAndGo': { args: { tabId: string | null }; result: void }
+  'urlbar.pasteAndSearch': { args: { tabId: string | null }; result: void }
+  /** The URL bar closed without an entry (Escape, a click away): an omnibox session ends. */
+  'urlbar.cancel': { args: void; result: void }
+  /**
+   * Whether the URL bar is holding user input for a tab (W8-F15): the desktop bar's field, over a
+   * fresh new tab page or in edit mode, now differs from the page's own text (a draft the user
+   * typed), or has gone back to it / the bar has closed. The core keeps this per tab in memory –
+   * this window's moment, not persisted and not synced (`Browser.barInput`, cleared on the tab's
+   * close) – and `freshTabIn` reads it: a tab the user is typing into is not a fresh empty one a
+   * launch URL may take, whatever its history says, as Chrome's omnibox carries its user input
+   * per tab (`OmniboxEditModel::user_input_in_progress()`, kept across a tab switch by
+   * `GetStateForTabSwitch`) and a URL handed to a running Chrome is appended as a new foreground
+   * tab, never written over the active one (`startup_browser_creator_impl.cc`,
+   * `BrowserOpenBehavior::USE_EXISTING` unless `--same-tab`). Fired on the flip, not per
+   * keystroke. The phone's bar sends it too; its host has no `freshTabIn` caller, so the core's
+   * record there is simply unread – harmless.
+   */
+  'urlbar.input': { args: { tabId: string; active: boolean }; result: void }
+  /** Delete on a row its owner marked `deletable` (`omnibox.onDeleteSuggestion`). */
+  'urlbar.deleteSuggestion': { args: { input: string }; result: void }
+  /**
+   * A right-click on a removable row of the desktop popup (context-menus-115): the host's native
+   * menu – Remove, and on a remembered search Delete Search History – where the event says
+   * (`MenuAnchor`). A pick comes back to the bar as `urlbar.suggestionAction`, the list being
+   * the bar's to edit; the core knows the row by the id the bar drew it under.
+   */
+  'urlbar.suggestionContextMenu': {
+    args: { id: string; kind: SuggestionKind } & MenuAnchor
+    result: void
+  }
+  /** Delete Search History (the suggestion menu's second row): every remembered search goes. */
+  'urlbar.clearSearchHistory': { args: void; result: void }
+
+  /**
+   * A picture of the tab's page for the chrome to stand in for it under an overlay. Only a page
+   * that is showing has one, unless `fresh` asks for the page as it is now though hidden under
+   * the chrome (it changed there: a zoom step behind the zoom bubble); hosts that cannot
+   * capture a hidden page answer null.
+   */
+  'overlay.snapshot': { args: { tabId: string; fresh?: boolean }; result: string | null }
+  /**
+   * The picture of the developer toolbox docked in the tab's frame box (design language v2
+   * §9.29) – the frontend's own capture, the whole box at its size – for the cover to lay under
+   * the page's picture, so a menu over a docked toolbox leaves the toolbox in view rather than
+   * the frame's ground. `fresh` as `overlay.snapshot` has it. Null with no toolbox up, one
+   * undocked (a window of its own) or on a host without an in-frame toolbox (Android).
+   */
+  'overlay.snapshotDevtools': { args: { tabId: string; fresh?: boolean }; result: string | null }
+
+  /**
+   * Tab card thumbnails, on hosts that keep them (`Platform.thumbnails`; the Android host). The
+   * host takes the pictures itself – of a page leaving the screen, of the app going to the
+   * background, from the cover it captures for a sheet – and raises `thumbnail.captured` for
+   * each; the chrome only says how wide a card is (`configure`, device pixels), reads the
+   * persisted picture of a card it shows (`load`, lazily, a few at a time – never in the boot
+   * payload; with the tab's `url`, so a picture of a page the tab has left is never answered),
+   * and forgets the pictures of pages that navigated or tabs that are gone for good (`drop`,
+   * with the `url` the tab left so a drop that arrives after the capture of the next page does
+   * not take that one; without a `url` for a tab gone for good – and `sweep` once at boot with
+   * the session's tab ids).
+   */
+  'thumbnail.configure': { args: { width: number }; result: void }
+  'thumbnail.load': { args: { tabId: string; url: string }; result: ThumbnailPicture | null }
+  'thumbnail.drop': { args: { tabId: string; url?: string }; result: void }
+  'thumbnail.sweep': { args: { keep: string[] }; result: void }
+
+  /** Connection, cookies, storage and permissions of the tab's site (null for an unknown tab). */
+  'site.info': { args: { tabId: string }; result: SiteInfo | null }
+  /** Remove the cookies of the tab's site; resolves with how many were removed. */
+  'site.clearCookies': { args: { tabId: string }; result: { removed: number } }
+  /** Remove cookies, storage and permissions of the tab's site and reload the page. */
+  'site.clearData': { args: { tabId: string }; result: void }
+  /** Forget one permission decision of the site (or all of them) and reload the page. */
+  'site.resetPermissions': { args: { tabId: string; permission?: string }; result: void }
+  /**
+   * Everything the desktop site-information popover shows for a tab: `site.info` plus the
+   * requests the blocker refused on the page and whether the site is excepted from blocking.
+   */
+  'siteInfo.snapshot': { args: { tabId: string }; result: SiteInfoSnapshot | null }
+
+  /**
+   * Clear browsing data of the chosen types in the range. Passwords need re-authentication
+   * (`passphrase` carries the vault passphrase when the chrome was asked for it); when it fails
+   * nothing is cleared and the outcome says which step is needed. With `'tabs'` among the types
+   * (the phone's Quick Delete, HB-07) the tabs the range holds AT THIS MOMENT close last, after
+   * the data – the set `privacy.tabsInRange` named a moment earlier, give or take a tab that
+   * navigated in between – with no undo and no "Recently closed" entry (Chrome's
+   * `QuickDeleteTabsFilter`: `allowUndo(false).saveToTabRestoreService(false)`). The Settings tab
+   * the form was confirmed from – the active tab of the window the command comes from, when it is
+   * the Settings page (a tab here where Chrome's surface is none) – stays, as it is left out of
+   * `privacy.tabsInRange`; any other active tab is a tab of the period and closes with it.
+   */
+  'privacy.clearBrowsingData': {
+    args: { range: BrowsingDataRange; types: BrowsingDataType[]; passphrase?: string }
+    result: ReauthOutcome<ClearBrowsingDataResult>
+  }
+  /**
+   * How much of each type the range holds, for the dialog's preview lines (the `tabs` row last;
+   * its count leaves out the Settings tab the form is up over, when the active tab of the window
+   * the command comes from is one, as `privacy.tabsInRange` does – the row counts the tabs that
+   * will close).
+   */
+  'privacy.clearBrowsingDataCounts': {
+    args: { range: BrowsingDataRange }
+    result: BrowsingDataCount[]
+  }
+  /**
+   * The tabs Quick Delete would close for the range right now (HB-07 / MOT-24), as ids in the
+   * order the overview lists them: every tab of every space and window whose last committed
+   * navigation (`Tab.lastNavigatedAt`) is at or after the range's start – pinned and essential
+   * tabs among them, private tabs never – or, for `'all'`, every tab (Chrome's ALL_TIME takes the
+   * whole model); less the Settings tab the form was confirmed from, when the active tab of the
+   * window the command comes from is one (the tab the phone's form is a sheet over: Chrome runs
+   * Quick Delete from no tab, so the surface the user acted from is never in its set) – any
+   * other active tab, a site under Quick Delete from the app menu, is a tab of the period. The
+   * chrome asks BEFORE `privacy.clearBrowsingData` with `'tabs'`, as Chrome shows the tab
+   * switcher and runs its motion on the cards first, then closes; the clear takes the set as it
+   * stands at clear time, so a tab that navigates between the two calls joins or leaves it – the
+   * motion's list may differ by that tab, as Chrome's may (cosmetic).
+   */
+  'privacy.tabsInRange': { args: { range: BrowsingDataRange }; result: string[] }
+
+  /**
+   * Cookies and site data (Chrome's `chrome://settings/content/siteData`): the default for sites
+   * on no list. `allow` and `block-third-party` are `Settings.privacy.thirdPartyCookies`'s word
+   * (`block-third-party` keeps a stricter `block`); `block-all` is the policy's own bit. The
+   * types cleared on exit are `Settings.privacy.clearOnExit` through `settings.update`.
+   */
+  'siteData.setDefault': { args: { default: SiteDataDefault }; result: void }
+  /**
+   * Add a site to one of the three lists, as a pattern in Chrome's grammar (`[*.]example.com`,
+   * `example.com`, `https://example.com:8443`; a bare host gets `[*.]`). A pattern on another
+   * list moves. Refused with the reason for the field when it is not a pattern or the list is full.
+   */
+  'siteData.add': { args: { list: SiteDataList; pattern: string }; result: SiteDataAddResult }
+  /** The site-information sheet's row: the page's site (`[*.]host`) onto a list. */
+  'siteData.addSite': { args: { list: SiteDataList; url: string }; result: SiteDataAddResult }
+  /** Remove a pattern from whichever list holds it. */
+  'siteData.remove': { args: { pattern: string }; result: void }
+  /** The site-data viewer: every origin with cookies, stored data or permissions, most data first. */
+  'siteData.list': { args: void; result: SiteDataListing }
+  /** Take one origin's cookies and stored data away (its permissions stay). */
+  'siteData.clearSite': { args: { origin: string }; result: void }
+  /** Every site's cookies and stored data, as the dialog's "Cookies and site data" over all time. */
+  'siteData.clearAll': { args: void; result: void }
+  /** Run Safety check now: updates, Safe Browsing, passwords, permissions, notifications, extensions. */
+  'privacy.safetyCheck': { args: void; result: SafetyCheckResult }
+  /**
+   * Third-party cookies in private windows and private tabs only
+   * (`Settings.privacy.thirdPartyCookiesPrivate`): the private switch writes `block` when turned
+   * on and `allow` when turned off (never `default`, so the choice survives a later change of
+   * the global mode); `default` follows the global mode again. The chrome disables the switch
+   * while `PrivacyStatus.privateThirdPartyCookies.locked` (the global `block` wins); a choice
+   * stored anyway is kept for when the lock lifts. An unknown mode is refused.
+   */
+  'privacy.setThirdPartyCookiesPrivate': {
+    args: { mode: ThirdPartyCookiePrivateMode }
+    result: void
+  }
+
+  /** Take a fresh resource sample right now and return it. */
+  'resources.snapshot': { args: void; result: ResourceSnapshot }
+  /** Purge, freeze and discard as if every budget were exceeded ("free up memory now"). */
+  'resources.trim': { args: void; result: void }
+  /** Restart the browser so changed startup switches take effect. */
+  'resources.relaunch': { args: void; result: void }
+  /**
+   * Energy Saver's "Turn off now" (W8-2, the toolbar leaf's bubble; Chrome's
+   * `SetTemporaryBatterySaverDisabledForSession`): off until the charger is plugged in or the
+   * mode is changed, `Settings.energySaver` untouched. `disabled: false` puts it back.
+   */
+  'resources.energySaverSession': { args: { disabled: boolean }; result: void }
+
+  // ---- The task manager (`zen://tasks`, `core/tasks.ts`) --------------------------------------
+  /**
+   * Every process the app runs right now, as the task manager page lists them (`TaskList`):
+   * the browser process, each tab's renderer named by its tab(s), each extension's host by the
+   * extension's name, the DevTools frontends, the GPU and the utility processes, with memory,
+   * CPU and – where the host counts it – network. Sampled on each call (the page asks every
+   * 1–2 s while it is visible): a host without a `TaskHost` answers an empty list, which the
+   * page shows as its one-sentence empty state.
+   */
+  'tasks.list': { args: void; result: TaskList }
+  /**
+   * End the process `pid` (Chrome's End process): a tab's renderer is crashed in place
+   * (`forcefullyCrashRenderer`, so the tab shows its crashed page and reloads on the user's
+   * word), an extension's or a helper process is killed. The browser process is refused, as is
+   * a pid that is not in the last list; the chrome asks first (a §9.23 destructive prompt). True
+   * when the process was told to go.
+   */
+  'tasks.end': { args: { pid: number }; result: boolean }
+
+  'settings.update': { args: SettingsPatch; result: void }
+  /**
+   * Settings › Reset settings › "Restore settings to their original defaults" (settings-70;
+   * Chrome's `chrome://settings/reset`), after the row's §9.23 confirmation: what the dialog's
+   * sentence names and nothing else – the startup pages, the home page and the new tab page back
+   * to their defaults, the default search engine back to the shipped one (the EEA's choice record
+   * cleared with it, so the choice screen asks again at the next run, as Chrome's does), every
+   * pinned tab unpinned, every site's remembered permission answers, device grants and the
+   * per-type defaults chosen in Settings › Site settings cleared (the whole of Chrome's
+   * `ResetContentSettings`), every extension disabled, cookies, site data and the cache cleared
+   * (`core/settingsReset.ts`). Bookmarks, history and saved passwords are not touched. The
+   * chrome says "Settings reset" (§9.33) when it is done.
+   */
+  'settings.reset': { args: void; result: void }
+  'shortcuts.update': { args: { id: string; binding: KeyBinding | null }; result: void }
+  /** Drop every override: the table goes back to the active preset. */
+  'shortcuts.reset': { args: void; result: void }
+  /**
+   * The Settings recorder is (or stopped) listening for a chord: while it is, key presses in the
+   * chrome are captured by the renderer and no shortcut runs.
+   */
+  'shortcuts.recording': { args: { recording: boolean }; result: void }
+  /**
+   * The tab strip's keyboard is on the row of this tab (tabs-34), or on no tab row (null: it
+   * left the strip, or sits on a header or an Essentials tile). The move chords – Ctrl+Shift+PgUp
+   * / PgDn, `tab.moveBackward` / `tab.moveForward` – act on that row while one is named; the
+   * host consumes the chord before the chrome sees it, so the chrome says where the keyboard is.
+   */
+  'strip.focus': { args: { tabId: string | null }; result: void }
+  'sidebar.setWidth': { args: { width: number }; result: void }
+  'sidebar.toggleExpanded': { args: void; result: void }
+
+  'history.search': { args: { query: string; limit: number }; result: HistoryEntry[] }
+  'history.recent': { args: { limit: number }; result: HistoryEntry[] }
+  'history.delete': { args: { url: string }; result: void }
+  'history.clear': { args: void; result: void }
+  /**
+   * The favicon cache's index (HB-47): every cached icon address with its content hash, read
+   * once when the chrome starts; `favicons.changed` carries the deltas from then on.
+   */
+  'favicons.index': { args: void; result: Array<[url: string, hash: string]> }
+  'history.visits': { args: { query: HistoryQuery }; result: HistoryVisit[] }
+  'history.grouped': { args: { query: HistoryQuery }; result: HistoryDayGroup[] }
+  'history.topSites': { args: { n: number; excludedHosts?: string[] }; result: TopSite[] }
+  /** Visits with `fromMs <= visitTime < toMs`. */
+  'history.count': { args: { fromMs: number; toMs: number }; result: number }
+  'history.deleteVisits': { args: { ids: string[] }; result: void }
+  'history.deleteUrls': { args: { urls: string[] }; result: void }
+  'history.deleteDay': { args: { dayKey: string }; result: void }
+  /** Removes the visits in range and returns how many went. */
+  'history.deleteRange': { args: { fromMs: number; toMs: number }; result: number }
+  /** Open the history page (`zen://history`). */
+  'history.open': { args: void; result: void }
+  /**
+   * Context menu of a History page row (open in new tab / window / private window, copy,
+   * remove…). `visitId` null is a row that names a page but no visit – a tab from another
+   * device (ID-28) – whose menu keeps the page's items (open, copy, more from the site) and
+   * drops the visit's own (Select, Remove from History, Forget About This Page).
+   */
+  'history.contextMenu': {
+    args: { visitId: string | null; url: string } & MenuAnchor
+    result: void
+  }
+  /** Menu of a day heading on the history page (delete the day). */
+  'history.dayMenu': { args: { dayKey: string; count: number }; result: void }
+  /**
+   * The other devices whose groups the History page keeps folded (ID-28, "Tabs from other
+   * devices"), by device id – the session's, held by the core so a History tab closed and opened
+   * again or a second window's chrome (a renderer of its own) finds them folded still; a restart
+   * unfolds them all (Chrome's synced-device cards start open too).
+   */
+  'history.foldedDevices': { args: void; result: string[] }
+  /** Fold or unfold one device's group; every window hears `history.foldedDevicesChanged`. */
+  'history.foldDevice': { args: { deviceId: string; folded: boolean }; result: void }
+  /**
+   * The other devices the History page hides for the session (Hide Device in a device
+   * heading's menu; Chrome's "Hide for now"), by device id – held as the folds are, so every
+   * window's page agrees, and gone at quit. A hidden device's tabs are listed nowhere until the
+   * device is shown again (the "Show hidden devices" row, `history.showHiddenDevices`).
+   */
+  'history.hiddenDevices': { args: void; result: string[] }
+  /** Hide or show one device's group; every window hears `history.hiddenDevicesChanged`. */
+  'history.hideDevice': { args: { deviceId: string; hidden: boolean }; result: void }
+  /** The "Show hidden devices" row: every hidden device is listed again. */
+  'history.showHiddenDevices': { args: void; result: void }
+  /**
+   * The menu of a device's heading on the History page (a right-click or the menu key on its
+   * line; the lead's #326 ruling): Open All in Tabs and Hide Device.
+   */
+  'history.deviceMenu': { args: { deviceId: string } & MenuAnchor; result: void }
+
+  /**
+   * The Inactive tabs archive (TAB-20): the archived tabs, the newest archived first – what the
+   * overview's Inactive tabs sheet lists. Every window hears `inactiveTabs.changed` when the
+   * list changes.
+   */
+  'inactiveTabs.list': { args: void; result: ArchivedTabSummary[] }
+  /**
+   * Bring an archived tab back into its space – at the start of its regular tabs, as Chrome
+   * restores one ("Restore tab at the 'start' of the list") – to the front, its last use read
+   * as now.
+   */
+  'inactiveTabs.restore': { args: { id: string }; result: void }
+  /** Every archived tab back into its space, the first of them to the front. */
+  'inactiveTabs.restoreAll': { args: void; result: void }
+  /** Close one archived tab: it goes to the recently closed list, where History finds it. */
+  'inactiveTabs.close': { args: { id: string }; result: void }
+  /**
+   * The sheet's "Close all" (behind its confirmation): every archived tab closed for good, as
+   * Chrome's. None goes to the recently closed list – a bulk close would flush that 25-entry undo
+   * list – and History keeps their pages, which is what the prompt promises.
+   */
+  'inactiveTabs.closeAll': { args: void; result: void }
+  /**
+   * Run the archive pass and the auto-close sweep now, as if the clock read `now` (the default is
+   * the real clock). The passes run on their own after the chrome has started and on their
+   * cadence; this is the instrumentation drivers' hook, so a threshold of days is crossed
+   * without a wait. Resolves with what the passes did.
+   */
+  'inactiveTabs.runPasses': {
+    args: { now?: number }
+    result: { archived: number; closed: number }
+  }
+
+  'session.recentlyClosed': { args: void; result: ClosedEntrySummary[] }
+  /**
+   * Bring back a recently closed entry. `background` (a middle or Ctrl click on the History
+   * page's row, §10.1): a tab comes back where it was without coming to the front; a window
+   * entry is a whole window and comes back as one either way.
+   */
+  'session.restoreClosed': { args: { id: string; background?: boolean }; result: void }
+  'session.clearRecentlyClosed': { args: void; result: void }
+
+  /**
+   * Copy arbitrary text (history rows, menus) through the host clipboard. `sensitive` marks a
+   * secret (a generated password): hidden from clipboard previews and cleared after the timeout.
+   * With a `confirmation` the core also says so where the chrome is the one to
+   * (`Browser.copyText`: a toast, or nothing on Android 13+ where the OS shows its clipboard chip).
+   */
+  'clipboard.writeText': {
+    args: { text: string; sensitive?: boolean; confirmation?: string }
+    result: void
+  }
+  /**
+   * The URL bar's clipboard row (Chrome's "Link you copied"): `peek` names what the clipboard
+   * holds from its description alone and never reads the content; `read` reads it once, on the
+   * user's reveal or pick; `markUsed` says the user opened the clip through the row (the pick),
+   * so `peek` does not offer it again until the clipboard changes. Hosts without the bridge
+   * answer `none` / no text / offer it again.
+   */
+  'clipboard.peek': { args: void; result: ClipboardPeekKind }
+  'clipboard.read': { args: void; result: ClipboardContent }
+  'clipboard.markUsed': { args: void; result: void }
+  /**
+   * Settings > Search: add an engine by hand (`%s` in `url` stands for the query; `keyword` the
+   * shortcut typed in the form, `@` or not – absent or empty for one derived from the name, as
+   * before the form carried one), edit one of the user's (name, template, shortcut – empty for
+   * one derived from the name; omnibox-09), take one out of the omnibox or bring it back
+   * (`active`, settings-43; the default engine stays active), forget one the user added or a
+   * page offered, or make one the default. The shipped engines cannot be edited or removed;
+   * `search.remove` on the default falls back to the shipped default. Both forms' shortcuts
+   * are refused with `engineKeywordProblem`'s line – the one the form shows as typed.
+   */
+  'search.addEngine': { args: { name: string; url: string; keyword?: string }; result: string }
+  'search.updateEngine': {
+    args: { id: string; name: string; searchUrl: string; keyword: string }
+    result: void
+  }
+  'search.setEngineActive': { args: { id: string; active: boolean }; result: void }
+  'search.removeEngine': { args: { id: string }; result: void }
+
+  /**
+   * Ctrl+T, the sidebar's New Tab button, double-click on the sidebar: a tab at `zen://newtab`
+   * (or, with the page turned off, the URL bar in new-tab mode).
+   */
+  'newtab.open': { args: void; result: void }
+  /** Custom shortcuts of the new tab page (Settings and the page's own dialogs). */
+  'newtab.addShortcut': { args: { title: string; url: string }; result: string }
+  'newtab.updateShortcut': { args: { id: string; title: string; url: string }; result: void }
+  'newtab.removeShortcut': { args: { id: string }; result: void }
+  'newtab.reorderShortcuts': { args: { ids: string[] }; result: void }
+  /**
+   * The Undo of the phone tile menu's Remove (NTP-07), the toast's one action: the tile back –
+   * a pin at the slot it held, a most visited site's host back among the most visited. False
+   * when `url` is not the last removal's (a later removal took the toast, or Undo ran already).
+   */
+  'newtab.undoRemove': { args: { url: string }; result: boolean }
+  /** Hide or show one of the Magic Stack's modules on this device (NTP-16). */
+  'newtab.setModuleHidden': { args: { id: MagicStackModuleId; hidden: boolean }; result: void }
+  /**
+   * The Safety check card's memory after an impression or a dismissal (NTP-19): the renderer
+   * runs the machine (`shared/safetyHubCard.ts`) over the published state and writes the record
+   * back whole; the core sanitises and keeps it with the device's other new-tab sets.
+   */
+  'newtab.setSafetyHubCardMemory': { args: { memories: SafetyHubCardMemories }; result: void }
+  /**
+   * The tip card's memory after an impression or a tap on its button (NTP-20): the renderer runs
+   * the machine (`shared/educationalTips.ts`) over the published state and writes the record
+   * back whole; the core sanitises and keeps it with the device's other new-tab sets.
+   */
+  'newtab.setEducationalTipMemory': { args: { memory: EducationalTipMemory }; result: void }
+  /** Pick a background image from disk (`capabilities` gate it; resolves false when cancelled). */
+  'newtab.pickBackgroundImage': { args: void; result: boolean }
+  'newtab.clearBackgroundImage': { args: void; result: void }
+  /**
+   * Settings › New Tab's "Reset to default" for the background alone (NTP-12): the space
+   * gradient, the device's picked image let go. One row's reset asks nothing (v2 §10.5).
+   */
+  'newtab.resetBackground': { args: void; result: void }
+  /**
+   * The whole page back to its defaults (NTP-22, a bulk action behind the row's §9.23
+   * confirmation): layout, shortcuts mode, background, greeting, the pinned shortcuts, the
+   * removed sites and the picked image. Whether the page opens at all (`enabled`) is kept.
+   */
+  'newtab.reset': { args: void; result: void }
+  /**
+   * Settings › New Tab's "Use the picture's colour" switch (NTP-14). On: the window's active
+   * space takes the background picture's colour (`UIState.newTabBackground.accent`) as its
+   * theme's primary, the rest of the theme kept, and follows each new picture from then on
+   * (`SpaceTheme.fromImage`). Off: the following ends; the colours stay. False when nothing
+   * changed – no picture or its colour not known yet, a private window (v2 §9.19), or off
+   * already.
+   */
+  'newtab.useImageColor': { args: { on: boolean }; result: boolean }
+  /**
+   * The background image's address for a chrome that paints the page itself (the phone's; a data
+   * URL there), or null when none is set.
+   */
+  'newtab.backgroundImage': { args: void; result: string | null }
+  /**
+   * Store an image the chrome read itself (the phone's file chooser), or with null forget it;
+   * the background follows the pick.
+   */
+  'newtab.setBackgroundImage': { args: { dataUrl: string | null }; result: void }
+
+  /** Bookmark the tab's page in the default folder, or remove its bookmarks (toast feedback). */
+  'bookmark.toggle': { args: { tabId: string }; result: void }
+  /** Star the tab's page: bookmarks it when needed, then opens the star dialog. */
+  'bookmark.star': { args: { tabId: string }; result: void }
+  'bookmark.create': {
+    args: {
+      parentId?: string
+      index?: number
+      title: string
+      url?: string
+      type?: BookmarkNodeType
+      /** Known icon of the page (a tab dropped on the bar brings its own). */
+      favicon?: string | null
+    }
+    result: BookmarkNode | null
+  }
+  'bookmark.update': {
+    args: { id: string; title?: string; url?: string }
+    result: void
+  }
+  /** Move nodes (in the given order) so that the first lands at `index` of `parentId`. */
+  'bookmark.move': { args: { ids: string[]; parentId: string; index?: number }; result: void }
+  /**
+   * Remove bookmarks and folders (folders with all their contents). Undoable: the window hears
+   * `bookmark.deleted` with the edit's token for its toast (bookmarks-31) – unless `quiet`, for
+   * a caller whose own undo already spoke (the phone panels' deferred deletes: `removeWithUndo`
+   * waits out its toast before the command runs, so the core's word would be a second one).
+   * The delete stays undoable (the manager's Ctrl+Z) either way.
+   */
+  'bookmark.remove': { args: { ids: string[]; quiet?: boolean }; result: void }
+  /**
+   * Take back the newest delete, move or rename (the manager's Ctrl+Z), or the one edit `token`
+   * names (a delete's toast). What came back or moved, under its current ids, with the token of
+   * the edit taken back; null for nothing. Every window hears `bookmark.undone`.
+   */
+  'bookmark.undo': {
+    args: { token?: number }
+    result: {
+      kind: 'remove' | 'move' | 'update'
+      token: number
+      ids: string[]
+      parentId: string | null
+    } | null
+  }
+  /**
+   * Do the newest undone edit again (the bar menu's Redo, the manager's Ctrl+Shift+Z / Ctrl+Y):
+   * the same word as `bookmark.undo`'s, the token the edit's new one on the undo stack; null for
+   * nothing. A delete done again tells the window `bookmark.deleted` as the first one did.
+   */
+  'bookmark.redo': {
+    args: void
+    result: {
+      kind: 'remove' | 'move' | 'update'
+      token: number
+      ids: string[]
+      parentId: string | null
+    } | null
+  }
+  /**
+   * Open a bookmark (records `dateLastUsed`); `background` with `newTab` is a tab behind the
+   * current one (a middle or Ctrl click on a manager row, §10.1), as `urlbar.submit` has it.
+   */
+  'bookmark.open': {
+    args: { id: string; newTab: boolean; tabId: string | null; background?: boolean }
+    result: void
+  }
+  /** Open every bookmark in the given folders / selection in new tabs. */
+  'bookmark.openAll': { args: { ids: string[] }; result: void }
+  /** Open the bookmarks below the given nodes in a new (or private) window. */
+  'bookmark.openInWindow': { args: { ids: string[]; private: boolean }; result: void }
+  /** "Bookmark all tabs": asks for the folder's name and place (`bookmark.allTabs` event). */
+  'bookmark.allTabs': { args: void; result: void }
+  /**
+   * The dialog's answer: one new folder with a bookmark per tab, in tab order. The core toasts
+   * the result ("Bookmarked 3 tabs in …") unless `quiet`, for a caller whose own toast carries
+   * an action of its own (the phone overview's Bookmark all, with Open).
+   */
+  'bookmark.createFromTabs': {
+    args: { tabIds: string[]; title: string; parentId: string; quiet?: boolean }
+    result: BookmarkNode | null
+  }
+  'bookmark.contextMenu': {
+    args: {
+      ids: string[]
+      folderId: string
+      x: number
+      y: number
+      /** Opened with Shift+F10 or the Menu key: the first item starts selected (`MenuAnchor`). */
+      keyboard?: boolean
+      /** The element the menu hangs from – the focused row, the "More" button (`MenuAnchor`). */
+      rect?: Rect
+      /** The bar and its folder panels get Chrome's bar menu (open targets, "Show bookmarks bar"). */
+      surface?: 'manager' | 'bar'
+    }
+    result: void
+  }
+  /** The bookmarks surface's overflow menu (bookmark all tabs, import, export) at `x`,`y`. */
+  'bookmark.menu': { args: { x: number; y: number }; result: void }
+  /** Ctrl+Shift+B: flips the bar between always shown and never shown. */
+  'bookmark.toggleBar': { args: void; result: void }
+  'bookmark.cut': { args: { ids: string[] }; result: void }
+  'bookmark.copy': { args: { ids: string[] }; result: void }
+  /** Paste the app's bookmark clipboard; false when it is empty (a URL on the host clipboard is the caller's). */
+  'bookmark.paste': { args: { folderId: string; index?: number }; result: boolean }
+  /** Netscape bookmark HTML import through the host's file picker. */
+  'bookmark.import': { args: void; result: BookmarkImportResult | null }
+  /** Netscape bookmark HTML export through the host's save dialog. */
+  'bookmark.export': { args: void; result: boolean }
+
+  // --- reading list (W6-1; `core/readingList.ts`) ---------------------------------------------
+  /**
+   * Save the tab's page for later (the star's menu, the tab's menu, the app menu's row); a page
+   * already listed is marked unread and brought to the top. Null when the tab has no page the
+   * list holds (`zen://`, blank).
+   */
+  'readingList.add': { args: { tabId: string | null }; result: ReadingListEntry | null }
+  /** The tab's page out of the list (the star menu's Remove row); false when it was not in it. */
+  'readingList.removeTab': { args: { tabId: string }; result: boolean }
+  'readingList.remove': { args: { id: string }; result: boolean }
+  'readingList.setRead': { args: { id: string; read: boolean }; result: boolean }
+  /** Every unread entry read; how many changed. */
+  'readingList.markAllRead': { args: void; result: number }
+  /**
+   * Open an entry's page and mark it read: a tab of this window already showing the page is
+   * brought forward; otherwise the page loads in `tabId` (the window's active tab when null) or,
+   * with `newTab`, in a new tab – behind this one with `background` (§10.1's middle click).
+   */
+  'readingList.open': {
+    args: { id: string; tabId: string | null; newTab?: boolean; background?: boolean }
+    result: void
+  }
+  /** The row's menu (Mark as read / unread, Open in New Tab, Copy Link, Remove) at a point. */
+  'readingList.contextMenu': {
+    args: { id: string } & MenuAnchor
+    result: void
+  }
+
+  /** The browsers and files an import can come from, freshly probed (profiles, locks). */
+  'import.sources': { args: void; result: ImportSource[] }
+  /**
+   * Import the chosen kinds from a source (`ImportSource.id`); one import runs at a time and its
+   * progress is `UIState.import`. Resolves with the finished progress, or null for an unknown
+   * source or nothing to import. `primaryPassword` is Firefox's primary password when the user
+   * typed one for a Firefox source's passwords (ID-42): sent with this run only, used to unwrap
+   * `key4.db`'s master key and kept nowhere; absent, the empty default is tried.
+   */
+  'import.run': {
+    args: { source: string; kinds: ImportKind[]; primaryPassword?: string }
+    result: ImportProgress | null
+  }
+  /** Stop the running import after the kind in flight; false when none runs. */
+  'import.cancel': { args: void; result: boolean }
+  /** Drop the finished import from `UIState.import` (the dialog closed). */
+  'import.dismiss': { args: void; result: void }
+
+  'download.pause': { args: { id: string }; result: void }
+  'download.resume': { args: { id: string }; result: void }
+  'download.cancel': { args: { id: string }; result: void }
+  'download.showInFolder': { args: { id: string }; result: void }
+  'download.open': { args: { id: string }; result: void }
+  /** Take the row out of the list; the file stays where it is. */
+  'download.remove': { args: { id: string }; result: void }
+  /** "Clear all": every finished row leaves the list (`download.clearCompleted` is the older name). */
+  'download.removeCompleted': { args: void; result: void }
+  'download.clearCompleted': { args: void; result: void }
+  /** Start over: a new request for the same URL with the same referrer, replacing the row. */
+  'download.retry': { args: { id: string }; result: void }
+  /** "Keep": release a flagged file from quarantine. */
+  'download.acceptDanger': { args: { id: string }; result: void }
+  /** "Discard": delete a flagged file (or what is left of a failed one) and drop the row. */
+  'download.discard': { args: { id: string }; result: void }
+  'download.setOpenWhenDone': { args: { id: string; on: boolean }; result: void }
+  /**
+   * Delete a completed download's file from disk (Chrome's "Delete file"); the row stays and
+   * reads `fileMissing`. Resolves with what happened, `missing` when the file was gone already.
+   */
+  'download.deleteFile': { args: { id: string }; result: DownloadDeleteFileResult }
+  /**
+   * Whether a completed download's file is still on disk, checked now; the row's `fileMissing`
+   * follows the answer. False for rows without a completed file.
+   */
+  'download.exists': { args: { id: string }; result: boolean }
+  /** Let the user pick the default downloads folder; resolves with it (or null when dismissed). */
+  'download.chooseDirectory': { args: void; result: string | null }
+  /**
+   * The folder new downloads go to right now: `Settings.downloads.directory` when set, else the
+   * platform's Downloads folder (Settings › Downloads › Location shows it; empty when the host
+   * cannot name one).
+   */
+  'download.directory': { args: void; result: string }
+  /** Show the downloads panel (Ctrl/Cmd+J, the app menu, a completion notification). */
+  'download.openPanel': { args: void; result: void }
+  /** Desktop UI plumbing: begin an OS drag of a finished file out of the downloads page. */
+  'download.dragOut': { args: { id: string }; result: void }
+  /** Desktop UI plumbing: open the folder downloads are saved to in the file manager. */
+  'download.openFolder': { args: void; result: void }
+  /**
+   * A row's context menu (Open, Show in folder, Copy download link, Pause / Resume / Cancel /
+   * Retry, Remove from list), at the pointer or at `x, y` when opened from the keyboard.
+   */
+  'download.contextMenu': {
+    args: { id: string } & MenuAnchor
+    result: void
+  }
+
+  'find.start': {
+    /** `newSession` starts a fresh search for `text`; otherwise steps to the next/previous match. */
+    args: { tabId: string; text: string; forward: boolean; newSession: boolean }
+    result: void
+  }
+  'find.stop': { args: { tabId: string; keepSelection: boolean }; result: void }
+
+  'container.create': {
+    args: { name: string; color: ContainerColor; icon: ContainerIcon }
+    result: string
+  }
+  'container.update': {
+    args: { id: string; patch: Partial<Pick<Container, 'name' | 'color' | 'icon'>> }
+    result: void
+  }
+  'container.delete': { args: { id: string }; result: void }
+  'container.reorder': { args: { id: string; index: number }; result: void }
+
+  'window.minimize': { args: void; result: void }
+  'window.toggleMaximize': { args: void; result: void }
+  /**
+   * The chrome's empty caption room was double-clicked (the sidebar's empty space; the tab
+   * strip's blank band is a drag region the OS handles itself): the window does what a
+   * double-clicked title bar does on this OS – maximise / restore on Windows and Linux, the
+   * user's "Double-click a window's title bar to" choice on macOS (`ZenWindow.captionDoubleClick`).
+   */
+  'window.captionDoubleClick': { args: void; result: void }
+  'window.close': { args: void; result: void }
+  'window.toggleFullscreen': { args: void; result: void }
+  /**
+   * Chrome docked under a page in HTML fullscreen (the find bar): the fullscreen view keeps
+   * `bottom` pixels of the window free for it; 0 gives the page the whole window back.
+   */
+  'window.fullscreenInset': { args: { bottom: number }; result: void }
+  /** Renderer → main: the layout the chrome settled on (sent on start and whenever it changes). */
+  'window.formFactor': { args: { formFactor: FormFactor }; result: void }
+  /**
+   * Renderer → main: a surface of this window's chrome mounted (or unmounted) – see
+   * `ChromeSurface`. The core holds a page's request open only for a window whose surface is up.
+   */
+  'ui.surface': { args: { surface: ChromeSurface; mounted: boolean }; result: void }
+  /** Zen: a new synced window starts at the current space showing the same tabs. */
+  'window.new': { args: void; result: void }
+  /** Zen's "New blank window" (Ctrl+Shift+N): an independent, temporary tab list. */
+  'window.newUnsynced': { args: void; result: void }
+  'window.newPrivate': { args: void; result: void }
+  /** Open a URL in a new window of the given kind (history rows: "Open in New / Private Window"). */
+  'window.openUrl': { args: { url: string; kind: WindowKind }; result: void }
+  /** Blank windows: move every local tab back into one of the real spaces. */
+  'window.moveTabsToSpace': { args: { spaceId: string }; result: void }
+  /**
+   * The Name window prompt's answer: the window's name (trimmed by the core; empty or null
+   * clears it), kept with the session and read into the OS title bar (`WindowState.name`).
+   */
+  'window.setName': { args: { name: string | null }; result: void }
+
+  /**
+   * Open an internal page (`shared/internalPages.ts`) in its tab. A page with `reuse: 'window'`
+   * that the window already has (in any of its spaces) is focused and, when `section` is given,
+   * moved to that section; otherwise a new tab opens after `openerTabId` (default: the active
+   * tab) and remembers it as its opener (`Tab.openerTabId`), so a back at the page's first entry
+   * closes it back to that tab. `section: null` is the landing page; leaving it out keeps the
+   * section a reused tab is on. A chrome page's section history is the tab's history: `tab.back`
+   * / `tab.forward` step through it and `Tab.canGoBack` reads it. A chrome page on a host
+   * without `capabilities.pageTabs`, or on a layout the page is not a tab in (`layouts`), opens
+   * as its overlay instead. `query` is the page's own parameters (`InternalPageQuery`: History's
+   * `q`, the manager's `folder`), which a reused tab moves to as it would to a section. Resolves
+   * with the tab id, or null when an overlay was opened.
+   */
+  'page.open': {
+    args: {
+      id: InternalPageId
+      section?: string | null
+      openerTabId?: string | null
+      query?: InternalPageQuery
+      /**
+       * The chrome's hand-back of a page the window's class change closed (a tablet's page tab
+       * narrowed into the phone class became the page's overlay, `PageService.reconcileLayout`;
+       * the window widening again, the overlay becomes the tab): the tab comes back at the slot
+       * it had while that still fits, else beside the active tab as any page opens.
+       */
+      handedBack?: boolean
+    }
+    result: string | null
+  }
+  /**
+   * Move a page tab to a section of its page (`null` is the landing page) – or to one of the
+   * section's own drill-in pages (`subpage`, v2 §10.2: `zen://settings/privacy/site-data`) –
+   * with the page's `query` when it has one: a new history entry, or with `replace` the current
+   * one rewritten – the two-pane layout's nav switches categories without stacking them (v2
+   * §10.5, Firefox's `about:preferences#category`). A document page loads the section's
+   * address in its view.
+   */
+  'page.navigate': {
+    args: {
+      tabId: string
+      section: string | null
+      subpage?: string | null
+      replace?: boolean
+      query?: InternalPageQuery
+    }
+    result: void
+  }
+  /**
+   * Save a screenshot of the page to Downloads: the visible area, or with `fullPage` the whole
+   * page beyond the viewport (Edge's "Capture full page"; the visible area when the host cannot).
+   */
+  'page.screenshot': { args: { tabId: string; fullPage?: boolean }; result: void }
+  // ---- Web capture (`core/capture.ts`, `shared/capture.ts`) ------------------------------------
+  /**
+   * The page's picture for the chrome's capture UI (Edge's Web capture): the visible area, the
+   * whole page or a region in CSS pixels relative to the document, as a data URL with its pixel
+   * size – PNG unless `format` says JPEG. Goes through the host's agent capture; a full page or
+   * region the host could not paint as asked comes back as the visible area with
+   * `fallback: 'viewport'`. Refuses a picture past `CAPTURE_MAX_PIXELS` with
+   * `CaptureTooLargeError` (a named error the UI shows), never with a silent null; null only
+   * for a page that cannot be captured at all (not painted yet, gone) or a region outside the
+   * document.
+   */
+  'page.capture': {
+    args: { tabId: string } & PageCaptureRequest
+    result: PageCaptureResult | null
+  }
+  /**
+   * The page's geometry for the overlay's drag rectangle (`regionFromChrome` in
+   * `shared/capture.ts`): scroll offset, viewport and document sizes, zoom and device pixel
+   * ratio; null when the host cannot read the page.
+   */
+  'page.viewport': { args: { tabId: string }; result: PageViewport | null }
+  /** Put a captured picture (an image data URL) on the clipboard as a PNG; false when the host could not. */
+  'capture.copy': { args: { dataUrl: string }; result: boolean }
+  /**
+   * Save a captured picture to the downloads location (Settings › Downloads, else the platform's
+   * folder) under `fileName` or the screenshot name rule, and list it as a completed download
+   * so the bubble and the Downloads page show it; `tabId` puts it in the tab's container (a
+   * private window's capture stays in the private list). Resolves with where it landed, null
+   * when the host could not write it.
+   */
+  'capture.save': {
+    args: { dataUrl: string; fileName?: string; tabId?: string }
+    result: { path: string } | null
+  }
+  /**
+   * Offer a captured picture to the browser's share hub (`ShareService`: the Share… menu's
+   * sheet on the desktop, the OS's own sheet where the host has one) as a PNG file under the
+   * screenshot name rule, with the tab's title as the message beside it; `tabId` names the
+   * page it was taken from. True once a sheet has the picture, false where the window has none
+   * to offer it to.
+   */
+  'capture.share': { args: { dataUrl: string; tabId?: string }; result: boolean }
+  /** Print through the system dialog (Ctrl+Shift+P; Ctrl+P too on a host without the preview). */
+  'page.print': { args: { tabId: string }; result: void }
+  /**
+   * Open Ione's print preview for the tab (`zen://print`; `capabilities.printPreview`): the
+   * page's overlay on the desktop. A host without the preview gets the system dialog instead.
+   */
+  'page.printPreview': { args: { tabId: string }; result: void }
+  // ---- Print preview (`core/print.ts`, `shared/print.ts`) -------------------------------------
+  /**
+   * The preview's session for a tab: the page's title and address, the system's printers and
+   * the settings the preview opens with (Chrome's sticky settings over the defaults). Null for a
+   * tab that cannot be printed (no page, a chrome page) or a host without the preview.
+   */
+  'print.session': { args: { tabId: string }; result: PrintSessionInfo | null }
+  /**
+   * Render the preview with `settings`: the page as a PDF, base64. `pageCount` is what the
+   * chrome learned from an earlier render (the pages picked need it); unknown, every page is
+   * rendered.
+   */
+  'print.preview': {
+    args: { tabId: string; settings: PrintSettings; pageCount?: number | null }
+    result: PrintPreviewResult
+  }
+  /**
+   * Print or save with `settings`, for a document of `pageCount` pages: a printer gets the job
+   * silently, Save as PDF asks where to save and lists the file in Downloads. The sticky part
+   * of the settings is remembered either way.
+   */
+  'print.run': {
+    args: { tabId: string; settings: PrintSettings; pageCount: number }
+    result: PrintRunResult
+  }
+  /** The preview closed without printing (Cancel, Escape, the tab going away). */
+  'print.close': { args: { tabId: string }; result: void }
+  // ---- PDF viewer (`zen://pdf`, `capabilities.pdfViewer`) -------------------------------------
+  /** Chrome's "Open with": the system chooser for the PDF the tab shows. */
+  'pdf.openWith': { args: { tabId: string }; result: void }
+  /** The system share sheet with the PDF file the tab shows. */
+  'pdf.share': { args: { tabId: string }; result: void }
+  /**
+   * Save a copy of the PDF with the form's values written in (pdf.js's incremental save) to the
+   * downloads location under the file's name, listed as a completed download; the viewer's
+   * form reads unmodified once it is written. The path the copy was written under (a `content:`
+   * address on a host that names none), or null when the tab shows no viewer, the host cannot
+   * write files, or the copy could not be made or written.
+   */
+  'pdf.save': { args: { tabId: string }; result: string | null }
+  /**
+   * The system print flow with the PDF the tab shows (`capabilities.pdfPrint`): the file as
+   * downloaded, or – the form edited – a copy with its values written in. False when the tab
+   * shows no viewer, the host cannot print, or the edited copy could not be made.
+   */
+  'pdf.print': { args: { tabId: string }; result: boolean }
+  /** What the viewer in the tab last reported (page, zoom, find, outline, form); null before it did. */
+  'pdf.state': { args: { tabId: string }; result: PdfViewerReport | null }
+  /** Drive the viewer in the tab (zoom, fit, go to a page, find, rotate); false when it has none. */
+  'pdf.command': { args: { tabId: string; command: PdfViewerCommand }; result: boolean }
+  'page.savePage': { args: { tabId: string }; result: void }
+  'page.viewSource': { args: { tabId: string }; result: void }
+  /** Page context menu requested from the chrome side (touch long-press forwarded by the host). */
+  'page.contextMenu': {
+    args: { tabId: string; linkURL: string; srcURL: string; x: number; y: number }
+    result: void
+  }
+
+  'onboarding.complete': {
+    args: { searchEngineId: string; colorScheme: ColorScheme; essentials: string[] }
+    result: void
+  }
+
+  /**
+   * The EEA's search-engine choice screen (W6-2). `choose`: the picked engine becomes the
+   * default (copied into the user's list when it is one of the EEA set) and the device's record
+   * is written; `skip`: "Skip for now" – nothing is written, the screen waits for the next run;
+   * `askAgain`: Settings › Search › "Choose your search engine again" puts the screen up.
+   */
+  'searchChoice.choose': { args: { engineId: string }; result: void }
+  'searchChoice.skip': { args: void; result: void }
+  'searchChoice.askAgain': { args: void; result: void }
+
+  /**
+   * Ask the system to make Ione the default browser (Android's role dialog, or the default-apps
+   * settings on older versions); resolves with whether it now is (null when the host cannot tell).
+   */
+  'defaultBrowser.request': {
+    args: { source: DefaultBrowserRequestSource }
+    result: boolean | null
+  }
+  /** "Not now" on the sheet, or the banner's close button. */
+  'defaultBrowser.dismiss': { args: { prompt: 'sheet' | 'banner' }; result: void }
+  /** Read the role again (the settings row opens; the app came back from the system dialog). */
+  'defaultBrowser.refresh': { args: void; result: boolean | null }
+
+  /**
+   * Settings › System › "Open your computer's proxy settings" (Chrome's System page): the OS
+   * panel where the computer's proxy is set – Windows Settings › Network & internet › Proxy,
+   * macOS System Settings › Network › Proxies, the Linux desktop's network settings by Chrome's
+   * table of desktops. `unsupported` when the host could not open one (a Linux desktop the
+   * table does not know, its tool not on the PATH, a host without the door): the page says so.
+   */
+  'system.openProxySettings': { args: void; result: ProxySettingsDoor }
+
+  'boost.update': {
+    args: { domain: string; patch: Partial<Omit<Boost, 'domain' | 'updatedAt'>> }
+    result: void
+  }
+  'boost.remove': { args: { domain: string }; result: void }
+  'boost.startZap': { args: { tabId: string }; result: void }
+  'boost.stopZap': { args: { tabId: string }; result: void }
+
+  /**
+   * Read aloud (CT-12 / CT-13, `shared/readAloud.ts`): start reading a tab's page from the top,
+   * the selection, the reader article or one sentence – a start on another tab ends the first
+   * session (one session). The playback state is `UIState.readAloud`.
+   */
+  'readAloud.start': { args: { tabId: string; from?: ReadAloudStartFrom }; result: void }
+  /** Pause a playing session, resume a paused one, restart an ended one. */
+  'readAloud.toggle': { args: void; result: void }
+  'readAloud.pause': { args: void; result: void }
+  'readAloud.resume': { args: void; result: void }
+  /** End the session: speech stops, the highlight clears, the OS controls let go. */
+  'readAloud.stop': { args: void; result: void }
+  'readAloud.next': { args: void; result: void }
+  'readAloud.previous': { args: void; result: void }
+  'readAloud.seek': { args: { sentenceIndex: number }; result: void }
+  /** The speed (0.5–4, `READ_ALOUD_RATES`); saved, applied from the next sentence. */
+  'readAloud.setRate': { args: { rate: number }; result: void }
+  /**
+   * The voice for the session's language (`voiceByLanguage[lang]`); saved, applied from the next
+   * sentence. `lang` names the language without a session (a Settings picker).
+   */
+  'readAloud.setVoice': { args: { voiceId: string; lang?: string }; result: void }
+  'readAloud.setHighlight': { args: { mode: ReadAloudHighlightMode }; result: void }
+  /** The host's voices and the per-language default among them (the pickers). */
+  'readAloud.voices': { args: void; result: ReadAloudVoicesResult }
+
+  /**
+   * The mini menu's chip `id` was pressed over the selection `UIState.selectionMenu` holds for
+   * `tabId` (CT-39): the matching page-menu selection action runs (`Menus.selectionActions`,
+   * the one list) and the state clears. False when the state is another tab's or gone.
+   */
+  'selectionMenu.run': { args: { tabId: string; id: SelectionMenuActionId }; result: boolean }
+  /** The mini menu was dismissed (Escape in the pill's document): the state clears, the page has the keyboard back. */
+  'selectionMenu.dismiss': { args: { tabId: string }; result: void }
+  /**
+   * The pill's document measured the size its content wants (CSS px, the pill's box without the
+   * surface's shadow margin) for the selection `UIState.selectionMenu` holds for `tabId`, in the
+   * pose it drew (`folded`: the glyph row, or the full pill) – with, for the folded row, the
+   * room its glyph buttons' tooltips need beyond the box while one is on its way or up (`room`,
+   * `MiniMenuRoom`; null at rest, the same box told again as the moment comes and goes); the
+   * core keeps one measurement per pose and places the popup surface to fit
+   * (`SelectionMenuService.surfaceSize`), back at the padded box on the null. Answers with the
+   * surface's size as set – the room's acknowledgement, which the document's tooltip waits for
+   * before it paints (`MiniMenuSurfaceSize`) – or null when the report placed no surface.
+   */
+  'selectionMenu.surfaceSize': {
+    args: {
+      tabId: string
+      width: number
+      height: number
+      folded: boolean
+      room?: MiniMenuRoom | null
+    }
+    result: MiniMenuSurfaceSize | null
+  }
+  /**
+   * A definition of `term` from Wiktionary (`core/define.ts`; English Wiktionary's REST
+   * definitions, the reader's language section when it has one, `lang` defaulting to the first
+   * preferred language). The answer carries the attribution the licence asks for, or a typed
+   * refusal; cached for a day.
+   */
+  'define.lookup': { args: { term: string; lang?: string }; result: DefineLookup }
+  'reader.toggle': { args: { tabId: string }; result: void }
+  /** Change Reader View's text preferences; every open reader page follows at once. */
+  'reader.setPreferences': { args: Partial<ReaderPreferences>; result: void }
+
+  /** Chrome's "Check the spelling of text fields". */
+  'spellcheck.setEnabled': { args: { enabled: boolean }; result: void }
+  /** Check (or stop checking) in one of the host's dictionary languages. */
+  'spellcheck.setLanguage': { args: { code: string; on: boolean }; result: void }
+  /** The custom dictionary (words added with "Add to Dictionary"), sorted. */
+  'spellcheck.words': { args: void; result: string[] }
+  'spellcheck.addWord': { args: { word: string }; result: boolean }
+  'spellcheck.removeWord': { args: { word: string }; result: boolean }
+  /** Android: the system's keyboard settings, where the spell checker that checks pages is set. */
+  'spellcheck.openKeyboardSettings': { args: void; result: void }
+
+  'liveFolder.save': {
+    args: {
+      /** Existing folder to convert, or `null` to create a new folder in the current space. */
+      folderId: string | null
+      name: string
+      config: Pick<
+        LiveFolderConfig,
+        | 'provider'
+        | 'source'
+        | 'includeDrafts'
+        | 'token'
+        | 'mapping'
+        | 'intervalMinutes'
+        | 'maxItems'
+      >
+    }
+    result: string
+  }
+  'liveFolder.refresh': { args: { folderId: string }; result: void }
+  'liveFolder.remove': { args: { folderId: string }; result: void }
+
+  'extension.add': { args: void; result: void }
+  /** Picks a `.crx` or `.zip` file and installs it. */
+  'extension.installFromFile': { args: void; result: void }
+  /** Installs from the Chrome Web Store or Edge Add-ons by id or listing URL. */
+  'extension.installFromStore': {
+    args: { ref: string; store?: 'chrome-web-store' | 'edge-add-ons' }
+    result: void
+  }
+  'extension.remove': { args: { id: string }; result: void }
+  'extension.setEnabled': { args: { id: string; enabled: boolean }; result: void }
+  /** Pin to a version: left out of update checks. */
+  'extension.setPinned': { args: { id: string; pinned: boolean }; result: void }
+  /** Lets (or stops letting) this extension's `chrome_url_overrides.newtab` page open new tabs. */
+  'extension.setNewTabOverride': { args: { id: string; enabled: boolean }; result: void }
+  /** Opens this extension's `chrome.sidePanel` beside the page, or closes it when it is showing. */
+  'extension.toggleSidePanel': { args: { id: string }; result: void }
+  'extension.closeSidePanel': { args: void; result: void }
+  /** Chrome's "Allow in Incognito": let the extension's request rules reach private windows. */
+  'extension.setAllowPrivate': { args: { id: string; allowed: boolean }; result: void }
+  /** Chrome's "Allow user scripts": make `chrome.userScripts` available and run its scripts. */
+  'extension.setAllowUserScripts': { args: { id: string; allowed: boolean }; result: void }
+  'extension.reload': { args: { id: string }; result: void }
+  'extension.checkForUpdates': { args: void; result: void }
+  'extension.update': { args: { id: string }; result: void }
+  'extension.openOptions': { args: { id: string }; result: void }
+  /**
+   * Open the action popup (or fire `action.onClicked` when the extension has none). `bounds` are
+   * the exact window-content coordinates for the popup view inside the frame the renderer draws,
+   * `radius` its corner; main reports the content's preferred size back via `extension.popupSize`
+   * and the renderer answers with `extension.resizePopup` once its frame has settled.
+   */
+  'extension.openPopup': {
+    args: { id: string; anchor: Rect; bounds?: Rect; radius?: number }
+    result: void
+  }
+  'extension.closePopup': { args: void; result: void }
+  /** Context menu of an extension's toolbar button (its `contextMenus` items plus Ione's). */
+  'extension.actionContextMenu': { args: { id: string } & MenuAnchor; result: void }
+  /**
+   * The items an extension adds to its own action's context menu (`chrome.contextMenus` items
+   * with the `action` context, in Chrome's layout: check states, submenus, separators), for the
+   * phone's long-press menu sheet, which shows them above the browser's rows as Chrome does
+   * (the desktop's native menu gets the same items through `extension.actionContextMenu`). Each
+   * item's `id` is a handle for `extension.actionMenuClick`; a fresh request retires the
+   * previous handles. Empty when the extension adds none.
+   */
+  'extension.actionMenuItems': { args: { id: string }; result: MenuItemDescriptor[] }
+  /**
+   * The user picked one of the items `extension.actionMenuItems` answered: the extension's
+   * `contextMenus.onClicked` fires with Chrome's `OnClickData` for the `action` context and the
+   * active tab, as a pick in the desktop's menu does.
+   */
+  'extension.actionMenuClick': { args: { id: string; itemId: string }; result: void }
+  /** Empties the extension's error console (`ExtensionInfo.errors`). */
+  'extension.clearErrors': { args: { id: string }; result: void }
+  // ---- PROVISIONAL: extensions UI (PR #68) ------------------------------------------------------
+  // Added by the UI wave ahead of the engine; `src/main/platform/extensions.ts` implements them
+  // as they stand. The API layer (#91) landed without competing names (`ExtensionAction` above is
+  // its shape); its `permissions.request` still confirms natively rather than through
+  // `extensionPermissionRequest`. Later engine PRs may rename or fold these: reconcile here and
+  // keep the renderer's call sites (`lib/extensions/*`, `components/extensions/*`) in step.
+  /** Move the open popup view to where the renderer's frame has settled, and show it. */
+  'extension.resizePopup': { args: { bounds: Rect; visible: boolean }; result: void }
+  /** Paths dropped on the management page: `.crx` / `.zip` packages or unpacked folders. */
+  'extension.installFromDrop': { args: { paths: string[] }; result: void }
+  /** Show as a toolbar button (or move back into the puzzle-piece panel). */
+  'extension.setToolbarPinned': { args: { id: string; pinned: boolean }; result: void }
+  'extension.setAllowFileAccess': { args: { id: string; allow: boolean }; result: void }
+  /** The answer to an `extensionInstallRequest`. */
+  'extension.confirmInstall': { args: { requestId: string; accept: boolean }; result: void }
+  /** The answer to an `extensionPermissionRequest`. */
+  'extension.respondPermissionRequest': {
+    args: { requestId: string; accept: boolean }
+    result: void
+  }
+  // ---- end PROVISIONAL ----------------------------------------------------------------------------
+
+  'mod.add': { args: { name: string; css: string; source?: string }; result: string }
+  'mod.update': {
+    args: { id: string; patch: Partial<Pick<Mod, 'name' | 'css' | 'enabled'>> }
+    result: void
+  }
+  'mod.remove': { args: { id: string }; result: void }
+  'mod.importFile': { args: void; result: void }
+  'mod.importUrl': { args: { url: string }; result: void }
+
+  'sync.chooseFolder': { args: void; result: string | null }
+  /**
+   * Turn sync on. `transport` names the folder's home (the folder of `folder` when absent, as
+   * before ID-32); with `webdav` the server's settings and app password come in `webdav` and
+   * `folder` is not read; with `account` the account signed in to (`sync.accountSignIn`) is the
+   * home and neither is read.
+   */
+  'sync.setup': {
+    args: {
+      folder: string
+      passphrase: string
+      deviceName: string
+      scope: SyncScope
+      transport?: SyncTransportKind
+      webdav?: WebDavSyncCredentials
+    }
+    /** A WebDAV server's refusal, or the secret store's, in the engine's typed terms; null when sync is on. */
+    result: SyncSetupRefusal | null
+  }
+  /** Reach a WebDAV server with these credentials once (nothing is created or kept): the Test connection row's answer. */
+  'sync.testWebDav': { args: WebDavSyncCredentials; result: WebDavProbe }
+  /**
+   * A new app password for the configured WebDAV server (after `authRefused`, or a rotation);
+   * sync runs again with it. The secret store not keeping it is the typed refusal, never a rejection.
+   */
+  'sync.setWebDavPassword': { args: { password: string }; result: SyncSetupRefusal | null }
+  /**
+   * Sign this device in to the Ione account: the sign-in page opens in a new tab and the code
+   * it must show lands in `SyncStatus.accountLink`; the engine waits for the approval in the
+   * background. Resolves once the code is shown (or the start failed: `accountLinkFailure`).
+   */
+  'sync.accountSignIn': { args: void; result: void }
+  /** Stop waiting for the sign-in under way; nothing is kept. */
+  'sync.accountCancel': { args: void; result: void }
+  /**
+   * Sign this device out of the Ione account: the service forgets its sign-in, the secret store
+   * forgets it here, and sync turns off (this device keeps what it has).
+   */
+  'sync.accountSignOut': { args: void; result: void }
+  'sync.setScope': { args: Partial<SyncScope>; result: void }
+  'sync.setDeviceName': { args: { name: string }; result: void }
+  /**
+   * Point a configured device at a folder again (the chosen one was lost, or the user moves
+   * to another): the key stays; a folder holding another passphrase's data is refused.
+   */
+  'sync.setFolder': { args: { folder: string }; result: void }
+  'sync.now': { args: void; result: void }
+  'sync.confirmMerge': { args: { merge: boolean }; result: void }
+  'sync.disconnect': { args: { wipeRemote: boolean }; result: void }
+  /** The other devices' open tabs (ID-28), those that publish them; [] with Open tabs off here. */
+  'sync.tabsFromDevices': { args: void; result: SyncDeviceTabs[] }
+  /**
+   * Send a page to one of the other devices (ID-27, Chrome's "Send to your devices"): it opens
+   * there as a tab once. `tabId` names the tab whose page it is (its title when none is given).
+   */
+  'sync.sendTab': {
+    args: { deviceId: string; url: string; title?: string; tabId?: string }
+    result: void
+  }
+
+  /** End an agent's session and release its tabs. */
+  'agent.disconnect': { args: { id: string }; result: void }
+  /**
+   * Release a disconnected agent's tab groups: they stay open, orphaned for any agent to adopt,
+   * and the agent can no longer resume them.
+   */
+  'agent.release': { args: { claimId: string }; result: void }
+  'agent.setMode': { args: { id: string; mode: AgentMode }; result: void }
+  /** Take a tab back from the agent driving it. */
+  'agent.releaseTab': { args: { tabId: string }; result: void }
+  /** Forget a previously approved agent name. */
+  'agent.forget': { args: { name: string }; result: void }
+  /** Issue a new token (existing HTTP sessions stay valid until they end). */
+  'agent.regenerateToken': { args: void; result: string }
+  /**
+   * Install the `ione-browser` Agent Skill into the named harnesses' skills directories
+   * (`AgentSkillTarget.id`s), or into every detected one when none are named.
+   */
+  'agent.installSkill': { args: { targets?: string[] }; result: void }
+  /** Remove Ione's copies from the named harnesses (every installed one when none are named). */
+  'agent.uninstallSkill': { args: { targets?: string[] }; result: void }
+  /** Detect the harnesses again and re-read the installed copies. */
+  'agent.refreshSkill': { args: void; result: void }
+
+  /** Look for a newer release now (Settings → Updates → "Check now"). */
+  'updates.check': { args: void; result: void }
+  /** Fetch and verify the release found by the last check. */
+  'updates.download': { args: void; result: void }
+  /** Apply a downloaded update: restart into it, open the installer, or hand it to the OS. */
+  'updates.install': { args: void; result: void }
+  'updates.cancel': { args: void; result: void }
+  /** Open the release notes on GitHub in a tab. */
+  'updates.openRelease': { args: void; result: void }
+
+  /**
+   * Who manages the browser (TB-13; `shared/managed.ts`): the host's app-restrictions bundle,
+   * read once on the first ask – the app menu's first build or the Management page's mount,
+   * never at start – or the unmanaged status on a host without a bundle to read.
+   */
+  'managed.status': { args: void; result: ManagedStatus }
+
+  /**
+   * Open (or first create) the vault. `passphrase` answers a `passphrase` outcome, and creates
+   * the vault after a `setup-passphrase` one (no OS keystore on this device).
+   */
+  'passwords.unlock': { args: { passphrase?: string }; result: ReauthOutcome<null> }
+  'passwords.lock': { args: void; result: void }
+  /** Throw the unreadable vault away and start empty (offered when `PasswordsStatus.error` is set). */
+  'passwords.reset': { args: void; result: void }
+  /**
+   * Set or change the vault passphrase (the desktop fallback when no OS keystore exists, and
+   * the re-authentication secret where the OS cannot verify the user). Changing an existing
+   * passphrase needs the current one.
+   */
+  'passwords.setPassphrase': {
+    args: { passphrase: string; current?: string }
+    result: ReauthOutcome<null>
+  }
+  /** Saved logins without their secrets, newest first; `query` filters by site and username. */
+  'passwords.list': { args: { query?: string }; result: CredentialSummary[] }
+  /** The password of one login, behind re-authentication. */
+  'passwords.reveal': { args: { id: string; passphrase?: string }; result: ReauthOutcome<string> }
+  /** Copy a login's username, or (behind re-authentication) its password. */
+  'passwords.copy': {
+    args: { id: string; field: 'username' | 'password'; passphrase?: string }
+    result: ReauthOutcome<null>
+  }
+  'passwords.add': {
+    args: { url: string; username: string; password: string; notes?: string }
+    result: CredentialSummary
+  }
+  'passwords.update': {
+    args: {
+      id: string
+      patch: Partial<Pick<Credential, 'url' | 'username' | 'password' | 'notes'>>
+    }
+    result: CredentialSummary | null
+  }
+  /** Delete a login; it can be brought back with `passwords.restore` for a short while. */
+  'passwords.remove': { args: { id: string }; result: void }
+  'passwords.restore': { args: { id: string }; result: boolean }
+  'passwords.neverSaveAdd': { args: { domain: string }; result: void }
+  'passwords.neverSaveRemove': { args: { domain: string }; result: void }
+  /** A fresh strong password; `domain` applies the site's published password rules. */
+  'passwords.generate': {
+    args: { options: GeneratorOptions; domain?: string }
+    result: { password: string; rules: string | null }
+  }
+  'passwords.checkupRun': { args: void; result: void }
+  'passwords.checkupCancel': { args: void; result: void }
+  /**
+   * Answer a sign-in leak warning (`PasswordsStatus.leaks`): `changePassword` opens the site's
+   * change-password page in the warning's tab, `ignore` remembers the warning as dismissed for
+   * this password value, `openManager` opens Settings › Passwords, `dismiss` only closes it.
+   */
+  'passwords.leakRespond': { args: { id: string; action: CredentialLeakAction }; result: void }
+  /** Pick a CSV export (Chrome, Edge, Firefox, Bitwarden, Safari, LastPass) and import it. */
+  'passwords.import': { args: { conflict: ImportConflict }; result: ImportResult | null }
+  /**
+   * Write every login to a Chrome-compatible CSV where the user chooses, behind
+   * re-authentication; `saved` is false when the save dialog was cancelled.
+   */
+  'passwords.export': {
+    args: { passphrase?: string }
+    result: ReauthOutcome<{ saved: boolean; count: number }>
+  }
+  /** Answer a save / update / passkey-account prompt (null dismisses it for this page load). */
+  'autofill.respond': {
+    args: { id: string; response: AutofillPromptResponse | null }
+    result: void
+  }
+  /**
+   * Fill the picker's item into the focused form (null closes the picker). `passphrase` answers
+   * a `passphrase` outcome of the re-authentication that guards passwords and card numbers.
+   */
+  'autofill.pick': {
+    args: { id: string; itemId: string | null; passphrase?: string }
+    result: ReauthOutcome<null>
+  }
+  /**
+   * The desktop picker's document (`?surface=popup`, `PickerSurface`) reports the height its
+   * content wants – with, for a tooltip's moment on one of its edge controls, the room the
+   * tooltip needs beyond the panel's box (`room`, `PopupSurfaceRoom`; null at rest, the same
+   * height told again as the moment comes and goes); the core sizes and places the popup
+   * surface from it (`placePickerSurface`), back at the panel's padded box on the null. Answers
+   * with the surface's size as set – the room's acknowledgement, which the document's tooltip
+   * waits for before it paints (`PopupSurfaceSize`) – or null when the report placed no surface.
+   */
+  'autofill.surfaceSize': {
+    args: { id: string; height: number; room?: PopupSurfaceRoom | null }
+    result: PopupSurfaceSize | null
+  }
+  /**
+   * The popup surface took or lost the keyboard: while it holds it the page field's blur does
+   * not close the picker (a press on a row blurs the field first).
+   */
+  'autofill.surfaceFocus': { args: { id: string; focused: boolean }; result: void }
+  /**
+   * The picker's "Manage…" row: the picker closes and Settings opens on the Autofill section of
+   * the window the picker belongs to (the desktop picker's document is not that window's chrome).
+   */
+  'autofill.manage': { args: void; result: void }
+  /** Saved addresses, most recently used first. */
+  'autofill.listAddresses': { args: void; result: AddressEntry[] }
+  'autofill.addAddress': { args: { address: AddressInput }; result: AddressEntry }
+  'autofill.updateAddress': {
+    args: { id: string; patch: Partial<AddressInput> }
+    result: AddressEntry | null
+  }
+  'autofill.removeAddress': { args: { id: string }; result: void }
+  /** The address form of a country: its fields in order, labels, required flags, region lists. */
+  'autofill.addressFormat': { args: { country: string }; result: AddressFormat }
+  /** Every country the address metadata knows, sorted by name. */
+  'autofill.countries': { args: void; result: { code: string; name: string }[] }
+  /** Saved cards without their numbers, most recently used first. */
+  'autofill.listCards': { args: void; result: PaymentCardSummary[] }
+  /** Rejects with a message when the number fails the Luhn check or the expiry is malformed. */
+  'autofill.addCard': { args: { card: PaymentCardInput }; result: PaymentCardSummary }
+  'autofill.updateCard': {
+    args: { id: string; patch: Partial<PaymentCardInput> }
+    result: PaymentCardSummary | null
+  }
+  'autofill.removeCard': { args: { id: string }; result: void }
+  /** The full number of a card, behind re-authentication. */
+  'autofill.revealCard': {
+    args: { id: string; passphrase?: string }
+    result: ReauthOutcome<string>
+  }
+  /** Copy a card's number (behind re-authentication) with the clipboard marked sensitive. */
+  'autofill.copyCardNumber': {
+    args: { id: string; passphrase?: string }
+    result: ReauthOutcome<null>
+  }
+  'autofill.listPasskeys': { args: void; result: PasskeyEntry[] }
+  /** Forget the record of a passkey (the key itself lives with the platform authenticator). */
+  'autofill.removePasskey': { args: { id: string }; result: void }
+  /** "Open anyway" for one blocked pop-up of a tab. */
+  'popups.open': { args: { tabId: string; url: string }; result: void }
+  'popups.dismiss': { args: { tabId: string }; result: void }
+  /** Always allow (or stop allowing) pop-ups on the site of the tab's current page. */
+  'popups.setSiteAllowed': { args: { tabId: string; allow: boolean }; result: void }
+  /** Forget one remembered per-site answer; the site asks (or is blocked) again. */
+  'permissions.forget': { args: { origin: string; permission: string }; result: void }
+  'permissions.reset': { args: void; result: void }
+  /** Answer (or dismiss) a pending permission prompt. */
+  'permissions.respond': { args: { id: string; answer: PermissionPromptAnswer }; result: void }
+  /**
+   * Settings › Site settings: the default for a content type (`ask` and the built-in default
+   * both clear the stored default), and the sites with a decision of their own.
+   */
+  'permissions.setDefault': {
+    args: { permission: string; decision: 'allow' | 'deny' | 'ask' }
+    result: void
+  }
+  'permissions.defaults': { args: void; result: Record<string, 'allow' | 'deny' | 'ask'> }
+  'permissions.listForPermission': {
+    args: { permission: string }
+    result: Array<{ origin: string; decision: 'allow' | 'deny' }>
+  }
+  /** Decide for a site without a prompt (an exception row), or forget with null. */
+  'permissions.set': {
+    args: { origin: string; permission: string; decision: 'allow' | 'deny' | null }
+    result: void
+  }
+  /** Forget every decision of a site (Settings' per-site list). */
+  'permissions.resetOrigin': { args: { origin: string }; result: void }
+  /**
+   * The Safety check's review of the permissions the unused-sites sweep took (PS-41). "Allow
+   * again": every permission in the site's record is allowed once more, marked `keepGranted` so
+   * no later sweep takes it, and the record goes; its Undo puts the answers back the way the
+   * sweep left them and the record back with its old times.
+   */
+  'permissions.regrantRevoked': { args: { origin: string }; result: void }
+  'permissions.undoRegrantRevoked': { args: { origin: string }; result: void }
+  /**
+   * "Got it": the whole list goes (the permissions stay revoked); the records are returned so
+   * the chrome's Undo can put them back as they were with `restoreRevokedList`.
+   */
+  'permissions.acknowledgeRevoked': { args: void; result: RevokedSitePermissions[] }
+  'permissions.restoreRevokedList': { args: { records: RevokedSitePermissions[] }; result: void }
+  /** Answer a pending HTTP authentication or client-certificate prompt (null cancels). */
+  'security.respond': {
+    args: { id: string; response: SecurityPromptResponse | null }
+    result: void
+  }
+  /** Answer a device chooser: the picked candidate's id (Connect), or null (Cancel). */
+  'devices.respond': { args: { id: string; deviceId: string | null }; result: void }
+  /** Answer a Bluetooth pairing prompt (null cancels the pairing). */
+  'devices.respondPairing': {
+    args: { id: string; response: DevicePairingResponse | null }
+    result: void
+  }
+  /**
+   * Take a site's connection to one device (or, without `deviceId`, to every device of the
+   * kind) away: the site must ask again through a chooser (Chrome's "Revoke").
+   */
+  'devices.forget': {
+    args: { origin: string; kind: DeviceKind; deviceId?: string }
+    result: void
+  }
+  /** Answer a page's `alert` / `confirm` / `prompt` or "Leave site?" dialog. */
+  'pageDialog.respond': { args: { id: string; response: PageDialogResponse }; result: void }
+  /** Answer the window-modal question the window is showing ("Close N tabs?"). */
+  'window.respondPrompt': { args: { id: string; accepted: boolean }; result: void }
+  /** After an unclean exit: bring the last session's pages back, or start without them. */
+  'session.crashRestore': { args: { restore: boolean }; result: void }
+  /** Drop the credentials and certificate choices remembered for this session. */
+  'security.forgetSession': { args: void; result: void }
+  /** Refresh one filter list (or every enabled one) from its canonical URL now. */
+  'blocking.updateLists': { args: { id?: string }; result: void }
+  /** The master switch of ad and tracker blocking (the `ads` permission's default). */
+  'blocking.setEnabled': { args: { enabled: boolean }; result: void }
+  /** Except a site (origin, URL or host) from blocking, or block on it again. */
+  'blocking.setSiteException': { args: { site: string; excepted: boolean }; result: void }
+  /** Refresh one Safe Browsing feed (or every feed) now, whatever its age. */
+  'protection.updateFeeds': { args: { id?: string }; result: void }
+  /** Ask again before loading `host` over plaintext: forget its session and stored allowance. */
+  'protection.forgetPlaintext': { args: { host: string }; result: void }
+  /**
+   * End the host's hold on the startup sweeps (`PerformanceHost.holdBackgroundWork`): the demo
+   * harness calls it once its scenes are over, and the held sweeps run at once. Idempotent; a
+   * no-op where nothing is held.
+   */
+  'performance.releaseBackgroundWork': { args: void; result: void }
+  /**
+   * Try a Google Safe Browsing key against the API before it is kept (one lookup of a prefix on
+   * no list); refused when Google rejects the key (v2 §9.30's busy form behind the key field).
+   */
+  'protection.checkApiKey': { args: { key: string }; result: ProtectionCheck }
+  /** Ask a custom DNS-over-HTTPS resolver one question before it is kept; refused when it does not answer. */
+  'protection.checkResolver': { args: { url: string }; result: ProtectionCheck }
+  /**
+   * The system's Private DNS screen (Android, where secure DNS is the system's: no
+   * `capabilities.secureDns`); a toast on hosts without one.
+   */
+  'protection.openPrivateDnsSettings': { args: void; result: void }
+  /** Translate the tab's page (into the default target when `target` is omitted). */
+  'translate.page': {
+    args: { tabId: string; target?: string; source?: string }
+    result: void
+  }
+  /** Show the original page again. */
+  'translate.revert': { args: { tabId: string }; result: void }
+  /** Close the translation offer for this page load. */
+  'translate.dismiss': { args: { tabId: string }; result: void }
+  /**
+   * The user asked for the translation UI (a menu item, the address pill's button): put the
+   * offer up for the tab, identifying the page language first when it is not known yet. A
+   * running or finished translation only gets its bar shown again.
+   */
+  'translate.offer': { args: { tabId: string }; result: void }
+  /** Change the languages the tab's offer would translate from or into, without translating. */
+  'translate.retarget': {
+    args: { tabId: string; source?: string; target?: string }
+    result: void
+  }
+  /**
+   * The translation options menu of a tab (always or never translate its language, never this
+   * site, offer to translate, the Languages settings), anchored at `x`,`y` in chrome pixels
+   * where the host draws its own menus.
+   */
+  'translate.menu': { args: { tabId: string; x?: number; y?: number }; result: void }
+  /**
+   * Put the selection-translation popover up for `text` (the tab's selection when omitted),
+   * anchored at `x`,`y` in CSS pixels of the page view when the caller knows where the user asked.
+   */
+  'translate.showSelection': {
+    args: { tabId: string; text?: string; x?: number; y?: number }
+    result: void
+  }
+  /** Translate the tab's selection (or `text`); null when nothing is selected. */
+  'translate.selection': {
+    args: { tabId: string; text?: string; target?: string }
+    result: TranslateSelectionResult | null
+  }
+  'translate.setPreferences': { args: Partial<TranslatePreferences>; result: void }
+  /**
+   * Translate the Reader View article the tab shows (CT-36): the article's blocks go through the
+   * engine in the core and the reader document re-renders from the translation, the original
+   * kept for the Show original toggle. `target` defaults to the first preferred language; a
+   * translation already shown is redone when the languages differ.
+   */
+  'translate.reader': {
+    args: { tabId: string; target?: string; source?: string }
+    result: void
+  }
+  /** The reader's Show original toggle: show the article as written (`true`) or its translation. */
+  'translate.readerShowOriginal': { args: { tabId: string; original: boolean }; result: void }
+  /** Always translate, never translate, or ask for pages in `language`. */
+  'translate.setLanguageRule': {
+    args: { language: string; rule: 'always' | 'never' | 'ask' }
+    result: void
+  }
+  /** Never offer to translate the tab's site (or offer again). */
+  'translate.setSiteRule': { args: { tabId: string; never: boolean }; result: void }
+  'translate.downloadModel': { args: { from: string; to: string }; result: void }
+  'translate.removeModel': { args: { from: string; to: string }; result: void }
+  /** Every language pair the model registry offers, flagged with whether it is on this device. */
+  'translate.models': { args: void; result: TranslateModelInfo[] }
+  /** The chrome renderer hands back an answer of the engine worker it runs for the core. */
+  'translate.engineResponse': { args: EngineRelayResponse; result: void }
+  /** Open the install / name-edit sheet for a tab (the ambient banner's "Add"). */
+  'webapp.openInstall': { args: { tabId: string }; result: void }
+  /**
+   * Pin the tab's page to the Home screen under `title` (the sheet's primary button).
+   * `openAsWindow` is the desktop's "Create shortcut?" box (Chrome's "Open as window"): true,
+   * the launcher opens the page in an app window of its own (`--app=<url>`); false, as a tab in
+   * Ione. Absent – the phone sheet, the pill's "Install <app>?" popover – the host keeps its
+   * own rule: the desktop's launcher opens a window, Android's tile reads the manifest's
+   * display mode (`ShortcutRequest.display`).
+   */
+  'webapp.pin': { args: { tabId: string; title: string; openAsWindow?: boolean }; result: void }
+  /** The install sheet closed without pinning (a site's deferred `prompt()` learns "dismissed"). */
+  'webapp.cancelInstall': { args: { tabId: string }; result: void }
+  /**
+   * The ambient banner's card is mounted on a surface that draws banners: the prompt counts as
+   * shown now and the app's cooldown starts on this word, not on the core's emit (#740). Without
+   * it inside the core's grace the prompt counts as undrawn and the cooldown is not spent.
+   * `visible` (absent: true – today's word, the card on screen as it is posted) says whether the
+   * card is on screen: false, a surface ACCEPTED the card but holds it back – the page-edge band
+   * under a cover (a sheet, the keyboard, the open tab overview) – so the core keeps the banner
+   * up, stamps no cooldown yet and waits for the same word with `visible` true (or absent) at
+   * the card's first drawn frame; a cover is not a view (seed #43, the Lead's S3).
+   */
+  'webapp.bannerShown': { args: { tabId: string; visible?: boolean }; result: void }
+  /** The ambient banner went away: swiped (starts the cooldown) or timed out. */
+  'webapp.dismissBanner': { args: { tabId: string; reason: 'swipe' | 'timeout' }; result: void }
+  /**
+   * Open an installed app (`PinnedWebApp.id`) the way its launcher does: in a standalone app
+   * window on hosts with windows (MW-23), as a tab at its start URL elsewhere.
+   */
+  'webapp.launch': { args: { appId: string }; result: void }
+  /** Remove an installed app: its launcher (where the host made one) and its record. */
+  'webapp.uninstall': { args: { appId: string }; result: void }
+}
+
+export type CommandName = keyof Commands
+export type CommandArgs<K extends CommandName> = Commands[K]['args']
+export type CommandResult<K extends CommandName> = Commands[K]['result']
+
+/**
+ * The one trailing action a core toast may carry (`Events['toast']`, §9.33): the label the
+ * chrome shows after the message and the command it runs on the pick, on the ordinary
+ * `zen:cmd` path – typed per command, so the args are the command's own. A toast without one
+ * is what it always was.
+ */
+export type ToastAction = {
+  [K in CommandName]: { label: string; command: K; args: CommandArgs<K> }
+}[CommandName]
+
+export type UrlbarOpenMode = 'new-tab' | 'edit' | 'search'
+
+/**
+ * The core command a touch host's close row closes its tabs with (`Events['tab.closeUndoable']`,
+ * §9.23): the row's one tab (`tab.close`; `force` is Remove Tab's – a pinned or essential tab
+ * closed outright rather than reset), the directed and other closes from the row
+ * (`tab.closeAbove` / `tab.closeBelow` / `tab.closeOthers`), or the selection's tabs
+ * (`tab.closeMany`, one page after the other as the desktop's "Close N Tabs" loop). Typed per
+ * command, so the chrome runs the command with the args that are its own.
+ */
+export type UndoableTabClose =
+  | { command: 'tab.close'; tabId: string; force: boolean }
+  | { command: 'tab.closeAbove' | 'tab.closeBelow' | 'tab.closeOthers'; tabId: string }
+  | { command: 'tab.closeMany'; tabIds: string[] }
+
+export interface Events {
+  state: UIState
+  'urlbar.toggle': { mode: UrlbarOpenMode; text?: string }
+  'urlbar.close': void
+  /**
+   * A native context menu the keyboard asked for (Shift+F10, the Menu key, Enter or Space on a
+   * "⋯") has closed: the chrome returns the keyboard to the element the menu hung from (§9.23),
+   * unless a pick moved the focus itself. Electron's native popup blurs the chrome document, so
+   * the element does not get the keyboard back on its own – the renderer refocuses it here.
+   */
+  'menu.keyboardReturn': void
+  /**
+   * A pick in a suggestion row's native menu (`urlbar.suggestionContextMenu`): the bar removes
+   * the row through the core's removes as Shift+Delete does (`remove`), or has every remembered
+   * search forgotten and takes their rows out of its list (`delete-search-history`).
+   */
+  'urlbar.suggestionAction': { id: string; action: 'remove' | 'delete-search-history' }
+  /**
+   * A new tab page was opened (and activated) for the user: the chrome waits for the tab to
+   * appear in its state, lets it paint, then opens the URL bar in new-tab mode over it.
+   */
+  'newtab.opened': { tabId: string; text?: string }
+  /**
+   * The new tab page in `tabId` asked for its add (`id` null) or edit shortcut dialog: the
+   * chrome shows it over the page, prefilled with `title` and `url`.
+   */
+  'newtab.shortcutDialog': { tabId: string; id: string | null; title: string; url: string }
+  /**
+   * `tabId`: the tab the overlay is about (the print preview prints it), else the active one.
+   * `reveal`: the overlay is being brought up for something that happened (a download began:
+   * the phone's Downloads sheet), not asked for again by the user – one already open stays open
+   * instead of toggling closed.
+   */
+  'overlay.open': {
+    kind: OverlayKind
+    folderId?: string
+    section?: string
+    tabId?: string
+    reveal?: boolean
+  }
+  /**
+   * Bookmarks > Import Bookmarks and Settings… (Chrome's `chrome://settings/importData`): the
+   * chrome opens Settings on its Import category with the import dialog up over it.
+   */
+  'import.open': void
+  /**
+   * Ctrl+Shift+Delete or the app menu's Delete Browsing Data… row: the chrome opens the Delete
+   * browsing data dialog (`siteControls/ClearBrowsingDataDialog`) over whatever is up.
+   */
+  'clearBrowsingData.open': void
+  /**
+   * More Tools › Name Window… (or the tab strip's row): the chrome opens the Name window prompt
+   * (`windowName/NameWindowDialog`) over the page, its field holding the current name.
+   */
+  'windowName.open': void
+  /** The PDF viewer document in a tab reported where it stands (`shared/pdfViewerProtocol.ts`). */
+  'pdf.changed': { tabId: string; report: PdfViewerReport }
+  /**
+   * Show the find bar for a tab with `text` in its field (the tab's last query, else the
+   * profile's, else the page's selection when it is short; empty for a first search), the text
+   * selected so typing replaces it. `again` runs the search at once and steps to the next or
+   * previous match (F3 / Ctrl+G with the bar closed reopen it with the last query, as Chrome).
+   */
+  'find.open': { tabId: string; text: string; again?: 'next' | 'prev' }
+  /** "Use Selection for Find" took `text` as the query; a bar open for the tab shows and searches it. */
+  'find.selection': { tabId: string; text: string }
+  /**
+   * A shortcut asked for the application menu: the renderer focuses the menu button and opens
+   * the menu from it (`app.menu` with `keyboard`), so Escape leaves the keyboard on the button.
+   */
+  'menu.app': void
+  /**
+   * Ctrl+Shift+A (or the menu item) asked for tab search: the chrome opens the popover from the
+   * sidebar's top row with the keyboard in its field (`tab.searchCandidates` lists the tabs).
+   */
+  'tabsearch.open': void
+  /**
+   * The crash page's Show tabs asked for the tab switcher (ERR-15: a page that crashed twice
+   * within the minute suggests closing other tabs): the phone chrome opens its overview.
+   */
+  'overview.open': void
+  /**
+   * A row of the tab overview's ⋯ menu (tab overview cleanup spec §4; `app.menu` with
+   * `overview`) that the chrome acts on – its view, its selection, its search, its sheets, the
+   * New Tab card's tap – handed back as the command; the mounted overview runs it.
+   */
+  'overview.command': { command: OverviewChromeCommand }
+  /**
+   * The app menu's "Media Controls…" row asked for the media hub (design language v2 §9.29: the
+   * hub's toolbar button folds into the menu at the 240 sidebar): the chrome opens the hub's
+   * popover from the "⋯" menu button the row's menu hung from (the toolbar button, were it up).
+   */
+  'mediahub.open': void
+  /**
+   * A shortcut asked the keyboard to move panes (F6, Shift+F6, Shift+Alt+T, Shift+Alt+B). The
+   * renderer works out the pane the keyboard is in and the one it goes to among those on screen,
+   * and asks the core for the chrome's or the page's focus accordingly (`focus.chrome`,
+   * `focus.content`).
+   */
+  'focus.pane': FocusPaneRequest
+  /**
+   * A page's view took the keyboard (the user clicked or tabbed into it, or the core gave it the
+   * focus): whatever control the chrome document had focused is stale – it would keep its focus
+   * ring, and count as the keyboard's place for F6 – and is let go.
+   */
+  'focus.page': { tabId: string }
+  /**
+   * A load the model saw start on `tabId` finished (`did-stop-loading` with the tab's `loading`
+   * on): the phone's screen reader hears "<name> loaded" (A11Y-02; `lib/announce.ts`). Sent
+   * once the state broadcast that turned `loading` off has gone out, so the window holds the
+   * page's title, and as a fact of its own because the finish cannot be read off the state's
+   * snapshots: a start and its stop in one tick (a reload off the loopback, a cached page)
+   * coalesce into one broadcast that never shows `loading` on. A stop without a start (a
+   * same-document navigation's) is no load and sends nothing.
+   */
+  'tab.loaded': { tabId: string }
+  /**
+   * The user zoomed a page (keyboard, Ctrl+wheel, the menu, the bubble's own controls): the
+   * chrome shows the zoom bubble for the tab. `factor` is the page's effective zoom; `siteKey`
+   * the site the factor is remembered for, null for a page that zooms on its own.
+   */
+  'zoom.changed': { tabId: string; factor: number; siteKey: string | null }
+  /**
+   * A download row changed. `progress` is throttled to 4 Hz per item, state changes arrive at
+   * once; `done` covers completed, cancelled and interrupted (read `item.state`). Private items
+   * only reach private windows. The full list also rides in `state.downloads`.
+   */
+  'download.changed': { item: DownloadItem; kind: DownloadChangeKind }
+  /** A dangerous or suspicious download finished and waits for Keep / Discard. */
+  'download.danger': { id: string }
+  /** Desktop shell: show the downloads bubble with this item marked (a notification was clicked). */
+  'downloads.reveal': { id: string | null }
+  /** Open the page zoom sheet for a tab (hosts with page controls). */
+  'zoom.open': { tabId: string }
+  /**
+   * The app menu's Page info button on a phone: the chrome opens the site information sheet for
+   * the tab, as the pill's site chip does (the sheet and its data are the chrome's; the core only
+   * asks for it, the way `zoom.open` asks for the zoom sheet).
+   */
+  'siteInfo.open': { tabId: string }
+  /**
+   * The app menu's Extensions row on a phone: the chrome opens its sheet of the extensions'
+   * actions (one row per enabled extension with an action; the desktop has the toolbar for it).
+   */
+  'extensions.open': void
+  /**
+   * "Send to Your Devices…" on a phone with several other devices (ID-27): the chrome opens the
+   * device picker sheet for the tab – one row per device, a tap sends its page (`sync.sendTab`).
+   * The desktop's and the tablet's menus carry the devices as a submenu and never ask for it.
+   */
+  'sendTab.open': { tabId: string }
+  /**
+   * Open Reader View's text preferences (size, font, theme, width) for a reader tab: the app
+   * menu's "Text Preferences…" – a popover under the address pill on a mouse, a sheet on a phone.
+   */
+  'reader.preferences': { tabId: string }
+  /** The host's recogniser reports while a voice search runs (after `voice.start` answered `listening`). */
+  'voice.event': VoiceEvent
+  /** The host's camera reports while a scan runs (after `qr.start` answered `scanning`). */
+  'qr.event': QrEvent
+  /**
+   * The share sheet's "QR code" was picked (SH-06): the host encoded the link and the chrome
+   * draws the code sheet with it; its Download asks `qr.download`.
+   */
+  'qr.code': QrCodeRequest
+  /**
+   * The host put up the browser's own share panel for a share (Android below 14, SH-03): the
+   * chrome draws it and answers with `share.panelAction`.
+   */
+  'share.panel': SharePanelRequest
+  /**
+   * A message in the chrome's toast slot; `action`, when the core sends one, is the toast's
+   * trailing action and the command the chrome runs when it is picked (the action clock,
+   * §9.33). Absent for every toast that has none, as before. `duration`, when the core sends
+   * one, is the toast's clock in ms in place of the chrome's default for its kind – §9.33's
+   * 8 s for a toast whose action is Undo (`TOAST_UNDO_MS`).
+   */
+  toast: { message: string; kind?: 'info' | 'error'; action?: ToastAction; duration?: number }
+  /**
+   * Take Screenshot put the visible page in the gallery (SH-07): the chrome shows the preview
+   * card in the toast's slot – the thumbnail, Share | Delete, Capture more – for `tabId`'s page.
+   */
+  'screenshot.saved': ScreenshotSaved & { tabId: string }
+  /**
+   * The long-screenshot editor asked for over `tabId`'s page from outside the chrome: Ione's
+   * Long screenshot in Android 14's share sheet (SH-02, `Share.kt`'s action row), relayed by the
+   * host once the sheet has closed. The chrome stitches the page and opens the editor (SH-08),
+   * as its own Long screenshot chips do. Hosts whose share sheet has no row of Ione's never send it.
+   */
+  'screenshot.openLong': { tabId: string }
+  /**
+   * Web capture asked for its overlay over `tabId`'s page (Ctrl+Shift+S in the Chrome preset,
+   * the app menu's "Screenshot…", the palette): the desktop chrome dims the page's frame over
+   * its stand-in and takes the user's region, visible area or full page (`shared/capture.ts`).
+   */
+  'capture.start': { tabId: string }
+  /** Link hover status text (Firefox shows this in the bottom corner). */
+  status: { text: string }
+  'sidebar.toggle': void
+  /**
+   * The cursor reached (or left) the edge of a hidden piece of chrome: the sidebar's side in
+   * compact mode, the top edge for the toolbar; both while the window is fullscreen.
+   */
+  'compact.reveal': { revealed: boolean; edge: 'sidebar' | 'toolbar' }
+  'theme.open': { spaceId: string }
+  'space.new': void
+  'tab.startRename': { tabId: string }
+  /**
+   * The keyboard moved a tab one place (tabs-34; `tab.moveBackward` / `tab.moveForward`): the
+   * chrome's live region says where it landed, and when the move was the focused strip row's the
+   * keyboard goes back onto the row where it now stands.
+   */
+  'tab.moved': TabMoveResult
+  /**
+   * A tab dragged from another window hovers this one: show its ghost at the given chrome
+   * coordinates and light up the drop target under it (null once it leaves or the drag ends).
+   */
+  'tab.dragOver': TabDragOver | null
+  'folder.startRename': { folderId: string }
+  /**
+   * Show the folder's editor (tabs-13): Chrome opens its group editor bubble when a group is
+   * made from the tab menu and from the group header's own menu. The desktop chrome opens the
+   * bubble beside the folder's header row; the phone, whose group sheet holds the colours, starts
+   * the inline rename on the group card.
+   */
+  'folder.edit': { folderId: string }
+  /**
+   * Ask before the folder is deleted (the desktop folder menu's "Delete Folder" on a folder that
+   * holds tabs or saved pages): the chrome shows its §9.23 prompt and runs `folder.delete` with
+   * `unpack: false` when the user confirms. A folder with nothing in it is deleted without asking.
+   */
+  'folder.confirmDelete': { folderId: string }
+  /** The folder menu's "Release from <agent>…": ask before releasing that agent's groups. */
+  'agent.confirmRelease': { claimId: string; folderId: string }
+  /**
+   * Close the group's tabs with Undo on the toast (the touch hosts' group menu's "Close Group (N
+   * Tabs)", TAB-16): the chrome runs `folder.close` through its one close-with-undo
+   * (`lib/closeUndo.ts`) so the toast reads "<Name> tab group closed and saved" and Undo brings
+   * the tabs back into the group, which re-opens. The desktop's folder menu never emits it: its
+   * "Close Folder (N Tabs)" calls the core's `closeFolder` directly, with no toast.
+   */
+  'folder.closeUndoable': { folderId: string }
+  /**
+   * Close tabs with Undo on the toast (the touch hosts' tab menus; OS-40 part B, §9.23: on a
+   * touch host, closing a tab never asks "Leave site?" – the page is let go – and the toast's
+   * Undo is the protection). `tabIds` are the tabs the close takes, as the core's own rule reads
+   * them (the row's tab; `closeScope(tabId, 'above' | 'below' | 'others')` – the space's regular
+   * tabs in the window, pinned and Essentials exempt; the selection's tabs), so the chrome
+   * counts and holds the right ones; `close` is the core command that closes them, which the
+   * chrome runs through its one close-with-undo (`lib/closeUndo.ts`), the toast reading "Closed
+   * <title>" or "N tabs closed", Undo bringing them back. The desktop's menus never emit it:
+   * their rows call the core directly, with no toast.
+   */
+  'tab.closeUndoable': { tabIds: string[]; close: UndoableTabClose }
+  /** Open the pinned-URL editor for a pinned/essential tab. */
+  'tab.editPinnedUrl': { tabId: string }
+  /** Open the emoji/icon picker for a tab. */
+  'tab.pickIcon': { tabId: string }
+  /** Show the star dialog for a bookmark that was just created (or already existed). */
+  'bookmark.star': { tabId: string; nodeId: string; created: boolean }
+  /** The bookmark manager should edit a node, or create one (`id: null`) inside `parentId`. */
+  'bookmark.edit': { id: string | null; parentId: string; type: BookmarkNodeType }
+  /**
+   * The user deleted bookmarks or folders in this window (bookmarks-31): `count` top-level
+   * nodes of `kind`; `bookmark.undo` with the `token` brings them back (the toast's Undo).
+   */
+  'bookmark.deleted': { token: number; count: number; kind: 'bookmark' | 'folder' | 'mixed' }
+  /**
+   * An edit was taken back (`bookmark.undo`, from any window): the token of the edit and its
+   * kind. A delete's toast still offering that token goes down – its delete is undone already.
+   */
+  'bookmark.undone': { token: number; kind: 'remove' | 'move' | 'update' }
+  /** Open the "Bookmark all tabs" dialog for these tabs. */
+  'bookmark.allTabs': { tabIds: string[]; defaultTitle: string }
+  'space.edit': { spaceId: string }
+  'space.switched': { fromIndex: number; toIndex: number }
+  /** Hosts without native menus ask the renderer to show one. */
+  'menu.show': MenuDescriptor
+  'menu.hide': { menuId: string }
+  /** A page wants to open another app: show the confirm sheet (answered by `externalProtocol.respond`). */
+  'externalProtocol.request': ExternalProtocolRequest
+  /** The request was withdrawn (its tab closed, another one took its place). */
+  'externalProtocol.cancel': { requestId: string }
+  /** History changed: visits are throttled to twice a second, deletions arrive at once. */
+  'history.changed': { kind: 'visit' | 'delete' | 'clear' }
+  /**
+   * The favicon cache's index changed (HB-47): icon addresses now cached, with their content
+   * hash, and addresses dropped (evicted, or forgotten with a history clear).
+   */
+  'favicons.changed': { added: Array<[url: string, hash: string]>; removed: string[] }
+  /**
+   * "Select" in a History page row's menu: the page picks the visit, entering its selection mode
+   * (v2 §10.1 – the checkbox column shows on every row while anything is picked).
+   */
+  'history.select': { visitId: string }
+  /** The History page's folded device groups changed (`history.foldDevice`): the ids now folded. */
+  'history.foldedDevicesChanged': string[]
+  /** The History page's hidden devices changed (`history.hideDevice`, `history.showHiddenDevices`): the ids now hidden. */
+  'history.hiddenDevicesChanged': string[]
+  'session.recentlyClosedChanged': void
+  /** The Inactive tabs archive changed (a pass, a restore, a close): read `inactiveTabs.list` again. */
+  'inactiveTabs.changed': void
+  /**
+   * Safe-area insets of the host window in CSS pixels (mobile status bar, IME, cutouts), and –
+   * from the Android host – whether the system bars are still on their way back from a page's
+   * fullscreen (`settling`): the chrome's return fade waits while they are
+   * (`lib/fullscreenLanding.ts`). A host without the word leaves it out.
+   */
+  insets: { top: number; right: number; bottom: number; left: number; settling?: boolean }
+  /**
+   * A foldable's posture from the Android host (`Posture.kt`, OS-11): the pose and the hinge's
+   * bounds in CSS px, at boot and whenever the window's layout says they changed. A host without
+   * the word never sends it; the chrome stands flat.
+   */
+  posture: DevicePosture
+  /**
+   * The core placed the page views as a `layout.report` asked: `hid` and `shown` name the tabs
+   * whose views it took down or brought back under that report (a tab without a view, or one
+   * already where the report wanted it, is in neither). The host's own word that a change is on
+   * screen follows as `view.drawn` where the chrome lies under the pages (`lib/pageView.ts`).
+   */
+  'layout.applied': { contentHidden: boolean; hid: string[]; shown: string[] }
+  /**
+   * The host has drawn the frame in which `tabId`'s page view is `visible` (or gone) at its
+   * place – raised by the Android host after every `view.setVisible`, for the chrome to time
+   * the swap between the live page and its cover.
+   */
+  'view.drawn': { tabId: string; visible: boolean }
+  /**
+   * The host's answer to the placement that brought `tabId`'s page view back (Q1, the
+   * observable landing; `HostCapabilities.placementAnswered`): `shown` once the placement is
+   * applied and the frame showing the view is drawn – the stand-in for the live page may leave
+   * now – or not, at once, for a view the host does not have or does not show, and after the
+   * host's bound when no frame came: nothing is coming, and the stand-in leaves as well.
+   */
+  'view.shown': { tabId: string; shown: boolean }
+  /**
+   * A hardware keyboard's Tab ran past the active page's last tabbable (`forward`) or its
+   * Shift+Tab past the first (`backward`) and the host handed the chrome the keyboard – the
+   * Android host, whose page and chrome are WebViews side by side (`FocusHandoff.kt`; A11Y-09):
+   * the chrome lands the focus on its first or last control (`lib/panes.ts`).
+   */
+  'focus.fromPage': { direction: 'forward' | 'backward' }
+  /**
+   * The host has drawn `tabId`'s page view at a new size (CSS px) – raised by the Android host
+   * after every change of the view's size, once the page has content at it – for the chrome's
+   * return from a page's fullscreen to fade in on the page's landing (`lib/fullscreenLanding.ts`).
+   */
+  'view.sized': { tabId: string; width: number; height: number }
+  /**
+   * The host took a card thumbnail of `tabId`'s page (it left the screen, the app went to the
+   * background, a sheet's cover was captured) and has it on disk: the chrome's copy for its
+   * cards (`lib/thumbnails.ts`).
+   */
+  'thumbnail.captured': ThumbnailPicture & { tabId: string }
+  /** A login was deleted; `passwords.restore` brings it back for a while. */
+  'passwords.removed': { id: string; site: string }
+  /**
+   * The core asks this window's renderer to run a translation engine request (Electron only;
+   * the payload carries `ArrayBuffer`s, so it is structured-cloned rather than JSON).
+   */
+  'translate.engine': EngineRelayRequest
+  /**
+   * Show the selection-translation popover for `text` in the tab. `x`,`y` is where the user
+   * asked, in CSS pixels of the page view, when known.
+   */
+  'translate.selection': { tabId: string; text: string; x: number | null; y: number | null }
+  /**
+   * Show the definition surface for `term` in the tab (CT-39's Define, from the mini menu, the
+   * desktop's page context menu or the phone's selection toolbar): the chrome looks the term up
+   * (`define.lookup`) and shows the answer over `rect` – the selection's box in CSS pixels of
+   * the page view, which the page's zoom scales – or, with null, hanging from `at` (the context
+   * menu's click in the view's own pixels, unscaled, as `translate.selection`'s point) when there
+   * is one, and in its sheet otherwise (the toolbar's touch anchors nothing).
+   */
+  'define.show': { tabId: string; term: string; rect: Rect | null; at?: { x: number; y: number } }
+  // ---- PROVISIONAL: extensions UI (PR #68), see the matching block in `Commands` --------------
+  /** The popup's document asked for this size (CSS px); the renderer fits its frame around it. */
+  'extension.popupSize': { id: string; width: number; height: number }
+  /**
+   * Main closed the popup itself (blur, Escape inside it, a link opened a tab). `reason` is
+   * `'escape'` when the document trapped the key: focus then goes back to the anchor (§9.22),
+   * where every other close leaves it where the close put it.
+   */
+  'extension.popupClosed': { id: string; reason?: 'escape' }
+  /** Ask before an install or update; the renderer answers with `extension.confirmInstall`. */
+  extensionInstallRequest: ExtensionPromptRequest
+  /** Ask before granting permissions; the renderer answers with `extension.respondPermissionRequest`. */
+  extensionPermissionRequest: ExtensionPromptRequest
+  /** An install finished; the renderer toasts it with a Pin action while it is not in the toolbar. */
+  'extension.installed': { id: string; name: string; toolbarPinned: boolean }
+  // ---- end PROVISIONAL ----------------------------------------------------------------------------
+  /** Show the install sheet (with a manifest) or the lighter name-edit sheet (without one). */
+  'webapp.install': WebAppInstallPrompt
+  /** Show the ambient "Add <app> to Home screen" banner over the page. */
+  'webapp.banner': WebAppBanner
+  /** Take the banner down (navigation left the app, or it was pinned another way). */
+  'webapp.bannerHide': { tabId: string }
+  /**
+   * The launcher confirmed a Home screen shortcut (NOT-20): the chrome toasts "Added <name> to
+   * Home screen" with an Open action that takes `tabId` to `url`, the shortcut's own. On desktop
+   * (`surface` `desktop`) the app was installed as a launcher and – with a manifest – opened in
+   * its own window already, as Chrome does; the toast's Open then launches it (`webapp.launch`
+   * with `appId`).
+   */
+  'webapp.pinned': {
+    tabId: string | null
+    name: string
+    url: string | null
+    surface: InstallSurface
+    /** The installed app's id when the page had a manifest, else null (a plain shortcut). */
+    appId: string | null
+  }
+}
+
+export type EventName = keyof Events
+
+/** Everything the install sheet shows; a snapshot so it survives the tab navigating on. */
+export interface WebAppInstallPrompt {
+  tabId: string
+  /** Suggested launcher title (the manifest's short name, else the page title or host). */
+  title: string
+  url: string
+  origin: string
+  /** Icon to preview: a manifest icon, else the page's favicon, else null for a letter tile. */
+  icon: string | null
+  /** The manifest, when the page has one; null selects the name-edit sheet. */
+  info: WebAppInfo | null
+  /** Colour behind the letter tile (the manifest's theme colour or the space accent). */
+  tint: string | null
+  /** Where the app lands – the copy follows it (`installSheetCopy`). */
+  surface: InstallSurface
+}
+
+export interface WebAppBanner {
+  tabId: string
+  name: string
+  origin: string
+  icon: string | null
+  tint: string | null
+}
+
+// ---------------------------------------------------------------------------
+// Recently closed tabs and windows (persisted in state.json, summaries in the snapshot)
+// ---------------------------------------------------------------------------
+
+/**
+ * A page's back/forward stack and which entry is current. `pageState` is Chromium's serialised
+ * state of an entry – scroll offset and form control values – handed back on restore so a page
+ * comes back where it was; absent when the engine has none for the entry (or it was too large
+ * to keep).
+ */
+export interface NavigationSnapshot {
+  entries: NavigationSnapshotEntry[]
+  index: number
+  /**
+   * An opaque, host-specific serialisation of the whole stack, for a host that cannot rebuild
+   * it from URLs and titles: on Android `WebView.saveState` (a Parcel, base64), which carries
+   * every entry's scroll and form state – the shape `pageState` takes there. Written and read by
+   * the same host only (desktop never writes it and ignores it; a host refusing a foreign blob
+   * loads the current entry instead); absent over 64 KB (`NAVIGATION_HOST_STATE_MAX_CHARS`) and
+   * after the entries were cut to `NAVIGATION_ENTRIES_MAX`, when it would describe another list.
+   */
+  hostState?: string
+}
+
+export interface NavigationSnapshotEntry {
+  url: string
+  title: string
+  pageState?: string
+}
+
+/** Which way along the tab's stack a directed history list looks. */
+export type NavigationDirection = 'back' | 'forward'
+
+/** One row of a directed history list (`tab.navigationHistory`): the entry and where it sits. */
+export interface NavigationHistoryEntry {
+  /** The entry's index in the stack, what `tab.goToIndex` takes. */
+  index: number
+  url: string
+  title: string
+  favicon: string | null
+}
+
+export interface ClosedTabEntry {
+  kind: 'tab'
+  id: string
+  closedAt: number
+  tab: Tab
+  spaceId: string | null
+  folderId: string | null
+  /** Position inside its section (essentials, pinned or regular) when it was closed. */
+  index: number
+  windowId: string | null
+  navigation: NavigationSnapshot | null
+}
+
+/**
+ * A tab in the Inactive tabs archive (TAB-20): what a recently-closed entry keeps of a tab –
+ * the record, its place and its back/forward stack – with the moment it left the grid, so the
+ * auto-close sweep counts from the archiving and not from the last use (Chrome's `archivedTimeMs`).
+ * `closedAt` is that same moment; an archived tab the user closes moves to the recently closed
+ * list as a plain entry stamped with the close.
+ */
+export interface ArchivedTabEntry extends ClosedTabEntry {
+  archivedAt: number
+}
+
+/** An archived tab as the Inactive tabs sheet lists it. */
+export interface ArchivedTabSummary {
+  id: string
+  title: string
+  url: string
+  favicon: string | null
+  /** When the tab was last in view, as ms since the epoch: the row's "last used". */
+  lastActiveAt: number
+  archivedAt: number
+}
+
+/** The archive threshold's ladder, in days; 0 is Never (Chrome's `ARCHIVE_TIME_DELTA_DAYS_OPTS`). */
+export type InactiveTabsArchiveDays = 0 | 7 | 14 | 21
+
+export interface ClosedWindowEntry {
+  kind: 'window'
+  id: string
+  closedAt: number
+  windowKind: WindowKind
+  bounds: Rect | null
+  activeTabId: string | null
+  tabs: ClosedTabEntry[]
+}
+
+export type ClosedEntry = ClosedTabEntry | ClosedWindowEntry
+
+/**
+ * A tab card's picture as the host hands it over: a JPEG data URL of the page as it was last
+ * seen, scaled to the card's width in device pixels, with the size of its pixels so the chrome
+ * can keep its cache by bytes rather than by count.
+ */
+export interface ThumbnailPicture {
+  data: string
+  width: number
+  height: number
+}
+
+/** What menus and the history page show for a closed entry (no full tab records). */
+export interface ClosedEntrySummary {
+  id: string
+  kind: 'tab' | 'window'
+  title: string
+  url: string | null
+  favicon: string | null
+  closedAt: number
+  tabCount: number
+}
+
+/** The pre-visit-model name; new code uses `ClosedTabEntry`. */
+export type ClosedTab = ClosedTabEntry
+
+/**
+ * One tab the tab search popover can switch to (tabs-17): what its row shows and what the
+ * renderer matches on. `windowLabel` names the other window a tab lives in (a blank or private
+ * window's own tab, named by its active tab as the "Move Tab to Another Window" submenu names
+ * windows); null for a tab this window shows itself.
+ */
+export interface TabSearchCandidate {
+  id: string
+  /** The user's name for the tab when it has one, else the page's title. */
+  title: string
+  url: string
+  favicon: string | null
+  /** The user's emoji for the tab ("Change Icon…"), shown in place of the favicon. */
+  customIcon: string | null
+  containerId: string
+  windowLabel: string | null
+  /** The tab this window (or the window the tab lives in) shows right now. */
+  active: boolean
+  /** Playing sound (or muted while it would): the "Audio and video" section. */
+  audible: boolean
+  muted: boolean
+  loading: boolean
+  discarded: boolean
+  lastActiveAt: number
+}

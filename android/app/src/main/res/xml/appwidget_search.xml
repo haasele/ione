@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Home-screen search widget (SearchWidgetProvider; WID-01 / OMN-33 / WID-03): the omnibox
+     pill's face at four cells by one – Ione's mark, the omnibox's hint, the mic, the private mask –
+     resizable along the row only (Chrome's search widget likewise keeps one row), and never below
+     four cells: minWidth is Chrome's 240 dp (chrome/android/java/res/xml/search_widget_info.xml:11)
+     and there is no minResizeWidth, so the platform makes the floor the minWidth itself
+     (AppWidgetServiceImpl.java:2735 – `minResizeWidth = value != null ? value.data : minWidth`),
+     exactly as Chrome's info (:9-19, one layout at every width, no minResizeWidth, no
+     targetCell*) has it. No narrower face exists in Chrome's widget to mirror and none is built
+     here; there is no RemoteViews size map and never was one (SearchWidgetProvider builds one
+     RemoteViews per id, as Chrome's SearchWidgetProvider.java:149-183 does). A launcher that lets
+     the user ignore a provider's floor (Nova, Lawnchair) would show this one layout clipped, as
+     Chrome's is there. The picker's target is four cells by one; the preview is the layout itself
+     where the picker can render one (API 31), as Chrome's is; older pickers draw the vector under
+     previewImage. The widget is offered in the searchbox category as well as the Home screen's, as
+     Chrome's is (search_widget_info.xml:19), so launchers with a search-box slot list it there. The
+     face's colours are the system's on Android 12+ (values-v31/colors.xml). -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:description="@string/widget_search_description"
+    android:initialLayout="@layout/widget_search"
+    android:minWidth="240dp"
+    android:minHeight="40dp"
+    android:minResizeHeight="40dp"
+    android:maxResizeHeight="40dp"
+    android:previewImage="@drawable/widget_search_preview"
+    android:previewLayout="@layout/widget_search"
+    android:resizeMode="horizontal"
+    android:targetCellWidth="4"
+    android:targetCellHeight="1"
+    android:updatePeriodMillis="0"
+    android:widgetCategory="home_screen|searchbox"
+    tools:targetApi="s" />

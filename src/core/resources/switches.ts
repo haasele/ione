@@ -1,0 +1,240 @@
+/**
+ * Chromium / V8 command-line switches derived from the resource settings. They can only be set
+ * before Electron's `ready` event, so they are read from the persisted profile at startup and a
+ * change in Settings shows a "restart required" notice until the browser is relaunched.
+ *
+ * Pure module (no Electron) so the derivation is unit tested; `startup.ts` applies the result.
+ */
+import type { ResourceSettings } from '../../shared/types'
+import { DEFAULT_RESOURCE_SETTINGS } from '../../shared/defaults'
+
+export interface StartupSwitch {
+  name: string
+  value?: string
+}
+
+export interface StartupProfile {
+  switches: StartupSwitch[]
+  /** False → `app.disableHardwareAcceleration()`. */
+  hardwareAcceleration: boolean
+}
+
+export const MAX_RENDERER_PROCESS_LIMIT = 64
+export const MAX_RENDERER_HEAP_MB = 16384
+export const MAX_RASTER_THREADS = 8
+
+/**
+ * The switches for the resource settings – the process profile's alone. Preload pages (PS-43)
+ * puts nothing here: under `none` the request engine refuses every speculative request live
+ * (`PreloadHandler`; the prerender's own first fetch, `Sec-Purpose: prefetch;prerender`, among
+ * them, so no prerender activates), which is the whole of the level's enforcement and needs no
+ * relaunch – the old "Block prerendering" switch (`process.disablePrerender`) is folded into the
+ * level and not read.
+ */
+export function deriveStartupProfile(settings: ResourceSettings): StartupProfile {
+  if (!settings.enabled) return { switches: [], hardwareAcceleration: true }
+  const p = settings.process
+  const switches: StartupSwitch[] = []
+  const jsFlags: string[] = []
+  const disabledFeatures: string[] = []
+
+  if (p.rendererProcessLimit > 0) {
+    switches.push({
+      name: 'renderer-process-limit',
+      value: String(Math.min(MAX_RENDERER_PROCESS_LIMIT, Math.round(p.rendererProcessLimit)))
+    })
+  }
+  if (p.rendererHeapMb > 0) {
+    jsFlags.push(
+      `--max-old-space-size=${Math.min(MAX_RENDERER_HEAP_MB, Math.round(p.rendererHeapMb))}`
+    )
+  }
+  if (p.v8OptimizeForSize) jsFlags.push('--optimize-for-size')
+  if (p.lowEndDeviceMode) switches.push({ name: 'enable-low-end-device-mode' })
+  // Electron already disables the spare renderer; listing it keeps the intent explicit.
+  if (p.disableSpareRenderer) disabledFeatures.push('SpareRendererForSitePerProcess')
+  if (p.disableBackForwardCache) disabledFeatures.push('BackForwardCache')
+  if (p.rasterThreads > 0) {
+    switches.push({
+      name: 'num-raster-threads',
+      value: String(Math.min(MAX_RASTER_THREADS, Math.round(p.rasterThreads)))
+    })
+  }
+  if (settings.gpuMemoryMb > 0) {
+    const mb = Math.round(settings.gpuMemoryMb)
+    switches.push({ name: 'force-gpu-mem-available-mb', value: String(mb) })
+    switches.push({
+      name: 'force-gpu-mem-discardable-limit-mb',
+      value: String(Math.max(16, Math.round(mb / 2)))
+    })
+  }
+  if (settings.gpuMode === 'low') {
+    switches.push(
+      { name: 'disable-gpu-rasterization' },
+      { name: 'disable-accelerated-video-decode' },
+      { name: 'disable-accelerated-2d-canvas' }
+    )
+  }
+  if (jsFlags.length) switches.push({ name: 'js-flags', value: jsFlags.join(' ') })
+  if (disabledFeatures.length)
+    switches.push({ name: 'disable-features', value: disabledFeatures.join(',') })
+  return { switches, hardwareAcceleration: settings.gpuMode !== 'off' }
+}
+
+/**
+ * Blink features the desktop browser switches off whatever the resource settings say.
+ *
+ * FedCM: Chromium exposes the API (`IdentityCredential`, `navigator.credentials.get({ identity })`)
+ * but Electron has no account-chooser UI behind it, so every call fails at once with "Error
+ * retrieving a token". Identity providers feature-detect the API – Google's "Sign in with
+ * Google" button takes the FedCM path when `IdentityCredential` exists and then just stops, the
+ * click doing nothing. Without the feature the API is absent, as in Firefox and Safari, and the
+ * providers use their pop-up flow, which works.
+ */
+export const BASELINE_DISABLED_FEATURES: readonly string[] = ['FedCm']
+
+/**
+ * Chromium's own MPRIS player on Linux (`org.mpris.MediaPlayer2.chromium`, registered under
+ * `HardwareMediaKeyHandling`) shows every tab's media as an anonymous "Chromium" and would sit
+ * beside Ione's own player (`main/platform/mpris.ts`), which carries the Media Session data;
+ * the desktop's media keys reach Ione's player instead.
+ */
+export const LINUX_DISABLED_FEATURES: readonly string[] = ['HardwareMediaKeyHandling']
+
+/** The baseline for an OS: the desktop's features plus the ones only Linux switches off. */
+export function baselineDisabledFeatures(os: string): string[] {
+  return os === 'linux'
+    ? [...BASELINE_DISABLED_FEATURES, ...LINUX_DISABLED_FEATURES]
+    : [...BASELINE_DISABLED_FEATURES]
+}
+
+/**
+ * Switches an OS needs whatever the resource settings say, beside the disabled features.
+ *
+ * Linux: Chromium's `speechSynthesis` talks to Speech Dispatcher, and the client is only
+ * compiled in behind `--enable-speech-dispatcher` – without it `getVoices()` is empty and every
+ * utterance ends at once, as Electron ships. Windows and macOS use their platform engines and
+ * need nothing. The switch alone is harmless when the daemon is absent (still no voices).
+ */
+export const LINUX_BASELINE_SWITCHES: readonly StartupSwitch[] = [
+  { name: 'enable-speech-dispatcher' }
+]
+
+export function baselineSwitches(os: string): StartupSwitch[] {
+  return os === 'linux' ? LINUX_BASELINE_SWITCHES.map((sw) => ({ ...sw })) : []
+}
+
+/**
+ * The switches to put on the command line for a profile: its own, with the baseline features
+ * merged into its one `disable-features` (Chromium reads a single such switch; a second one
+ * replaces the first).
+ */
+export function startupSwitches(
+  profile: StartupProfile,
+  baseline: readonly string[] = BASELINE_DISABLED_FEATURES
+): StartupSwitch[] {
+  const switches = profile.switches.filter((sw) => sw.name !== 'disable-features')
+  const disabled = new Set<string>()
+  for (const sw of profile.switches)
+    if (sw.name === 'disable-features')
+      for (const feature of (sw.value ?? '').split(',')) if (feature) disabled.add(feature)
+  for (const feature of baseline) disabled.add(feature)
+  if (disabled.size) switches.push({ name: 'disable-features', value: [...disabled].join(',') })
+  return switches
+}
+
+/** Stable string form used to detect that the running process was started with other switches. */
+export function serializeProfile(profile: StartupProfile): string {
+  const parts = profile.switches
+    .map((s) => (s.value === undefined ? `--${s.name}` : `--${s.name}=${s.value}`))
+    .sort()
+  parts.push(profile.hardwareAcceleration ? 'gpu:on' : 'gpu:off')
+  return parts.join(' ')
+}
+
+export function profilesDiffer(a: StartupProfile, b: StartupProfile): boolean {
+  return serializeProfile(a) !== serializeProfile(b)
+}
+
+/**
+ * The startup switches that differ between the profile the settings ask for and the one this
+ * process runs with, by name – `js-flags`, `disable-features`, `renderer-process-limit`…, and
+ * `gpu` for hardware acceleration – for a relaunch notice or a log that names what the relaunch
+ * is for (`ResourceSnapshot.pendingSwitches`). Empty while the profiles agree. A switch present
+ * on one side only counts once; one present on both with another value counts once.
+ */
+export function pendingStartupSwitches(wanted: StartupProfile, running: StartupProfile): string[] {
+  const names = new Set<string>()
+  const byName = (profile: StartupProfile): Map<string, string | undefined> =>
+    new Map(profile.switches.map((sw) => [sw.name, sw.value]))
+  const a = byName(wanted)
+  const b = byName(running)
+  for (const [name, value] of a) if (!b.has(name) || b.get(name) !== value) names.add(name)
+  for (const name of b.keys()) if (!a.has(name)) names.add(name)
+  if (wanted.hardwareAcceleration !== running.hardwareAcceleration) names.add('gpu')
+  return [...names].sort()
+}
+
+/**
+ * Deep-merge a persisted (possibly partial or malformed) `resources` block with the defaults and
+ * clamp every number to a sane range. Used both by the startup reader and by settings updates.
+ */
+export function sanitizeResourceSettings(raw: unknown): ResourceSettings {
+  const d = DEFAULT_RESOURCE_SETTINGS
+  const r = isRecord(raw) ? raw : {}
+  const p = isRecord(r.process) ? r.process : {}
+  return {
+    enabled: bool(r.enabled, d.enabled),
+    enforcement: oneOf(r.enforcement, ['balanced', 'strict', 'extreme'], d.enforcement),
+    memoryMb: int(r.memoryMb, d.memoryMb, 0, 1_048_576),
+    memoryPercent: int(r.memoryPercent, d.memoryPercent, 5, 100),
+    cpuPercent: int(r.cpuPercent, d.cpuPercent, 5, 100),
+    gpuMemoryMb: int(r.gpuMemoryMb, d.gpuMemoryMb, 0, 65_536),
+    gpuMode: oneOf(r.gpuMode, ['auto', 'low', 'off'], d.gpuMode),
+    freezeAfterMinutes: int(r.freezeAfterMinutes, d.freezeAfterMinutes, 0, 24 * 60),
+    idleFreezeMinutes: int(r.idleFreezeMinutes, d.idleFreezeMinutes, 0, 24 * 60),
+    maxLoadedTabs: int(r.maxLoadedTabs, d.maxLoadedTabs, 0, 500),
+    maxConcurrentLoads: int(r.maxConcurrentLoads, d.maxConcurrentLoads, 1, 16),
+    batteryFactor: num(r.batteryFactor, d.batteryFactor, 0.25, 1),
+    protectPinned: bool(r.protectPinned, d.protectPinned),
+    protectEssentials: bool(r.protectEssentials, d.protectEssentials),
+    protectAudible: bool(r.protectAudible, d.protectAudible),
+    process: {
+      rendererProcessLimit: int(
+        p.rendererProcessLimit,
+        d.process.rendererProcessLimit,
+        0,
+        MAX_RENDERER_PROCESS_LIMIT
+      ),
+      rendererHeapMb: int(p.rendererHeapMb, d.process.rendererHeapMb, 0, MAX_RENDERER_HEAP_MB),
+      lowEndDeviceMode: bool(p.lowEndDeviceMode, d.process.lowEndDeviceMode),
+      disableSpareRenderer: bool(p.disableSpareRenderer, d.process.disableSpareRenderer),
+      disableBackForwardCache: bool(p.disableBackForwardCache, d.process.disableBackForwardCache),
+      disablePrerender: bool(p.disablePrerender, d.process.disablePrerender),
+      rasterThreads: int(p.rasterThreads, d.process.rasterThreads, 0, MAX_RASTER_THREADS),
+      v8OptimizeForSize: bool(p.v8OptimizeForSize, d.process.v8OptimizeForSize)
+    }
+  }
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null
+}
+
+function bool(v: unknown, fallback: boolean): boolean {
+  return typeof v === 'boolean' ? v : fallback
+}
+
+function num(v: unknown, fallback: number, lo: number, hi: number): number {
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(lo, Math.min(hi, n))
+}
+
+function int(v: unknown, fallback: number, lo: number, hi: number): number {
+  return Math.round(num(v, fallback, lo, hi))
+}
+
+function oneOf<T extends string>(v: unknown, options: readonly T[], fallback: T): T {
+  return typeof v === 'string' && (options as readonly string[]).includes(v) ? (v as T) : fallback
+}

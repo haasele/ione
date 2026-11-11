@@ -1,0 +1,144 @@
+import type { SyncFetch, SyncPlatformHost, SyncTransport } from '../core/platform'
+import type { SyncDeviceKind } from '../shared/types'
+import { SyncFolderLostError } from '../core/sync/transport'
+import type { Bridge } from './bridge'
+import { androidSyncFetch } from './syncFetch'
+
+/** Kotlin's rejection for a tree whose permission is gone (`SyncFolder.kt`, `LOST_PREFIX`). */
+export const FOLDER_LOST_PREFIX = 'folder-lost:'
+/** How often the phone re-reads the folder while the app is in front (no watcher on a tree URI). */
+export const ANDROID_POLL_MS = 30_000
+
+/**
+ * The sync folder on Android: a document tree the user picked through the Storage Access
+ * Framework (`ACTION_OPEN_DOCUMENT_TREE`), kept as a persisted URI permission; `SyncFolder.kt`
+ * lists, reads, writes and deletes the documents of its `ione-sync` child. A tree whose
+ * permission was revoked (or that was deleted) rejects every call with `folder-lost:` and the
+ * transport raises `SyncFolderLostError`, which the engine turns into `SyncStatus.folderLost`.
+ */
+export class AndroidSyncTransport implements SyncTransport {
+  constructor(
+    private readonly bridge: Bridge,
+    readonly folder: string,
+    private readonly foreground: ForegroundSignal
+  ) {}
+
+  private async call<T>(method: string, args: Record<string, unknown> = {}): Promise<T> {
+    try {
+      return await this.bridge.call<T>(method, { folder: this.folder, ...args })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (message.startsWith(FOLDER_LOST_PREFIX))
+        throw new SyncFolderLostError(message.slice(FOLDER_LOST_PREFIX.length).trim() || undefined)
+      throw error
+    }
+  }
+
+  async list(): Promise<string[]> {
+    const names = await this.call<unknown>('sync.list')
+    return Array.isArray(names) ? names.filter((n): n is string => typeof n === 'string') : []
+  }
+
+  async read(name: string): Promise<string | null> {
+    const text = await this.call<unknown>('sync.read', { name })
+    return typeof text === 'string' ? text : null
+  }
+
+  write(name: string, text: string): Promise<void> {
+    return this.call<void>('sync.write', { name, text })
+  }
+
+  remove(name: string): Promise<void> {
+    return this.call<void>('sync.remove', { name })
+  }
+
+  removeAll(): Promise<void> {
+    return this.call<void>('sync.removeAll')
+  }
+
+  /** No file watcher on a document tree: the app's return to the foreground is the trigger. */
+  watch(onChange: () => void): () => void {
+    return this.foreground.subscribe(onChange)
+  }
+}
+
+/** The activity's resumes, fanned out to whoever wants a look at the folder then. */
+export class ForegroundSignal {
+  private readonly listeners = new Set<() => void>()
+  focused = true
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  /** The activity resumed (`focus` host event with `focused: true`) or paused. */
+  setFocused(focused: boolean): void {
+    const resumed = focused && !this.focused
+    this.focused = focused
+    if (resumed) for (const listener of [...this.listeners]) listener()
+  }
+}
+
+/**
+ * The Android pieces of sync: the system folder picker behind `sync.chooseFolder`, the device
+ * model as the default device name (Chrome names a phone by its model), the SAF transport, a
+ * foreground-only poll every 30 seconds instead of a watcher (no background service), and the
+ * WebDAV transport's HTTP (`fetch`, `syncFetch.ts` over `sync.fetch` / `sync.fetchAbort`).
+ */
+export class AndroidSyncHost implements SyncPlatformHost {
+  readonly pollMs = ANDROID_POLL_MS
+  readonly signal = new ForegroundSignal()
+  /**
+   * Any method to any server, from the Kotlin side's OkHttp client (`SyncFetch.kt`). A closure
+   * over the bridge and a counter, so `webdavAvailable()` reads a field at boot; nothing on the
+   * Kotlin side is built until the engine's first request.
+   */
+  readonly fetch: SyncFetch
+
+  constructor(
+    private readonly bridge: Bridge,
+    private readonly deviceModel: string,
+    /** The screen's smallest width is 600 dp or more at start (`PageEnvironment.largeScreen`). */
+    private readonly largeScreen = false
+  ) {
+    this.fetch = androidSyncFetch(bridge)
+  }
+
+  async chooseFolder(): Promise<string | null> {
+    const uri = await this.bridge.call<unknown>('sync.chooseFolder')
+    return typeof uri === 'string' && uri ? uri : null
+  }
+
+  async folderName(folder: string): Promise<string> {
+    const name = await this.bridge.call<unknown>('sync.folderName', { folder })
+    return typeof name === 'string' ? name : ''
+  }
+
+  deviceNameDefault(): string {
+    return this.deviceModel.trim() || 'Android phone'
+  }
+
+  /**
+   * A tablet at the 600 dp line Chrome draws too (`ui::GetDeviceFormFactor`, read once at
+   * start), else a phone. Chrome calls a device with a hinge a phone before it looks at the
+   * width (`GetLocalDeviceFormFactor`: `DEVICE_FORM_FACTOR_FOLDABLE` → `kPhone`); the host
+   * knows only the width, so a foldable open at start reads as a tablet.
+   */
+  deviceKind(): SyncDeviceKind {
+    return this.largeScreen ? 'tablet' : 'phone'
+  }
+
+  createTransport(folder: string): SyncTransport {
+    return new AndroidSyncTransport(this.bridge, folder, this.signal)
+  }
+
+  foreground(): boolean {
+    return this.signal.focused
+  }
+
+  /** The activity's resumes, for the Ione account's version poll (the folder transport has its own). */
+  onForeground(listener: () => void): () => void {
+    return this.signal.subscribe(listener)
+  }
+}

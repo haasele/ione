@@ -1,0 +1,480 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- A page playing audio keeps playing behind other apps: the media notification's service
+         (MediaPlaybackService.kt) holds the process up as one of the mediaPlayback kind. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- A page capturing the camera or the microphone keeps capturing behind other apps: the
+         "<site> is using your microphone" notification's service (CaptureService.kt) holds the
+         process up as one of the camera / microphone kinds; Android 14 names each kind's permission. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- The chrome's gesture haptics (a tab card picked up in the overview). -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- In-app updates: hand a downloaded release APK to the package installer. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="http" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="mailto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.DIAL" />
+        </intent>
+        <!--
+          The share targets: below Android 14 Ione draws its own share panel (SH-03, Share.kt's
+          openPanel) whose apps row (Share.panelTargets) comes from
+          PackageManager.queryIntentActivities for a text or an image share. Since API 30 that
+          query sees nothing without these entries.
+        -->
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="text/plain" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="image/*" />
+        </intent>
+        <!--
+          The apps behind the links that leave the web, so the external-protocol sheet can say
+          "Open in Gmail?" rather than "another app" (ExternalProtocols.VISIBLE_SCHEMES lists the
+          same schemes). Everything else is launched blind and falls back if nothing answers.
+        -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="mailto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="tel" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="sms" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="smsto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="mms" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="mmsto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="market" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="geo" />
+        </intent>
+        <!--
+          Voice search (Voice.kt): on Android 11+ SpeechRecognizer.isRecognitionAvailable only sees
+          the device's recogniser service when the app declares it wants to; without this the mic
+          buttons would never show there.
+        -->
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <!--
+          Read aloud (ReadAloud.kt): on Android 11+ TextToSpeech finds the device's speech engines
+          (getEngines, the default engine the constructor binds) only when the app declares it
+          wants to see them; without this the engine list is empty and Listen to this page never shows.
+        -->
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <!--
+          The camera apps behind the file chooser's Camera and Camcorder entries (OS-22,
+          BrowserActivity.showFileChooser): without these, Android 11+ hides them from
+          resolveActivity and the chooser would offer the files alone.
+        -->
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.VIDEO_CAPTURE" />
+        </intent>
+    </queries>
+
+    <!--
+      Browsing data stays on this device: no cloud backup, and (Android 12+, where allowBackup
+      alone does not cover it) no device-to-device transfer either. Nothing here needs restoring:
+      settings and profile are small and rebuilt or synced, while WebView cookies, storage,
+      downloads metadata, remembered permissions and the agent token must not leave the device.
+    -->
+    <application
+        android:name=".ZenApplication"
+        android:allowBackup="false"
+        android:fullBackupContent="@xml/ione_backup_rules"
+        android:dataExtractionRules="@xml/ione_data_extraction_rules"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Zen"
+        android:usesCleartextTraffic="true"
+        android:enableOnBackInvokedCallback="true"
+        tools:targetApi="tiramisu">
+
+        <!-- Samsung DeX: keep the process (and its tabs) alive when switching displays / density. -->
+        <meta-data android:name="com.samsung.android.keepalive.density" android:value="true" />
+        <meta-data android:name="com.samsung.android.multidisplay.keep_process_alive" android:value="true" />
+
+        <!--
+          The Google Play services client version the WebView's shape-detection binding demands of
+          its host. When a page constructs a BarcodeDetector, the WebView (Chromium's
+          BarcodeDetectionProviderImpl, on its in-process GPU thread) asks GoogleApiAvailability
+          whether Play services are usable, and that client reads THIS value off our
+          ApplicationInfo first: absent, it throws GooglePlayServicesMissingManifestValueException,
+          which crosses the JNI boundary uncaught and kills the whole process (no promise ever
+          rejects). Present, the check proceeds: without Play (AOSP) it reports "missing", the
+          provider is not created and the page's detect() rejects with NotSupportedError; with Play
+          the detector works. The value is GOOGLE_PLAY_SERVICES_VERSION_CODE, an integer literal
+          the client compares against - we do not depend on play-services-basement, so it is spelled
+          out here (it has been 12451000 since play-services-basement 15.0.0 (2018), through the
+          18.10.0 Chromium 152 builds against and 18.12.0; any OTHER integer trips the client's
+          "incorrect manifest value" throw, the same death). aapt2 stores a numeric android:value as
+          an int, which is the type the client reads (metaData.getInt). Covered by
+          ShapeDetectionManifestTest.
+        -->
+        <meta-data android:name="com.google.android.gms.version" android:value="12451000" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Zen.Splash"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|keyboard|navigation|uiMode|locale|layoutDirection|fontScale|fontWeightAdjustment|colorMode">
+            <!-- The launcher entry is one of the icon aliases below (Settings → Look and Feel → App
+                 icon), which reach this activity through IconTapActivity in this activity's own
+                 task; everything that targets the activity itself keeps working whichever alias
+                 is on. Web links arrive through LinkDispatchActivity below, which owns the VIEW
+                 http/https filter. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.APP_BROWSER" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.WEB_SEARCH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <!-- Ione's own pages: an `ione://settings/privacy` deep link (from a notification, a shortcut,
+                 another app, `adb shell am start`) opens the page's tab in the browser
+                 window – see src/shared/internalPages.ts. The browser's task is the only place it
+                 can land. DEFAULT only, no BROWSABLE: a web page must not be able to launch the
+                 browser's own pages (Chrome does not register chrome:// either; the desktop takes
+                 `ione://` from argv and open-url but registers no OS handler), and TabWebView
+                 refuses a web document's own navigation to them (DeepLinks.refusedFromDocument). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="ione" />
+                <!-- Old links keep working: the previous name stays a registered scheme. -->
+                <data android:scheme="zenium" />
+            </intent-filter>
+            <!-- Share target: text and links open or search; an image opens as a page (Share.kt). -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <!-- A Chrome extension package (.crx, which Android types as this) opened with or shared
+                 to Ione installs as an extension (ext/ExtensionStore.kt); .zip files come through
+                 the picker instead, so Ione does not offer itself for every archive. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/x-chrome-extension" />
+            </intent-filter>
+        </activity>
+
+        <!-- The icon aliases' target (IconTapActivity.kt): the splash theme, so the platform draws
+             the starting window at the tap; the package's affinity, so MainActivity joins THIS task
+             and the platform transfers that window to it; the identity relinquished to
+             MainActivity the moment it joins, so disabling an alias never removes the browser's
+             task. Not exported: the aliases are. -->
+        <activity
+            android:name=".IconTapActivity"
+            android:exported="false"
+            android:noHistory="true"
+            android:relinquishTaskIdentity="true"
+            android:theme="@style/Theme.Zen.Splash" />
+
+        <!-- The shortcuts' target: hands over to MainActivity from a task of its own and finishes
+             unseen, so the CLEAR_TASK the system stamps on a shortcut clears only this task (see
+             LauncherIconActivity). -->
+        <activity
+            android:name=".LauncherIconActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay" />
+
+        <!-- Where web links arrive (this is what the system offers as a browser and what
+             CustomTabsIntent.launchUrl starts). A plain link is forwarded to MainActivity in the
+             browser's task; another app's custom tab becomes CustomTabActivity in the caller's own
+             task, which this trampoline was started in. Gone before it draws. -->
+        <activity
+            android:name=".LinkDispatchActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+            </intent-filter>
+            <!-- "Open with Ione" for a document on the device (a downloaded page, a PDF, an
+                 SVG): the twin of the desktop's file associations (electron-builder.yml). The
+                 host reads the document itself (LocalDocuments.kt); a page never reaches these
+                 schemes on its own. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="file" />
+                <data android:scheme="content" />
+                <data android:mimeType="text/html" />
+                <data android:mimeType="application/xhtml+xml" />
+                <data android:mimeType="application/pdf" />
+                <data android:mimeType="image/svg+xml" />
+            </intent-filter>
+        </activity>
+
+        <!-- Another app's custom tab (CustomTabActivity.kt). Its own, empty affinity keeps it out of
+             the singleTask browser's task: it stacks on the caller, as Chrome's does, so closing it
+             lands back in the app that opened it. Not exported: everything reaches it through
+             LinkDispatchActivity or MainActivity, which have vetted the intent. Picture-in-picture
+             is the tab's Minimize (the toolbar button shrinks the tab to a floating card, as
+             Chrome's minimized custom tab does); only this activity enters it. -->
+        <activity
+            android:name=".CustomTabActivity"
+            android:exported="false"
+            android:launchMode="standard"
+            android:taskAffinity=""
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.Zen.CustomTab"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|locale|layoutDirection|fontScale|colorMode" />
+
+        <!-- An installed web app's tile lands here (WebAppLauncherActivity.kt): gone before it
+             draws, it opens the app's window in the app's own task, or – a tile pinned before the
+             window existed, a `browser` app – the page as a tab of the browser, as before. Not
+             exported: the system starts a pinned shortcut under its creator's uid, so the tile
+             reaches it and another app's intent does not (Chrome's SecureWebAppLauncher). -->
+        <activity
+            android:name=".WebAppLauncherActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay" />
+
+        <!-- An installed web app's window (WebAppActivity.kt, PWA-07): one task per app, found again
+             by the launch intent's data (`zen-webapp://<shortcut id>`, documentLaunchMode
+             intoExisting) and handed a repeat launch (singleTop), out of the browser's task (its own,
+             empty affinity), listed in Recents under the app's name and icon; not kept across a
+             reboot, as Chrome's WebappActivity is not. Not exported: only the trampoline above
+             starts it. Its theme is the launch's splash (PWA-06, WebAppSplash.kt), which leaves
+             the window in Theme.Zen.WebApp. -->
+        <activity
+            android:name=".WebAppActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:documentLaunchMode="intoExisting"
+            android:persistableMode="persistNever"
+            android:taskAffinity=""
+            android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.Zen.WebApp.Splash"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|locale|layoutDirection|fontScale|colorMode" />
+
+        <!-- The Custom Tabs provider service other apps bind before they open a custom tab
+             (CustomTabsConnectionService.kt): warmup, sessions, likely URLs. The AuthTab category
+             is what `CustomTabsClient.isAuthTabSupported` looks for: this browser returns an Auth
+             Tab's redirect to its caller (CCT-13, AuthTab.kt). -->
+        <service
+            android:name=".CustomTabsConnectionService"
+            android:exported="true"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="android.support.customtabs.action.CustomTabsService" />
+                <category android:name="androidx.browser.auth.category.AuthTab" />
+            </intent-filter>
+        </service>
+
+        <!-- app-icon-aliases:begin (Generated by scripts/app-icons.ts from logo/ione-*.svg; run `bun run icons` instead of editing.) -->
+        <activity-alias
+            android:name=".icon.Black"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_black"
+            android:label="@string/app_name"
+            android:targetActivity=".IconTapActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
+        </activity-alias>
+        <activity-alias
+            android:name=".icon.White"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_white"
+            android:label="@string/app_name"
+            android:targetActivity=".IconTapActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
+        </activity-alias>
+        <activity-alias
+            android:name=".icon.Transp"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_transp"
+            android:label="@string/app_name"
+            android:targetActivity=".IconTapActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
+        </activity-alias>
+        <!-- app-icon-aliases:end -->
+
+        <!-- The pages' media on the OS controls (MediaSessions.kt): the media-style notification's
+             foreground service, so a page playing audio keeps playing behind other apps and under
+             the lock screen, as Chrome's does. Nothing else starts it; it stops with the session. -->
+        <service
+            android:name=".MediaPlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- The "<site> is using your microphone" card's service (CaptureService.kt, NOT-13): while a
+             page holds the camera or the microphone the process is one with a camera / microphone
+             service in the foreground, so the capture carries on behind other apps (Android 11+
+             cuts a background app's otherwise). Started from the permission grant path alone,
+             while the app is in front, as Android 14 requires of these kinds; it stops with the
+             capture. -->
+        <service
+            android:name=".CaptureService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone" />
+
+        <!-- The launcher's confirmation that a Home-screen shortcut was pinned (Shortcuts.kt). -->
+        <receiver
+            android:name=".ShortcutPinnedReceiver"
+            android:exported="false" />
+
+        <!-- The Home-screen search widget (SearchWidgetProvider; WID-01): the pill's face opens the
+             app in the omnibox, the mic in voice search, the mask in a new private tab, each through
+             the landing extra (Landing.kt). Exported for the system's APPWIDGET_UPDATE alone. -->
+        <receiver
+            android:name=".SearchWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_search_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/appwidget_search" />
+        </receiver>
+
+        <!-- The Home-screen quick actions widget (QuickActionsWidgetProvider; WID-02): the omnibox pill
+             with the mic, the private mask and the QR scanner in one freely resized widget, as Chrome's
+             quick action search widget; each part lands through the landing extra (Landing.kt).
+             Exported for the system's APPWIDGET_UPDATE alone; a receiver, so nothing of it runs at
+             the app's boot – the launcher wakes it on placement, on a resize and after an update. -->
+        <receiver
+            android:name=".QuickActionsWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_quick_actions_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/appwidget_quick_actions" />
+        </receiver>
+
+        <!-- The Home-screen game widget (GameWidgetProvider; WID-04 / ERR-03): a one-cell face – Roll's
+             runner on its ground line – that opens the offline game on zen://game through the landing
+             extra (Landing.kt). Exported for the system's APPWIDGET_UPDATE alone; a receiver, so
+             nothing of it runs at the app's boot. -->
+        <receiver
+            android:name=".GameWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_game_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/appwidget_game" />
+        </receiver>
+
+        <!-- "Close all private tabs" on the private session's notification (PrivateSession.kt); in the
+             manifest so a press on a card that outlived the process still takes the card down. -->
+        <receiver
+            android:name=".PrivateSessionReceiver"
+            android:exported="false" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

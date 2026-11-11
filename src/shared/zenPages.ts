@@ -1,0 +1,1581 @@
+/**
+ * `zen://` internal pages. `zen://newtab` is the new tab page (its document lives in
+ * `newTabPage.ts`; the host's preload fills it), `zen://blank` an empty page that picks up the
+ * theme (new tabs on hosts without the page); `zen://error` renders navigation failures,
+ * `zen://reader` shows Reader View articles, `zen://image` an image another app shared in and
+ * `zen://version` the build's facts (chrome://version).
+ *
+ * Pure HTML generation shared by every host: Electron serves these through a privileged protocol,
+ * Android loads them straight into the tab's WebView. Reader articles and shared images live in
+ * the core; hosts pass lookups so this module stays free of state.
+ */
+// The chrome's stylesheet as text (a Vite `?raw` import: nothing of the renderer runs here). The
+// error page is a document inside the tab and cannot link the stylesheet, so it cuts the design
+// language v2 token block, the v2 button and its own rules out of this text instead of carrying
+// a copy of any value; `v2Tokens.test.ts` lists the page among the v2 surfaces.
+import chromeStylesheet from '../renderer/src/assets/main.css?raw'
+import { PHONE_MAX_WIDTH } from './formFactor'
+import type { CertificateDetails, ColorScheme, Platform as PlatformOs } from './types'
+import {
+  SAFE_BROWSING_THREAT_LABELS,
+  isLookalikeReason,
+  isLookalikeSource,
+  type LookalikeReason,
+  type LookalikeSource,
+  type SafeBrowsingThreat
+} from './privacy'
+import { INTERSTITIAL_MESSAGE_KEY, type InterstitialAction } from './interstitial'
+import { unicodeHost } from './punycode'
+import { fillSearchTemplate } from './search'
+import { isCertificateError } from './siteInfo'
+import {
+  crashPageOptionsOf,
+  errorPageAccentOf,
+  errorPageCertificate,
+  errorPageSearchOf,
+  type CrashPageOptions,
+  type ErrorPageAccent,
+  type ErrorPageSearch
+} from './url'
+import { hexToRgb, resolveTheme, rgbToHex } from './theme'
+import { newTabPageHtml } from './newTabPage'
+import { pdfMissingPageHtml, pdfViewerPageHtml, type PdfPageLookup } from './pdfPage'
+import { GAME_TITLE, gameMarkupHtml } from './game/page'
+import { gameRuntimeScriptHtml } from './game/inlineRuntime'
+
+export const ZEN_SCHEME = 'zen'
+
+/** An image shared into the browser (`zen://image?id=…`); the bytes live in the core. */
+export const IMAGE_URL_PREFIX = 'zen://image'
+
+/** Headline of the error page for one family of failures (Chrome's own wording). */
+const UNREACHABLE = "This site can't be reached"
+const NOT_WORKING = "This page isn't working"
+const NOT_PRIVATE = 'Your connection is not private'
+const NO_INTERNET = 'No internet'
+
+/**
+ * Chrome's suggestion flags for a code (`localized_error.cc`'s `SUGGEST_*` in `net_error_options[]`),
+ * the ones its summary list – "Try:" and the lines under it – is drawn from (ERR-05). The two
+ * that need a facility Ione has no counterpart for are left out: `SUGGEST_DIAGNOSE_TOOL` (a
+ * network diagnostics dialog on Windows, macOS and ChromeOS) and `SUGGEST_CAPTIVE_PORTAL_SIGNIN`
+ * (the portal detector's state).
+ */
+type Suggestion = 'connection' | 'dns' | 'firewall' | 'proxy' | 'antivirus' | 'offline'
+
+/** Chrome's phrasing for a failed load, with the site named where Chrome names it. */
+interface NetErrorCopy {
+  /** The Chromium `net::` name, shown as the small line at the end (`ERR_…`). */
+  name: string
+  title: string
+  /** The one-line reason; `site` is the host of the failed URL or '' when it has none. */
+  reason: (site: string) => string
+  /** The flags the suggestion list draws from (`suggestionsFor`); none when Chrome lists nothing. */
+  suggest?: Suggestion[]
+  /**
+   * A one-sentence suggestion Chrome shows on its own instead of a list (its "standalone"
+   * summaries): the redirect loop's "Try deleting your cookies."
+   */
+  hint?: string
+}
+
+const named =
+  (withSite: (site: string) => string, without: string) =>
+  (site: string): string =>
+    site ? withSite(site) : without
+
+/** Chrome's flags for a connection that was made and lost: timed out, reset, closed, refused. */
+const CONNECTION_LOST: Suggestion[] = ['connection', 'firewall', 'proxy']
+
+/**
+ * Keep the names equal to `BY_NAME` in the Android host's `NetErrors.kt`, which reports failures
+ * by them. Titles and reasons are Chrome 152's (`error_page_strings.grdp`) in the app's voice;
+ * the suggestion flags are its `net_error_options[]` rows for the same codes.
+ */
+const NET_ERRORS: Record<number, NetErrorCopy> = {
+  [-2]: {
+    name: 'ERR_FAILED',
+    title: UNREACHABLE,
+    reason: named((s) => `${s} could not be loaded.`, 'The page could not be loaded.')
+  },
+  [-6]: {
+    name: 'ERR_FILE_NOT_FOUND',
+    title: 'File not found',
+    reason: () => 'It may have been moved, edited or deleted.'
+  },
+  [-7]: {
+    name: 'ERR_TIMED_OUT',
+    title: UNREACHABLE,
+    reason: named((s) => `${s} took too long to respond.`, 'The server took too long to respond.'),
+    suggest: CONNECTION_LOST
+  },
+  [-20]: {
+    name: 'ERR_BLOCKED_BY_CLIENT',
+    title: 'This page has been blocked',
+    reason: () => 'Ione blocked this request.'
+  },
+  [-21]: {
+    // `net_error_list.h`: -21 is the network changing under the request (a Wi-Fi to mobile
+    // handover); `ERR_NETWORK_ACCESS_DENIED` is -138 below. Chrome's row
+    // (`IDS_ERRORPAGES_HEADING_CONNECTION_INTERRUPTED`, `SUGGEST_NONE`): the connection, not
+    // the site, is what failed, so there is nothing to check – Reload alone.
+    name: 'ERR_NETWORK_CHANGED',
+    title: 'Your connection was interrupted',
+    reason: () => 'A network change was detected.'
+  },
+  [-100]: {
+    name: 'ERR_CONNECTION_CLOSED',
+    title: UNREACHABLE,
+    reason: named(
+      (s) => `${s} unexpectedly closed the connection.`,
+      'The connection was closed unexpectedly.'
+    ),
+    suggest: CONNECTION_LOST
+  },
+  [-101]: {
+    name: 'ERR_CONNECTION_RESET',
+    title: UNREACHABLE,
+    reason: () => 'The connection was reset.',
+    suggest: CONNECTION_LOST
+  },
+  [-102]: {
+    name: 'ERR_CONNECTION_REFUSED',
+    title: UNREACHABLE,
+    reason: named((s) => `${s} refused to connect.`, 'The server refused to connect.'),
+    suggest: CONNECTION_LOST
+  },
+  [-105]: {
+    name: 'ERR_NAME_NOT_RESOLVED',
+    title: UNREACHABLE,
+    reason: named(
+      (s) => `${s}'s server IP address could not be found.`,
+      "The server's IP address could not be found."
+    ),
+    suggest: ['connection', 'dns', 'firewall', 'proxy']
+  },
+  [-106]: {
+    name: 'ERR_INTERNET_DISCONNECTED',
+    title: NO_INTERNET,
+    // The offline page: the device, not the site, is the reason; the list under it says what
+    // to check, and the page reloads itself when the device is back (`connectivity`).
+    reason: () => 'Your device is offline.',
+    suggest: ['offline']
+  },
+  [-107]: {
+    name: 'ERR_SSL_PROTOCOL_ERROR',
+    title: "This site can't provide a secure connection",
+    reason: named((s) => `${s} sent an invalid response.`, 'The server sent an invalid response.')
+  },
+  [-109]: {
+    name: 'ERR_ADDRESS_UNREACHABLE',
+    title: UNREACHABLE,
+    reason: named((s) => `${s} is unreachable.`, 'The address is unreachable.')
+  },
+  [-113]: {
+    name: 'ERR_SSL_VERSION_OR_CIPHER_MISMATCH',
+    title: "This site can't provide a secure connection",
+    reason: named(
+      (s) => `${s} uses an unsupported protocol.`,
+      'The server uses an unsupported protocol.'
+    )
+  },
+  [-118]: {
+    name: 'ERR_CONNECTION_TIMED_OUT',
+    title: UNREACHABLE,
+    reason: named((s) => `${s} took too long to respond.`, 'The server took too long to respond.'),
+    suggest: CONNECTION_LOST
+  },
+  [-138]: {
+    name: 'ERR_NETWORK_ACCESS_DENIED',
+    // Chrome's casing (`IDS_ERRORPAGES_HEADING_NETWORK_ACCESS_DENIED`): a capital Internet here,
+    // where its offline heading has "No internet".
+    title: 'Your Internet access is blocked',
+    reason: () => 'Firewall or antivirus software may have blocked the connection.',
+    suggest: ['connection', 'firewall', 'antivirus']
+  },
+  [-200]: {
+    name: 'ERR_CERT_COMMON_NAME_INVALID',
+    title: NOT_PRIVATE,
+    reason: named(
+      (s) => `The certificate ${s} sent is not trusted.`,
+      'The certificate this site sent is not trusted.'
+    )
+  },
+  [-201]: {
+    name: 'ERR_CERT_DATE_INVALID',
+    title: NOT_PRIVATE,
+    reason: named(
+      (s) => `The certificate ${s} sent has expired or is not yet valid.`,
+      'The certificate this site sent has expired or is not yet valid.'
+    )
+  },
+  [-202]: {
+    name: 'ERR_CERT_AUTHORITY_INVALID',
+    title: NOT_PRIVATE,
+    reason: named(
+      (s) => `The certificate ${s} sent was issued by an authority Ione does not trust.`,
+      'The certificate this site sent was issued by an authority Ione does not trust.'
+    )
+  },
+  [-207]: {
+    name: 'ERR_CERT_INVALID',
+    title: NOT_PRIVATE,
+    reason: named(
+      (s) => `The certificate ${s} sent is invalid.`,
+      'The certificate this site sent is invalid.'
+    )
+  },
+  [-300]: {
+    name: 'ERR_INVALID_URL',
+    title: UNREACHABLE,
+    reason: () => 'The address is invalid.'
+  },
+  [-310]: {
+    name: 'ERR_TOO_MANY_REDIRECTS',
+    title: NOT_WORKING,
+    reason: named(
+      (s) => `${s} redirected you too many times.`,
+      'The page redirected you too many times.'
+    ),
+    hint: 'Try deleting your cookies.'
+  },
+  [-312]: {
+    // Chromium never connects to a few reserved ports (1, 7, 25, …): `localhost:1` fails this way.
+    name: 'ERR_UNSAFE_PORT',
+    title: UNREACHABLE,
+    reason: named(
+      (s) => `${s} uses a port Ione does not connect to.`,
+      'The address uses a port Ione does not connect to.'
+    )
+  },
+  [-324]: {
+    name: 'ERR_EMPTY_RESPONSE',
+    title: NOT_WORKING,
+    reason: named((s) => `${s} didn't send any data.`, "The server didn't send any data.")
+  },
+  [-501]: {
+    name: 'ERR_INSECURE_RESPONSE',
+    title: NOT_PRIVATE,
+    reason: named((s) => `${s} sent an insecure response.`, 'The site sent an insecure response.')
+  }
+}
+
+/**
+ * The hosts report a crashed renderer through this code (not a `net::` error); the description
+ * carries Chrome's name for the way the process ended (`crashCodeName`). A tab whose `errorCode`
+ * is this one is the sad tab (tabs-44): the row shows the crashed favicon until the next load.
+ */
+export const CRASH_ERROR_CODE = -1
+
+/** Chromium's `content::ResultCode` names, the exit codes a renderer is ended with on purpose. */
+const RESULT_CODES: Record<number, string> = {
+  1: 'RESULT_CODE_KILLED',
+  2: 'RESULT_CODE_HUNG',
+  3: 'RESULT_CODE_KILLED_BAD_MESSAGE',
+  4: 'RESULT_CODE_GPU_DEAD_ON_ARRIVAL'
+}
+
+/** The Windows exception statuses a renderer dies of (its exit code is the `NTSTATUS`). */
+const WINDOWS_STATUSES: Record<number, string> = {
+  0x80000003: 'STATUS_BREAKPOINT',
+  0xc0000005: 'STATUS_ACCESS_VIOLATION',
+  0xc0000006: 'STATUS_IN_PAGE_ERROR',
+  0xc0000008: 'STATUS_INVALID_HANDLE',
+  0xc000001d: 'STATUS_ILLEGAL_INSTRUCTION',
+  0xc0000025: 'STATUS_NONCONTINUABLE_EXCEPTION',
+  0xc0000094: 'STATUS_INTEGER_DIVIDE_BY_ZERO',
+  0xc00000fd: 'STATUS_STACK_OVERFLOW',
+  0xc0000135: 'STATUS_DLL_NOT_FOUND',
+  0xc0000142: 'STATUS_DLL_INIT_FAILED',
+  0xc000027b: 'STATUS_STOWED_EXCEPTION',
+  0xc0000374: 'STATUS_HEAP_CORRUPTION',
+  0xc0000409: 'STATUS_STACK_BUFFER_OVERRUN',
+  0xc0000417: 'STATUS_INVALID_CRUNTIME_PARAMETER',
+  0xc0000420: 'STATUS_ASSERTION_FAILURE',
+  0xc0000602: 'STATUS_FAIL_FAST_EXCEPTION'
+}
+
+/** The signals a renderer dies of, by number; the ones Linux and macOS number differently apart. */
+const SIGNALS: Record<number, string> = {
+  1: 'SIGHUP',
+  2: 'SIGINT',
+  3: 'SIGQUIT',
+  4: 'SIGILL',
+  5: 'SIGTRAP',
+  6: 'SIGABRT',
+  8: 'SIGFPE',
+  9: 'SIGKILL',
+  11: 'SIGSEGV',
+  13: 'SIGPIPE',
+  14: 'SIGALRM',
+  15: 'SIGTERM'
+}
+const LINUX_SIGNALS: Record<number, string> = {
+  7: 'SIGBUS',
+  10: 'SIGUSR1',
+  12: 'SIGUSR2',
+  31: 'SIGSYS'
+}
+const MAC_SIGNALS: Record<number, string> = {
+  7: 'SIGEMT',
+  10: 'SIGBUS',
+  12: 'SIGSYS',
+  31: 'SIGUSR2'
+}
+
+/**
+ * The name Chrome's sad tab puts on its code line ("Error code: …") for a renderer that went
+ * away with `reason` (the host's `render-process-gone` reason) and `exitCode` (the process's,
+ * when the host has it): Chromium's own result code where the process was ended on purpose, the
+ * signal (POSIX: the raw wait status, the signal in its low bits) or the Windows exception status
+ * it died of where the exit code names one, the bare number where it does not (Chrome's
+ * "Error code: 5"), and the reason itself, spelt as a code, where the host sent none.
+ */
+export function crashCodeName(
+  reason: string,
+  exitCode: number | null | undefined = null,
+  os: PlatformOs = 'linux'
+): string {
+  if (reason === 'oom' || reason === 'memory-eviction' || reason === 'oom-kill')
+    return 'Out of Memory'
+  if (reason === 'hung') return 'RESULT_CODE_HUNG'
+  if (reason === 'launch-failed') return 'LAUNCH_FAILED'
+  if (reason === 'integrity-failure') return 'INTEGRITY_FAILURE'
+  const code = typeof exitCode === 'number' && Number.isFinite(exitCode) ? exitCode : null
+  if (code === null) return reason.toUpperCase().replace(/-/g, '_')
+  if (os === 'win32') {
+    const status = WINDOWS_STATUSES[code >>> 0]
+    if (status) return status
+    return RESULT_CODES[code] ?? (reason === 'killed' ? 'RESULT_CODE_KILLED' : String(code))
+  }
+  // POSIX: a signalled process reports the raw wait status, the signal in the low seven bits
+  // (the core-dump bit above them); one that exited reports its exit code in the second byte.
+  const signal = code & 0x7f
+  if (signal !== 0 && signal !== 0x7f && code < 0x100) {
+    const named = (os === 'darwin' ? MAC_SIGNALS[signal] : LINUX_SIGNALS[signal]) ?? SIGNALS[signal]
+    if (named) return named
+  }
+  const exited = code >= 0x100 && (code & 0xff) === 0 ? (code >> 8) & 0xff : code
+  return RESULT_CODES[exited] ?? (reason === 'killed' ? 'RESULT_CODE_KILLED' : String(exited))
+}
+
+/** Chromium `net::` error codes eligible for the https→http typed-input fallback. */
+export const HTTP_FALLBACK_CODES = new Set([
+  -102, -105, -107, -113, -118, -7, -100, -101, -109, -200, -201, -202, -203, -204, -205, -206,
+  -207, -208, -210, -211, -212, -213, -324, -501
+])
+
+/** The one-line reason for a `net::` error code, without naming the site (the hosts' fallback description). */
+export function describeNetError(code: number, fallback: string): string {
+  return NET_ERRORS[code]?.reason('') ?? fallback
+}
+
+/**
+ * The host the page is drawn for, which decides the suggestion list as Chrome's
+ * `GetSuggestionsSummaryList` decides it per platform: Android's list is the connection line
+ * (and, offline, the phone's three checks); the desktop's adds the proxy, firewall and DNS line
+ * (and, offline, the cables and the Wi-Fi). Every host but the Android one is the desktop.
+ */
+export type ErrorPageHost = 'android' | 'desktop'
+
+/**
+ * The lines Chrome lists under "Try:" for a code on `host` (ERR-05): its
+ * `IDS_ERRORPAGES_SUGGESTION_*_SUMMARY` strings in the order and under the platform conditions of
+ * `GetSuggestionsSummaryList` – the connection first; the proxy / firewall / DNS combinations
+ * behind `!IS_ANDROID && !IS_IOS`; the offline checks per platform. Empty when Chrome lists none.
+ */
+export function suggestionsFor(code: number, host: ErrorPageHost): string[] {
+  const flags = NET_ERRORS[code]?.suggest ?? []
+  const has = (flag: Suggestion): boolean => flags.includes(flag)
+  const lines: string[] = []
+  if (has('connection')) lines.push('Checking the connection')
+  if (host === 'desktop') {
+    if (has('dns') && has('firewall') && has('proxy'))
+      lines.push('Checking the proxy, firewall and DNS configuration')
+    else if (has('firewall') && has('antivirus'))
+      lines.push('Checking firewall and antivirus configurations')
+    else if (has('proxy') && has('firewall')) lines.push('Checking the proxy and the firewall')
+    else if (has('proxy')) lines.push('Checking the proxy address')
+  }
+  if (has('offline')) {
+    // Chrome Android's three lines in the product's spelling (design language §10.5: British on
+    // every surface; Android's own en-GB setting is "Aeroplane mode").
+    if (host === 'android')
+      lines.push(
+        'Turning off aeroplane mode',
+        'Turning on mobile data or Wi-Fi',
+        'Checking the signal in your area'
+      )
+    else lines.push('Checking the network cables, modem and router', 'Reconnecting to Wi-Fi')
+  }
+  return lines
+}
+
+/**
+ * The word a failed host is when it reads as a search term (ERR-05, Chrome's "Search <engine>
+ * for <term>" for a typed word): one label with no dot – neither a domain nor an IP literal –
+ * and not `localhost`, which names this device. A punycode label is shown as the user typed it.
+ * Null for any other host.
+ */
+export function searchTermOf(site: string): string | null {
+  if (!site || /[.:[\]]/.test(site) || site === 'localhost') return null
+  return unicodeHost(site)
+}
+
+/** The search action the page offers: its label, `Search <engine> for <term>`, and the results' address. */
+export interface ErrorPageSearchAction {
+  label: string
+  url: string
+}
+
+/**
+ * "Search <engine> for <term>" for a DNS failure (`ERR_NAME_NOT_RESOLVED`) of a host that reads
+ * as a typed word (`searchTermOf`), through the engine the core handed over; null for any other
+ * failure, host or when no engine came.
+ */
+export function errorPageSearchAction(
+  code: number,
+  site: string,
+  search: ErrorPageSearch | null
+): ErrorPageSearchAction | null {
+  if (code !== NAME_NOT_RESOLVED_CODE || !search) return null
+  const term = searchTermOf(site)
+  if (!term) return null
+  return {
+    label: `Search ${search.engine} for ${term}`,
+    url: fillSearchTemplate(search.template, term)
+  }
+}
+
+/** `net::ERR_NAME_NOT_RESOLVED`: the name did not resolve – the one failure that offers a search. */
+export const NAME_NOT_RESOLVED_CODE = -105
+
+/** What the error page shows: everything is derived here so the rendering stays a template. */
+export interface ErrorPageContent {
+  title: string
+  /** The host name of the failed URL ('' when the URL has none). */
+  site: string
+  reason: string
+  /**
+   * Chrome's suggestion list for the code on this host (`suggestionsFor`), the lines under "Try:";
+   * empty when Chrome lists none, and the header goes with it.
+   */
+  suggestions: string[]
+  /** Chrome's standalone suggestion sentence for the code (`NetErrorCopy.hint`), or null. */
+  hint: string | null
+  /** "Search <engine> for <term>" beside Reload (`errorPageSearchAction`), or null. */
+  search: ErrorPageSearchAction | null
+  /** The Chromium error name (`ERR_…`), or the host's own description when the code has no name. */
+  code: string
+  /** The failed URL the Reload control goes back to ('' when there is none). */
+  target: string
+  /**
+   * The crash page's second action (ERR-15): a page that crashed twice within the minute offers
+   * the tab switcher beside Reload, so other tabs can be closed to free memory.
+   */
+  showTabs: boolean
+  /**
+   * The certificate interstitial's part, for an `ERR_CERT_*` failure of an https address: the
+   * page then offers Back to safety and Advanced, which reveals this and the proceed control, as
+   * Chrome's does. Null for every other failure, which keeps the Reload control.
+   */
+  interstitial: CertificateInterstitial | null
+}
+
+export interface CertificateInterstitial {
+  /** Chrome's explanation of what is wrong with the certificate (the Advanced block's paragraph). */
+  explanation: string
+  /** The refused certificate's fields, label and value; empty when the host could not describe it. */
+  details: Array<{ label: string; value: string }>
+  /**
+   * The proceed control's label, `Proceed to <host> (unsafe)`; null when the host could not
+   * fingerprint the certificate, since an exception is remembered by that and none could be.
+   */
+  proceed: string | null
+}
+
+/** Chrome's Advanced-block sentence per certificate error; the default covers the rest of the family. */
+const CERTIFICATE_EXPLANATIONS: Record<
+  number,
+  (site: string, cert: CertificateDetails | null) => string
+> = {
+  [-200]: (site, cert) =>
+    `This server could not prove that it is ${site}; its security certificate is ${
+      cert?.subjectName ? `from ${cert.subjectName}` : 'for another site'
+    }. This may be caused by a misconfiguration or an attacker intercepting your connection.`,
+  [-201]: (site) =>
+    `This server could not prove that it is ${site}; its security certificate has expired or is not yet valid. This may be caused by a misconfiguration, an attacker intercepting your connection, or a wrong clock on this device.`,
+  [-202]: (site) =>
+    `This server could not prove that it is ${site}; its security certificate is not trusted by this device's operating system. This may be caused by a misconfiguration or an attacker intercepting your connection.`
+}
+
+/** A certificate date for the details list; ISO when the runtime has no locale formatting. */
+function certificateDate(ms: number): string {
+  const date = new Date(ms)
+  try {
+    return date.toLocaleDateString(undefined, { dateStyle: 'medium' })
+  } catch {
+    return date.toISOString().slice(0, 10)
+  }
+}
+
+/**
+ * The interstitial's part of the page for an `ERR_CERT_*` failure of an https address (`target`);
+ * null for any other failure or address, so an http or `file:` failure never offers to proceed.
+ */
+export function certificateInterstitial(
+  code: number,
+  target: string,
+  certificate: CertificateDetails | null
+): CertificateInterstitial | null {
+  if (!isCertificateError(code) || !/^https:\/\//i.test(target)) return null
+  const site = siteOf(target)
+  if (!site) return null
+  const explain =
+    CERTIFICATE_EXPLANATIONS[code] ??
+    ((s: string) =>
+      `This server could not prove that it is ${s}; its security certificate is not valid. This may be caused by a misconfiguration or an attacker intercepting your connection.`)
+  const details: Array<{ label: string; value: string }> = []
+  if (certificate) {
+    if (certificate.subjectName)
+      details.push({ label: 'Issued to', value: certificate.subjectName })
+    if (certificate.issuerName) details.push({ label: 'Issued by', value: certificate.issuerName })
+    if (certificate.validStart)
+      details.push({ label: 'Valid from', value: certificateDate(certificate.validStart) })
+    if (certificate.validExpiry)
+      details.push({ label: 'Valid until', value: certificateDate(certificate.validExpiry) })
+    if (certificate.fingerprint)
+      details.push({ label: 'Fingerprint', value: certificate.fingerprint })
+  }
+  return {
+    explanation: explain(site, certificate),
+    details,
+    proceed: certificate?.fingerprint ? `Proceed to ${site} (unsafe)` : null
+  }
+}
+
+/** The `net::ERR_…` name in a host description like `net::ERR_NAME_NOT_RESOLVED`, or null. */
+function errorNameIn(description: string): string | null {
+  const match = /^(?:net::)?(ERR_[A-Z0-9_]+)$/.exec(description.trim())
+  return match ? match[1] : null
+}
+
+/** The host name of `url` for the page's copy (Chrome names the host, never the port); '' when unusable. */
+function siteOf(url: string): string {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * The sad tab's words (tabs-44, ERR-15): Chrome's "Aw, Snap!" family in Ione's voice, one
+ * title and reason per way the renderer went – a crash, the OS taking the memory back while the
+ * page was in front, the user ending a page that stopped responding – and, for a second time
+ * within the minute, Chrome's suggestion to close other tabs, with the way to them beside Reload.
+ */
+const CRASH_COPY: Record<
+  NonNullable<CrashPageOptions['variant']>,
+  { title: string; reason: string; again: string }
+> = {
+  crash: {
+    title: 'This page crashed',
+    reason: 'Something went wrong while displaying this page. Reload to try again.',
+    again:
+      'Something went wrong while displaying this page, again. Closing other tabs can free up memory.'
+  },
+  memory: {
+    title: 'This page was closed to free up memory',
+    reason: 'Android needed the memory this page was using. Reload to open it again.',
+    again:
+      'Android needed the memory this page was using, again. Closing other tabs can free some up.'
+  },
+  hung: {
+    title: 'This page crashed',
+    reason: 'The page stopped responding and was closed. Reload to try again.',
+    again:
+      'The page stopped responding and was closed, again. Closing other tabs can free up memory.'
+  }
+}
+
+/** What besides the failure the page is built from: the host it is drawn for, the engine it may search with. */
+export interface ErrorPageOptions {
+  host?: ErrorPageHost
+  search?: ErrorPageSearch | null
+}
+
+export function errorPageContent(
+  code: number,
+  description: string,
+  target: string,
+  certificate: CertificateDetails | null = null,
+  crash: CrashPageOptions = {},
+  options: ErrorPageOptions = {}
+): ErrorPageContent {
+  const site = siteOf(target)
+  if (code === CRASH_ERROR_CODE) {
+    // The sad tab (tabs-44): Chrome's "Aw, Snap!" in Ione's words, the way the renderer
+    // ended on the code line the way Chrome's sad tab writes it ("Error code: …").
+    const copy = CRASH_COPY[crash.variant ?? 'crash']
+    const repeat = crash.repeat === true
+    return {
+      title: repeat && crash.variant !== 'memory' ? `${copy.title} again` : copy.title,
+      site,
+      reason: repeat ? copy.again : copy.reason,
+      suggestions: [],
+      hint: null,
+      search: null,
+      code: description ? `Error code: ${description}` : '',
+      target,
+      showTabs: repeat,
+      interstitial: null
+    }
+  }
+  const copy = NET_ERRORS[code]
+  // The host's description is the exact Chromium name when it has one (`net::ERR_…`); a code
+  // without a table entry keeps whatever prose the host sent as its reason.
+  const name = errorNameIn(description) ?? copy?.name ?? ''
+  const fallback = (!name && description) || 'The page could not be loaded.'
+  const interstitial = certificateInterstitial(code, target, certificate)
+  return {
+    // Every certificate failure is Chrome's "not private" page, named in the table or not.
+    title: copy?.title ?? (interstitial ? NOT_PRIVATE : UNREACHABLE),
+    site,
+    reason: copy?.reason(site) ?? (interstitial ? NET_ERRORS[-207].reason(site) : fallback),
+    suggestions: interstitial ? [] : suggestionsFor(code, options.host ?? 'desktop'),
+    hint: copy?.hint ?? null,
+    search: errorPageSearchAction(code, site, options.search ?? null),
+    code: name,
+    target,
+    showTabs: false,
+    interstitial
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string
+  )
+}
+
+const BASE_STYLE = `
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { background: transparent; color: light-dark(#1e1e24, #f0f0f5); display: grid; place-items: center; }
+  .card { max-width: 480px; padding: 32px; text-align: center; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 12px; }
+  p { margin: 0 0 20px; line-height: 1.5; opacity: .8; }
+  code { font-family: ui-monospace, monospace; font-size: 13px; opacity: .7; word-break: break-all; }
+  button { font: inherit; padding: 8px 18px; border-radius: 999px; border: 1px solid light-dark(#0002, #fff3); background: light-dark(#fff8, #ffffff14); color: inherit; cursor: pointer; }
+  button:hover { background: light-dark(#fff, #ffffff22); }
+`
+
+export function blankPageHtml(): string {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>New Tab</title><style>${BASE_STYLE}</style></head><body></body></html>`
+}
+
+/**
+ * `css` from `start` up to the next `end`, without comments and blank lines: the part of the
+ * chrome's stylesheet the error page reads. '' when a marker is gone, so the page degrades to an
+ * unstyled document rather than failing (`zenPages.test.ts` fails instead).
+ */
+function cssBetween(css: string, start: number, end: string): string {
+  const to = start === -1 ? -1 : css.indexOf(end, start)
+  if (to === -1) return ''
+  return css
+    .slice(start, to)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\n(?:[ \t]*\n)+/g, '\n')
+    .trim()
+}
+
+/** Ends the design language v2 token block of `main.css` (it starts at the `:root {` declaring `--v2-page`). */
+export const V2_TOKENS_END = '/* Zen clamps its primary colour'
+
+/** The `.zen-v2-button` rule and its variants (a v2 surface of its own in `main.css`). */
+export const V2_BUTTON_END = '/* Safe-area insets pushed by mobile hosts'
+
+/** The error page's own rules in `main.css`, listed in `v2Tokens.test.ts` as the page's surface. */
+export const ERROR_PAGE_RULES_START = '.zen-error-document {'
+export const ERROR_PAGE_RULES_END = '@layer base {'
+
+/**
+ * The status inks – `--zen-ok`, `--zen-warn`, `--zen-danger` and their rgb triples, which the
+ * token block's `--v2-ok` / `--v2-warn` / `--v2-danger` alias (§9.29: status ink is shared by
+ * both families, as ink only) – cut from the chrome's first light and dark root blocks and set
+ * on the page's root, for the interstitials' title glyphs and the way on to a dangerous site.
+ * '' when the blocks are gone.
+ */
+function statusInkStyle(css: string): string {
+  const declarations = (selector: string): string[] => {
+    const start = css.indexOf(`${selector} {`)
+    if (start === -1) return []
+    const body = css.slice(start, css.indexOf('\n}', start))
+    return body.match(/--zen-(?:ok|warn|danger)(?:-rgb)?: [^;]+;/g) ?? []
+  }
+  // Restated on the page's root under the token block's own selectors (the page is a document
+  // of its own, so `:root` is the error document).
+  const rule = (selector: string): string => {
+    const lines = declarations(selector)
+    return lines.length ? `${selector} {\n  ${lines.join('\n  ')}\n}` : ''
+  }
+  return [rule(':root'), rule(":root[data-theme='dark']")].filter(Boolean).join('\n')
+}
+
+/**
+ * The error page's stylesheet, cut from the chrome's (design-language-v2-draft §1, §2, §4): the
+ * token block (light, dark, coarse pointer, phone, the shared `zen-v2-*` focus ring), the v2
+ * button that the Reload control is, the status inks the token block aliases, and the page's
+ * own layout and type rules – the interstitials' included. Every colour and size is read from a
+ * token; `light-dark()`, which the system WebView the page ships to (113 on the emulator) does
+ * not know, appears nowhere.
+ */
+export function errorPageStyle(css: string = chromeStylesheet): string {
+  const tokens = css.indexOf('--v2-page:')
+  return [
+    cssBetween(css, tokens === -1 ? -1 : css.lastIndexOf(':root {', tokens), V2_TOKENS_END),
+    cssBetween(css, css.indexOf('.zen-v2-button {'), V2_BUTTON_END),
+    statusInkStyle(css),
+    cssBetween(css, css.indexOf(ERROR_PAGE_RULES_START), ERROR_PAGE_RULES_END)
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+const ERROR_STYLE = errorPageStyle()
+
+/** The selectors under which Roll's stage carries the other theme (`runtime.ts`'s `showNight`). */
+export const GAME_STAGE_LIGHT = ".zen-game[data-theme='light']"
+export const GAME_STAGE_DARK = ".zen-game[data-theme='dark']"
+
+/**
+ * The tokens restated under Roll's stage for its night (§9.17: "the night is the stage's alone –
+ * the region's theme attribute flips, its tokens re-resolve, the canvas paints the other theme's
+ * `--v2-page` as sky"): every token the dark root block declares – the set that differs between
+ * the themes – under `GAME_STAGE_DARK` with the dark values and under `GAME_STAGE_LIGHT` with
+ * the light block's values of the same names, and the page surface's control aliases
+ * (`--v2-control-*`, which the card's Play again reads) under both, so they resolve against the
+ * stage's values and not the body's. Nothing outside the region reads any of it: the page text
+ * and the chrome keep their theme. '' when the blocks are gone.
+ */
+export function gameStageThemeStyle(css: string = chromeStylesheet): string {
+  const blockAfter = (selector: string, from: number): string | null => {
+    const start = css.indexOf(`${selector} {`, from)
+    if (start === -1) return null
+    const open = start + selector.length + 2
+    const close = css.indexOf('\n}', open)
+    return close === -1 ? null : css.slice(open, close).replace(/\/\*[\s\S]*?\*\//g, '')
+  }
+  const declarations = (block: string): Array<[string, string]> =>
+    Array.from(block.matchAll(/(--[\w-]+):\s*([^;]+);/g), (m) => [m[1]!, m[2]!.trim()])
+  const tokens = css.indexOf('--v2-page:')
+  if (tokens === -1) return ''
+  const lightStart = css.lastIndexOf(':root {', tokens)
+  const light = blockAfter(':root', lightStart)
+  const dark = blockAfter(":root[data-theme='dark']", tokens)
+  const surface = blockAfter("[data-surface='page']", tokens)
+  if (!light || !dark || !surface) return ''
+  const darkDeclarations = declarations(dark)
+  const names = new Set(darkDeclarations.map(([name]) => name))
+  const lightDeclarations = declarations(light).filter(([name]) => names.has(name))
+  const controls = declarations(surface)
+  const rule = (selector: string, lines: Array<[string, string]>): string =>
+    `${selector} {\n  ${[...lines, ...controls].map(([n, v]) => `${n}: ${v};`).join('\n  ')}\n}`
+  return `${rule(GAME_STAGE_LIGHT, lightDeclarations)}\n${rule(GAME_STAGE_DARK, darkDeclarations)}`
+}
+
+const GAME_STAGE_STYLE = gameStageThemeStyle()
+
+/**
+ * The active theme's accent, set on the document's root beside the token block (design language
+ * v2 §9.11): `--zen-accent` and its triple as the chrome's `.zen-window` carries them
+ * (`themeCssVariables`), the light one on `:root` and the dark one under the block's own dark
+ * selector, so the block's `--v2-accent` – the accent mixed towards black or white – resolves
+ * here as it does in the window, and a `data-primary` control is the accent and not the
+ * unresolved variable's black or white. The core writes the accent into the page's URL when it
+ * builds one; a URL without it (a page restored from an older session) takes the default
+ * theme's, the same values the chrome falls back to. With `game`, the same two rules under
+ * Roll's stage selectors, so the stage's night resolves its `--v2-accent` against the other
+ * theme's accent as the page does its own.
+ */
+export function errorPageAccentStyle(accent: ErrorPageAccent | null, game = false): string {
+  const rule = (selector: string, hex: string | undefined, dark: boolean): string => {
+    const rgb = (hex && hexToRgb(hex)) || resolveTheme(null, dark).accent
+    return `${selector} {\n  --zen-accent: ${rgbToHex(rgb)};\n  --zen-accent-rgb: ${rgb.join(' ')};\n}`
+  }
+  return [
+    rule(':root', accent?.light, false),
+    rule(":root[data-theme='dark']", accent?.dark, true),
+    ...(game
+      ? [rule(GAME_STAGE_LIGHT, accent?.light, false), rule(GAME_STAGE_DARK, accent?.dark, true)]
+      : [])
+  ].join('\n')
+}
+
+/**
+ * The error document's whole stylesheet: the chrome's cuts, then the theme's accent beside them;
+ * a document that carries Roll (`game`) adds the stage's theme restatement and the accent under
+ * it, which no other page pays for.
+ */
+function errorDocumentStyle(accent: ErrorPageAccent | null, game = false): string {
+  return game
+    ? `${ERROR_STYLE}\n${GAME_STAGE_STYLE}\n${errorPageAccentStyle(accent, true)}`
+    : `${ERROR_STYLE}\n${errorPageAccentStyle(accent)}`
+}
+
+/**
+ * Puts the chrome's root attributes on the page's root, so the token block's
+ * `:root[data-theme='dark']`, `[data-pointer='coarse']` and `[data-form-factor='phone']` rules
+ * apply to the page as they do to the chrome. The pointer and form factor come from the media
+ * the tab sees, classified as `classifyViewport` does (`formFactor.ts`), including the WebView's
+ * `pointer: fine` on plain touch screens. The theme is the app's: an explicit Light or Dark
+ * setting is written as the chrome writes its own `data-theme` – the engine's colour scheme is
+ * not asked, because on Linux `nativeTheme.themeSource` never reaches a renderer's
+ * `prefers-color-scheme` and the page would paint the OS's side under a chrome of the other –
+ * and only `system` reads the tab's media query, which is the OS's scheme everywhere.
+ */
+export function errorPageAttributesScript(scheme: ColorScheme = 'system'): string {
+  const theme =
+    scheme === 'system'
+      ? "if(q('(prefers-color-scheme: dark)'))d.dataset.theme='dark';"
+      : scheme === 'dark'
+        ? "d.dataset.theme='dark';"
+        : ''
+  return (
+    '(function(){var d=document.documentElement,q=function(m){return matchMedia(m).matches};' +
+    theme +
+    "var hover=q('(hover: hover)'),coarse=q('(pointer: coarse)')||(navigator.maxTouchPoints>0&&!hover)," +
+    'side=coarse&&!hover?Math.min(innerWidth,innerHeight):innerWidth;' +
+    "d.dataset.pointer=coarse?'coarse':'fine';" +
+    `d.dataset.formFactor=side<${PHONE_MAX_WIDTH}?'phone':coarse?'tablet':'desktop'})()`
+  )
+}
+
+/** The attributes script of a page that follows the system (a host that hands no scheme over). */
+export const ERROR_PAGE_ATTRIBUTES_SCRIPT = errorPageAttributesScript()
+
+/** The reason with the site's name set in bold, the way Chrome names the site it could not reach. */
+function emphasiseSite(reason: string, site: string): string {
+  const at = site ? reason.indexOf(site) : -1
+  if (at === -1) return escapeHtml(reason)
+  return `${escapeHtml(reason.slice(0, at))}<strong>${escapeHtml(site)}</strong>${escapeHtml(reason.slice(at + site.length))}`
+}
+
+/** `net::ERR_BLOCKED_BY_CLIENT`: the request engine stopped the navigation itself. */
+export const BLOCKED_BY_CLIENT_CODE = -20
+
+/**
+ * `net::ERR_INTERNET_DISCONNECTED`: the one page that carries the offline game (ERR-03), as
+ * Chrome's does (`neterror.ts:279-287` mounts its runner on the `icon-offline` page alone).
+ */
+export const OFFLINE_CODE = -106
+
+/** Toggles the Advanced block open and closed (the page's own script; nothing crosses to the browser). */
+const ADVANCED_TOGGLE_SCRIPT =
+  "var a=document.getElementById('zen-error-advanced'),open=a.hidden;a.hidden=!open;" +
+  "this.setAttribute('aria-expanded',String(open));this.textContent=open?'Hide advanced':'Advanced'"
+
+/**
+ * The certificate interstitial's controls: a page's action row (design language v2 §9.11) with
+ * Back to safety as the one primary button, last, so it trails on both platforms – right-aligned
+ * on desktop, the trailing half of the split row on the phone (`.zen-error-actions`) – and
+ * Advanced before it, revealing the explanation, the certificate and the proceed control, which
+ * reads as text so nobody presses it in passing. Back and Proceed post the interstitial message
+ * the other warning pages post (`postAction`), which the page script relays.
+ */
+function interstitialHtml(interstitial: CertificateInterstitial, target: string): string {
+  const rows = interstitial.details
+    .map((d) => `\n      <div><dt>${escapeHtml(d.label)}</dt><dd>${escapeHtml(d.value)}</dd></div>`)
+    .join('')
+  const details = rows ? `\n    <dl class="zen-error-certificate">${rows}\n    </dl>` : ''
+  const proceed = interstitial.proceed
+    ? `\n    <button type="button" class="zen-error-proceed" onclick="${escapeHtml(postAction('proceed', target))}">${escapeHtml(interstitial.proceed)}</button>`
+    : ''
+  return `
+  <div class="zen-error-actions">
+    <button type="button" class="zen-v2-button" aria-expanded="false" aria-controls="zen-error-advanced" onclick="${escapeHtml(ADVANCED_TOGGLE_SCRIPT)}">Advanced</button>
+    <button type="button" class="zen-v2-button" data-primary onclick="${escapeHtml(postAction('back', target))}">Back to safety</button>
+  </div>
+  <section id="zen-error-advanced" class="zen-error-advanced" hidden>
+    <p>${escapeHtml(interstitial.explanation)}</p>${details}${proceed}
+  </section>`
+}
+
+/**
+ * The script that puts the `zen://error` page `url` in place of the empty document Chromium
+ * commits for a failed load (`TabView.showErrorPage`): the document's own root stays, so the
+ * page script's listeners and the entry the failure committed stay with it, and the root
+ * attributes the page's inline script would set are set here (markup written this way runs no
+ * scripts). Only an error document is touched; a page that did load meanwhile is left alone.
+ * `scheme` is the app's colour scheme (`errorPageAttributesScript`). The certificate
+ * interstitial is the one page written this way (`TabsService.showInterstitial`); the offline
+ * page, which carries Roll's inline runtime, is always served as a document (`zen://error`), so
+ * the runtime runs as a script of the document's own on both hosts – and the in-place shape
+ * carries no game at all (`shape: 'in-place'`): a script written through `innerHTML` never runs,
+ * so a stage here would be a dead payload, the canvas standing with nothing behind it.
+ */
+export function inPlaceErrorPageScript(url: URL, scheme: ColorScheme = 'system'): string {
+  const html = JSON.stringify(errorPageHtml(url, scheme, 'desktop', 'in-place'))
+  return (
+    "(function(html){if(location.protocol!=='chrome-error:')return false;" +
+    "var doc=new DOMParser().parseFromString(html,'text/html'),root=document.documentElement;" +
+    'root.className=doc.documentElement.className;root.innerHTML=doc.documentElement.innerHTML;' +
+    `${errorPageAttributesScript(scheme)};return true})(${html})`
+  )
+}
+
+/**
+ * `zen://error?code=…&description=…&url=…`: Chrome's error page, in the tab, for the failed URL.
+ * `scheme` is the app's colour scheme, which the page's root takes (`errorPageAttributesScript`);
+ * `host` decides the suggestion list (`suggestionsFor`). The body is a `data-surface="page"` root
+ * (design language v2 §9.29): the document is a page inside the tab, so its controls draw in the
+ * page family's ink and fill, never the window's. `shape` is how the page reaches the tab: the
+ * served document (the protocol's answer, where the offline page carries Roll's stage and inline
+ * runtime) or the in-place write of `inPlaceErrorPageScript`, which runs no script and so gets
+ * no game.
+ */
+export type ErrorPageShape = 'document' | 'in-place'
+
+export function errorPageHtml(
+  url: URL,
+  scheme: ColorScheme = 'system',
+  host: ErrorPageHost = 'desktop',
+  shape: ErrorPageShape = 'document'
+): string {
+  const code = Number(url.searchParams.get('code') ?? 0)
+  const target = url.searchParams.get('url') ?? ''
+  const kind = url.searchParams.get('kind')
+  const accent = errorPageAccentOf(url.searchParams)
+  if (kind === 'safebrowsing')
+    return safeBrowsingPageHtml(target, threatOf(url.searchParams.get('threat')), accent, scheme)
+  if (kind === 'https-only') return httpsOnlyPageHtml(target, code, accent, scheme)
+  if (kind === 'lookalike') {
+    const reason = url.searchParams.get('reason')
+    const source = url.searchParams.get('source')
+    return lookalikePageHtml(
+      target,
+      url.searchParams.get('target') ?? '',
+      isLookalikeReason(reason) ? reason : 'edit-distance',
+      isLookalikeSource(source) ? source : 'top',
+      accent,
+      scheme
+    )
+  }
+  if (code === BLOCKED_BY_CLIENT_CODE) return blockedPageHtml(target)
+  const content = errorPageContent(
+    code,
+    url.searchParams.get('description') ?? '',
+    target,
+    errorPageCertificate(url.searchParams),
+    crashPageOptionsOf(url.searchParams),
+    { host, search: errorPageSearchOf(url.searchParams) }
+  )
+  const controls = content.interstitial
+    ? interstitialHtml(content.interstitial, content.target)
+    : content.target
+      ? reloadHtml(content)
+      : ''
+  const name = content.code ? `\n  <p class="zen-error-code">${escapeHtml(content.code)}</p>` : ''
+  // The offline page carries Roll above its title (ERR-03), where Chrome's carries its runner in
+  // the icon's slot, and the game's runtime inline after its markup (`gameRuntimeScriptHtml`):
+  // the one error page that pays for the game's bytes – as a served document alone.
+  const game = code === OFFLINE_CODE && shape === 'document'
+  const stage = game ? `\n  ${gameMarkupHtml()}` : ''
+  const runtime = game ? gameRuntimeScriptHtml() : ''
+  return `<!doctype html><html class="zen-error-document"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(content.site || 'Problem loading page')}</title><script>${errorPageAttributesScript(scheme)}</script><style>${errorDocumentStyle(accent, game)}</style></head>
+<body class="zen-error-page" data-surface="page"><main>${stage}
+  <h1>${escapeHtml(content.title)}</h1>
+  <p>${emphasiseSite(content.reason, content.site)}</p>${suggestionsHtml(content)}${name}${controls}
+</main><script>${RELOADING_SCRIPT}</script>${runtime}</body></html>`
+}
+
+/**
+ * `zen://game`: Roll on its own page (ERR-03's second half; Chrome's `chrome://dino`,
+ * `offline.ts:1481-1493`, and `chrome://dino` typed into the bar comes here, `shared/url.ts`),
+ * the stage alone in the error page's column on the error page's chassis – the same tokens, the
+ * same anchor at 30% – so it reads as the offline page's game come out on its own, with the
+ * runtime inline after it. The 1×1 widget (WID-04) lands here. The accent is the URL's where
+ * the core wrote one (`errorPageAccentOf`), the default theme's otherwise.
+ */
+export function gamePageHtml(url: URL, scheme: ColorScheme = 'system'): string {
+  const accent = errorPageAccentOf(url.searchParams)
+  return `<!doctype html><html class="zen-error-document zen-game-document"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${GAME_TITLE}</title><script>${errorPageAttributesScript(scheme)}</script><style>${errorDocumentStyle(accent, true)}</style></head>
+<body class="zen-error-page zen-game-page" data-surface="page"><main>
+  ${gameMarkupHtml()}
+</main>${gameRuntimeScriptHtml()}</body></html>`
+}
+
+/**
+ * Chrome's suggestions between the reason and the code line (ERR-05): the standalone sentence
+ * where the code has one, and the list – "Try:" over the lines for the code on this host – where
+ * it has lines. Nothing when the code has neither, so the page reads as it did.
+ */
+function suggestionsHtml(content: ErrorPageContent): string {
+  const hint = content.hint ? `\n  <p class="zen-error-hint">${escapeHtml(content.hint)}</p>` : ''
+  if (content.suggestions.length === 0) return hint
+  const items = content.suggestions.map((line) => `\n      <li>${escapeHtml(line)}</li>`).join('')
+  return `${hint}\n  <div class="zen-error-suggestions">\n    <p>Try:</p>\n    <ul>${items}\n    </ul>\n  </div>`
+}
+
+/**
+ * The page's "Reloading…" state (ERR-06; design language v2 §9.30): the Reload control turns
+ * busy – its label swapped for the spinner at the same width, `aria-busy`, "Reloading" as its
+ * name for a screen reader – and the other actions wait at .4 until the browser answers by
+ * leaving the page. The page calls it from its own Reload; the core calls it
+ * (`ERROR_PAGE_RELOADING_SCRIPT`) before it reloads an offline error page itself when the
+ * device comes back. Should the load never come, the page frees itself after a while so
+ * Reload can be pressed again.
+ */
+const RELOADING_SCRIPT =
+  'function zenReloading(){var b=document.getElementById("zen-error-reload");if(!b||b.getAttribute("aria-busy")==="true")return;' +
+  'b.setAttribute("aria-busy","true");b.setAttribute("aria-label","Reloading");' +
+  'var o=document.querySelectorAll(".zen-error-actions button");for(var i=0;i<o.length;i++)if(o[i]!==b)o[i].disabled=true;' +
+  'setTimeout(function(){b.removeAttribute("aria-busy");b.removeAttribute("aria-label");for(var i=0;i<o.length;i++)o[i].disabled=false},8000)}'
+
+/**
+ * The error page's controls when it stands in for a page that could not be had: Reload, which
+ * goes back to the page with the busy state above, and before it, where the page has one, its
+ * second action (a page's §9.11 action row, Reload the primary and trailing): on the crash
+ * page's repeat variant the way to the tab switcher (the phone's overview is what the switcher
+ * is, so the control is the phone's: `.zen-error-show-tabs`); for a typed word that did not
+ * resolve, "Search <engine> for <term>" (ERR-05) – a link drawn as the secondary, since it goes
+ * to another page, which the browser also lets be held for its own menu. The search label
+ * carries the engine's name and the word, so the row's shape is the stylesheet's to decide
+ * (§9.11's clause): the pair splits the row only while both labels fit on one line, and stacks
+ * full width with Reload on top when a label would wrap – which is why Reload stays last in the
+ * document (the reversed wrap lands the last line on top).
+ */
+function reloadHtml(content: ErrorPageContent): string {
+  const primary = content.showTabs || content.search !== null
+  const reload = `<button type="button" id="zen-error-reload" class="zen-v2-button zen-interstitial-action"${primary ? ' data-primary' : ''} onclick="zenReloading();location.replace(${escapeHtml(JSON.stringify(content.target))})"><span class="zen-interstitial-label">Reload</span><span class="zen-interstitial-spinner">${glyph('loader-circle')}</span></button>`
+  if (!primary) return `\n  ${reload}`
+  const showTabs = content.showTabs
+    ? `<button type="button" class="zen-v2-button zen-error-show-tabs" onclick="${escapeHtml(postAction('show-tabs', content.target))}">Show tabs</button>`
+    : ''
+  const search = content.search
+    ? `<a id="zen-error-search" class="zen-v2-button zen-error-search" href="${escapeHtml(content.search.url)}">${escapeHtml(content.search.label)}</a>`
+    : ''
+  return `\n  <div class="zen-error-actions">${showTabs}${search}${reload}</div>`
+}
+
+/**
+ * Shown when a filter list blocks a whole page (malware hosts, ad-only domains). The site can be
+ * excepted in Settings → Privacy and Security; the page itself only offers the way back.
+ */
+export function blockedPageHtml(target: string): string {
+  let host = target
+  try {
+    host = new URL(target).hostname || target
+  } catch {
+    // Keep the raw target for URLs that do not parse.
+  }
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Page blocked</title><style>${BASE_STYLE}</style></head>
+<body><div class="card">
+  <h1>Ione blocked this page</h1>
+  <p><strong>${escapeHtml(host)}</strong> is on one of your filter lists as an ad, tracking or malware host, so Ione did not load it.</p>
+  <p>To visit it anyway, add the site to the exceptions in Settings &rsaquo; Privacy and Security.</p>
+  <p><code>${escapeHtml(target)}</code></p>
+  <button onclick="history.back()">Go back</button>
+</div></body></html>`
+}
+
+function hostOf(target: string): string {
+  try {
+    return new URL(target).hostname || target
+  } catch {
+    return target
+  }
+}
+
+/**
+ * A host named on the lookalike page (PS-18): an IDN host in the form the user saw (`аpple.com`)
+ * with its punycode beside it in the family's deemphasised ink (`(xn--80ak6aa92e.com)`, 69 %),
+ * only when the two differ – an ASCII host once. The address bar keeps the punycode form; only
+ * the page names both. `strong` wraps the shown name, never the punycode.
+ */
+function hostHtml(host: string, strong = false): string {
+  const shown = unicodeHost(host)
+  const name = strong ? `<strong>${escapeHtml(shown)}</strong>` : escapeHtml(shown)
+  return shown === host ? name : `${name} ${punycodeHtml(host)}`
+}
+
+function punycodeHtml(host: string): string {
+  return `<span class="zen-interstitial-punycode">(${escapeHtml(host)})</span>`
+}
+
+/** `url` for the page's address line: its host in the form the user saw, the punycode beside it when the two differ. */
+function addressHtml(url: string): string {
+  const host = hostOf(url)
+  const shown = unicodeHost(host)
+  if (shown === host) return escapeHtml(url)
+  // The scheme cannot spell `xn--`, so the first occurrence is the host.
+  return `${escapeHtml(url.replace(host, shown))} ${punycodeHtml(host)}`
+}
+
+function threatOf(value: string | null): SafeBrowsingThreat {
+  return value && value in SAFE_BROWSING_THREAT_LABELS ? (value as SafeBrowsingThreat) : 'unknown'
+}
+
+/** An inline handler posting the interstitial message `action` for `target` (the certificate page's controls). */
+function postAction(action: InterstitialAction, target: string): string {
+  return `window.postMessage({${INTERSTITIAL_MESSAGE_KEY}:{action:${JSON.stringify(action)},url:${JSON.stringify(target)}}},'*')`
+}
+
+/** Lucide's glyphs the warning pages draw inline (the page cannot import the icon set). */
+const GLYPHS = {
+  'shield-alert':
+    '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
+  'lock-open':
+    '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/>',
+  'shield-question':
+    '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M9.1 9a3 3 0 0 1 5.82 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>',
+  'loader-circle': '<path d="M21 12a9 9 0 1 1-6.219-8.56"/>'
+} as const
+
+function glyph(name: keyof typeof GLYPHS): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${GLYPHS[name]}</svg>`
+}
+
+/** A warning page's action: the v2 button that posts `action` for the page it stands in for. */
+interface WarningButton {
+  action: InterstitialAction
+  label: string
+  /** HTML in `label`'s place: the lookalike page's Continue names an IDN address in its two forms. */
+  labelHtml?: string
+  /** The page's one primary (Back to safety). */
+  primary?: boolean
+  /** Goes on to a site Safe Browsing flagged: the label in danger ink. */
+  danger?: boolean
+}
+
+/** What a warning page says and offers; `warningPageHtml` lays it out. */
+interface WarningPage {
+  kind: 'safebrowsing' | 'https-only' | 'lookalike'
+  /** The `<title>`. */
+  name: string
+  /** The status ink of the title's glyph. */
+  tone: 'danger' | 'warn'
+  glyph: keyof typeof GLYPHS
+  /** HTML: the `<h1>`. */
+  title: string
+  /** HTML: the title block's description. */
+  description: string
+  /** The actions beside Details, in order; the primary trails. */
+  actions: WarningButton[]
+  /** HTML paragraphs under Details, before the address. */
+  details: string
+  /** The actions under Details, after the address; none for a page whose only way back is the browser's own. */
+  detailActions: WarningButton[]
+  /** The page the interstitial stands in for. */
+  target: string
+  /** HTML: the address line under Details, `target` escaped when absent. */
+  address?: string
+  /** Extra `data-` attributes on the page's `<main>`. */
+  data?: Record<string, string>
+}
+
+/**
+ * The warning pages' script: Details toggles its section; an action posts the page's message
+ * (`INTERSTITIAL_MESSAGE_KEY`, relayed to the core) and turns busy – `aria-busy` with the
+ * spinner in the label's place, the other actions disabled at .4 (§9.30) – until the browser
+ * answers by leaving the page. Should it not, the page frees itself after a while so the
+ * choice can be made again.
+ */
+function warningPageScript(target: string): string {
+  const url = JSON.stringify(target).replace(/</g, '\\u003c')
+  return (
+    '(function(){var main=document.querySelector("main"),toggle=document.getElementById("zen-details-toggle"),details=document.getElementById("zen-details"),' +
+    'all=function(){return Array.prototype.slice.call(document.querySelectorAll(".zen-interstitial-action"))};' +
+    'toggle.addEventListener("click",function(){var open=details.hidden;details.hidden=!open;toggle.setAttribute("aria-expanded",String(open))});' +
+    'all().forEach(function(b){if(!b.dataset.action)return;b.addEventListener("click",function(){' +
+    'if(main.dataset.busy)return;main.dataset.busy="true";b.setAttribute("aria-busy","true");' +
+    'all().forEach(function(o){if(o!==b)o.disabled=true});' +
+    `window.postMessage({${INTERSTITIAL_MESSAGE_KEY}:{action:b.dataset.action,url:${url}}},"*");` +
+    'setTimeout(function(){delete main.dataset.busy;b.removeAttribute("aria-busy");all().forEach(function(o){o.disabled=false})},8000)})})})()'
+  )
+}
+
+function warningButton(button: WarningButton, autofocus: boolean): string {
+  const classes = ['zen-v2-button', 'zen-interstitial-action']
+  if (button.danger) classes.push('zen-interstitial-danger')
+  return `<button type="button" class="${classes.join(' ')}"${button.primary ? ' data-primary' : ''}${autofocus ? ' autofocus' : ''} data-action="${button.action}"><span class="zen-interstitial-label">${button.labelHtml ?? escapeHtml(button.label)}</span><span class="zen-interstitial-spinner">${glyph('loader-circle')}</span></button>`
+}
+
+/**
+ * A warning page – Safe Browsing's and HTTPS-only mode's interstitials – on the error page's
+ * surface (design-language-v2-draft §9.11, §9.23, §9.30;
+ * the rules are the page's own in `main.css`): the neutral page, its block anchored at 30% of
+ * the page's height (§9.17), a title block – the glyph in status ink before the 22/600 title, the
+ * description under it – and the actions 16 below: Details first, the way on beside it, Back to
+ * safety as the primary trailing, the row right-aligned on desktop (a phone splits two peers and
+ * stacks three, primary first). Under Details, 16 below the actions, the reason, the address at
+ * 13 and the secondary that goes on regardless.
+ */
+function warningPageHtml(
+  page: WarningPage,
+  accent: ErrorPageAccent | null,
+  scheme: ColorScheme
+): string {
+  const data = Object.entries({ interstitial: page.kind, ...page.data })
+    .map(([k, v]) => ` data-${k}="${escapeHtml(v)}"`)
+    .join('')
+  const actions = [
+    `<button type="button" id="zen-details-toggle" class="zen-v2-button zen-interstitial-action" aria-expanded="false" aria-controls="zen-details">Details</button>`,
+    ...page.actions.map((b) => warningButton(b, b.primary === true))
+  ]
+  const detailActions = page.detailActions.length
+    ? `
+    <div class="zen-interstitial-actions">
+      ${page.detailActions.map((b) => warningButton(b, false)).join('\n      ')}
+    </div>`
+    : ''
+  return `<!doctype html><html class="zen-error-document"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(page.name)}</title><script>${errorPageAttributesScript(scheme)}</script><style>${errorDocumentStyle(accent)}</style></head>
+<body class="zen-error-page" data-surface="page"><main${data}>
+  <div class="zen-interstitial-title" data-tone="${page.tone}">
+    ${glyph(page.glyph)}
+    <div>
+      <h1>${page.title}</h1>
+      <p>${page.description}</p>
+    </div>
+  </div>
+  <div class="zen-interstitial-actions">
+    ${actions.join('\n    ')}
+  </div>
+  <section id="zen-details" class="zen-interstitial-details" hidden>
+    ${page.details}
+    <p class="zen-interstitial-address">${page.address ?? escapeHtml(page.target)}</p>${detailActions}
+  </section>
+</main><script>${warningPageScript(page.target)}</script></body></html>`
+}
+
+/**
+ * Safe Browsing's interstitial (Chrome's red page, in Ione's words on the neutral page): the
+ * request engine refused the navigation because the site is on a malware or phishing feed.
+ * "Proceed anyway", under Details, excepts the host until the browser closes.
+ */
+export function safeBrowsingPageHtml(
+  target: string,
+  threat: SafeBrowsingThreat,
+  accent: ErrorPageAccent | null = null,
+  scheme: ColorScheme = 'system'
+): string {
+  const host = hostOf(target)
+  const copy = SAFE_BROWSING_THREAT_LABELS[threat]
+  return warningPageHtml(
+    {
+      kind: 'safebrowsing',
+      name: 'Security warning',
+      tone: 'danger',
+      glyph: 'shield-alert',
+      title: escapeHtml(copy.title),
+      description: `Ione stopped this page. ${escapeHtml(copy.description)}`,
+      actions: [{ action: 'back', label: 'Back to safety', primary: true }],
+      details: `<p><strong>${escapeHtml(host)}</strong> is on one of the open malware and phishing feeds Ione checks (URLhaus, Phishing.Database, malware-filter). Feeds are refreshed while the browser runs; Safe Browsing can be turned off in Settings &rsaquo; Privacy and Security.</p>`,
+      detailActions: [{ action: 'proceed', label: 'Proceed anyway (unsafe)', danger: true }],
+      target,
+      data: { threat }
+    },
+    accent,
+    scheme
+  )
+}
+
+/**
+ * HTTPS-only mode's question: the https upgrade of `httpUrl` failed, so the page can only be
+ * had over plaintext. "Continue" allows the site until the browser closes; "Always allow",
+ * under Details, remembers it (the `https-only` permission).
+ */
+export function httpsOnlyPageHtml(
+  httpUrl: string,
+  code: number,
+  accent: ErrorPageAccent | null = null,
+  scheme: ColorScheme = 'system'
+): string {
+  const host = hostOf(httpUrl)
+  const reason = describeNetError(code, 'The secure connection could not be made.')
+  return warningPageHtml(
+    {
+      kind: 'https-only',
+      name: 'Secure connection not available',
+      tone: 'warn',
+      glyph: 'lock-open',
+      title: 'Secure connection not available',
+      description: `Ione tried to reach <strong>${escapeHtml(host)}</strong> over https and could not. Loading it over http means what you send and receive can be read and changed on the way.`,
+      actions: [
+        { action: 'continue', label: 'Continue to HTTP site' },
+        { action: 'back', label: 'Back to safety', primary: true }
+      ],
+      details: `<p>${escapeHtml(reason)}${code ? ` (${code})` : ''}</p>
+    <p>HTTPS-only mode can be changed in Settings &rsaquo; Privacy and Security.</p>`,
+      detailActions: [{ action: 'continue-always', label: 'Always allow for this site' }],
+      target: httpUrl
+    },
+    accent,
+    scheme
+  )
+}
+
+/**
+ * The lookalike page's one vocabulary for the three tests (`LookalikeReason`): the clause between
+ * the address and the target, and what follows the target (the embedding test's "but is not part
+ * of that site"). The Details sentence is `<address> <clause> <target>, <source>[<tail>].`
+ */
+export const LOOKALIKE_REASON_LABELS: Record<LookalikeReason, { clause: string; tail: string }> = {
+  'edit-distance': { clause: 'is one character off', tail: '' },
+  embedding: { clause: 'contains the name of', tail: ', but is not part of that site' },
+  skeleton: { clause: 'is spelled with characters that look like those of', tail: '' }
+}
+
+/** What the target is to the user, by the list it came from (`LookalikeSource`). */
+export const LOOKALIKE_SOURCE_LABELS: Record<LookalikeSource, string> = {
+  top: 'a site many people visit',
+  engaged: 'a site you visit'
+}
+
+/**
+ * The lookalike question (PS-18; Chrome's "Did you mean…?" interstitial, Edge's typo
+ * protection) on the family's surface: the address asked for looks like a well-known site's
+ * (one character off, containing its name, or spelled in look-alike characters). The primary
+ * goes to the site it looks like (`suggested`), "Continue to <lookalike>" beside it goes on to
+ * the address and remembers the host (`proceed`, the `lookalike` permission); Details names the
+ * test that matched, whose site the target is (the top list's or the user's own), what Continue
+ * does, and the address. No Back row: the browser's own back is the way back. An IDN address is
+ * named in the form the user saw with its punycode beside it (`hostHtml`); the address bar keeps
+ * the punycode.
+ */
+export function lookalikePageHtml(
+  lookalikeUrl: string,
+  target: string,
+  reason: LookalikeReason,
+  source: LookalikeSource,
+  accent: ErrorPageAccent | null = null,
+  scheme: ColorScheme = 'system'
+): string {
+  const host = hostOf(lookalikeUrl)
+  const shownTarget = target || 'another site'
+  const targetName = unicodeHost(shownTarget)
+  const question = `Did you mean ${targetName}${targetName === shownTarget ? '' : ` (${shownTarget})`}?`
+  const { clause, tail } = LOOKALIKE_REASON_LABELS[reason]
+  return warningPageHtml(
+    {
+      kind: 'lookalike',
+      name: question,
+      tone: 'warn',
+      glyph: 'shield-question',
+      title: `Did you mean ${hostHtml(shownTarget)}?`,
+      description: `The address ${hostHtml(host, true)} looks like ${hostHtml(shownTarget, true)}. Sites imitating well-known names are a common way to steal passwords.`,
+      actions: [
+        {
+          action: 'proceed',
+          label: `Continue to ${unicodeHost(host)}`,
+          labelHtml: `Continue to ${hostHtml(host)}`
+        },
+        {
+          action: 'suggested',
+          label: `Go to ${targetName}`,
+          labelHtml: `Go to ${hostHtml(shownTarget)}`,
+          primary: true
+        }
+      ],
+      details: `<p>${hostHtml(host, true)} ${clause} ${hostHtml(shownTarget, true)}, ${LOOKALIKE_SOURCE_LABELS[source]}${tail}. If you meant to open ${hostHtml(host)}, Continue takes you there and Ione will not ask about it again.</p>`,
+      detailActions: [],
+      target: lookalikeUrl,
+      address: addressHtml(lookalikeUrl),
+      data: { reason, source, target: shownTarget }
+    },
+    accent,
+    scheme
+  )
+}
+
+export function readerMissingPageHtml(original: string | null): string {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Reader View</title><style>${BASE_STYLE}</style></head>
+<body><div class="card">
+  <h1>This article is no longer available</h1>
+  <p>Reader View keeps articles only while the browser is open.</p>
+  ${original ? `<button onclick="location.replace(${JSON.stringify(original)})">Open the original page</button>` : ''}
+</div></body></html>`
+}
+
+/** The `zen://image` page: the shared picture, fitted to the viewport like Chrome's image view. */
+export function imagePageHtml(dataUrl: string): string {
+  if (!/^data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]*$/i.test(dataUrl))
+    return imageMissingPageHtml()
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Shared image</title><style>${BASE_STYLE}
+  body { display: grid; place-items: center; }
+  img { max-width: 100vw; max-height: 100vh; object-fit: contain; }
+</style></head>
+<body><img src="${dataUrl}" alt="Shared image"></body></html>`
+}
+
+export function imageMissingPageHtml(): string {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Shared image</title><style>${BASE_STYLE}</style></head>
+<body><div class="card">
+  <h1>This image is no longer available</h1>
+  <p>Images shared into Ione are kept only while the browser is open.</p>
+</div></body></html>`
+}
+
+/** Resolves `zen://reader?id=…` to the article's HTML (null once the article is gone). */
+export type ReaderPageLookup = (id: string) => string | null
+
+/** Resolves `zen://image?id=…` to the image's `data:` URL (null once the image is gone). */
+export type ImagePageLookup = (id: string) => string | null
+
+/**
+ * What `zen://version` prints (SET-66): Chrome's chrome://version rows
+ * (`components/webui/version/resources/about_version.html`, 152.0.7977.89), as the host knows
+ * them. Each is a line of text; the page escapes and lays them out, nothing more. A row the host
+ * leaves undefined is not printed (Chrome's page is built per platform the same way).
+ */
+export interface VersionPageFacts {
+  /**
+   * The product row: the version, the build's kind in Chrome's words ("Official Build" /
+   * "Developer Build") and its bitness ("(64-bit)") – "0.5.9 (Official Build) (64-bit)".
+   */
+  app: string
+  /**
+   * The engine – Ione's row where Chrome prints its Revision: the WebView package and its
+   * version (Android); Chromium's version and Electron's (the desktop).
+   */
+  engine: string
+  /**
+   * Chrome's OS row: "Android 14; Pixel 7 Build/UQ1A.240105.004; 34; REL" on Android
+   * (`AndroidAboutAppInfo::GetOsInfo` + the SDK and the codename, `version_ui.cc`), the OS and
+   * its release elsewhere.
+   */
+  os: string
+  /** Chrome Android's "APK versionCode" row. */
+  versionCode?: string
+  /** Chrome Android's "APK targetSdkVersion" row. */
+  targetSdkVersion?: string
+  /** The JavaScript engine, where the host knows it ("V8 15.2.x" on the desktop). */
+  javascript?: string
+  userAgent: string
+  /** Chrome's Command Line row, on a host that has one (the desktop's process arguments). */
+  commandLine?: string
+  /** The APK or the executable. */
+  executablePath?: string
+  /** The profile's directory. */
+  profilePath?: string
+}
+
+/** The host's facts for `zen://version`; null on a host that has none (the page is then blank). */
+export type VersionPageLookup = () => VersionPageFacts | null
+
+const VERSION_STYLE = `
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 14px; }
+  body { color: light-dark(#1e1e24, #f0f0f5); background: transparent; }
+  main { padding: 24px; max-width: 960px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 16px; }
+  table { border-collapse: collapse; }
+  th, td { padding: 6px 0; vertical-align: top; text-align: left; }
+  th { font-weight: 600; white-space: nowrap; padding-right: 20px; color: light-dark(#5c5c66, #b8b8c4); }
+  td { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; word-break: break-all; }
+`
+
+/**
+ * The `zen://version` document: Chrome's chrome://version, one row per fact in Chrome's order
+ * and under Chrome's labels (`version_ui_strings.grdp`: "OS", "User Agent", "Command Line",
+ * "Executable Path", "Profile Path"; the literal "APK versionCode" / "APK targetSdkVersion" /
+ * "JavaScript" of `about_version.html`) – the product row under Ione's name, the engine row
+ * where Chrome prints its Revision – as a table a bug report is copied from. Chrome's title
+ * ("About Version"); a `data-surface="page"` root like the other documents in the tab.
+ */
+export function versionPageHtml(facts: VersionPageFacts): string {
+  const rows: [string, string | undefined][] = [
+    ['Ione', facts.app],
+    ['Engine', facts.engine],
+    ['OS', facts.os],
+    ['APK versionCode', facts.versionCode],
+    ['APK targetSdkVersion', facts.targetSdkVersion],
+    ['JavaScript', facts.javascript],
+    ['User Agent', facts.userAgent],
+    ['Command Line', facts.commandLine],
+    ['Executable Path', facts.executablePath],
+    ['Profile Path', facts.profilePath]
+  ]
+  const body = rows
+    .filter((row): row is [string, string] => row[1] !== undefined)
+    .map(
+      ([label, value]) =>
+        `<tr><th scope="row">${escapeHtml(label)}</th><td>${escapeHtml(value)}</td></tr>`
+    )
+    .join('\n    ')
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>About Version</title><style>${VERSION_STYLE}</style></head>
+<body data-surface="page"><main>
+  <h1>About Version</h1>
+  <table>
+    ${body}
+  </table>
+</main></body></html>`
+}
+
+/**
+ * A `zen://` URL as a `URL` whose `hostname` is the page name. Parsed as `http://` because
+ * engines before Chromium 130 (the Android WebView that hosts the core on older devices and on
+ * the emulator) give a non-special scheme no host at all, which turned every error page into the
+ * blank page.
+ */
+export function parseZenUrl(rawUrl: string): URL | null {
+  if (!/^zen:\/\//i.test(rawUrl)) return null
+  try {
+    return new URL(`http://${rawUrl.slice('zen://'.length)}`)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * HTML for any `zen://` URL (unknown pages fall back to the blank page). `scheme` is the app's
+ * colour scheme for the pages that paint a theme of their own (`errorPageAttributesScript`); a
+ * host whose pages' `prefers-color-scheme` follows the setting already (Android's night mode)
+ * leaves it out. `host` names the Android host, whose error page lists Chrome Android's
+ * suggestions (`ErrorPageHost`); every other host is the desktop. `version` answers
+ * `zen://version` with the host's facts; a host that passes none serves the blank page there.
+ */
+export function zenPageHtml(
+  rawUrl: string,
+  reader?: ReaderPageLookup,
+  image?: ImagePageLookup,
+  pdf?: PdfPageLookup,
+  scheme: ColorScheme = 'system',
+  host: ErrorPageHost = 'desktop',
+  version?: VersionPageLookup
+): string {
+  const url = parseZenUrl(rawUrl)
+  if (!url) return blankPageHtml()
+  switch (url.hostname) {
+    case 'newtab':
+      // The Android host's page has no state to hand before its first paint (`pageScript.ts`
+      // fetches none synchronously): its document awaits the state transparent and comes in
+      // whole (NTP-35, `newTabPage.ts`); the desktop's document is as it was.
+      return newTabPageHtml({ awaitState: host === 'android' })
+    case 'version': {
+      const facts = version?.()
+      return facts ? versionPageHtml(facts) : blankPageHtml()
+    }
+    case 'error':
+      return errorPageHtml(url, scheme, host)
+    case 'reader':
+      return (
+        reader?.(url.searchParams.get('id') ?? '') ??
+        readerMissingPageHtml(url.searchParams.get('url'))
+      )
+    case 'image': {
+      const data = image?.(url.searchParams.get('id') ?? '')
+      return data ? imagePageHtml(data) : imageMissingPageHtml()
+    }
+    case 'pdf': {
+      const doc = pdf?.(url.searchParams.get('id') ?? '')
+      return doc ? pdfViewerPageHtml(doc) : pdfMissingPageHtml()
+    }
+    case 'game':
+      return gamePageHtml(url, scheme)
+    default:
+      return blankPageHtml()
+  }
+}

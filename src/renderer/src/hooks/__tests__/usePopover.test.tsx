@@ -1,0 +1,227 @@
+// @vitest-environment happy-dom
+import { afterEach, describe, expect, it } from 'vitest'
+import { act, useRef, useState, type JSX, type ReactElement } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { usePopover } from '../usePopover'
+
+/*
+ * The chassis's keyboard hook (v2 draft §9.22): focus moves into the popover once, when it
+ * becomes active – to the element the caller names – and stays where the user put it through
+ * the re-renders that follow (a state push repaints the popover; callers pass `initial` inline,
+ * a fresh function each time, and that is not a reason to take the keyboard back). Escape and the
+ * return of focus on unmount are exercised with the surfaces that use them.
+ */
+
+;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+
+let root: Root | null = null
+let mount: HTMLElement | null = null
+
+function render(el: ReactElement): HTMLElement {
+  mount = document.createElement('div')
+  document.body.appendChild(mount)
+  root = createRoot(mount)
+  act(() => root!.render(el))
+  return mount
+}
+
+afterEach(() => {
+  act(() => root?.unmount())
+  mount?.remove()
+  root = null
+  mount = null
+})
+
+/** A popover with a field and a second control; `version` is a state push that repaints it. */
+function Popover({ active, version }: { active: boolean; version: number }): JSX.Element {
+  const ref = useRef<HTMLDivElement>(null)
+  const fieldRef = useRef<HTMLInputElement>(null)
+  usePopover(ref, {
+    onClose: () => undefined,
+    active,
+    // Inline, as the surfaces write it: a new function on every render.
+    initial: () => fieldRef.current
+  })
+  return (
+    <div ref={ref} role="dialog" tabIndex={-1} data-version={version}>
+      <input ref={fieldRef} data-field />
+      <button type="button" data-swatch>
+        Swatch
+      </button>
+    </div>
+  )
+}
+
+function Harness({ active = true }: { active?: boolean }): JSX.Element {
+  const [version, setVersion] = useState(0)
+  return (
+    <>
+      <button type="button" data-push onClick={() => setVersion((v) => v + 1)}>
+        push
+      </button>
+      <Popover active={active} version={version} />
+    </>
+  )
+}
+
+describe('usePopover', () => {
+  it('focuses the element `initial` names once the popover is active', () => {
+    const el = render(<Harness />)
+    expect(document.activeElement).toBe(el.querySelector('[data-field]'))
+  })
+
+  it('does not take the keyboard back on a re-render with a fresh `initial`', () => {
+    const el = render(<Harness />)
+    const swatch = el.querySelector<HTMLElement>('[data-swatch]')!
+    act(() => swatch.focus())
+    expect(document.activeElement).toBe(swatch)
+    act(() => el.querySelector<HTMLElement>('[data-push]')!.click())
+    expect(el.querySelector('[role="dialog"]')?.getAttribute('data-version')).toBe('1')
+    expect(document.activeElement).toBe(swatch)
+  })
+
+  it('waits for `active` before moving focus in', () => {
+    const el = render(<Harness active={false} />)
+    expect(document.activeElement).not.toBe(el.querySelector('[data-field]'))
+    act(() => root!.render(<Harness active />))
+    expect(document.activeElement).toBe(el.querySelector('[data-field]'))
+  })
+})
+
+/** Two popovers up at once: a card, and a second one opened over it (`over`). */
+function Nested({ over }: { over: boolean }): JSX.Element {
+  const card = useRef<HTMLDivElement>(null)
+  const top = useRef<HTMLDivElement>(null)
+  usePopover(card, { onClose: () => undefined, initial: 'container' })
+  usePopover(top, { onClose: () => undefined, active: over, initial: 'first' })
+  return (
+    <>
+      <div ref={card} role="dialog" tabIndex={-1} data-card>
+        <button type="button" data-card-first>
+          Close
+        </button>
+        <button type="button" data-card-last>
+          Save
+        </button>
+      </div>
+      {over && (
+        <div ref={top} role="dialog" data-top>
+          <button type="button" data-top-first>
+            Copy image
+          </button>
+          <button type="button" data-top-last>
+            Save file
+          </button>
+        </div>
+      )}
+    </>
+  )
+}
+
+/** Tab (or Shift+Tab) on the focused element; true when a wrap took the key from the browser. */
+function tab(shift = false): boolean {
+  let prevented = false
+  act(() => {
+    const e = new KeyboardEvent('keydown', {
+      key: 'Tab',
+      shiftKey: shift,
+      bubbles: true,
+      cancelable: true
+    })
+    document.activeElement?.dispatchEvent(e)
+    prevented = e.defaultPrevented
+  })
+  return prevented
+}
+
+describe('Tab wraps in the topmost popover alone (§9.5 one hop)', () => {
+  it('a popover over a card takes the wrap; the card has it again once the popover has gone', () => {
+    const el = render(<Nested over />)
+    const topFirst = el.querySelector<HTMLElement>('[data-top-first]')!
+    const topLast = el.querySelector<HTMLElement>('[data-top-last]')!
+    expect(document.activeElement).toBe(topFirst)
+    // A step within the popover is the browser's: the card's wrap does not take the key and
+    // pull the keyboard to its Close on the way.
+    expect(tab()).toBe(false)
+    expect(document.activeElement).toBe(topFirst)
+    // From the popover's last control Tab wraps to its first, Shift+Tab back.
+    act(() => topLast.focus())
+    expect(tab()).toBe(true)
+    expect(document.activeElement).toBe(topFirst)
+    expect(tab(true)).toBe(true)
+    expect(document.activeElement).toBe(topLast)
+
+    // The popover leaves: the card is on top again and wraps Tab as before.
+    act(() => root!.render(<Nested over={false} />))
+    const cardLast = el.querySelector<HTMLElement>('[data-card-last]')!
+    act(() => cardLast.focus())
+    expect(tab()).toBe(true)
+    expect(document.activeElement).toBe(el.querySelector('[data-card-first]'))
+  })
+})
+
+/**
+ * An opener in the window chrome, which the frame dialog host keeps inert through the popover's
+ * way out (lib/portals.tsx), and the popover it opened; `open` false unmounts the popover.
+ */
+function Chrome({ open }: { open: boolean }): JSX.Element {
+  return (
+    <>
+      <div data-surface="window" data-chrome>
+        <button type="button" data-opener>
+          Make default
+        </button>
+      </div>
+      {open && <Popover active version={0} />}
+    </>
+  )
+}
+
+/** The mutation observers' callbacks run as microtasks; let them. */
+const tick = (): Promise<void> => act(async () => undefined)
+
+describe('the return of focus on unmount', () => {
+  it('waits for an inert opener until the chrome is back', async () => {
+    const el = render(<Chrome open={false} />)
+    const chrome = el.querySelector<HTMLElement>('[data-chrome]')!
+    const opener = el.querySelector<HTMLElement>('[data-opener]')!
+    act(() => opener.focus())
+    act(() => root!.render(<Chrome open />))
+    expect(document.activeElement).toBe(el.querySelector('[data-field]'))
+    // The host's hold: the opener refuses the focus as the popover goes, and it falls to `body`.
+    chrome.setAttribute('inert', '')
+    act(() => root!.render(<Chrome open={false} />))
+    expect(document.activeElement).toBe(document.body)
+    // The hold lifts: the opener takes it.
+    chrome.removeAttribute('inert')
+    await tick()
+    expect(document.activeElement).toBe(opener)
+  })
+
+  it('leaves the focus where something else put it meanwhile', async () => {
+    const el = render(<Chrome open={false} />)
+    const chrome = el.querySelector<HTMLElement>('[data-chrome]')!
+    const opener = el.querySelector<HTMLElement>('[data-opener]')!
+    act(() => opener.focus())
+    act(() => root!.render(<Chrome open />))
+    chrome.setAttribute('inert', '')
+    act(() => root!.render(<Chrome open={false} />))
+    // Another surface took the keyboard (a dialog opened over the way out).
+    const other = document.createElement('button')
+    document.body.appendChild(other)
+    act(() => other.focus())
+    chrome.removeAttribute('inert')
+    await tick()
+    expect(document.activeElement).toBe(other)
+    other.remove()
+  })
+
+  it('returns at once to an opener that can take it', () => {
+    const el = render(<Chrome open={false} />)
+    const opener = el.querySelector<HTMLElement>('[data-opener]')!
+    act(() => opener.focus())
+    act(() => root!.render(<Chrome open />))
+    act(() => root!.render(<Chrome open={false} />))
+    expect(document.activeElement).toBe(opener)
+  })
+})

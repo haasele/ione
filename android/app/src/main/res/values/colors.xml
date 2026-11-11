@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="zen_background">#F2F1F5</color>
+    <color name="zen_background_dark">#16161B</color>
+    <!-- The private theme's purple (PRIVATE_THEME's second stop), behind the launcher shortcut's mask glyph. -->
+    <color name="shortcut_private_background">#3F2C7A</color>
+    <!-- The app icon's indigo (Theme.Zen's primary), behind the New tab, Search and Scan QR code shortcuts' glyphs. -->
+    <color name="shortcut_background">#6264DC</color>
+    <!--
+      Ione's accent (the default theme's zen-accent custom property, main.css), the colour the shade tints
+      the app's glyph and name with on every card Ione posts in its own name (the private
+      session's, the capture's, the updates'; NOT-13, NOT-17): one brand colour on the shade.
+    -->
+    <color name="zen_accent">#6264DC</color>
+
+    <!--
+      The v2 token block (design-language-v2-draft.md §1; the v2 custom properties main.css
+      declares for light and dark), for what the app draws natively: the custom tab's toolbar
+      and menu sheet, the extension sheet, the native prompt sheet (NativePromptSheet, read
+      through V2Ink). Every value here is the stylesheet's, and V2TokensPinTest holds it so: the
+      test resolves each token for both themes from main.css and fails when a `v2_*` colour
+      below differs, or is not one of the tokens it names – so nothing is retyped, and a re-tune
+      happens in the CSS.
+    -->
+    <!-- Window and toolbar chrome without a theme (the sidebar-neutral token). -->
+    <color name="v2_window_light">#E9E9E9</color>
+    <color name="v2_window_dark">#131313</color>
+    <!-- Page. -->
+    <color name="v2_page_light">#FBFBFE</color>
+    <color name="v2_page_dark">#1C1B22</color>
+    <!-- Panel, popover, menu, phone sheet. -->
+    <color name="v2_panel_light">#F4F4F4</color>
+    <color name="v2_panel_dark">#1F1F1F</color>
+    <!-- Hairline: rgb(0 0 0 / .15) and rgb(255 255 255 / .12). -->
+    <color name="v2_border_light">#26000000</color>
+    <color name="v2_border_dark">#1FFFFFFF</color>
+    <!-- The opaque hairline between a list's rows and round a card (the install prompt's warning rows). -->
+    <color name="v2_card_border_light">#E7E7E8</color>
+    <color name="v2_card_border_dark">#302F38</color>
+    <!-- Text; deemphasised text is this at 69%. -->
+    <color name="v2_text_light">#15141A</color>
+    <color name="v2_text_dark">#FBFBFE</color>
+    <!-- Scrim behind sheets: rgb(0 0 0 / .4) and .55. -->
+    <color name="v2_scrim_light">#66000000</color>
+    <color name="v2_scrim_dark">#8C000000</color>
+    <!--
+      The control accent under the default space colour (#6264dc): the space colour mixed 40 %
+      into black (light) or white (dark), and what is drawn on it – white, or the text ink. The
+      chrome hands its live theme's pair over (`chrome.setTheme`); these stand in until it has.
+    -->
+    <color name="v2_accent_light">#272858</color>
+    <color name="v2_accent_dark">#C0C1F1</color>
+    <color name="v2_on_accent_light">#FFFFFF</color>
+    <color name="v2_on_accent_dark">#15141A</color>
+    <!-- The danger ink (the zen-danger status ink): a destructive peer's label (Exit page, Remove). -->
+    <color name="v2_danger_light">#B02A2A</color>
+    <color name="v2_danger_dark">#FF8080</color>
+
+    <!--
+      The search widget's face (SearchWidgetProvider, res/layout/widget_search.xml; WID-01): the
+      launcher inflates it in the system's theme, so these carry the v2 tokens' light values and
+      values-night/colors.xml the dark ones. The fill is the panel's (a surface floating over the
+      wallpaper, as a sheet floats over the page), the hairline the border's, the glyphs the text
+      ink, the hint the text ink at 69 % (§9.29's deemphasised text; res/color/widget_search_hint.xml
+      derives it from the ink), the mark the app icon's indigo (Theme.Zen's primary, lifted for
+      dark as the theme lifts it). On Android 12+ the fill, ink and hint take the system's
+      Material You colours instead (values-v31/colors.xml, values-v34/colors.xml and the night
+      pair, the fill in res/color-v31/widget_search_fill.xml and its pairs at Chrome's 0.9 over
+      the wallpaper; WID-03), as Chrome's widget does, and the pill loses its hairline
+      (res/drawable-v31/widget_search_pill.xml) – the hairline is the pre-31 face's alone; the
+      mark stays this indigo everywhere.
+    -->
+    <color name="widget_search_fill">@color/v2_panel_light</color>
+    <color name="widget_search_hairline">@color/v2_border_light</color>
+    <color name="widget_search_ink">@color/v2_text_light</color>
+    <color name="widget_search_mark">#6264DC</color>
+
+    <!--
+      The quick actions widget's face below Android 12 (QuickActionsWidgetProvider,
+      res/layout/widget_quick_actions_*.xml; WID-02), on the v2 tokens as the search widget's is:
+      the card is the page (Chrome's colorSurface), the bar and the buttons on it are panels
+      (Chrome's colorSurfaceContainerHigh and colorSurfaceContainer), the card's and the bar's
+      hairline is the border's; the glyphs, the hint and the mark are the search widget's
+      (widget_search_ink, widget_search_hint, widget_search_mark). On Android 12+ the three
+      surfaces take the system's Material You roles instead (res/color-v31/widget_quick_actions_*.xml
+      and their night / v34 pairs), and the hairlines go (res/drawable-v31/widget_quick_actions_*.xml),
+      as Chrome's quick action widget has none. The hairline colour stays on every level for one
+      more line: the picker's frame round the preview (res/drawable/widget_quick_actions_preview_frame.xml),
+      by day and by night.
+    -->
+    <color name="widget_quick_actions_surface">@color/v2_page_light</color>
+    <color name="widget_quick_actions_bar">@color/v2_panel_light</color>
+    <color name="widget_quick_actions_button">@color/v2_panel_light</color>
+    <color name="widget_quick_actions_hairline">@color/v2_border_light</color>
+</resources>

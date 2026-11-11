@@ -1,0 +1,180 @@
+appId: io.github.benitbuhner.ione
+productName: Ione
+directories:
+  buildResources: build
+files:
+  - '!**/.vscode/*'
+  - '!.github/**'
+  - '!android/**'
+  - '!logo/**'
+  - '!patches/**'
+  - '!scripts/**'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!vite.android.config.{js,ts,mjs,cjs}'
+  - '!vitest.config.{js,ts,mjs,cjs}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
+  - '!{.env,.env.*,.npmrc,bun.lock,bun.lockb,pnpm-lock.yaml}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+asarUnpack:
+  - resources/**
+# macOS without a Developer ID: ad-hoc sign the bundle so it carries a resource seal (otherwise
+# Apple Silicon reports it as "damaged" with no Open Anyway). No-op on other platforms and when a
+# certificate is configured.
+afterPack: ./build/after-pack.mjs
+
+# What a browser registers with the OS. macOS turns `protocols` into CFBundleURLTypes and the
+# platform `fileAssociations` into CFBundleDocumentTypes; the Linux desktop entry gets
+# `x-scheme-handler/http;x-scheme-handler/https` from `protocols` and the document types from
+# `linux.mimeTypes`. Windows is registered by build/installer.nsh (RegisteredApplications,
+# Clients\StartMenuInternet, the IoneHTML ProgID): electron-builder's own Windows
+# fileAssociations would also make Ione the per-user default for every listed extension at
+# install time, which a browser must leave to the user (Chrome only adds OpenWithProgids).
+protocols:
+  - name: Web URL
+    schemes:
+      - http
+      - https
+    role: Viewer
+# Automatic updates (electron-updater). This block makes electron-builder write `app-update.yml`
+# into the packaged app and emit the `latest*.yml` feed files next to every installer, even with
+# `--publish never` (the Release workflow uploads them itself). The app never uses it to discover
+# releases: it reads the release's update-manifest.json first and then points electron-updater at
+# that exact release (src/main/platform/updates.ts).
+publish:
+  provider: github
+  owner: haasele
+  repo: ione
+  releaseType: release
+# Every artifact name carries the CPU architecture so that the x64 and arm64 builds of one release
+# can sit next to each other on the GitHub release page (see .github/workflows/release.yml).
+win:
+  executableName: ione
+  # One NSIS installer per architecture. Build one arch per electron-builder invocation
+  # (--x64 / --arm64); asking for both at once merges them into a single installer.
+  target:
+    - nsis
+nsis:
+  artifactName: ${name}-${version}-${arch}-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  createDesktopShortcut: always
+  # The app used to be "Zen" (appId app.zen-browser.chromium); Windows sees Ione as a different
+  # program. The include removes the old installation silently and keeps its user data for the
+  # app to migrate on first launch (src/main/platform/legacyPaths.ts).
+  include: build/installer.nsh
+mac:
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    # Squirrel.Mac (the updater behind electron-updater on macOS) installs from a zip, not a DMG.
+    # Only usable once the app is code-signed; unsigned builds fall back to opening the DMG.
+    - target: zip
+      arch:
+        - x64
+        - arm64
+  artifactName: ${name}-${version}-${arch}.${ext}
+  entitlementsInherit: build/entitlements.mac.plist
+  # A mapping, not a list: electron-builder copies these keys straight into Info.plist. As a YAML
+  # list of one-key maps the plist got numeric keys ("0", "1", "2") plus "length" instead.
+  extendInfo:
+    NSCameraUsageDescription: Ione requests access to the device's camera for websites that ask for it.
+    NSMicrophoneUsageDescription: Ione requests access to the device's microphone for websites that ask for it.
+    NSDownloadsFolderUsageDescription: Ione saves downloaded files to your Downloads folder.
+    # CoreLocation refuses an app without a usage description; the engine's own location provider
+    # (behind the geolocation permission, MW-04) needs it. The network provider stands in when
+    # the OS says no.
+    NSLocationUsageDescription: Ione shares your location with websites that ask for it and that you allow.
+    NSLocationWhenInUseUsageDescription: Ione shares your location with websites that ask for it and that you allow.
+  # Documents Ione can open from the Finder ("Open With" lists it; Alternate rank keeps Preview
+  # and Safari as the system's own defaults until the user chooses otherwise).
+  fileAssociations:
+    - ext:
+        - html
+        - htm
+        - shtml
+        - xhtml
+        - xht
+        - mhtml
+        - mht
+      name: HTML Document
+      role: Viewer
+      rank: Alternate
+    - ext: pdf
+      name: PDF Document
+      role: Viewer
+      rank: Alternate
+    - ext: svg
+      name: SVG Image
+      role: Viewer
+      rank: Alternate
+    - ext: webp
+      name: WebP Image
+      role: Viewer
+      rank: Alternate
+    - ext: avif
+      name: AVIF Image
+      role: Viewer
+      rank: Alternate
+  # Notarization only runs after a successful code signature and only when the Apple credentials
+  # (APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID) are in the environment; without them
+  # electron-builder logs "skipped macOS notarization" and carries on.
+  notarize: true
+dmg:
+  artifactName: ${name}-${version}-${arch}.${ext}
+linux:
+  executableName: ione
+  target:
+    - AppImage
+    - deb
+  maintainer: Bennett Buhner <136861830+BenItBuhner@users.noreply.github.com>
+  category: Network
+  # Existing types only (no mime-info file of our own); `protocols` above adds the URL schemes.
+  mimeTypes:
+    - text/html
+    - application/xhtml+xml
+    - multipart/related
+    - image/svg+xml
+    - image/webp
+    - image/avif
+    - application/pdf
+  desktop:
+    entry:
+      # The desktop file is ione.desktop (executableName); `desktopName` in package.json makes
+      # electron-builder write the matching StartupWMClass and Electron the matching app id.
+      Actions: new-window;new-private-window;
+    # `ione` resolves through the /usr/bin symlink the deb installs; the AppImage relies on the
+    # integrator (AppImageLauncher) to point Exec at the image.
+    desktopActions:
+      new-window:
+        Name: New Window
+        Exec: ione --new-window
+      new-private-window:
+        Name: New Private Window
+        Exec: ione --private-window
+deb:
+  # The package was called zen-chromium before v0.2.0 and zenium after it. Conflicts + Replaces
+  # make dpkg and apt remove either package when this one is installed instead of leaving two
+  # browsers side by side.
+  fpm:
+    - --conflicts
+    - zen-chromium
+    - --conflicts
+    - zenium
+    - --replaces
+    - zenium
+    - --provides
+    - zenium
+    - --replaces
+    - zen-chromium
+    - --provides
+    - zen-chromium
+  # electron-builder's own scripts plus `zenium` / `zen-chromium` command aliases (the former
+  # package names) kept for one release so agent configs that launch them with --mcp keep working.
+  afterInstall: build/linux/after-install.sh
+  afterRemove: build/linux/after-remove.sh
+appImage:
+  artifactName: ${name}-${version}-${arch}.${ext}
+npmRebuild: false

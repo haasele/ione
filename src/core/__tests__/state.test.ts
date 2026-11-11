@@ -1,0 +1,993 @@
+import { describe, expect, it } from 'vitest'
+import type { HostCapabilities, Platform } from '../../shared/types'
+import { DEFAULT_SETTINGS } from '../../shared/defaults'
+import { emptyEducationalTipMemory } from '../../shared/educationalTips'
+import { DEFAULT_NEW_TAB_SETTINGS } from '../../shared/newTab'
+import type { StoreIO } from '../platform'
+import { BrowserState, PERSISTED_VERSION, type Persisted } from '../state'
+import { createFolder, createSpace, createTabRecord, nextFolderColor } from '../model'
+import { closedTabEntry } from '../session'
+
+function fakeIo(initial: string | null = null): StoreIO & { writes: string[] } {
+  const io = {
+    writes: [] as string[],
+    readSync: () => initial,
+    write: async (_name: string, text: string) => {
+      io.writes.push(text)
+    },
+    writeSync: (_name: string, text: string) => {
+      io.writes.push(text)
+    }
+  }
+  return io
+}
+
+function state(io: StoreIO): BrowserState {
+  const s = new BrowserState(io, {} as Platform, {} as HostCapabilities, '0.0')
+  s.load()
+  return s
+}
+
+const tick = (): Promise<void> => new Promise((r) => setImmediate(r))
+
+describe('BrowserState commits', () => {
+  it('persists a commit even when a volatile commit was scheduled first in the same tick', async () => {
+    const io = fakeIo()
+    const s = state(io)
+    s.commitVolatile()
+    s.commit()
+    await tick()
+    await s.flush()
+    expect(io.writes.length).toBeGreaterThan(0)
+  })
+
+  it('does not persist for volatile commits alone', async () => {
+    const io = fakeIo()
+    const s = state(io)
+    s.commitVolatile()
+    await tick()
+    // flush() writes unconditionally, so look at the store directly: nothing was scheduled.
+    expect(io.writes).toEqual([])
+  })
+
+  it('notifies listeners once per tick for any mix of commits', async () => {
+    const io = fakeIo()
+    const s = state(io)
+    let calls = 0
+    s.subscribe(() => calls++)
+    s.commitVolatile()
+    s.commit()
+    s.commitVolatile()
+    await tick()
+    expect(calls).toBe(1)
+  })
+
+  it('runs afterBroadcast callbacks once the pending broadcast has gone out', async () => {
+    const io = fakeIo()
+    const s = state(io)
+    const order: string[] = []
+    s.subscribe(() => order.push('broadcast'))
+    s.commit()
+    s.afterBroadcast(() => order.push('after'))
+    expect(order).toEqual([])
+    await tick()
+    expect(order).toEqual(['broadcast', 'after'])
+  })
+
+  it('runs afterBroadcast callbacks right away when nothing is pending', async () => {
+    const io = fakeIo()
+    const s = state(io)
+    let calls = 0
+    s.subscribe(() => calls++)
+    let ran = false
+    s.afterBroadcast(() => (ran = true))
+    expect(ran).toBe(true)
+    await tick()
+    expect(calls).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Recently closed persistence (state.json v3) and "restore previous session" off
+// ---------------------------------------------------------------------------
+
+function profile(): { doc: Record<string, unknown>; spaceId: string; ids: string[] } {
+  const space = createSpace('Work', '')
+  const pinned = createTabRecord({
+    spaceId: space.id,
+    containerId: 'default',
+    url: 'https://p.test/',
+    pinned: true
+  })
+  const a = createTabRecord({ spaceId: space.id, containerId: 'default', url: 'https://a.test/' })
+  const b = createTabRecord({ spaceId: space.id, containerId: 'default', url: 'https://b.test/' })
+  const essential = createTabRecord({
+    spaceId: null,
+    containerId: 'default',
+    url: 'https://e.test/',
+    essential: true
+  })
+  space.tabIds = [pinned.id, a.id, b.id]
+  space.activeTabId = b.id
+  const doc = {
+    version: 2,
+    spaces: [space],
+    tabs: [pinned, a, b, essential],
+    essentialTabIds: [essential.id],
+    activeSpaceId: space.id,
+    settings: {},
+    windows: [
+      {
+        id: 'w1',
+        bounds: null,
+        maximized: false,
+        activeSpaceId: space.id,
+        selection: { [space.id]: b.id },
+        compact: false
+      },
+      {
+        id: 'w2',
+        bounds: null,
+        maximized: false,
+        activeSpaceId: space.id,
+        selection: {},
+        compact: false
+      }
+    ]
+  }
+  return { doc, spaceId: space.id, ids: [pinned.id, a.id, b.id, essential.id] }
+}
+
+function stateFrom(doc: unknown): { s: BrowserState; io: ReturnType<typeof fakeIo> } {
+  const io = fakeIo()
+  io.readSync = () => JSON.stringify(doc)
+  const s = new BrowserState(io, {} as Platform, {} as HostCapabilities, '0.0')
+  s.load()
+  return { s, io }
+}
+
+describe('recently closed persistence', () => {
+  it('starts empty for profiles written before v3 and round-trips v3 entries', async () => {
+    const { doc } = profile()
+    const { s, io } = stateFrom(doc)
+    expect(s.recentlyClosed).toEqual([])
+    const tab = createTabRecord({ spaceId: null, containerId: 'default', url: 'https://c.test/' })
+    s.recentlyClosed = [
+      closedTabEntry(tab, { spaceId: null, folderId: null, index: 0, windowId: null }, null, 5)
+    ]
+    s.commit()
+    await tick()
+    await s.flush()
+    const written = JSON.parse(io.writes[io.writes.length - 1]) as {
+      version: number
+      recentlyClosed: unknown[]
+    }
+    expect(written.version).toBe(PERSISTED_VERSION)
+    expect(written.recentlyClosed).toHaveLength(1)
+    const reloaded = stateFrom(written).s
+    expect(reloaded.recentlyClosed).toHaveLength(1)
+    expect(reloaded.recentlyClosed[0]).toMatchObject({ kind: 'tab', closedAt: 5 })
+  })
+
+  it('ignores a corrupt recentlyClosed list', () => {
+    const { doc } = profile()
+    const { s } = stateFrom({ ...doc, version: 3, recentlyClosed: 'oops' })
+    expect(s.recentlyClosed).toEqual([])
+  })
+})
+
+describe('folder (tab group) persistence', () => {
+  it('round-trips a folder’s name, colour, collapsed state and membership (session-22)', async () => {
+    const { doc, spaceId, ids } = profile()
+    const [, a, b] = ids
+    const { s, io } = stateFrom(doc)
+    const folder = createFolder(s.model, spaceId, 'Research', '📁', 'purple')
+    folder.collapsed = true
+    s.model.tabs[a].folderId = folder.id
+    s.model.tabs[b].folderId = folder.id
+    s.commit()
+    await tick()
+    await s.flush()
+    const written = JSON.parse(io.writes[io.writes.length - 1]) as Persisted
+    expect(written.folders).toEqual([
+      { id: folder.id, spaceId, name: 'Research', icon: '📁', color: 'purple', collapsed: true }
+    ])
+    const reloaded = stateFrom(written).s
+    expect(reloaded.model.folders[folder.id]).toEqual(folder)
+    expect(reloaded.model.tabs[a].folderId).toBe(folder.id)
+    expect(reloaded.model.tabs[b].folderId).toBe(folder.id)
+    expect(nextFolderColor(reloaded.model, spaceId)).toBe('grey')
+  })
+
+  it('drops a folder whose space is gone and the membership that pointed at it', () => {
+    const { doc, spaceId, ids } = profile()
+    const [, a] = ids
+    const tabs = (doc.tabs as Array<Record<string, unknown>>).map((t) =>
+      t.id === a ? { ...t, folderId: 'folder_orphan' } : t
+    )
+    const { s } = stateFrom({
+      ...doc,
+      tabs,
+      folders: [
+        { id: 'folder_orphan', spaceId: 'space_gone', name: 'Old', icon: '📁', collapsed: false },
+        { id: 'folder_kept', spaceId, name: 'Kept', icon: '📁', color: 'red', collapsed: false }
+      ]
+    })
+    expect(Object.keys(s.model.folders)).toEqual(['folder_kept'])
+    expect(s.model.tabs[a].folderId).toBeNull()
+  })
+})
+
+describe('tab navigation persistence', () => {
+  const stack = {
+    entries: [
+      { url: 'https://a.test/', title: 'A', pageState: 'c2Nyb2xs' },
+      { url: 'https://a.test/two', title: 'A two' }
+    ],
+    index: 1
+  }
+
+  it('writes the stacks of the open tabs with the page state and reads them back', async () => {
+    const { doc, ids } = profile()
+    const [, a] = ids
+    const { s, io } = stateFrom(doc)
+    expect(s.tabNavigation.size).toBe(0)
+    s.tabNavigation.set(a, stack)
+    s.commit()
+    await tick()
+    await s.flush()
+    const written = JSON.parse(io.writes[io.writes.length - 1]) as {
+      navigation: Record<string, unknown>
+    }
+    expect(written.navigation).toEqual({ [a]: stack })
+    const reloaded = stateFrom(written).s
+    expect(reloaded.tabNavigation.get(a)).toEqual(stack)
+  })
+
+  it('leaves out stacks whose tab is gone or private, and drops garbage on load', async () => {
+    const { doc, ids } = profile()
+    const [, a, b] = ids
+    const { s, io } = stateFrom({
+      ...doc,
+      version: 3,
+      navigation: {
+        [a]: stack,
+        [b]: { entries: [{ url: '' }, { title: 'no url' }, 7], index: 0 },
+        ghost: stack,
+        nonsense: 'oops'
+      }
+    })
+    expect([...s.tabNavigation.keys()]).toEqual([a, 'ghost'])
+    s.model.tabs[b].containerId = 'private'
+    s.tabNavigation.set(b, stack)
+    s.commit()
+    await tick()
+    await s.flush()
+    const written = JSON.parse(io.writes[io.writes.length - 1]) as {
+      navigation: Record<string, unknown>
+    }
+    expect(Object.keys(written.navigation)).toEqual([a])
+    expect(s.tabNavigation.has('ghost')).toBe(false)
+    expect(s.tabNavigation.has(b)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Quick Delete's tab stamp (HB-07): `Tab.lastNavigatedAt` persists with the tab and a record
+// from before the field reads null (that it never travels in the `open-tabs` sync record is
+// `sync/__tests__/documents.test.ts`).
+// ---------------------------------------------------------------------------
+
+describe('Tab.lastNavigatedAt persistence (HB-07)', () => {
+  it('round-trips the stamp with the tab and reads null for a record older than the field', async () => {
+    const { doc, ids } = profile()
+    const [, a, b] = ids
+    const { s, io } = stateFrom(doc)
+    // `createTabRecord` gave the profile's tabs an explicit null; a record from before the
+    // field carries no key at all, and reads the same.
+    const tabs = doc.tabs as Array<Record<string, unknown>>
+    for (const raw of tabs) delete raw.lastNavigatedAt
+    const older = stateFrom(doc).s
+    expect(older.model.tabs[a].lastNavigatedAt).toBeNull()
+    expect(older.model.tabs[b].lastNavigatedAt).toBeNull()
+
+    s.model.tabs[a].lastNavigatedAt = 1_700_000_000_000
+    s.commit()
+    await tick()
+    await s.flush()
+    const written = JSON.parse(io.writes[io.writes.length - 1]) as {
+      tabs: Array<{ id: string; lastNavigatedAt?: number | null }>
+    }
+    expect(written.tabs.find((t) => t.id === a)?.lastNavigatedAt).toBe(1_700_000_000_000)
+    expect(written.tabs.find((t) => t.id === b)?.lastNavigatedAt).toBeNull()
+    const reloaded = stateFrom(written).s
+    expect(reloaded.model.tabs[a].lastNavigatedAt).toBe(1_700_000_000_000)
+    expect(reloaded.model.tabs[b].lastNavigatedAt).toBeNull()
+  })
+})
+
+describe('forgetSession', () => {
+  it('drops regular tabs, keeps pinned tabs and essentials, and leaves one window without a selection', () => {
+    const { doc, ids } = profile()
+    const [pinned, a, b, essential] = ids
+    const { s } = stateFrom(doc)
+    expect(Object.keys(s.model.tabs)).toHaveLength(4)
+    expect(s.restoredWindows).toHaveLength(2)
+    s.forgetSession()
+    expect(Object.keys(s.model.tabs).sort()).toEqual([pinned, essential].sort())
+    expect(s.model.tabs[a]).toBeUndefined()
+    expect(s.model.tabs[b]).toBeUndefined()
+    expect(s.model.spaces[0].tabIds).toEqual([pinned])
+    expect(s.model.essentialTabIds).toEqual([essential])
+    expect(s.restoredWindows).toHaveLength(1)
+    expect(s.restoredWindows[0].selection).toEqual({})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// New tab page persistence (state.json v4 → v5)
+// ---------------------------------------------------------------------------
+
+/** A minimal profile as an older build wrote it (`version` picks the schema). */
+function legacyProfile(version: 1 | 2 | 3 | 4 | 5 | 6, extra: Partial<Persisted> = {}): string {
+  const base: Persisted = {
+    version,
+    spaces: [],
+    tabs: [],
+    essentialTabIds: [],
+    activeSpaceId: 'space_1',
+    containers: [],
+    folders: [],
+    splitGroups: [],
+    settings: structuredClone(DEFAULT_SETTINGS),
+    shortcutOverrides: {},
+    bookmarks: [],
+    ...extra
+  }
+  return JSON.stringify(base)
+}
+
+/** `settings` of a 0.3.x profile: the desktop's first `newTab` next to the phone's `newTabPhone`. */
+function settingsOfBothKeys(): Persisted['settings'] {
+  const settings = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>
+  settings.newTab = { enabled: true, shortcuts: 'custom', background: 'space', greeting: true }
+  settings.newTabPhone = {
+    preset: 'inspirational',
+    modules: { searchBox: true, shortcuts: true, wallpaper: false, feed: false },
+    shortcutStyle: 'most-visited',
+    wallpaper: 'image',
+    pinned: [
+      { url: 'https://pinned.example/', title: 'Pinned' },
+      { url: 'https://a.example/', title: 'Also a desktop shortcut' }
+    ],
+    hiddenHosts: ['www.news.example', 'Gone.example']
+  }
+  return settings as unknown as Persisted['settings']
+}
+
+const newTabKeys = (
+  text: string
+): Pick<Persisted, 'version' | 'newTabDevice' | 'newTabShortcuts' | 'newTabHiddenHosts'> & {
+  newTab: unknown
+  newTabPhone: unknown
+} => {
+  const written = JSON.parse(text) as Persisted & { settings: Record<string, unknown> }
+  return {
+    version: written.version,
+    newTabDevice: written.newTabDevice,
+    newTabShortcuts: written.newTabShortcuts,
+    newTabHiddenHosts: written.newTabHiddenHosts,
+    newTab: written.settings.newTab,
+    newTabPhone: written.settings.newTabPhone
+  }
+}
+
+describe('state.json v5 (new tab page)', () => {
+  it('writes the current schema version with the device-local document', async () => {
+    const io = fakeIo()
+    const s = state(io)
+    s.newTabDevice = {
+      shortcuts: [{ id: 'sc_1', title: 'Zen', url: 'https://zen-browser.app/' }],
+      hiddenHosts: ['news.example'],
+      hiddenModules: ['downloads'],
+      safetyHubCard: {},
+      educationalTips: emptyEducationalTipMemory()
+    }
+    await s.flush()
+    const written = JSON.parse(io.writes.at(-1) ?? '{}') as Persisted
+    expect(written.version).toBe(PERSISTED_VERSION)
+    expect(written.version).toBe(6)
+    expect(written.newTabDevice).toEqual({
+      shortcuts: [{ id: 'sc_1', title: 'Zen', url: 'https://zen-browser.app/' }],
+      hiddenHosts: ['news.example'],
+      hiddenModules: ['downloads'],
+      safetyHubCard: {},
+      educationalTips: emptyEducationalTipMemory()
+    })
+    expect(written.newTabShortcuts).toBeUndefined()
+    expect(written.newTabHiddenHosts).toBeUndefined()
+    expect(written.settings.newTab).toEqual(DEFAULT_NEW_TAB_SETTINGS)
+    expect('newTabPhone' in written.settings).toBe(false)
+  })
+
+  it('migrates a v2 profile: no shortcuts, default new tab settings', () => {
+    const settings = structuredClone(DEFAULT_SETTINGS) as Partial<typeof DEFAULT_SETTINGS>
+    delete settings.newTab
+    const s = state(fakeIo(legacyProfile(2, { settings: settings as typeof DEFAULT_SETTINGS })))
+    expect(s.newTabDevice).toEqual({
+      shortcuts: [],
+      hiddenHosts: [],
+      hiddenModules: [],
+      safetyHubCard: {},
+      educationalTips: emptyEducationalTipMemory()
+    })
+    expect(s.settings.newTab).toEqual(DEFAULT_NEW_TAB_SETTINGS)
+  })
+
+  it('migrates a v1 profile the same way', () => {
+    const s = state(fakeIo(legacyProfile(1, { windowBounds: null, maximized: false })))
+    expect(s.newTabDevice).toEqual({
+      shortcuts: [],
+      hiddenHosts: [],
+      hiddenModules: [],
+      safetyHubCard: {},
+      educationalTips: emptyEducationalTipMemory()
+    })
+    expect(s.settings.newTab.enabled).toBe(true)
+  })
+
+  it('migrates a v3 profile (bookmark tree, recently closed) keeping its closed list', () => {
+    const s = state(fakeIo(legacyProfile(3, { bookmarks: undefined, recentlyClosed: [] })))
+    expect(s.newTabDevice).toEqual({
+      shortcuts: [],
+      hiddenHosts: [],
+      hiddenModules: [],
+      safetyHubCard: {},
+      educationalTips: emptyEducationalTipMemory()
+    })
+    expect(s.recentlyClosed).toEqual([])
+    expect(s.settings.newTab).toEqual(DEFAULT_NEW_TAB_SETTINGS)
+  })
+
+  it('reads v4 shortcuts and the block list and sanitises the new tab settings', () => {
+    const settings = structuredClone(DEFAULT_SETTINGS)
+    ;(settings.newTab as unknown as Record<string, unknown>).mode = 'bogus'
+    ;(settings.newTab as unknown as Record<string, unknown>).background = 'solid'
+    const s = state(
+      fakeIo(
+        legacyProfile(4, {
+          settings,
+          newTabHiddenHosts: ['WWW.News.Example', 'news.example', '', 7 as unknown as string],
+          newTabShortcuts: [
+            { id: 'a', title: 'A', url: 'https://a.example/' },
+            { id: 'a', title: 'dup', url: 'https://dup.example/' },
+            { id: 'b', title: '  ', url: 'https://b.example/' },
+            { id: '', title: 'no id', url: 'https://c.example/' }
+          ]
+        })
+      )
+    )
+    expect(s.newTabDevice).toEqual({
+      shortcuts: [
+        { id: 'a', title: 'A', url: 'https://a.example/' },
+        { id: 'b', title: 'https://b.example/', url: 'https://b.example/' }
+      ],
+      hiddenHosts: ['news.example'],
+      hiddenModules: [],
+      safetyHubCard: {},
+      educationalTips: emptyEducationalTipMemory()
+    })
+    expect(s.settings.newTab).toEqual({ ...DEFAULT_NEW_TAB_SETTINGS, background: 'solid' })
+  })
+
+  it('reads the split view drag and drop switch as on unless the profile turned it off (split-12)', () => {
+    const without = structuredClone(DEFAULT_SETTINGS) as Partial<typeof DEFAULT_SETTINGS>
+    delete without.splitEdgeZones
+    const older = state(fakeIo(legacyProfile(5, { settings: without as typeof DEFAULT_SETTINGS })))
+    expect(older.settings.splitEdgeZones).toBe(true)
+
+    const garbage = structuredClone(DEFAULT_SETTINGS)
+    ;(garbage as unknown as Record<string, unknown>).splitEdgeZones = 'off'
+    expect(state(fakeIo(legacyProfile(5, { settings: garbage }))).settings.splitEdgeZones).toBe(
+      true
+    )
+
+    const off = structuredClone(DEFAULT_SETTINGS)
+    off.splitEdgeZones = false
+    expect(state(fakeIo(legacyProfile(5, { settings: off }))).settings.splitEdgeZones).toBe(false)
+  })
+
+  it('keeps a split’s link rule with the split (split-13, §9.35): a restored session reads it on only where the record says true; a record from before it, or garbage, reads off and is stored as absent', () => {
+    const session = (linksToRight: unknown): string => {
+      const space = createSpace('Work', '')
+      const a = createTabRecord({
+        spaceId: space.id,
+        containerId: 'default',
+        url: 'https://a.test/'
+      })
+      const b = createTabRecord({
+        spaceId: space.id,
+        containerId: 'default',
+        url: 'https://b.test/'
+      })
+      space.tabIds = [a.id, b.id]
+      const group: Record<string, unknown> = {
+        id: 'split_1',
+        spaceId: space.id,
+        tabIds: [a.id, b.id],
+        layout: 'vertical',
+        sizes: [0.5, 0.5]
+      }
+      if (linksToRight !== undefined) group.linksToRight = linksToRight
+      return legacyProfile(5, {
+        spaces: [space],
+        tabs: [a, b],
+        activeSpaceId: space.id,
+        splitGroups: [group as unknown as Persisted['splitGroups'][number]]
+      })
+    }
+    const kept = state(fakeIo(session(true)))
+    expect(kept.model.splitGroups.split_1).toMatchObject({ layout: 'vertical', linksToRight: true })
+    expect('linksToRight' in state(fakeIo(session(undefined))).model.splitGroups.split_1).toBe(
+      false
+    )
+    expect('linksToRight' in state(fakeIo(session('on'))).model.splitGroups.split_1).toBe(false)
+    expect('linksToRight' in state(fakeIo(session(false))).model.splitGroups.split_1).toBe(false)
+    // The browser has no such setting any more (one home for the switch: the pane's ⋯ menu).
+    expect('splitLinksToRight' in DEFAULT_SETTINGS).toBe(false)
+  })
+
+  it('reads the developer tools dock, the bottom for profiles from before it and for garbage (§9.29)', () => {
+    const without = structuredClone(DEFAULT_SETTINGS) as Partial<typeof DEFAULT_SETTINGS>
+    delete without.devtoolsDock
+    const older = state(fakeIo(legacyProfile(5, { settings: without as typeof DEFAULT_SETTINGS })))
+    expect(older.settings.devtoolsDock).toBe('bottom')
+
+    const garbage = structuredClone(DEFAULT_SETTINGS)
+    ;(garbage as unknown as Record<string, unknown>).devtoolsDock = 'detach'
+    expect(state(fakeIo(legacyProfile(5, { settings: garbage }))).settings.devtoolsDock).toBe(
+      'bottom'
+    )
+
+    for (const dock of ['right', 'left', 'undocked'] as const) {
+      const chosen = structuredClone(DEFAULT_SETTINGS)
+      chosen.devtoolsDock = dock
+      expect(state(fakeIo(legacyProfile(5, { settings: chosen }))).settings.devtoolsDock).toBe(dock)
+    }
+  })
+
+  it('reads window transparency, off for profiles from before the row and for garbage', () => {
+    const without = structuredClone(DEFAULT_SETTINGS) as Partial<typeof DEFAULT_SETTINGS>
+    delete without.windowTransparency
+    expect(
+      state(fakeIo(legacyProfile(5, { settings: without as typeof DEFAULT_SETTINGS }))).settings
+        .windowTransparency
+    ).toBe('off')
+
+    const garbage = structuredClone(DEFAULT_SETTINGS)
+    ;(garbage as unknown as Record<string, unknown>).windowTransparency = 'frosted'
+    expect(
+      state(fakeIo(legacyProfile(5, { settings: garbage }))).settings.windowTransparency
+    ).toBe('off')
+
+    for (const value of ['translucent', 'transparent'] as const) {
+      const chosen = structuredClone(DEFAULT_SETTINGS)
+      chosen.windowTransparency = value
+      expect(state(fakeIo(legacyProfile(5, { settings: chosen }))).settings.windowTransparency).toBe(
+        value
+      )
+    }
+  })
+
+  it('folds a v4 profile carrying both keys into the one model, once', async () => {
+    const io = fakeIo(
+      legacyProfile(4, {
+        settings: settingsOfBothKeys(),
+        newTabShortcuts: [{ id: 'a', title: 'A', url: 'https://a.example/' }],
+        newTabHiddenHosts: ['news.example', 'old.example']
+      })
+    )
+    const s = state(io)
+    // The desktop's `custom` grid reads as `my-shortcuts`; the phone's non-default preset and
+    // image source win; the desktop's greeting lives on in the modules of the phone's preset.
+    expect(s.settings.newTab).toEqual({
+      enabled: true,
+      mode: 'my-shortcuts',
+      preset: 'inspirational',
+      modules: { searchBox: true, shortcuts: true, wallpaper: false, feed: false, greeting: true },
+      background: 'image'
+    })
+    expect('newTabPhone' in s.settings).toBe(false)
+    // Pins follow the desktop's shortcuts, once per address; the block lists are one normalised
+    // list; pinning a hidden host (as the desktop copy of a.example was not) is not in play here.
+    expect(s.newTabDevice.shortcuts.map((x) => [x.url, x.title])).toEqual([
+      ['https://a.example/', 'A'],
+      ['https://pinned.example/', 'Pinned']
+    ])
+    expect(s.newTabDevice.hiddenHosts).toEqual(['news.example', 'old.example', 'gone.example'])
+
+    await s.flush()
+    const first = io.writes.at(-1) ?? '{}'
+    const keys = newTabKeys(first)
+    expect(keys.version).toBe(6)
+    expect(keys.newTabPhone).toBeUndefined()
+    expect(keys.newTabShortcuts).toBeUndefined()
+    expect(keys.newTabHiddenHosts).toBeUndefined()
+    expect(keys.newTabDevice).toEqual(s.newTabDevice)
+
+    // A second launch reads the v6 file as it was written: nothing to migrate, nothing changes.
+    const again = fakeIo(first)
+    const s2 = state(again)
+    expect(s2.settings.newTab).toEqual(s.settings.newTab)
+    expect(s2.newTabDevice).toEqual(s.newTabDevice)
+    await s2.flush()
+    expect(newTabKeys(again.writes.at(-1) ?? '{}')).toEqual(keys)
+  })
+
+  it('folds the phone key wherever it turns up, a v5 file included', () => {
+    const settings = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>
+    settings.newTabPhone = {
+      preset: 'custom',
+      modules: { searchBox: true, shortcuts: false, wallpaper: false, feed: false },
+      shortcutStyle: 'my-shortcuts',
+      wallpaper: 'space',
+      pinned: [],
+      hiddenHosts: []
+    }
+    const s = state(
+      fakeIo(
+        legacyProfile(5, {
+          settings: settings as unknown as Persisted['settings'],
+          newTabDevice: {
+            shortcuts: [],
+            hiddenHosts: ['kept.example'],
+            hiddenModules: [],
+            safetyHubCard: {},
+            educationalTips: emptyEducationalTipMemory()
+          }
+        })
+      )
+    )
+    expect(s.settings.newTab.preset).toBe('custom')
+    expect(s.settings.newTab.modules.shortcuts).toBe(false)
+    expect(s.settings.newTab.mode).toBe('my-shortcuts')
+    expect('newTabPhone' in s.settings).toBe(false)
+    expect(s.newTabDevice.hiddenHosts).toEqual(['kept.example'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The rail's Expand on hover, on by default (state.json v5 → v6; tabs-03, W5-17)
+// ---------------------------------------------------------------------------
+
+describe('state.json v6 (Expand on hover on by default)', () => {
+  const stored = (version: 1 | 2 | 3 | 4 | 5 | 6, value: unknown): BrowserState => {
+    const settings = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>
+    if (value === undefined) delete settings.sidebarExpandOnHover
+    else settings.sidebarExpandOnHover = value
+    return state(
+      fakeIo(legacyProfile(version, { settings: settings as unknown as Persisted['settings'] }))
+    )
+  }
+
+  it('ships on: a fresh profile and a profile from before the row (no key) take the default', () => {
+    expect(DEFAULT_SETTINGS.sidebarExpandOnHover).toBe(true)
+    expect(state(fakeIo()).settings.sidebarExpandOnHover).toBe(true)
+    for (const version of [1, 2, 3, 4, 5] as const) {
+      expect(stored(version, undefined).settings.sidebarExpandOnHover, `v${version}`).toBe(true)
+    }
+  })
+
+  it('reads a pre-v6 profile’s false as the old default written back, not a choice: on; its true was a choice and stays on', () => {
+    // The settings are written whole, so every profile a build with the off default wrote
+    // carries `false` whether or not the row was ever seen; only `true` could have been chosen.
+    for (const version of [4, 5] as const) {
+      expect(stored(version, false).settings.sidebarExpandOnHover, `v${version} false`).toBe(true)
+      expect(stored(version, true).settings.sidebarExpandOnHover, `v${version} true`).toBe(true)
+    }
+  })
+
+  it('keeps a v6 profile’s stored value, off only where it says so; garbage reads the default', () => {
+    expect(stored(6, false).settings.sidebarExpandOnHover).toBe(false)
+    expect(stored(6, true).settings.sidebarExpandOnHover).toBe(true)
+    expect(stored(6, undefined).settings.sidebarExpandOnHover).toBe(true)
+    expect(stored(6, 'off').settings.sidebarExpandOnHover).toBe(true)
+  })
+
+  it('writes v6, so a profile turned off after the flip stays off across a relaunch', async () => {
+    const settings = structuredClone(DEFAULT_SETTINGS)
+    settings.sidebarExpandOnHover = false
+    const io = fakeIo(legacyProfile(5, { settings }))
+    const s = state(io)
+    expect(s.settings.sidebarExpandOnHover).toBe(true)
+    s.settings.sidebarExpandOnHover = false
+    s.commit()
+    await s.flush()
+    const written = JSON.parse(io.writes.at(-1) ?? '{}') as Persisted
+    expect(written.version).toBe(6)
+    expect(written.settings.sidebarExpandOnHover).toBe(false)
+    const again = state(fakeIo(io.writes.at(-1) ?? '{}'))
+    expect(again.settings.sidebarExpandOnHover).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Accessibility's "Swipe between pages using a touchpad" (Android; GN-23 / A11Y-14): on until
+// the profile says off, read sanitised at load like the other device-local switches
+// ---------------------------------------------------------------------------
+
+describe('settings.touchpadSwipeToNavigate on load', () => {
+  const stored = (value: unknown): BrowserState => {
+    const settings = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>
+    if (value === undefined) delete settings.touchpadSwipeToNavigate
+    else settings.touchpadSwipeToNavigate = value
+    return state(
+      fakeIo(legacyProfile(6, { settings: settings as unknown as Persisted['settings'] }))
+    )
+  }
+
+  it('ships on, keeps a stored value, and reads a missing key or anything but a boolean as on', () => {
+    expect(DEFAULT_SETTINGS.touchpadSwipeToNavigate).toBe(true)
+    expect(state(fakeIo()).settings.touchpadSwipeToNavigate).toBe(true)
+    expect(stored(undefined).settings.touchpadSwipeToNavigate).toBe(true)
+    expect(stored(false).settings.touchpadSwipeToNavigate).toBe(false)
+    expect(stored(true).settings.touchpadSwipeToNavigate).toBe(true)
+    expect(stored('off').settings.touchpadSwipeToNavigate).toBe(true)
+    expect(stored(0).settings.touchpadSwipeToNavigate).toBe(true)
+    expect(stored(null).settings.touchpadSwipeToNavigate).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Performance's "Show tab memory usage" (settings-29, W8-10): off until the switch says on –
+// Chrome 152's effective default, `browser.hovercard.memory_usage_enabled` registered true and
+// flipped to false once by `MigrateHoverCardMemoryPref` under Tab Declutter; a fresh setting
+// flips with no migration, read sanitised at load like the other device-local switches
+// ---------------------------------------------------------------------------
+
+describe('settings.hoverCardMemoryUsage on load', () => {
+  const stored = (value: unknown): BrowserState => {
+    const settings = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>
+    if (value === undefined) delete settings.hoverCardMemoryUsage
+    else settings.hoverCardMemoryUsage = value
+    return state(
+      fakeIo(legacyProfile(6, { settings: settings as unknown as Persisted['settings'] }))
+    )
+  }
+
+  it('ships off, keeps a stored true, and reads a missing key or anything but true as off', () => {
+    expect(DEFAULT_SETTINGS.hoverCardMemoryUsage).toBe(false)
+    expect(state(fakeIo()).settings.hoverCardMemoryUsage).toBe(false)
+    expect(stored(undefined).settings.hoverCardMemoryUsage).toBe(false)
+    expect(stored(true).settings.hoverCardMemoryUsage).toBe(true)
+    expect(stored(false).settings.hoverCardMemoryUsage).toBe(false)
+    expect(stored('on').settings.hoverCardMemoryUsage).toBe(false)
+    expect(stored(1).settings.hoverCardMemoryUsage).toBe(false)
+    expect(stored(null).settings.hoverCardMemoryUsage).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The phone app menu's order (TB-22): a list loads as a list, the empty one included
+// ---------------------------------------------------------------------------
+
+describe('settings.menuOrder on load', () => {
+  const stored = (value: unknown): BrowserState => {
+    const settings = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>
+    if (value !== undefined) settings.menuOrder = value
+    return state(
+      fakeIo(legacyProfile(6, { settings: settings as unknown as Persisted['settings'] }))
+    )
+  }
+
+  it('has no key on a fresh profile or one that never held it, keeps a saved list sanitised, and keeps the empty list of a Reset as a value', () => {
+    expect('menuOrder' in DEFAULT_SETTINGS).toBe(false)
+    expect('menuOrder' in state(fakeIo()).settings).toBe(false)
+    expect('menuOrder' in stored(undefined).settings).toBe(false)
+    expect(stored(['row.settings', 3, 'row.newTab', 'row.settings']).settings.menuOrder).toEqual([
+      'row.settings',
+      'row.newTab'
+    ])
+    // The Reset's write: kept, so it persists across a relaunch and travels in the sync record.
+    expect(stored([]).settings.menuOrder).toEqual([])
+    expect(stored([3, null]).settings.menuOrder).toEqual([])
+  })
+
+  it('reads anything that is no list as no setting', () => {
+    for (const bad of [null, 'row.settings', 42, { 0: 'row.settings' }]) {
+      expect('menuOrder' in stored(bad).settings, JSON.stringify(bad)).toBe(false)
+    }
+  })
+
+  it('writes the empty list back, so a Reset survives a relaunch', async () => {
+    const io = fakeIo(legacyProfile(6))
+    const s = state(io)
+    s.settings.menuOrder = []
+    s.commit()
+    await s.flush()
+    const written = JSON.parse(io.writes.at(-1) ?? '{}') as Persisted
+    expect(written.settings.menuOrder).toEqual([])
+    expect(state(fakeIo(io.writes.at(-1) ?? '{}')).settings.menuOrder).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Energy Saver's mode (W8-2, settings-26; Chrome's local-state battery_saver_mode.state)
+// ---------------------------------------------------------------------------
+
+describe('Settings.energySaver (W8-2)', () => {
+  const stored = (value: unknown): BrowserState => {
+    const settings = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>
+    if (value === undefined) delete settings.energySaver
+    else settings.energySaver = value
+    return state(
+      fakeIo(legacyProfile(6, { settings: settings as unknown as Persisted['settings'] }))
+    )
+  }
+
+  it('ships as on-battery – the budgets shrank on battery before the mode had a name – and a profile from before the key reads it', () => {
+    expect(DEFAULT_SETTINGS.energySaver).toBe('on-battery')
+    expect(stored(undefined).settings.energySaver).toBe('on-battery')
+  })
+
+  it('keeps a stored mode, and reads anything that is none of the three as the default', () => {
+    expect(stored('off').settings.energySaver).toBe('off')
+    expect(stored('low-battery').settings.energySaver).toBe('low-battery')
+    expect(stored('on-battery').settings.energySaver).toBe('on-battery')
+    for (const bad of ['always', 20, true, null, { mode: 'off' }]) {
+      expect(stored(bad).settings.energySaver, JSON.stringify(bad)).toBe('on-battery')
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Roll's best score (ERR-03, §9.17 (i)): a synced setting, sanitised at load like the rest.
+// ---------------------------------------------------------------------------
+
+describe('Settings.gameBestScore (ERR-03)', () => {
+  const stored = (value: unknown): BrowserState => {
+    const settings = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>
+    if (value === undefined) delete settings.gameBestScore
+    else settings.gameBestScore = value
+    return state(
+      fakeIo(legacyProfile(6, { settings: settings as unknown as Persisted['settings'] }))
+    )
+  }
+
+  it('ships at 0 and a profile from before the game reads 0', () => {
+    expect(DEFAULT_SETTINGS.gameBestScore).toBe(0)
+    expect(stored(undefined).settings.gameBestScore).toBe(0)
+  })
+
+  it('keeps a stored whole number within the meter’s five digits, and reads anything else as 0 or the bound', () => {
+    expect(stored(420).settings.gameBestScore).toBe(420)
+    expect(stored(99999).settings.gameBestScore).toBe(99999)
+    expect(stored(12.7).settings.gameBestScore).toBe(12)
+    expect(stored(123456).settings.gameBestScore).toBe(99999)
+    for (const bad of ['420', -3, Number.NaN, null, true, { best: 3 }]) {
+      expect(stored(bad).settings.gameBestScore, JSON.stringify(bad)).toBe(0)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The Delete browsing data dialog's remembered range (services pass 13, seed #20): Chrome's
+// `browser.clear_data.time_period`, the last hour by default (`pref_names.cc:23–25`) – a
+// device-local setting, sanitised at load like the rest.
+// ---------------------------------------------------------------------------
+
+describe('Settings.clearBrowsingDataRange (seed #20)', () => {
+  const stored = (value: unknown): BrowserState => {
+    const settings = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>
+    if (value === undefined) delete settings.clearBrowsingDataRange
+    else settings.clearBrowsingDataRange = value
+    return state(
+      fakeIo(legacyProfile(6, { settings: settings as unknown as Persisted['settings'] }))
+    )
+  }
+
+  it('ships as the last hour, and a profile from before the key opens the dialog on it', () => {
+    expect(DEFAULT_SETTINGS.clearBrowsingDataRange).toBe('hour')
+    expect(stored(undefined).settings.clearBrowsingDataRange).toBe('hour')
+    expect(state(fakeIo()).settings.clearBrowsingDataRange).toBe('hour')
+  })
+
+  it('keeps every range the pickers offer, and reads anything else as the last hour', () => {
+    for (const range of ['15min', 'hour', 'day', 'week', 'month', 'all'] as const) {
+      expect(stored(range).settings.clearBrowsingDataRange).toBe(range)
+    }
+    for (const bad of ['year', 'Hour', '', 1, null, true, { range: 'all' }, ['all']]) {
+      expect(stored(bad).settings.clearBrowsingDataRange, JSON.stringify(bad)).toBe('hour')
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Settings › Performance on a fresh profile (W8-2; pr-584 §D (2)(3)): Chrome's defaults for a
+// profile written for the first time, an existing profile keeping what it had.
+// ---------------------------------------------------------------------------
+
+describe('Performance defaults – a fresh desktop profile vs an existing one (W8-2)', () => {
+  const on = (platform: Platform, disk: string | null = null): BrowserState => {
+    const s = new BrowserState(fakeIo(disk), platform, {} as HostCapabilities, '0.0')
+    s.load()
+    return s
+  }
+  /** A v6 profile of the shipped defaults with no Energy Saver key: every real pre-W8-2 profile. */
+  const existing = (): string => {
+    const settings = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>
+    delete settings.energySaver
+    return legacyProfile(6, { settings: settings as unknown as Persisted['settings'] })
+  }
+
+  it('gives a fresh desktop profile Chrome’s defaults – Memory Saver at Balanced (4 hours), Energy Saver at the 20% threshold where the host reads a battery level, on-battery on Windows, where it cannot yet', () => {
+    for (const platform of ['linux', 'darwin'] as const) {
+      expect(on(platform).settings.unloadTimeoutMinutes, platform).toBe(240)
+      expect(on(platform).settings.energySaver, platform).toBe('low-battery')
+    }
+    expect(on('win32').settings.unloadTimeoutMinutes).toBe(240)
+    expect(on('win32').settings.energySaver).toBe('on-battery')
+    // The phone's fresh profile is not a desktop's: Edge's 20 minutes, beside the 240 above.
+    expect(on('android').settings.unloadTimeoutMinutes).toBe(20)
+    // The defaults are in the profile's first write, so a later launch reads them as stored.
+    const io = fakeIo()
+    const s = new BrowserState(io, 'linux', {} as HostCapabilities, '0.0')
+    s.load()
+    s.flushSync()
+    const written = JSON.parse(io.writes[io.writes.length - 1]) as Persisted
+    expect(written.settings.unloadTimeoutMinutes).toBe(240)
+    expect(written.settings.energySaver).toBe('low-battery')
+    // And the launch after reads a profile, not a fresh one: what it holds stands.
+    expect(on('win32', io.writes[io.writes.length - 1]).settings.energySaver).toBe('low-battery')
+  })
+
+  it('leaves the phone on the shipped defaults – 20 minutes on Edge’s ladder, and the mode it never reads', () => {
+    expect(on('android').settings.unloadTimeoutMinutes).toBe(DEFAULT_SETTINGS.unloadTimeoutMinutes)
+    expect(on('android').settings.energySaver).toBe(DEFAULT_SETTINGS.energySaver)
+    expect(DEFAULT_SETTINGS.unloadTimeoutMinutes).toBe(20)
+    expect(DEFAULT_SETTINGS.energySaver).toBe('on-battery')
+  })
+
+  it('keeps an existing profile’s timer and mode on every desktop host – the shipped 20 minutes stand (the page lists them as Custom – 20 minutes) and a profile from before the mode’s key reads on-battery', () => {
+    for (const platform of ['linux', 'darwin', 'win32'] as const) {
+      const s = on(platform, existing())
+      expect(s.settings.unloadTimeoutMinutes, platform).toBe(20)
+      expect(s.settings.energySaver, platform).toBe('on-battery')
+    }
+    // A stored choice stands too, whatever the host's fresh default.
+    const chosen = structuredClone(DEFAULT_SETTINGS)
+    chosen.unloadTimeoutMinutes = 120
+    chosen.energySaver = 'off'
+    const s = on('win32', legacyProfile(6, { settings: chosen }))
+    expect(s.settings.unloadTimeoutMinutes).toBe(120)
+    expect(s.settings.energySaver).toBe('off')
+  })
+})
+
+describe('the update dot’s seen record on load and on the write (TB-12)', () => {
+  /** A profile carrying `updateDot` as given (any shape – the sanitiser's input). */
+  const stored = (updateDot: unknown): BrowserState =>
+    state(fakeIo(legacyProfile(6, { updateDot } as Partial<Persisted>)))
+
+  it('starts empty on a fresh profile and one from before the record, reads a saved version back, and reads anything else as empty', () => {
+    expect(state(fakeIo()).updateDot).toEqual({ seenVersion: null })
+    expect(state(fakeIo(legacyProfile(6))).updateDot).toEqual({ seenVersion: null })
+    expect(stored({ seenVersion: '2.0.0' }).updateDot).toEqual({ seenVersion: '2.0.0' })
+    for (const bad of [null, '2.0.0', { seenVersion: 2 }, { seenVersion: '' }, []]) {
+      expect(stored(bad).updateDot, JSON.stringify(bad)).toEqual({ seenVersion: null })
+    }
+  })
+
+  it('writes the record with the profile, outside the synced settings, and reads it back on a relaunch', async () => {
+    const io = fakeIo(legacyProfile(6))
+    const s = state(io)
+    s.updateDot = { seenVersion: '2.0.0' }
+    s.commit()
+    await s.flush()
+    const written = JSON.parse(io.writes.at(-1) ?? '{}') as Persisted
+    expect(written.updateDot).toEqual({ seenVersion: '2.0.0' })
+    // Device-local: not a setting, so never in the sync record.
+    expect('updateDot' in written.settings).toBe(false)
+    expect(state(fakeIo(io.writes.at(-1) ?? '{}')).updateDot).toEqual({ seenVersion: '2.0.0' })
+  })
+})

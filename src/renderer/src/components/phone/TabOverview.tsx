@@ -1,0 +1,3075 @@
+import type { CSSProperties, JSX, ReactNode, RefObject } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Group, Share2, Star, VenetianMask, X } from 'lucide-react'
+import type {
+  ArchivedTabSummary,
+  Folder,
+  PhoneBarPosition,
+  Rect,
+  SyncRemoteTab,
+  Tab,
+  UIState
+} from '@shared/types'
+import { PRIVATE_CONTAINER_ID } from '@shared/types'
+import { TOUCH_GROUP_DEFAULT_NAME } from '@shared/groupNames'
+import {
+  otherOverviewView,
+  OVERVIEW_LABELS,
+  type OverviewChromeCommand
+} from '@shared/overviewMenu'
+import { defaultBookmarkFolderId } from '@shared/bookmarks'
+import { isEmptyTabUrl } from '@shared/url'
+import { useFadeEdges } from '@renderer/hooks/useFadeEdges'
+import { announce } from '@renderer/lib/announce'
+import { cmd, run } from '@renderer/lib/api'
+import { useBackSurface } from '@renderer/lib/back'
+import { closeWithUndo } from '@renderer/lib/closeUndo'
+import { chromeUnderPages } from '@renderer/lib/cover'
+import { useViewport } from '@renderer/lib/formFactor'
+import type { DropOutcome } from '@renderer/lib/gestures/dropTarget'
+import {
+  closeOverview,
+  overviewInteractive,
+  setTabletOverviewTravel,
+  stageStore,
+  type OverviewState
+} from '@renderer/lib/gestures/stage'
+import { hintBubbleStore, hintBubbleTabId } from '@renderer/lib/iph'
+import { groupRows, isPrivateGroup, type GroupRow } from '@renderer/lib/groupRows'
+import { DEFAULT_FOLDER_ICON, groupsOf, nextGroupColor } from '@renderer/lib/groups'
+import { historyAdapter, type ClosedEntrySummary } from '@renderer/lib/historyAdapter'
+import { inactiveTabsAdapter } from '@renderer/lib/inactiveTabs'
+import { overviewColumns, tabletCardAspect } from '@renderer/lib/layout'
+import { FRAME_SHADOW, cardShadow, lerpShadow, shadowCss } from '@renderer/lib/motion/elevation'
+import { REDUCED_FADE_MS } from '@renderer/lib/motion/flip'
+import { ZEN_EASE } from '@renderer/lib/motion/tokens'
+import { planSpaceSwitch, SPACE_SLIDE_ID, switchDirection } from '@renderer/lib/motion/spaceSwitch'
+import {
+  reducedMotion,
+  SPRING_GENTLE,
+  SPRING_SNAPPY,
+  SpringAnimation
+} from '@renderer/lib/motion/spring'
+import { onOverviewCommand } from '@renderer/lib/overviewCommands'
+import { spaceSwatch } from '@renderer/lib/overviewHeader'
+import { tabCardLabel } from '@renderer/lib/overviewLabels'
+import { OVERVIEW_MENU_OFF, publishOverviewMenu } from '@renderer/lib/overviewMenuRequest'
+import {
+  filterTabs,
+  normalizeQuery,
+  searchResultAnnouncement,
+  tabMatchesQuery
+} from '@renderer/lib/overviewSearch'
+import {
+  NO_SELECTION,
+  allSelected,
+  bookmarkFolderTitle,
+  bookmarkedMessage,
+  deselectAll,
+  endSelection,
+  groupableTabs,
+  isSelected,
+  pageTabs,
+  pruneSelection,
+  selectAll,
+  selectedTabs,
+  selectionTitle,
+  shareTabsPayload,
+  startSelection,
+  toggleSelected,
+  type OverviewSelection
+} from '@renderer/lib/overviewSelection'
+import {
+  SEARCH_OFF,
+  noteOverviewScroll,
+  overviewUiStore,
+  setOverviewSearch,
+  setOverviewSearchBack,
+  setOverviewSelection,
+  setOverviewSheet,
+  type OverviewSheet as Sheet
+} from '@renderer/lib/overviewUi'
+import {
+  OverviewWindowContext,
+  cancelFill,
+  claimOverviewWindow,
+  fillCards,
+  fillEveryCard,
+  guessWindow,
+  newOverviewWindowToken,
+  overviewRowPitch,
+  overviewWindowStore,
+  readWindow,
+  releaseOverviewWindow,
+  scheduleFill,
+  windowOf,
+  type CellRect,
+  type GridItem
+} from '@renderer/lib/overviewWindow'
+import { coveredNow, pageCovered, pageViewStore } from '@renderer/lib/pageView'
+import { PRIVATE_TAB_PLACEHOLDER, privateLockStore } from '@renderer/lib/privateLock'
+import {
+  isPrivateTab,
+  overviewPane,
+  pickOverviewPane,
+  privateTabsOf,
+  privateTabsStore,
+  tabsOnPane,
+  type OverviewPane
+} from '@renderer/lib/privateTabs'
+import {
+  activeSpace,
+  activeTab,
+  essentialsFor,
+  isDarkScheme,
+  pinnedOf,
+  regularOf,
+  tabTitle
+} from '@renderer/lib/selectors'
+import { browserStore, openOverlay, pushToast, uiStore } from '@renderer/lib/ui'
+import { GroupGlyph } from '../GroupGlyph'
+import { Favicon } from '../sidebar/Favicon'
+import { CloseAllSheet } from './CloseAllSheet'
+import { Departures } from './Departures'
+import {
+  clearDepartures,
+  depart,
+  departed,
+  departStore,
+  departureGone,
+  isHeld,
+  rectOf,
+  releaseDepartures,
+  type Departure,
+  type GroupDeparture
+} from './departureStore'
+import { setQuickDeleteWipe, type QuickDeleteWipe } from './quickDelete'
+import { groupActions } from './groupActions'
+import { GroupCard } from './GroupCard'
+import { DeleteGroupSheet, GroupColorPalette, GroupRowSheet } from './GroupSheets'
+import { InactiveTabsSheet } from './InactiveTabsSheet'
+import { CARD_ASPECT, CARD_RADIUS, CardBody, NewTabFace, OverviewCard } from './OverviewCard'
+import { cardHeaderHeight } from './overviewCardHeader'
+import { OverviewTitle } from './OverviewHeader'
+import { OverviewSearchField, OverviewSearchReach } from './OverviewSearch'
+import { OverviewSheet, type SheetAction } from './OverviewSheet'
+import { PaneSlot, PaneStills, type PaneStill } from './PaneSlot'
+import { SavedGroupCard } from './SavedGroupCard'
+import { SpacesSheet } from './SpacesSheet'
+import { PhoneEmptyNote } from './PhoneList'
+import { noteSheetOpener } from './phonePanel'
+import { PrivateLockCover } from './PrivateLockCover'
+import { RecentlyClosedSheet } from './RecentlyClosedSheet'
+import { placeholderPx } from './tabPlaceholder'
+import { TabPreview } from './TabPreview'
+import { cancelLift, liftStore, retargetLift, settleLift, type LiftHover } from './useCardLift'
+import { overviewHintCandidates, useOverviewGroupsHint } from './useOverviewGroupsHint'
+import { useFlip } from './useFlip'
+import { useOverviewHandle } from './usePillGestures'
+import { useSpaceSwipe, type SpaceSwipeHandoff } from './useSpaceSwipe'
+import { useSearchReach } from './useSearchReach'
+
+/** Cell key of the New Tab card: the last cell of the grid, in the glide with the rest. */
+export const NEW_TAB_CELL = 'new-tab'
+/** How long a dropped card waits for the browser to confirm its new place before it lands anyway. */
+const DROP_TIMEOUT_MS = 900
+/** How long a restored tab is waited for before the overview leaves on whatever tab is active. */
+const RESTORE_TIMEOUT_MS = 800
+/**
+ * How long a tab opened for another device's page is waited for before the overview leaves on
+ * whatever tab is active (the tab search's rows from the other devices, TAB-21 / TAB-02).
+ */
+const OPEN_TIMEOUT_MS = 800
+/** Travel (px) of the entrance spring of a card the search lets back in: the exit's, run backwards. */
+const ENTER_TRAVEL = 120
+/** How far such a card grows on its way in (the exit's shrink). */
+const ENTER_SCALE = 0.1
+/** How long the search waits after a keystroke before its count is announced. */
+const SEARCH_ANNOUNCE_MS = 500
+/**
+ * How long the grid waits for a reopened group's card to show – a saved group's pages coming
+ * back as tabs (`folder.open`, the saved card's tap) – before the "show the group" request is
+ * dropped.
+ */
+const REVEAL_TIMEOUT_MS = 800
+/**
+ * The middle of a card, as fractions of its width and height inset from each edge, is where a
+ * dragged card merges into it; the bands outside put the dragged card before or after it.
+ */
+const MERGE_INSET_X = 0.26
+const MERGE_INSET_Y = 0.2
+
+interface Props {
+  state: UIState
+  /**
+   * The overview's state. Its `progress` is read for the frames the store does not drive (a
+   * render outside the stage: the tests, a preview); with the stage's overview up, the store's
+   * progress is the morph's, written per frame off React (see the morph effect).
+   */
+  overview: OverviewState
+  /** Where the page normally is, in window coordinates. */
+  area: Rect
+  /** Edge the address bar is docked at: the overview fills the rest of the screen. */
+  edge: PhoneBarPosition
+  /**
+   * The tablet shell's mount (TABLET-14, MOT-04; v2 §9.36): the same grid at the width's
+   * columns, with the tab search as a field in the header row in place of the phone's magnifier
+   * (a tablet has the room), the cards' pictures at the frame's aspect, and an entrance that
+   * brings the whole layer DOWN from the toolbar's edge over the page on the spring – the
+   * overview is pulled down from the toolbar, and a surface arrives from where it lives (§11) –
+   * in place of the phone's morph of the page into its card. The phone's rendering is untouched
+   * by it.
+   */
+  tablet?: boolean
+}
+
+/** A group the saved card asked the grid to show, reopened: scrolled to once its card is there. */
+interface Reveal {
+  folderId: string
+  /** When to give up waiting for the card (`performance.now()`). */
+  deadline: number
+}
+/** The grid's catch of `folderId`'s card, asked now: it gives up after `REVEAL_TIMEOUT_MS`. */
+const revealOf = (folderId: string): Reveal => ({
+  folderId,
+  deadline: performance.now() + REVEAL_TIMEOUT_MS
+})
+
+interface PendingDrop {
+  /** True once the browser state shows the drop – then the card's new slot can be measured. */
+  landed: (state: UIState) => boolean
+  /** When to stop waiting for the browser (`performance.now()`), and whether that has come. */
+  deadline: number
+  expired: boolean
+}
+
+/** A group as the grid last showed it holding cards. */
+interface HeldGroup {
+  folder: Folder
+  count: number
+}
+
+interface ShownGroups {
+  /** The view the grid showed: its groups are the regular view's, and the private view has none. */
+  pane: OverviewPane
+  /**
+   * The Space the grid showed: its groups are that Space's. Another Space's grid (a switch from
+   * the Spaces sheet or the swipe, MOT-05) is a fresh one in the same component – the last
+   * Space's groups did not lose their cards, they are simply not there.
+   */
+  spaceId: string
+  /** The groups holding cards after the last render, by folder id. */
+  held: ReadonlyMap<string, HeldGroup>
+  /**
+   * Groups that have lost their last card while on screen and are shrinking to nothing
+   * (v2 §11.4), at the span and count they had, until their spring has settled.
+   */
+  lingering: ReadonlyMap<string, HeldGroup>
+}
+
+/**
+ * The tab overview of the phone layout (`docs/tab-overview-cleanup-spec.md`): the active
+ * space's tabs as a grid of thumbnail cards – Essentials on top, pinned tabs first, its groups
+ * INLINE as cards of their own (§2: folded, one card with a mosaic in the group's place; a tap
+ * unfolds it in place; the SAVED groups, whose tabs have closed but whose pages the group kept,
+ * as cards with the saved ring at the grid's end before New Tab) – under ONE header row (§1):
+ * the space's dot and name with the count, "Default · 3 tabs", which IS the space switcher
+ * (`OverviewTitle`: a tap opens the Spaces sheet; a horizontal drag across the grid's background
+ * moves between the spaces, GN-19, `useSpaceSwipe`), and nothing trailing it. The overview draws
+ * no ⋯ of its own: while it stands the BAR's ⋯ opens the overview's menu (§4, the core's
+ * `overviewMenuTemplate`), whose picks come back here as `overview.command`s. Its entrance is
+ * driven by `overview.progress`: the grid scales and fades in while the page shrinks into the
+ * slot of its own card (and grows back out of the card that is picked when leaving), so a
+ * half-finished drag always shows exactly where things are going. Cards can be held and dragged
+ * onto each other to make groups (see `useCardLift`).
+ *
+ * The overview has two VIEWS (§3, `OverviewView`; TAB-02, TAB-03): the space's tabs, and – on a
+ * host with private tabs – the private ones: the private session is one across the spaces, so
+ * that view lists every private tab, as loose cards on the private theme's backdrop (the window
+ * surfaces blend to it while the view is up, §9.29), under the mask and "Private · N tabs" (no
+ * control: the session has no space to switch), with §9.17's sentence when there are none. A
+ * private card never shows in the regular view, nor a regular one in the private view
+ * (`tabsOnPane`); the overview opens on the view of the tab in view, and the menu's "Private
+ * Tabs (N)" / "Tabs (N)" row switches between them, a 120 ms cross-fade (§6).
+ *
+ * The menu's Search Tabs opens the TAB SEARCH (TAB-21, `lib/overviewSearch.ts`): a field pinned
+ * under the header that narrows the view's cards to the ones whose title or address holds what
+ * is typed – the cards the query drops depart in place as closing cards do while the rest glide
+ * into their slots (§11.4), and come back as the exit run backwards when the query lets them.
+ * In the regular view the search reaches past the cards (the #316 gate): this device's recently
+ * closed tabs and the other devices' open ones – History's two groups (TAB-02, history-07) – list
+ * as rows under headings beneath the matching cards (`OverviewSearchReach`), as Chrome's tab
+ * search lists its recently closed matches; a row brings its tab to the front and the overview
+ * leaves on it.
+ */
+export function TabOverview({ state, overview, area, edge, tablet = false }: Props): JSX.Element {
+  const { progress, phase, heroTabId } = overview
+  const space = activeSpace(state)
+  const active = activeTab(state)
+  const picked = privateTabsStore.use((s) => s.pane)
+  const hasPrivate = state.capabilities.privateTabs
+  // A host without private tabs has no private view to follow a private tab onto.
+  const followed = overviewPane(state, picked)
+  const pane: OverviewPane = followed === 'private' && !hasPrivate ? 'tabs' : followed
+  const privatePane = pane === 'private'
+  // The private tabs are locked (INC-05): the private view is under the lock cover, its cards
+  // blurred beneath it; the regular view and the header are not.
+  const locked = privateLockStore.use((s) => s.locked)
+  // Taps work as soon as the overview is heading open; layout tracking waits for it to rest.
+  const interactive = overviewInteractive(overview)
+  // The tab search (TAB-21): open from the menu's Search Tabs row (§4), off with the overview –
+  // the field is reset in the commit that takes it off, as the select-tabs mode's scope is. The
+  // state is `overviewUiStore`'s, not this component's – with the picks, the sheet and the
+  // scroll – so that a window resized from the phone layout into the tablet's (or back) swaps
+  // shells with the overview, the field and the query where they were (TABLET-08); the stage
+  // resets the store when the overview goes, so the field never outlives the grid it narrowed.
+  // The field is the same on the tablet (§7: the tablet's header field moved into the ⋯ row).
+  const search = overviewUiStore.use((s) => s.search)
+  const setSearch = setOverviewSearch
+  const searchOpen = search.open && interactive
+  const query = searchOpen ? normalizeQuery(search.query) : ''
+  const searching = query.length > 0
+  // The private view is a session, not a workspace: its cards are neither pinned nor grouped
+  // here – a drag rearranges them and nothing more (`hoverAt`, `dropCard`), as Chrome's incognito
+  // grid lets it; the regular view keeps its structure. The `all` lists are the view's; the
+  // grid's are the ones the search leaves (the same lists with no query).
+  const essentialsAll = privatePane ? [] : tabsOnPane(essentialsFor(state, space), 'tabs')
+  const pinnedAll = privatePane ? [] : tabsOnPane(pinnedOf(state, space), 'tabs')
+  const regularAll = privatePane
+    ? privateTabsOf(state)
+    : tabsOnPane(regularOf(state, space), 'tabs')
+  const essentials = searching ? filterTabs(essentialsAll, query) : essentialsAll
+  const pinned = searching ? filterTabs(pinnedAll, query) : pinnedAll
+  const regular = searching ? filterTabs(regularAll, query) : regularAll
+  // The space's groups, less the PRIVATE ones (`isPrivateGroup`: private tabs alone live in
+  // them, nothing saved) – the private view's, whose existence and name no regular surface
+  // shows: not the group sheets, not a saved card, not a count. `liveOf` names a group's live
+  // members, private ones included, the way the space holds them.
+  const liveOf = (folderId: string): Tab[] =>
+    regularOf(state, space).filter((t) => t.folderId === folderId)
+  const groups = privatePane
+    ? []
+    : groupsOf(state, space.id).filter((f) => !isPrivateGroup(f, liveOf(f.id)))
+  const count = essentialsAll.length + pinnedAll.length + regularAll.length
+  const found = essentials.length + pinned.length + regular.length
+  // The regular view with nothing on it (TAB-34): §9.17's sentence in place of the grid
+  // (`TabsEmpty`), as the private view at none is; not while a query stands, whose "No tabs
+  // found" and reach are the grid's own.
+  const tabsEmpty = pane === 'tabs' && count === 0 && !searching
+  // Past the cards, in the regular view: the recently closed tabs and the other devices' tabs
+  // the query finds, as rows under the grid; nothing in the private view (a private tab is never
+  // filed, and the other devices' pages are not private ones).
+  const reach = useSearchReach(state, query, searching && !privatePane)
+  const foundAll = found + reach.closed.length + reach.remote.length
+
+  // The last private tab closing ends the session, and the overview returns to the regular view
+  // whether the private view was picked or followed (Chrome's switcher does the same): the
+  // pick is released, so the next private tab opened does not find the private view picked
+  // already. (`overviewPane` reads a pick of the private view with none open as the regular
+  // view at once; there is no empty private view, §4.)
+  const privateCount = hasPrivate ? privateTabsOf(state).length : 0
+  const privateCountBefore = useRef(privateCount)
+  useEffect(() => {
+    const before = privateCountBefore.current
+    privateCountBefore.current = privateCount
+    if (before > 0 && privateCount === 0 && picked === 'private') pickOverviewPane('tabs')
+  }, [privateCount, picked])
+
+  // A view switch is a cross-fade (v2 §11.4; §6: the private view in and out, no slide): the
+  // view that leaves is kept in view as a still fading out over its slot while the next fades
+  // in – `PaneSlot` takes the still as the view goes, `PaneStills` draws it until its 120 ms
+  // are up. A Space switch is the grid's slot's own (`enterSpace`), the still the same.
+  const [stills, setStills] = useState<PaneStill[]>([])
+  const leavePane = useCallback((still: PaneStill) => setStills((s) => [...s, still]), [])
+  const stillDone = useCallback(
+    (key: number) => setStills((s) => s.filter((still) => still.key !== key)),
+    []
+  )
+
+  // While a card is dragged its stand-in sits in the slot under the finger, not where the tab
+  // is: the grid shows the order the drop would make, and glides into it as the slot moves.
+  const liftTabId = liftStore.use((s) => s.tabId)
+  const liftSlot = liftStore.use((s) => s.slot)
+  const dragged = liftSlot && liftTabId ? (state.tabs[liftTabId] ?? null) : null
+  const shown = (list: Tab[], folderId: string | null): Tab[] => {
+    if (!dragged || !liftSlot) return list
+    const without = list.filter((t) => t.id !== dragged.id)
+    if (liftSlot.folderId !== folderId) return without
+    const i = Math.min(liftSlot.index, without.length)
+    return [...without.slice(0, i), dragged, ...without.slice(i)]
+  }
+  // A group's members on this pane: the grid's (`membersOf`: the ones a query leaves, what its
+  // card shows and departs with) and the pane's whole (`liveMembersOf`: what "Close Group"
+  // closes, what a whole-group close reads, the count on the sheets' rows – a query narrows what
+  // is shown, not what a group is).
+  const membersOf = (folderId: string): Tab[] => regular.filter((t) => t.folderId === folderId)
+  const liveMembersOf = (folderId: string): Tab[] =>
+    regularAll.filter((t) => t.folderId === folderId)
+  const loose = shown(
+    privatePane ? regular : regular.filter((t) => !t.folderId || !state.folders[t.folderId]),
+    null
+  )
+  const members = new Map(groups.map((f) => [f.id, shown(membersOf(f.id), f.id)] as const))
+  const hero = heroTabId ? (state.tabs[heroTabId] ?? null) : null
+  // The hero of the morph from a locked private tab reads the placeholder, as its card does
+  // (§9.19): the real title never rises into view under the cover.
+  const lifting = privateLockStore.use((s) => s.lifting)
+  const heroMasked = hero !== null && (locked || lifting) && isPrivateTab(hero)
+  // The progress as the tree reads it – whether the morph is short of open, which is what the
+  // hero's mount and its card's hiding turn on; the frames between are the morph effect's.
+  const p = clampProgress(progress)
+  const settled = phase === 'open'
+  const isDark = isDarkScheme(state)
+  // A phone on its side gets a row of four smaller cards, as Chrome's grid does.
+  const viewportWidth = useViewport().width
+  const columns = overviewColumns(viewportWidth)
+  // On the tablet the cards take the frame's aspect (§9.36): the ratio is set on the layer's box
+  // for its cells to read (`CARD_ASPECT` – a card, the New Tab card, a dissolving group's
+  // members); the phone sets nothing and its cells draw 3 / 4. The column is the grid's – the
+  // box spans the window less its horizontal insets (the layer covers the sidebar) – and the
+  // picture's ratio the page frame's, which is `area`, beside the sidebar.
+  const sideInsets = uiStore.use((s) => s.insets.left + s.insets.right)
+  const cardAspect = tablet
+    ? tabletCardAspect(area, viewportWidth - sideInsets, columns, cardHeaderHeight())
+    : 3 / 4
+  const cardAspectStyle = tablet
+    ? ({ '--zen-overview-card-aspect': String(cardAspect) } as CSSProperties)
+    : undefined
+
+  const boxRef = useRef<HTMLDivElement>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const heroRef = useRef<HTMLDivElement>(null)
+  const heroHeaderRef = useRef<HTMLDivElement>(null)
+  const fadeGrid = useFadeEdges<HTMLDivElement>({ axis: 'y' })
+  /**
+   * The grid's ref: the scroller, and its edge fades. One function for the grid's life – a ref
+   * callback made anew each render is called again each render (the last one's cleanup first),
+   * and with it `attachFadeEdges` measured the scroller again: a forced layout on every render
+   * of the overview, at every commit of a Space switch, a page's load or an idle fill's step
+   * (PERF-5, ruling 5: `useFadeEdges.ts`'s `update` was the switch scenes' largest self time).
+   * The fades attach once the commit is over: `attachFadeEdges` measures the scroller as it
+   * attaches, and in the commit that swaps the grids at a Space switch that read was a forced
+   * layout in the middle of the commit, with the commit's other writes still to come. After the
+   * commit the same read is done once, before anything is drawn – no edge is seen unfaded.
+   */
+  const gridRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      scrollRef.current = el
+      if (!el) return
+      let detach: (() => void) | undefined
+      let gone = false
+      queueMicrotask(() => {
+        if (!gone) detach = fadeGrid(el) ?? undefined
+      })
+      return () => {
+        gone = true
+        detach?.()
+      }
+    },
+    [fadeGrid]
+  )
+  // Where the hero's own card sits (measured below): a ref, not state – the morph's writer reads
+  // it as it writes, and a measurement is not a render of the grid (each phase change, each
+  // scroll of the grid re-measures; as state each one rendered every card again, PERF-5).
+  const heroCell = useRef<Rect | null>(null)
+  // The drag-to-group teaching's bubble (TB-19, `useOverviewGroupsHint`): in the regular view
+  // of the phone's overview, on the loose page card in view nearest the active card – the cell
+  // before it in grid order, else the one after; the active card itself only when no other page
+  // card is in view; never the new tab page's card, the one the tip's "Try it now" left (the
+  // design lead's fold on #701). The cards go in grid order, the hook chooses among them as the
+  // bubble goes up; the private view groups nothing, the tablet has no tips card. While it
+  // stands, its card pulses and carries it as its description (`OverviewCard`'s `hinted`).
+  const hintCandidates =
+    tablet || pane !== 'tabs'
+      ? []
+      : overviewHintCandidates(
+          loose.map((t) => ({ id: t.id, page: !isEmptyTabUrl(t.url) })),
+          active?.id ?? null
+        )
+  useOverviewGroupsHint({ state, overview, candidates: hintCandidates, grid: scrollRef })
+  const hintedTabId = hintBubbleStore.use((s) => (s.leaving ? null : hintBubbleTabId(s.bubble)))
+  const sheet = overviewUiStore.use((s) => s.sheet)
+  const setSheet = setOverviewSheet
+  /**
+   * A sheet has left: forget it – unless the row it was dismissed for has put the next sheet up
+   * already (the menu's "Close All Tabs" opens the question as the menu goes).
+   */
+  const leaveSheet = (kind: Sheet['kind']): void =>
+    setSheet((current) => (current?.kind === kind ? null : current))
+  // The select-tabs mode (TAB-08, `lib/overviewSelection.ts`): on from the menu's Select Tabs
+  // or a card's hold sheet, off by Done, back, Escape or an action. It belongs to the grid it was
+  // entered on – this view of this space, with the overview open – and is off the moment that
+  // grid is another (a view or space switch, the overview leaving): the mode is kept with the
+  // scope it was entered in and read as off, and reset, under any other, in the commit that
+  // brings the other grid. The picks are pruned against the cards on show the same way.
+  const scope = interactive ? `${pane}|${space.id}` : null
+  // Read resolved against this grid's scope: a kept mode under another scope reads as `NO_SELECTION`,
+  // the constant the reset below writes – so the reset re-renders nothing (the phase change that
+  // makes the overview interactive renders each card once, PERF-5; the morph test pins it).
+  const selection = overviewUiStore.use((s) =>
+    s.kept.scope === scope ? s.kept.selection : NO_SELECTION
+  )
+  useEffect(() => {
+    if (overviewUiStore.get().kept.scope !== scope) {
+      setOverviewSelection({ scope, selection: NO_SELECTION })
+    }
+  }, [scope])
+  const selecting = selection.on
+  const setSelection = useCallback(
+    (next: OverviewSelection | ((current: OverviewSelection) => OverviewSelection)): void =>
+      setOverviewSelection((k) => ({
+        scope,
+        selection:
+          typeof next === 'function' ? next(k.scope === scope ? k.selection : NO_SELECTION) : next
+      })),
+    [scope]
+  )
+  const exitSelection = useCallback(() => setSelection(endSelection()), [setSelection])
+  useBackSurface(selecting ? { name: 'overview-selection', onCommit: exitSelection } : null)
+  const handle = useOverviewHandle({ edge })
+  // A horizontal drag over the grid's background moves to the neighbouring SPACE (GN-19; §1,
+  // §6), the Space's slot riding the finger and the header following; not while tabs are being
+  // selected (the grid is the selection's), not in the private view (the session is one across
+  // the spaces) and not before the overview has settled. A committed swipe hands the incoming
+  // grid where the finger left it (`swipeHandoff`, read by `enterSpace` in the commit that
+  // brings the next Space).
+  const swipeHandoff = useRef<SpaceSwipeHandoff | null>(null)
+  const swipe = useSpaceSwipe(rootRef, {
+    spaceId: space.id,
+    spaceIds: state.spaces.map((s) => s.id),
+    enabled: interactive && !selecting && pane === 'tabs' && state.spaces.length > 1,
+    onPick: (spaceId, handoff) => {
+      swipeHandoff.current = handoff
+      run('space.activate', { spaceId })
+    }
+  })
+  // The grid's slot is the SPACE's in the regular view (MOT-05, v2 §11.4 / §11.6): a Space
+  // switch brings the next Space's grid up in a slot of its own (`PaneSlot` keyed by `gridKey`,
+  // inside the view's) – the header above stays, its title following – while a still of the
+  // grid that left fades over 120 ms (`PaneStills`, the view switch's mechanism) and the new
+  // grid comes in from the side the new Space stands on in the spaces' order: after a SWIPE it
+  // springs the rest of the way on `SPRING_SNAPPY` from the finger's speed (§6; `enterSpace`),
+  // after a tap – the Spaces sheet's row, the menu's Switch Space – it slides in over 250 ms
+  // (`planSpaceSwitch`: later, from the trailing edge; earlier, from the leading), the window's
+  // theme blending meanwhile (`useTheme`). Under reduced motion nothing travels (§11.3): the
+  // new grid fades in place over 120 ms; the blend stays, a colour blend
+  // being a fade and not travel (§11.6 as amended). The private view's grid is one slot for the
+  // view's life (its key the view's), so it never slides.
+  const gridKey = pane === 'tabs' ? space.id : `#${pane}`
+  // The empty note's fade is keyed to the REPLACEMENT, not to its mount (v2 §11.1, the gate's
+  // ruling on #562): it runs when the note takes the grid's place in the slot it stands in – the
+  // last card gone, the New Tab card's exit `with` it – and not when the note comes up with its
+  // view (the views' cross-fade is the motion) or with its Space (the slot's slide is), or with
+  // the overview itself: one object, one move. `gridDrawn` is the slot whose grid the last commit
+  // drew, written after each commit; the note reads it at its own mount (`TabsEmpty`, whose
+  // layout effect runs before this one, so it still reads the last commit's word) and fades
+  // only if it is its slot's.
+  const gridDrawn = useRef<string | null>(null)
+  useLayoutEffect(() => {
+    gridDrawn.current = pane === 'tabs' && !tabsEmpty ? gridKey : null
+  })
+  // The slot in its slide, for as long as it slides – the FLIP tracker measures the cells with
+  // its transform held off (`useFlip`'s `frame`), so nothing reads the slide as a move.
+  const spaceSlotRef = useRef<HTMLDivElement | null>(null)
+  const slideRef = useRef<Animation | null>(null)
+  const springRef = useRef<SpringAnimation | null>(null)
+  const endSlide = (): void => {
+    const slide = slideRef.current
+    const spring = springRef.current
+    const slot = spaceSlotRef.current
+    slideRef.current = null
+    springRef.current = null
+    spaceSlotRef.current = null
+    slide?.finish()
+    if (spring) {
+      spring.stop()
+      if (slot) slot.style.transform = ''
+    }
+  }
+  /**
+   * The grid of the Space a SWIPE picked comes in from where the finger left (§6; GN-19): the
+   * leaving grid's still stands `progress` of a width along, so this one starts the remaining
+   * `1 - progress` out on the same side and springs home on `SPRING_SNAPPY` at the finger's
+   * speed – one transform per frame, the FLIP tracker holding the slot's transform off
+   * (`spaceSlotRef`) as it does for the slide. Under reduced motion it stands home at once and
+   * fades in as the slot's own 120 ms does (§11.3).
+   */
+  const springIn = (el: HTMLDivElement, handoff: SpaceSwipeHandoff): void => {
+    const sign = handoff.direction === 'left' ? 1 : -1
+    const from = sign * (1 - handoff.progress) * handoff.width
+    if (reducedMotion() || from === 0) return
+    // The finger's progress per second is the slot's px per second along its travel.
+    const velocity = -sign * handoff.velocity * handoff.width
+    el.style.transform = `translate3d(${from}px, 0, 0)`
+    spaceSlotRef.current = el
+    const spring = new SpringAnimation(
+      SPRING_SNAPPY,
+      (x) => {
+        el.style.transform = `translate3d(${x}px, 0, 0)`
+      },
+      () => {
+        if (springRef.current === spring) endSlide()
+      }
+    )
+    springRef.current = spring
+    spring.start(from, velocity, 0)
+  }
+  const enterSpace = (el: HTMLDivElement, from: string): void => {
+    endSlide()
+    const handoff = swipeHandoff.current
+    swipeHandoff.current = null
+    if (handoff) {
+      springIn(el, handoff)
+      return
+    }
+    const direction = switchDirection(
+      state.spaces.map((s) => s.id),
+      from,
+      space.id
+    )
+    const plan = planSpaceSwitch(direction, {
+      reduced: reducedMotion(),
+      rtl: getComputedStyle(el).direction === 'rtl'
+    })
+    const slide = el.animate?.(plan.incoming.keyframes, {
+      duration: plan.incoming.duration,
+      easing: plan.incoming.easing,
+      id: SPACE_SLIDE_ID
+    })
+    if (!slide) return
+    // A cancelled animation rejects its `finished` promise, which nobody awaits.
+    slide.finished.catch(() => undefined)
+    slideRef.current = slide
+    spaceSlotRef.current = plan.slide === 0 ? null : el
+    slide.onfinish = () => {
+      if (slideRef.current === slide) endSlide()
+    }
+  }
+  // Every `data-cell` under the grid – page and blank-tab cards, group cards, the New Tab card –
+  // is one set on one spring; the same set answers where a card is for the morph and the exits.
+  // A new Space's grid is a new set (`epoch`): nothing glides from the grid that left.
+  const flip = useFlip(scrollRef, settled, { frame: spaceSlotRef, epoch: gridKey })
+  // The overview leaving mid-slide (a card picked, the back gesture) lands the grid at rest
+  // first: the morph's and the exits' measurements below read the cards where they will stand,
+  // not a frame of the slide. Declared before them, so it runs before them in the same commit.
+  useLayoutEffect(() => {
+    if (!settled) endSlide()
+  }, [settled])
+  /**
+   * A group's card leaving the grid visibly, with its cards, where it stands: the one exit
+   * `Departures` draws over it (a saved card holds no tab, and has nothing to leave). A group
+   * whose every card goes – closed, or dropped by the query (`filtered`, TAB-21), or the last the
+   * query left it closed – is a container with nothing to hold, and its frame departs as a card
+   * does (v2 §11.4's leave: this exit fades in place while the cells below glide up on one
+   * spring), never a cut and never the shrink of a group a card left for the grid (`lost`, below).
+   */
+  const groupExit = (folder: Folder, filtered = false): GroupDeparture | null => {
+    const rect = rectOf(flip.element(`group:${folder.id}`))
+    if (!rect) return null
+    const exit: GroupDeparture = {
+      key: `group:${folder.id}`,
+      kind: 'group',
+      folder,
+      tabs: membersOf(folder.id),
+      rect,
+      columns
+    }
+    return filtered ? { ...exit, filtered: true } : exit
+  }
+
+  // The tab search's field (TAB-21). The query is taken as it is typed: the cards it drops are
+  // departed first, from where they stand on the grid – the cards a collapsed group folds away,
+  // or an earlier query dropped, have no element and nothing to leave from – so their exits
+  // start in the commit that unmounts them, the survivors gliding on the same frame (§11.4).
+  // A group none of whose members the query keeps leaves whole: its card's one exit, the cards
+  // drawn inside it, in place of theirs (`groupExit`; the card itself leaves the grid on that
+  // same commit, see `lost` below). The New Tab card goes with them while a query stands
+  // (§9.34: it is not a match, and a tap on it would open a blank page under a query), and
+  // comes back as they do when it clears.
+  const searchInput = useRef<HTMLInputElement>(null)
+  const changeQuery = (next: string): void => {
+    const q = normalizeQuery(next)
+    const exits: Departure[] = []
+    const withGroup = new Set<string>()
+    for (const folder of groups) {
+      const live = liveMembersOf(folder.id)
+      if (live.length === 0 || live.some((tab) => tabMatchesQuery(tab, q))) continue
+      const exit = groupExit(folder, true)
+      if (!exit) continue
+      for (const tab of live) withGroup.add(tab.id)
+      exits.push(exit)
+    }
+    const leaving = [...pinnedAll, ...regularAll].filter(
+      (tab) => !withGroup.has(tab.id) && !tabMatchesQuery(tab, q)
+    )
+    for (const tab of leaving) {
+      const rect = rectOf(flip.element(tab.id))
+      if (rect) exits.push({ key: tab.id, kind: 'tab', tab, rect, filtered: true })
+    }
+    const newTab = q ? rectOf(flip.element(NEW_TAB_CELL)) : null
+    if (newTab)
+      exits.push({ key: NEW_TAB_CELL, kind: 'new-tab', isPrivate: privatePane, rect: newTab })
+    depart(exits)
+    setSearch({ open: true, query: next })
+  }
+  /** The menu's Search Tabs (§4): the field comes up pinned under the header, empty, focused. */
+  const openSearch = (): void => setSearch((s) => (s.open ? s : { open: true, query: '' }))
+  const closeSearch = (): void => setSearch(SEARCH_OFF)
+  /** The X on a query: the query goes, the field stays, with the keyboard. */
+  const clearQuery = (): void => {
+    changeQuery('')
+    searchInput.current?.focus()
+  }
+  /** Escape, back, or the X on an empty field: a query is cleared first; an empty field closes. */
+  const backSearch = (): void => {
+    if (normalizeQuery(search.query)) clearQuery()
+    else closeSearch()
+  }
+  // The Escape listener below is bound once per state it depends on, and reads the latest here.
+  const searchBack = useRef(backSearch)
+  useEffect(() => {
+    searchBack.current = backSearch
+  })
+  // The field is the user's ask (the menu's Search Tabs): it takes the focus, and the keyboard
+  // with it through the host's policy on `focusin`. Nothing else ever focuses it – the overview opens
+  // with the field closed – so the keyboard never comes up with the overview. Nor does it come
+  // up with a shell swap: a grid mounted with the search already up (the store's, from the
+  // shell before, TABLET-08) was not asked for the keyboard by anyone, so only the change from
+  // closed to open in this component's own life focuses the field.
+  const searchWasOpen = useRef(searchOpen)
+  useLayoutEffect(() => {
+    const was = searchWasOpen.current
+    searchWasOpen.current = searchOpen
+    if (searchOpen && !was) searchInput.current?.focus()
+  }, [searchOpen])
+  // The search's back surface is the store's, pushed as the search opens (`overviewUi.ts`: it
+  // keeps its place in the stack through a shell swap); the handler is this mount's.
+  useEffect(() => {
+    setOverviewSearchBack(() => searchBack.current())
+    return () => setOverviewSearchBack(null)
+  }, [])
+  // What a screen reader is told of the narrowing (TalkBack, the chrome's status region): the
+  // count once the typing has paused, not per letter.
+  useEffect(() => {
+    const text = searchResultAnnouncement(query, foundAll)
+    if (!text) return
+    const timer = setTimeout(() => announce(text), SEARCH_ANNOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [query, foundAll])
+
+  // Where the hero's own card sits, in layout space (the root's entrance scale divided out). A
+  // hero inside a collapsed group has no card to land on: it heads for the group's card instead
+  // and fades into it.
+  const heroGroup = hero?.folderId ? (state.folders[hero.folderId] ?? null) : null
+  const heroCellKey = heroGroup?.collapsed ? `group:${heroGroup.id}` : heroTabId
+  const heroFades = Boolean(heroGroup?.collapsed)
+  const cardsKey = [...essentials, ...pinned, ...regular].map((t) => t.id).join('|')
+  const measure = (): void => {
+    const root = rootRef.current
+    const cell = heroCellKey ? flip.element(heroCellKey) : null
+    if (!root || !cell) {
+      heroCell.current = null
+      return
+    }
+    const r = cell.getBoundingClientRect()
+    const rr = root.getBoundingClientRect()
+    const scale = root.offsetWidth ? rr.width / root.offsetWidth : 1
+    const cx = rr.left + rr.width / 2
+    const cy = rr.top + rr.height / 2
+    heroCell.current = {
+      x: cx + (r.left - cx) / scale,
+      y: cy + (r.top - cy) / scale,
+      width: r.width / scale,
+      height: r.height / scale
+    }
+  }
+  useLayoutEffect(() => {
+    const cell = heroCellKey ? flip.element(heroCellKey) : null
+    // The page morphs out of / into its card: make sure that card is fully on screen first. A
+    // hero inside an open group brings its group along – the group's card first, so the header
+    // is in view when the group fits (the strip's show-group chip opens the overview at the
+    // group, TAB-14), then its own card, which wins when the group is taller than the grid.
+    // `nearest` with the grid's `scrollPaddingBlock` moves the grid the least that shows the
+    // card whole, clear of the fades: a card already in view leaves the scroll alone. On the
+    // tablet nothing morphs, and the same rule is the grid's opening scroll (v2 §9.36): the
+    // active card's row whole under the header, set by the hero's slot – the rows above it cut
+    // at the top are the grid's earlier rows. The progress read live: the prop's is the one at
+    // the shape's last change, and a card arriving or leaving mid-drag re-runs this with the
+    // finger well past the start.
+    const morphing = (phase === 'dragging' && liveProgress(overview) < 0.05) || phase === 'settling'
+    if (cell && morphing) {
+      if (heroGroup && !heroGroup.collapsed)
+        flip.element(`group:${heroGroup.id}`)?.scrollIntoView({ block: 'nearest' })
+      cell.scrollIntoView({ block: 'nearest' })
+    }
+    measure()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- re-measure when the layout inputs change
+  }, [heroCellKey, cardsKey, area.width, area.height, phase])
+  // The grid's scroll is the store's too (`noteOverviewScroll`, on the grid's scroll event): a
+  // grid mounted by the next shell with the overview open – a phone window widened into the
+  // tablet layout, or a tablet's narrowed – picks up where the last one's stood, once, before
+  // its first paint (TABLET-08). A fresh overview finds nothing there (the stage reset it), and
+  // a pane switch keeps its own rule: the new pane's grid comes up at the top.
+  const scrollRestored = useRef(false)
+  useLayoutEffect(() => {
+    if (scrollRestored.current) return
+    scrollRestored.current = true
+    const scroll = overviewUiStore.get().scroll
+    const grid = scrollRef.current
+    if (scroll && grid && scroll.pane === pane && settled && scroll.top > 0)
+      grid.scrollTop = scroll.top
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the mount alone
+  }, [])
+
+  // The grid's WINDOW (`lib/overviewWindow.ts`, W6-0): which cells are built as cards. Read
+  // from the layout the commit made – after the hero's card has been scrolled into view and the
+  // shell swap's scroll restored, both above – on the commits that can change the geometry: the
+  // cards or the columns (a query, a close, a fold, a rotation), the frame, the pane. The cells
+  // in view and a row's margin the mount's guess missed fill in this very commit (the store's
+  // word reaches each cell before the frame paints); once the overview has settled the rest
+  // fill in idle time, nearest first, and not before – the pull's and the spring's frames are
+  // the morph's. The phase reads no layout: the settle starts the idle fill from the last read,
+  // a drag, a close or the landing held after one cancels it (a read at the close would force
+  // the style and layout of a grid about to unmount). A grid with no layout to read (the tests'
+  // DOM) builds every card. The grid's scroll re-reads the window (below).
+  const foldKey = groups
+    .filter((f) => f.collapsed)
+    .map((f) => f.id)
+    .join('|')
+  // The mount's GUESS at the window (`guessWindow`): the render builds these cards outright,
+  // before there is a layout to read, so a mount whose guess holds builds its cards in one pass.
+  // The grid's items in its order – the pinned cards, the groups (a folded one or one of a
+  // single card is a cell of the flow; one spanning the grid lays its cards in rows of its own),
+  // the loose cards – laid into rows by the columns and the cards' aspect; the hero's row at the
+  // view's foot when it must scroll into view. A guessed card stays a card: the guess is recorded
+  // in the store on the commit it is rendered in (below).
+  const gridItems: GridItem[] = [
+    ...pinned.map((t): GridItem => ({ kind: 'cell', key: t.id, card: true })),
+    ...groups.flatMap((folder): GridItem[] => {
+      const tabs = members.get(folder.id) ?? []
+      if (tabs.length === 0) return []
+      if (folder.collapsed) return [{ kind: 'cell', key: `group:${folder.id}`, card: false }]
+      if (tabs.length === 1) return [{ kind: 'cell', key: tabs[0].id, card: true }]
+      return [{ kind: 'row', key: `group:${folder.id}`, cards: tabs.map((t) => t.id) }]
+    }),
+    ...loose.map((t): GridItem => ({ kind: 'cell', key: t.id, card: true }))
+  ]
+  const guessed = new Set(
+    guessWindow(
+      gridItems,
+      heroCellKey,
+      columns,
+      area.height,
+      overviewRowPitch(viewportWidth - sideInsets, columns, cardAspect)
+    )
+  )
+  // The window is THIS grid's (`lib/overviewWindow.ts`): a token minted at the render, so the
+  // cells read the store under it from their first render, claimed in the grid's first layout
+  // effect – the store starts afresh – and released as that effect's cleanup. Two grids stand in
+  // one commit when the shell swaps with the overview open (a phone window widened into the
+  // tablet layout, or a tablet's narrowed, TABLET-08: `App.tsx` mounts the other shell's
+  // `TabOverview` in the commit that unmounts this one's): React runs the old grid's layout
+  // cleanup before the new grid's layout effects, so the release goes before the claim, and a
+  // passive cleanup after them – a plain reset from one wiped the rows the new grid had just
+  // built beyond its guess, placeholders in view for a frame. The release touches only a window
+  // still this grid's, whatever the order. The close keeps the overview mounted while the
+  // landing is held (`PhoneStage`, `landOverview`), its hero at the page's frame: the window
+  // stands until the grid goes, and not before. A SPACE SWITCH is a new grid in the same
+  // overview (MOT-05, `gridKey` above): the token is minted afresh with the key, so the render
+  // that brings the next Space's cells reads the store under a token it does not own yet –
+  // placeholders but for the guess – and this effect's cleanup releases the grid that left (its
+  // idle fill cancelled, `all` reset: a grid that had built every card must not hand thirty
+  // built cards to the next) and its body claims for the one that came, in the one commit,
+  // before the fills below: the guess recorded, the window read and built, ahead of the slide's
+  // first frame. The claim, the guess and the read are THIS component's effects, in this order –
+  // a claim in a child of its own ran before them by React's child-first order, and ran again
+  // after them wherever a new mount's effects are replayed (StrictMode's development check), the
+  // window wiped with nothing left to rebuild it.
+  const token = useMemo(
+    () => newOverviewWindowToken(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- a token per grid: minted afresh with the grid's key
+    [gridKey]
+  )
+  useLayoutEffect(() => {
+    claimOverviewWindow(token)
+    return () => releaseOverviewWindow(token)
+  }, [token])
+  // The guess is the store's from the commit it is rendered in: `eager` builds a guessed card
+  // whatever the store says, and a render that guesses differently with no read between – a
+  // drag's stand-in moving through the grid re-orders the cards under the finger (`shown`,
+  // above) while the cards' key, the state's order, stands – must not take a card back to a
+  // placeholder when the order reverts (the drag cancelled). Recorded, the card stays a card.
+  const guessKey = [...guessed].join('|')
+  useLayoutEffect(() => {
+    fillCards(guessed)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the guess's keys
+  }, [guessKey])
+  // The last read's cards outside the window, nearest first: the idle fill's order when the
+  // overview settles after the read.
+  const restRef = useRef<readonly string[]>([])
+  // Where a cell will REST, once the tracker has this commit's measurement (it commits before
+  // this effect on every settled commit): a glide in flight is drawn by a transform, which the
+  // cell's own box includes, and a fold's or a whole-group close's moves the rows below by more
+  // than the margin – read where they are drawn, the rows the glide brings into view would
+  // arrive as placeholders and wait for the idle fill, no scroll event firing for a glide. Short
+  // of the settle the tracker only observes, and the drawn box is the one there is.
+  const restRect: CellRect = (el, key) => flip.layoutRect(key) ?? el.getBoundingClientRect()
+  const rewindow = (scrolled = false): void => {
+    const grid = scrollRef.current
+    if (scrolled) {
+      // A scroll with every card built has nothing to read the layout for.
+      const { all, filled } = overviewWindowStore.get()
+      if (all || (pinned.every((t) => filled.has(t.id)) && regular.every((t) => filled.has(t.id))))
+        return
+    }
+    const read = grid ? readWindow(grid, settled ? restRect : undefined) : null
+    if (!read) {
+      restRef.current = []
+      fillEveryCard()
+      return
+    }
+    const { shown, rest } = windowOf(read.view, read.cells)
+    restRef.current = rest
+    fillCards(shown)
+    if (settled) scheduleFill(rest)
+    else cancelFill()
+  }
+  useLayoutEffect(() => {
+    rewindow()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- re-read when the layout inputs change
+  }, [cardsKey, foldKey, columns, area.width, area.height, pane, gridKey])
+  useEffect(() => {
+    if (settled) scheduleFill(restRef.current)
+    else cancelFill()
+  }, [settled])
+  // The rows a fold or a whole-group close brings in set off when the tracker releases its hold
+  // – the group's height has settled and the cells below glide to their slots (v2 §11.4). The
+  // tracker measures afresh at the release, and the window is re-read from where the cells will
+  // rest: what the commit's read built stands, and a destination that moved meanwhile (a second
+  // fold, a retarget) is caught. Subscribed once; the read is the latest render's.
+  const rewindowLatest = useRef(rewindow)
+  useLayoutEffect(() => {
+    rewindowLatest.current = rewindow
+  })
+  useEffect(() => flip.onRelease(() => rewindowLatest.current(true)), [flip])
+
+  // Escape closes the overview – unless a sheet or the Spaces drawer is up over it; the top
+  // surface takes the key, and the next Escape reaches the overview. The search field takes it
+  // first (its query, then the field itself), then the select-tabs mode ends, as back does.
+  const sheetOpen = sheet !== null
+  const drawerOpen = uiStore.use((s) => s.drawerOpen)
+  useEffect(() => {
+    if (!interactive || sheetOpen || drawerOpen) return
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        if (searchOpen) searchBack.current()
+        else if (selecting) exitSelection()
+        else closeOverview()
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [interactive, sheetOpen, drawerOpen, selecting, exitSelection, searchOpen])
+
+  // A card in the hand has nowhere to go once the overview leaves (the sheet stays in state but
+  // off screen; the overview unmounts altogether when it is closed), and cards on their way out
+  // have nothing to leave from.
+  useEffect(() => {
+    if (!interactive) {
+      cancelLift()
+      clearDepartures()
+    }
+  }, [interactive])
+  useEffect(
+    () => () => {
+      cancelLift()
+      clearDepartures()
+    },
+    []
+  )
+
+  // A dropped card flies to its new slot once the browser has moved it there: to where its
+  // stand-in is drawn, and after it while the stand-in glides (the cells below a group set off
+  // once its height has settled, v2 §11.4), so the ghost lands on the card wherever that is.
+  // The stand-in's slot goes with the confirmation, before that slot is measured: the browser
+  // shows the card where the drop put it, which for a drop on a target is not the slot the
+  // stand-in held – kept, the card would stand in the old slot for one more render (a group made
+  // from it would form with the other card alone) and glide to the new one when the ghost had
+  // landed, in a second step.
+  const liftPhase = liftStore.use((s) => s.phase)
+  const pendingDrop = useRef<PendingDrop | null>(null)
+  const standInRect = (tabId: string): Rect | null => {
+    // Before the grid has settled nothing is tracked yet and the cell's own box is the answer.
+    const rect = flip.drawnRect(tabId) ?? flip.element(tabId)?.getBoundingClientRect()
+    return rect ? { x: rect.left, y: rect.top, width: rect.width, height: rect.height } : null
+  }
+  useLayoutEffect(() => {
+    const pending = pendingDrop.current
+    if (!pending || liftPhase !== 'dropping' || !liftTabId) return
+    if (!pending.landed(state) && !pending.expired && performance.now() < pending.deadline) return
+    if (liftSlot) {
+      // The render this asks for lays the card out where the tab is; it lands there.
+      liftStore.set({ slot: null })
+      return
+    }
+    pendingDrop.current = null
+    const to = standInRect(liftTabId) ?? liftStore.get().origin
+    if (to) settleLift(to)
+    else cancelLift()
+  })
+  useEffect(() => {
+    // The browser may never confirm (the command failed): land the card where the tab is.
+    const pending = pendingDrop.current
+    if (!pending || liftPhase !== 'dropping') return
+    const timer = setTimeout(
+      () => {
+        if (pendingDrop.current !== pending) return
+        pending.expired = true
+        const s = liftStore.get()
+        if (s.phase !== 'dropping') return
+        if (s.slot) {
+          // The layout effect above lands the card on the render this asks for.
+          liftStore.set({ slot: null })
+          return
+        }
+        pendingDrop.current = null
+        const to = (s.tabId ? standInRect(s.tabId) : null) ?? s.origin
+        if (to) settleLift(to)
+        else cancelLift()
+      },
+      Math.max(0, pending.deadline - performance.now())
+    )
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- standInRect reads the tracker, which is stable
+  }, [liftPhase, flip])
+  useEffect(() => {
+    if (liftPhase !== 'dropping') return
+    return flip.onFrame(() => {
+      const s = liftStore.get()
+      if (s.phase !== 'dropping' || !s.tabId) return
+      const to = standInRect(s.tabId)
+      if (to) retargetLift(to)
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- standInRect reads the tracker, which is stable
+  }, [liftPhase, flip])
+
+  // Groups made or emptied while the grid is on screen (v2 §11.4). A group whose card the
+  // tracker has not seen, holding cards it has, was just made from them: it grows out of their
+  // row with its header and tint off until the tracker's release at the end of the glide. A group
+  // whose last card has left it for the grid (dragged out, ungrouped) lingers, shrinking to
+  // nothing on its spring under the loose card that took its cell while the cells below wait; it
+  // leaves once it has settled. A group whose every card has GONE – closed, dropped by the
+  // query, the last the query left it closed – leaves as the cards do (§11.4's leave): its exit,
+  // drawn over it with its cards since the close or the query (`departAll`, `swipedAway`,
+  // `changeQuery`), fades where the card stood while the cells below glide up once, in the
+  // commit its cell leaves – this one; it never lingers.
+  const forming = (folder: Folder, tabs: Tab[]): boolean =>
+    settled &&
+    flip.element(`group:${folder.id}`) === null &&
+    tabs.some((t) => flip.element(t.id) !== null)
+  const subscribeRelease = useCallback((fn: () => void) => flip.onRelease(fn), [flip])
+  // The groups holding cards after the last render, and the ones lingering since: a group that
+  // has lost its last card since the last render must be on the grid in this very render, so it
+  // is found here, from the last render's groups, not in an effect after it.
+  const [shownGroups, setShownGroups] = useState<ShownGroups>(() => ({
+    pane,
+    spaceId: space.id,
+    held: new Map(),
+    lingering: new Map()
+  }))
+  const held = new Map<string, HeldGroup>()
+  for (const folder of groups) {
+    const count = members.get(folder.id)?.length ?? 0
+    if (count) held.set(folder.id, { folder, count })
+  }
+  // The other view's grid, or another Space's, is a fresh one: its groups did not dissolve, they
+  // are simply not here (the Space switch draws the last grid as a still over this one, the
+  // group's card among what it shows, see `PaneSlot`).
+  const samePane = shownGroups.pane === pane && shownGroups.spaceId === space.id
+  // A group with an exit standing for it leaves whole, and does not linger. Read off the store
+  // here, in the render that finds the group empty, not subscribed: the exit was drawn before
+  // the close was asked, or in the same turn as the query, and stands until the grid has
+  // released it – and the grid must not render again for each exit drawn, released and done.
+  const leavingWhole = (id: string): boolean =>
+    departStore.get().items.some((item) => item.kind === 'group' && item.folder.id === id)
+  const lost = samePane
+    ? [...shownGroups.held].filter(([id]) => !held.has(id) && !leavingWhole(id))
+    : []
+  const back = [...shownGroups.lingering.keys()].filter((id) => held.has(id))
+  let lingering = samePane ? shownGroups.lingering : new Map<string, HeldGroup>()
+  if (lost.length || back.length) {
+    const next = new Map(lingering)
+    for (const [id, was] of lost) next.set(id, was)
+    for (const id of back) next.delete(id)
+    lingering = next
+  }
+  if (
+    !samePane ||
+    lingering !== shownGroups.lingering ||
+    held.size !== shownGroups.held.size ||
+    [...held].some(([id, h]) => shownGroups.held.get(id)?.count !== h.count)
+  ) {
+    setShownGroups({ pane, spaceId: space.id, held, lingering })
+  }
+  const dissolvedGroup = (folder: Folder): void =>
+    setShownGroups((shown) => {
+      if (!shown.lingering.has(folder.id)) return shown
+      const next = new Map(shown.lingering)
+      next.delete(folder.id)
+      return { ...shown, lingering: next }
+    })
+  // The group cards, one keyed list: a group that has just lost its last card (or whose folder
+  // is gone with it) keeps its element – the same key in the same list – so its card's height
+  // spring runs on from where the card is rather than starting over in a fresh mount.
+  const groupCards: Array<{ folder: Folder; tabs: Tab[]; gone: HeldGroup | undefined }> = []
+  for (const folder of groups) {
+    const tabs = members.get(folder.id) ?? []
+    const gone = lingering.get(folder.id)
+    if (tabs.length || gone) groupCards.push({ folder, tabs, gone })
+  }
+  for (const gone of lingering.values())
+    if (!groups.some((f) => f.id === gone.folder.id))
+      groupCards.push({ folder: gone.folder, tabs: [], gone })
+
+  const pick = (tab: Tab): void => closeOverview(tab.id)
+
+  const groupTabs = (tabIds: string[], folderId: string): void => {
+    for (const tabId of tabIds) run('tab.moveToFolder', { tabId, folderId })
+  }
+  const makeGroup = async (tabIds: string[], rename: boolean): Promise<string | null> => {
+    try {
+      const folderId = await cmd('folder.create', {
+        spaceId: space.id,
+        name: TOUCH_GROUP_DEFAULT_NAME,
+        icon: DEFAULT_FOLDER_ICON,
+        color: nextGroupColor(state, space.id),
+        rename
+      })
+      groupTabs(tabIds, folderId)
+      return folderId
+    } catch {
+      return null
+    }
+  }
+
+  /** The group a tab is shown in (a folder of this space), or null for a loose tab. */
+  const groupIdOf = (tab: Tab, s: UIState = state): string | null =>
+    tab.folderId && s.folders[tab.folderId]?.spaceId === space.id ? tab.folderId : null
+  /**
+   * The pane's tabs shown in a group (or loose, for null), in the browser's order: the regular
+   * pane's are the space's regular tabs of that group, the private ones aside; the private pane's
+   * list is the session's, across the spaces (it makes no groups).
+   */
+  const listIn = (s: UIState, folderId: string | null): Tab[] =>
+    privatePane
+      ? privateTabsOf(s)
+      : tabsOnPane(regularOf(s, activeSpace(s)), 'tabs').filter((t) => groupIdOf(t, s) === folderId)
+
+  /**
+   * What the finger is over, from the slots of the last layout (the glide in flight ignored, so
+   * cards passing under the finger cannot flip the answer). On another card: its middle merges
+   * into it, its edges put the card before or after it; on a group's own chrome: into the group;
+   * on the New Tab card or past the last card: the end; anywhere else (a gutter, the stand-in):
+   * no change. Off the grid altogether: null, and nothing is targeted.
+   */
+  const hoverAt = (tab: Tab, x: number, y: number, current: LiftHover): LiftHover | null => {
+    const keep: LiftHover = { target: null, slot: current.slot }
+    const grid = scrollRef.current?.getBoundingClientRect()
+    if (!grid || x < grid.left || x > grid.right || y < grid.top || y > grid.bottom) return null
+    const inside = (r: DOMRect | null): r is DOMRect =>
+      r !== null && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+    // Member cards of an expanded group and the loose cards, as shown right now (the private
+    // pane's cards are all loose: it makes no groups, a session being no workspace, so a drag
+    // there only rearranges, as Chrome's incognito grid lets it).
+    const cards: Array<{ tab: Tab; list: Tab[]; folderId: string | null }> = []
+    for (const folder of groups) {
+      if (folder.collapsed) continue
+      const list = members.get(folder.id) ?? []
+      for (const t of list) cards.push({ tab: t, list, folderId: folder.id })
+    }
+    for (const t of loose) cards.push({ tab: t, list: loose, folderId: null })
+    for (const { tab: other, list, folderId } of cards) {
+      if (other.id === tab.id) continue
+      const r = flip.layoutRect(other.id)
+      if (!inside(r)) continue
+      const ix = r.width * MERGE_INSET_X
+      const iy = r.height * MERGE_INSET_Y
+      if (
+        !privatePane &&
+        x > r.left + ix &&
+        x < r.right - ix &&
+        y > r.top + iy &&
+        y < r.bottom - iy
+      )
+        return { target: `card:${other.id}`, slot: current.slot }
+      const cx = r.left + r.width / 2
+      const cy = r.top + r.height / 2
+      const after = Math.abs(x - cx) / r.width > Math.abs(y - cy) / r.height ? x > cx : y > cy
+      const index = list.filter((t) => t.id !== tab.id).indexOf(other)
+      return { target: null, slot: { folderId, index: index + (after ? 1 : 0) } }
+    }
+    for (const folder of groups) {
+      if (inside(flip.layoutRect(`group:${folder.id}`)))
+        return { target: `group:${folder.id}`, slot: current.slot }
+    }
+    if (inside(flip.layoutRect(tab.id))) return keep
+    const looseWithout = loose.filter((t) => t.id !== tab.id)
+    const end: LiftHover = { target: null, slot: { folderId: null, index: looseWithout.length } }
+    if (inside(flip.layoutRect(NEW_TAB_CELL))) return end
+    const lastGroup = groups.filter((f) => (members.get(f.id) ?? []).length > 0).at(-1)
+    const lastKey =
+      looseWithout.at(-1)?.id ?? (lastGroup ? `group:${lastGroup.id}` : pinned.at(-1)?.id)
+    const last = lastKey ? flip.layoutRect(lastKey) : null
+    if (!last || y > last.bottom || (y >= last.top && x > last.right)) return end
+    return keep
+  }
+
+  /**
+   * A card was dropped: act on the outcome (a target, a slot, or nothing), then let the settle
+   * effect above fly the ghost to the card's slot once the browser shows it there (straight away
+   * when nothing changes).
+   */
+  const dropCard = (tab: Tab, outcome: DropOutcome): void => {
+    const expect = (landed: (s: UIState) => boolean): void => {
+      pendingDrop.current = {
+        landed,
+        deadline: performance.now() + DROP_TIMEOUT_MS,
+        expired: false
+      }
+    }
+    const unchanged = (): void => expect(() => true)
+    /**
+     * Move the tab right before `before` (or right after `after`, or to the end of the regular
+     * tabs), into `folderId`. The browser's index counts a space's whole regular section – both
+     * modes' tabs, since a space's track holds its private tabs too – so the neighbour's place is
+     * looked up there, not in the pane's list; a private neighbour filed in another space takes
+     * the tab into that space (the private session is one across the spaces).
+     */
+    const moveTo = (folderId: string | null, before: Tab | undefined, after?: Tab): void => {
+      const anchor = before ?? after
+      const into = state.spaces.find((s) => s.id === anchor?.spaceId) ?? space
+      const track = regularOf(state, into).filter((t) => t.id !== tab.id)
+      const index = before ? track.indexOf(before) : after ? track.indexOf(after) + 1 : track.length
+      run('tab.move', { tabId: tab.id, spaceId: into.id, section: 'regular', index })
+      if (!privatePane && groupIdOf(tab) !== folderId)
+        run('tab.moveToFolder', { tabId: tab.id, folderId })
+    }
+    const target = outcome.kind === 'target' ? outcome.target : null
+    const slot = outcome.kind === 'slot' ? outcome.slot : null
+    // The private pane never targets a card or a group (`hoverAt`): only its slots move anything.
+    if (privatePane && target) return unchanged()
+    if (target?.startsWith('group:')) {
+      const folderId = target.slice('group:'.length)
+      if (!state.folders[folderId] || groupIdOf(tab) === folderId) return unchanged()
+      moveTo(folderId, undefined, membersOf(folderId).at(-1))
+      return expect((s) => groupIdOf(s.tabs[tab.id] ?? tab, s) === folderId)
+    }
+    if (target?.startsWith('card:')) {
+      const other = state.tabs[target.slice('card:'.length)]
+      if (!other || other.id === tab.id || other.pinned || other.essential) return unchanged()
+      const theirs = groupIdOf(other)
+      if (theirs) {
+        // Dropped on a member of a group: join that group, right behind it.
+        moveTo(theirs, undefined, other)
+        return expect((s) => groupIdOf(s.tabs[tab.id] ?? tab, s) === theirs)
+      }
+      // Dropped on a loose card: the two make a group, the dropped card right behind the other –
+      // the order joining a group gives, so the two gestures read as one rule (v2 §11.4). The
+      // stand-in holds its slot until the group shows, so the move is not seen on its own.
+      run('tab.move', {
+        tabId: tab.id,
+        spaceId: space.id,
+        section: 'regular',
+        index:
+          regularOf(state, space)
+            .filter((t) => t.id !== tab.id)
+            .indexOf(other) + 1
+      })
+      void makeGroup([other.id, tab.id], false)
+      return expect((s) => {
+        const mine = s.tabs[tab.id]?.folderId
+        return Boolean(mine) && mine === s.tabs[other.id]?.folderId
+      })
+    }
+    if (slot) {
+      const list = listIn(state, slot.folderId).filter((t) => t.id !== tab.id)
+      const index = Math.min(slot.index, list.length)
+      const from = listIn(state, groupIdOf(tab))
+      if (slot.folderId === groupIdOf(tab) && from.indexOf(tab) === index) return unchanged()
+      moveTo(slot.folderId, list[index], list.at(-1))
+      return expect((s) => {
+        const t = s.tabs[tab.id]
+        if (!t) return true
+        if (groupIdOf(t, s) !== slot.folderId) return false
+        const now = listIn(s, slot.folderId)
+        return now.findIndex((o) => o.id === tab.id) === Math.min(index, now.length - 1)
+      })
+    }
+    unchanged()
+  }
+
+  /** Tabs told to close leave the grid visibly: their cards collapse where they stand. */
+  const closesForReal = (tab: Tab): boolean =>
+    !(tab.pinned || tab.essential) || state.settings.pinnedCloseBehavior === 'close'
+  /**
+   * Every close goes through at once and comes with Undo on the toast (lib/closeUndo.ts):
+   * "Closed <title>" or "N tabs closed", the restore through the core's recently closed store.
+   */
+  const undoable = (tabs: Tab[], close: () => void): void =>
+    closeWithUndo({ tabs, settings: state.settings, activeTabId: active?.id ?? null, close })
+  /**
+   * The groups every member of which is among `tabs` – on one of two readings of "every".
+   * `wholeGroupsAmong` reads the pane's whole (`liveMembersOf`): those CLOSE as groups
+   * (`closeSet`'s `folder.close`, the group saved with all its pages, TAB-16). `wholeOnGridAmong`
+   * reads what the card shows (`membersOf`): those LEAVE as groups – the card's one exit
+   * (`departAll`, `swipedAway`). The two readings part under a query that hides some of a
+   * group's cards: the X on the last card it shows closes that tab alone, the group staying
+   * open with its hidden cards, but the card, with nothing left to show, is a group whose every
+   * card has gone – filtered out, closed (ruling 3's words) – and departs as one, never the
+   * shrink of a group a card left for the grid.
+   */
+  const wholeAmong = (tabs: Tab[], membersIn: (folderId: string) => Tab[]): Folder[] => {
+    const ids = new Set(tabs.map((t) => t.id))
+    return groups.filter((f) => {
+      const every = membersIn(f.id)
+      return every.length > 0 && every.every((t) => ids.has(t.id))
+    })
+  }
+  const wholeGroupsAmong = (tabs: Tab[]): Folder[] => wholeAmong(tabs, liveMembersOf)
+  const wholeOnGridAmong = (tabs: Tab[]): Folder[] => wholeAmong(tabs, membersOf)
+  /**
+   * Tabs told to close leave the grid visibly. A group whose every shown card is among them
+   * leaves as the group does – its card's one exit, the cards drawn inside it, in place of
+   * theirs (v2 §11.4: the card fades where it stood and the cells below glide up once, as for
+   * any card; the card itself leaves the grid on the commit its tabs are gone, see `lost`); the
+   * rest one by one. No member of such a group gets an exit of its own – the ones a query hides
+   * have no card to leave from anyway. `forced` reads every tab as closing for real (Quick
+   * Delete's `closeUnrecorded` closes a pinned card too); `held` marks the exits as the wipe's,
+   * run ahead of the close (`departureStore.ts`).
+   */
+  const exitsFor = (tabs: Tab[], forced = false, held = false): Departure[] => {
+    const whole = wholeOnGridAmong(tabs)
+    const asGroup = new Set(whole.flatMap((f) => liveMembersOf(f.id).map((t) => t.id)))
+    const exits: Departure[] = []
+    const mark = held ? ({ held: true } as const) : {}
+    for (const folder of whole) {
+      const exit = groupExit(folder)
+      if (exit) exits.push({ ...exit, ...mark })
+    }
+    for (const tab of tabs) {
+      if (asGroup.has(tab.id)) continue
+      const rect = forced || closesForReal(tab) ? rectOf(flip.element(tab.id)) : null
+      if (rect) exits.push({ key: tab.id, kind: 'tab', tab, rect, ...mark })
+    }
+    const plus = newTabExit(tabs, forced)
+    if (plus) exits.push(plus)
+    return exits
+  }
+  const departAll = (tabs: Tab[]): void => depart(exitsFor(tabs))
+  /**
+   * A close that takes the Tabs pane's every card takes the New Tab card with it (TAB-34):
+   * §9.17's sentence stands in the grid's place once the tabs are gone (`TabsEmpty`), and the
+   * card leaves on that same commit as the cards do, in place – never a cut (§11.4); the
+   * `Departures` layer releases it once the browser shows every tab of `with` gone. The Private
+   * pane's last close hands the overview to the Tabs pane on the panes' cross-fade, its still
+   * leaving whole, so its card needs no exit of its own.
+   */
+  const newTabExit = (tabs: Tab[], forced = false): Departure | null => {
+    if (privatePane || tabs.length === 0 || !emptiesPane(tabs, forced)) return null
+    const rect = rectOf(flip.element(NEW_TAB_CELL))
+    if (!rect) return null
+    return {
+      key: NEW_TAB_CELL,
+      kind: 'new-tab',
+      isPrivate: false,
+      rect,
+      with: tabs.map((t) => t.id)
+    }
+  }
+  /** Whether closing `tabs` leaves the pane with no card: every tab of it closes for real. */
+  const emptiesPane = (tabs: Tab[], forced = false): boolean => {
+    const closing = new Set(tabs.map((t) => t.id))
+    return [...essentialsAll, ...pinnedAll, ...regularAll].every(
+      (t) => closing.has(t.id) && (forced || closesForReal(t))
+    )
+  }
+  /**
+   * Quick Delete's wipe (MOT-24, `quickDelete.ts`): the range's cards on this pane – a group's
+   * as one exit only when every tab of it is in range, Chrome's rule – as held exits, with the
+   * grid's visible rect for the sweep. The runner asks once the overview has landed.
+   */
+  const wipeFor = (ids: readonly string[]): QuickDeleteWipe => {
+    const inRange = new Set(ids)
+    const tabs = [...essentialsAll, ...pinnedAll, ...regularAll].filter((t) => inRange.has(t.id))
+    return { exits: exitsFor(tabs, true, true), grid: rectOf(scrollRef.current) }
+  }
+  const wipeRef = useRef(wipeFor)
+  useEffect(() => {
+    wipeRef.current = wipeFor
+  })
+  useEffect(() => {
+    setQuickDeleteWipe((ids) => wipeRef.current(ids))
+    return () => setQuickDeleteWipe(null)
+  }, [])
+  // While the wipe runs the grid takes no press: a card picked under it would leave the
+  // overview with the exits half-run over cards the core is about to close.
+  const wiping = departStore.use((s) => s.items.some(isHeld))
+  /**
+   * Close `tabs` as the user asks for them, with the one undo. The tabs that make up a whole
+   * group among them – every live member of it – close as the group does ("Close Group", the
+   * core's `folder.close`), so the group stays SAVED with all their pages (TAB-16) rather than
+   * with the last one closed, which is what closing them one by one would leave it. The rest
+   * close one after the other through the core's close chain, so a page whose `beforeunload`
+   * handler objects asks "Leave site?" in its turn (PUI-28): one card is `tab.close`; several
+   * are `tab.closeMany` – the dialog is tab-modal and shows on its own tab, so two asked at
+   * once would leave one waiting unseen – and a "Cancel" keeps that tab alone, the others going
+   * on. `activate` is the tab to end on once the closes are through. A card's own close, Close
+   * Other Tabs, Close All Tabs and the select-tabs mode's Close all read this one rule.
+   */
+  const closeSet = (tabs: Tab[], activate?: Tab): void => {
+    const whole = wholeGroupsAmong(tabs)
+    const asGroup = new Set(whole.flatMap((f) => liveMembersOf(f.id).map((t) => t.id)))
+    const rest = tabs.filter((t) => !asGroup.has(t.id))
+    undoable(tabs, () => {
+      for (const f of whole) run('folder.close', { folderId: f.id })
+      if (rest.length === 1 && !activate) run('tab.close', { tabId: rest[0].id })
+      else if (rest.length > 0)
+        run('tab.closeMany', { tabIds: rest.map((t) => t.id), activate: activate?.id })
+      else if (activate) run('tab.activate', { tabId: activate.id })
+    })
+  }
+  const closeTabs = (tabs: Tab[]): void => {
+    departAll(tabs)
+    closeSet(tabs)
+  }
+  // "Close other tabs" closes the other cards of this pane – the core's `tab.closeOthers` takes
+  // the whole space, private tabs included, and would end the private session from the regular
+  // pane (or take the space's regular tabs with it from the private one) – then keeps `tab` in
+  // view, as the core's does. The pane's, not the search's: a query narrows what is shown, not
+  // what "other tabs" and "all tabs" mean (their counts on the rows say so).
+  const closeOthers = (tab: Tab): void => {
+    const others = regularAll.filter((t) => t.id !== tab.id)
+    departAll(others)
+    closeSet(others, tab)
+  }
+  /**
+   * "Close All Tabs": every unpinned card of the pane goes (Zen's Clear tabs); pinned ones stay.
+   * The regular pane closes its own cards one by one, as "Close other tabs" does – each page's
+   * `beforeunload` heard in turn – rather than through the core's `space.closeUnpinned`, which
+   * asks no page and, on a host with private tabs, where the space holds both modes, would take
+   * them all: from the regular pane it would end the private session, from the private one
+   * take the space's tabs with it. The private pane's row is the app menu's Close Private Tabs
+   * (`tab.closePrivate`: the session ends and its profile is wiped, INC-04; a private tab is
+   * never filed, so no toast follows).
+   */
+  const closeAll = (): void => {
+    departAll(regularAll)
+    if (privatePane) {
+      run('tab.closePrivate', undefined)
+      return
+    }
+    closeSet(regularAll)
+  }
+  /**
+   * The regular view's Close All asks nothing (v2 §9.23: a close that can be taken back from
+   * its toast confirms nothing, and `closeSet`'s one Undo brings the lot back); the private
+   * view's Close Private Tabs still asks (`CloseAllSheet`), since a private tab is never filed
+   * and there is no Undo to stand in for the question.
+   */
+  const closeAllAsked = (): void => {
+    if (regularAll.length === 0) return
+    if (privatePane) setSheet({ kind: 'close-all' })
+    else closeAll()
+  }
+  /**
+   * The menu's Recently Closed (N) row (§4; matrix TAB-22, TAB-23): the list is read as the
+   * sheet opens, the tabs among its entries (a window's entry is the desktop's). The private
+   * view has no such row – a private tab is never filed (the core's `captureClosed`).
+   */
+  const openRecentlyClosed = async (): Promise<void> => {
+    noteSheetOpener()
+    const closed = await historyAdapter.recentlyClosed().catch(() => [])
+    setSheet({ kind: 'recently-closed', closed: closed.filter((entry) => entry.kind === 'tab') })
+  }
+  /**
+   * A tab brought back – a recently closed one into its place, an inactive one to the start of
+   * its space – is a new record, and the overview leaves on it once the browser shows it.
+   */
+  const leaveOnRestored = (restore: () => void): void => {
+    const known = new Set(Object.keys(state.tabs))
+    restore()
+    void whenState(
+      (s) => Object.keys(s.tabs).find((id) => !known.has(id)) ?? null,
+      RESTORE_TIMEOUT_MS
+    ).then((tabId) => closeOverview(tabId ?? undefined))
+  }
+  /** A recently closed tab picked from the sheet comes back into its place. */
+  const restoreClosed = (entry: ClosedEntrySummary): void =>
+    leaveOnRestored(() => void historyAdapter.restoreClosed(entry.id))
+  /**
+   * The menu's Inactive Tabs (N) row (TAB-20; §4, §9: a ⋯ row, never a control of the header):
+   * it reads the archive first, so the sheet opens full; the private view has no such row, a
+   * private tab being never archived.
+   */
+  const openInactiveTabs = async (): Promise<void> => {
+    noteSheetOpener()
+    const entries = await inactiveTabsAdapter.list().catch(() => [])
+    setSheet({ kind: 'inactive-tabs', entries })
+  }
+  /** An inactive tab picked from the sheet comes back at the start of its space, in front. */
+  const restoreArchived = (entry: ArchivedTabSummary): void =>
+    leaveOnRestored(() => void inactiveTabsAdapter.restore(entry.id))
+  /**
+   * A search row from another device leaves the overview on the tab it brings to the front: the
+   * device's page in a new tab of this space, or the tab this device already holds. Either way
+   * the tab in view changes, and the leave waits for the browser to show which it is.
+   */
+  const leaveOn = (ask: () => void): void => {
+    const before = active?.id ?? null
+    ask()
+    void whenState((s) => {
+      const now = activeTab(s)?.id ?? null
+      return now !== before ? now : null
+    }, OPEN_TIMEOUT_MS).then((tabId) => closeOverview(tabId ?? undefined))
+  }
+  /**
+   * Another device's tab found by the search (TAB-21 / TAB-02): its address in a new tab of this
+   * space – or, when this device already holds that very tab (the Open tabs scope carries the
+   * records too, ID-10), that tab to the front rather than a second one, as Settings › Sync's
+   * and History's rows do (#314, `OtherDevicesGroup`).
+   */
+  const openRemote = (tab: SyncRemoteTab): void =>
+    leaveOn(() =>
+      tab.tabId in state.tabs
+        ? run('tab.activate', { tabId: tab.tabId })
+        : run('tab.create', { url: tab.url, spaceId: space.id, active: true })
+    )
+  /** A group's card leaves the grid visibly, with its cards, where it stands. */
+  const departGroup = (folder: Folder): void => {
+    const exit = groupExit(folder)
+    if (exit) depart([exit])
+  }
+  /**
+   * "Close Group" (TAB-16): the group's tabs close – with the one Undo, as any close here, the
+   * toast in the group's words, "<Name> tab group closed and saved" (the tablet's Close Group
+   * says the same through `folder.closeUndoable`) – and the group stays, SAVED with their pages,
+   * a card with the saved ring at the grid's end (§2); the core's `folder.close`.
+   */
+  const closeGroup = (folder: Folder): void => {
+    departGroup(folder)
+    closeWithUndo({
+      tabs: liveMembersOf(folder.id),
+      settings: state.settings,
+      activeTabId: active?.id ?? null,
+      close: () => run('folder.close', { folderId: folder.id }),
+      group: folder
+    })
+  }
+  // The space's groups by state (TAB-16, `lib/groupRows.ts`): the SAVED ones – tabs closed,
+  // pages kept – stand as cards at the grid's end (§2, `SavedGroupCard`); a group's private
+  // members count for nothing (a group with pages saved and private tabs alone live is a saved
+  // group). The sheets read their group by its row, live.
+  const rows = groupRows(groups, liveOf)
+  const rowOf = (folderId: string): GroupRow | null =>
+    [...rows.open, ...rows.saved].find((row) => row.folder.id === folderId) ?? null
+  /**
+   * "Delete Group": the group's record goes, its live tabs closing with it – each to Recently
+   * Closed, with no Undo on a toast after the ask (TAB-13 / TAB-16, the Design Lead's option C:
+   * Undo for Close, a confirmation for Delete, never both) – or its saved pages forgotten. It
+   * asks first (§9.23, `DeleteGroupSheet`) when there is anything to lose; an empty group just
+   * goes.
+   */
+  const deleteGroupAsked = (row: GroupRow): void => {
+    if (row.count > 0) setSheet({ kind: 'delete-group', folderId: row.folder.id })
+    else run('folder.delete', { folderId: row.folder.id, unpack: false })
+  }
+  /** The same ask from a card's Delete Group (its hold sheet, or the reader's control). */
+  const deleteGroupOf = (folder: Folder): void => {
+    const row = rowOf(folder.id)
+    if (row) deleteGroupAsked(row)
+  }
+  const deleteGroup = (row: GroupRow): void => {
+    const live = liveMembersOf(row.folder.id)
+    const remove = (): void => run('folder.delete', { folderId: row.folder.id, unpack: false })
+    if (live.length === 0) {
+      remove()
+      return
+    }
+    // The card's visible departure, then the deletion itself: the prompt was the guard, so no
+    // `closeWithUndo` here – the tabs go to Recently Closed and the toast stays away.
+    departGroup(row.folder)
+    remove()
+  }
+  /**
+   * The saved card's tap, and its sheet's Open (§2; TAB-16): the group is reopened – its pages
+   * come back as tabs of the group (`folder.open`) – and shown expanded and scrolled to, the grid
+   * catching its card as the tabs arrive (`reveal`); an open group's card is already there, and
+   * is unfolded and scrolled to; an empty group has nothing to show.
+   */
+  const reveal = useRef<Reveal | null>(null)
+  const showGroup = (row: GroupRow): void => {
+    if (row.kind === 'empty') return
+    if (row.kind === 'saved') void cmd('folder.open', { folderId: row.folder.id }).catch(() => null)
+    else if (row.folder.collapsed)
+      run('folder.update', { folderId: row.folder.id, patch: { collapsed: false } })
+    reveal.current = revealOf(row.folder.id)
+  }
+  const reopenSaved = (folder: Folder): void => {
+    const row = rowOf(folder.id)
+    if (row) showGroup(row)
+  }
+  /**
+   * "New Tab in Group" (§2): a tab at the group's end through the core (`folder.newTab`, which
+   * makes it active), and the overview leaves on it once the browser shows it – its new tab page
+   * is the page under the overview, not a card to keep standing over.
+   */
+  const newTabInGroup = (folder: Folder): void =>
+    leaveOnRestored(() => run('folder.newTab', { folderId: folder.id }))
+  useLayoutEffect(() => {
+    const asked = reveal.current
+    if (!asked) return
+    const card = pane === 'tabs' ? flip.element(`group:${asked.folderId}`) : null
+    // Not there yet: the next commit (the opened group's tabs arriving) has another look, up to
+    // the deadline; past it the request is dropped on whichever commit finds it stale.
+    if (card) card.scrollIntoView({ block: 'start' })
+    if (card || performance.now() > asked.deadline) reveal.current = null
+  })
+  /**
+   * A card swiped off the grid is already out of sight: just close the tab. A group it was the
+   * last card the grid shows of leaves whole as it stands – the frame with its slot empty
+   * (`flown`) – as on a close by the X (v2 §11.4's leave; `departAll`, `wholeOnGridAmong`).
+   */
+  const swipedAway = (tab: Tab): void => {
+    const exits: Departure[] = []
+    for (const folder of wholeOnGridAmong([tab])) {
+      const exit = groupExit(folder)
+      if (exit) exits.push({ ...exit, flown: true })
+    }
+    // The last card flung off leaves the New Tab card to fade where it stands (TAB-34).
+    const plus = newTabExit([tab])
+    if (plus) exits.push(plus)
+    depart(exits)
+    undoable([tab], () => run('tab.close', { tabId: tab.id }))
+  }
+
+  // The pane's tabs in the order the grid shows them, for what TalkBack says of each card
+  // ("tab 2 of 7", `tabCardLabel`): the essentials' row, the pinned cards, the groups' members
+  // group by group, then the loose cards – the visual order, which is also the DOM's.
+  const ordered = [...essentials, ...pinned, ...groupCards.flatMap((g) => g.tabs), ...loose]
+  const placeOf = (tab: Tab): number => ordered.findIndex((t) => t.id === tab.id) + 1
+
+  // The select-tabs mode's cards: what is on show as a card can be picked – the pinned cards,
+  // the members of the groups that are open, the loose cards; a folded group's members, a saved
+  // group's card and the essentials' row are not cards and take no check. A pick whose card has
+  // left this set (its tab closed elsewhere, its group folded) goes in this same render.
+  const checkable = [
+    ...pinned,
+    ...groupCards.flatMap((g) => (g.folder.collapsed ? [] : g.tabs)),
+    ...loose
+  ]
+  // The bar's ⋯ asks for the overview's menu while the overview stands (§4): its word – the view
+  // on show and, in the select-tabs mode, "N selected" of the cards the selection could hold
+  // (§5) – is published at rest, not per frame, and withdrawn as the overview leaves or goes.
+  useEffect(() => {
+    publishOverviewMenu(
+      interactive
+        ? {
+            view: pane,
+            selection: selection.on
+              ? { selected: selection.picked.length, total: checkable.length }
+              : null
+          }
+        : OVERVIEW_MENU_OFF
+    )
+  }, [interactive, pane, selection, checkable.length])
+  useEffect(() => () => publishOverviewMenu(OVERVIEW_MENU_OFF), [])
+  // The search's departures and returns (TAB-21). A card the query dropped is off the grid in
+  // this commit: its exit runs from here (`Departures` waits for the browser to show a close;
+  // this close is the grid's own). A card a shorter query lets back in is drawn again: the exit
+  // still running for it is dropped, and the card enters as that exit run backwards – growing
+  // from .9 as it fades in on the exit's spring, a 120 ms fade under reduced motion (§11.3).
+  // The New Tab card is one of them: off with the first letter, back with the query cleared. A
+  // group the query dropped whole (`changeQuery`: one exit, its cards drawn in it) comes back
+  // whole the same way – its card enters as that one exit run backwards, its cards with it, not
+  // each on its own inside a frame that cut in. A group's exit is the grid's to release whatever
+  // took its cards: a closed group's folder stays, saved, so the commit its cell leaves – the
+  // one whose glide closes the gap – is the one that shows its close (v2 §11.4).
+  const shownCards = useRef<{
+    query: string
+    ids: ReadonlySet<string>
+    groups: ReadonlySet<string>
+  }>({ query: '', ids: new Set(), groups: new Set() })
+  const entrances = useRef(new Set<() => void>())
+  useLayoutEffect(() => {
+    const was = shownCards.current
+    const ids = new Set(checkable.map((t) => t.id))
+    if (!searching) ids.add(NEW_TAB_CELL)
+    const groupKeys = new Set(groupCards.map((g) => `group:${g.folder.id}`))
+    shownCards.current = { query, ids, groups: groupKeys }
+    const released: string[] = []
+    const gone: string[] = []
+    for (const item of departStore.get().items) {
+      // The New Tab card leaving with a close (TAB-34) is the close's exit, not the query's: it
+      // stands while the card is drawn and the close is in flight, and `Departures` releases it
+      // when the tabs are gone – the commit that takes the grid off (the card's element with it).
+      if (item.kind === 'new-tab' && item.with) continue
+      const dropped = item.kind === 'new-tab' || item.filtered === true
+      const el = flip.element(item.key)
+      if (dropped) {
+        if (el) departed(item.key)
+        else released.push(item.key)
+      } else if (item.kind === 'group' && !el) {
+        // A group Quick Delete wiped has run its exit already: the cell's leaving takes it
+        // (`departureGone`); any other group's exit runs on this commit, the gap's.
+        if (isHeld(item)) gone.push(item.key)
+        else released.push(item.key)
+      }
+    }
+    if (gone.length) departureGone(gone)
+    if (released.length) releaseDepartures(released)
+    if (was.query === query || !settled) return
+    const inside = new Set<string>()
+    for (const { folder, tabs } of groupCards) {
+      const key = `group:${folder.id}`
+      if (was.groups.has(key) || tabs.some((t) => was.ids.has(t.id))) continue
+      const el = flip.element(key)
+      if (!el) continue
+      enterCard(el, entrances.current)
+      for (const t of tabs) inside.add(t.id)
+    }
+    for (const id of ids) {
+      const el = was.ids.has(id) || inside.has(id) ? null : flip.element(id)
+      if (el) enterCard(el, entrances.current)
+    }
+  })
+  useEffect(() => {
+    const running = entrances.current
+    if (!interactive) for (const cancel of [...running]) cancel()
+    return () => {
+      for (const cancel of [...running]) cancel()
+    }
+  }, [interactive])
+  const pruned = pruneSelection(selection, new Set(checkable.map((t) => t.id)))
+  if (pruned !== selection) setSelection(pruned)
+  const chosen = selectedTabs(pruned, checkable)
+  const toggleCard = (tab: Tab): void => setSelection((s) => toggleSelected(s, tab.id))
+  const everyPicked = allSelected(
+    pruned,
+    checkable.map((t) => t.id)
+  )
+  const toggleAll = (): void =>
+    setSelection((s) =>
+      everyPicked
+        ? deselectAll(s)
+        : selectAll(
+            s,
+            checkable.map((t) => t.id)
+          )
+    )
+  /**
+   * The action row's targets (`lib/overviewSelection.ts`): Group takes the picks a group can
+   * hold and is not offered on the private pane, which makes no groups; Bookmark and Share take
+   * the pages among the picks – a private page's address is the user's to share, as Chrome lets
+   * an Incognito tab be shared. Each action ends the mode as it runs; the cards it leaves keep
+   * their places (§11.4: nothing reflows on a pick or on Done).
+   */
+  const groupable = privatePane ? [] : groupableTabs(chosen)
+  const pages = pageTabs(chosen)
+  const closeSelected = (): void => {
+    exitSelection()
+    closeTabs(chosen)
+  }
+  const groupSelected = (folderId: string | null): void => {
+    exitSelection()
+    const ids = groupable.map((t) => t.id)
+    if (folderId) groupTabs(ids, folderId)
+    else void makeGroup(ids, true)
+  }
+  /**
+   * Bookmark all (TAB-35): the pages go into one new folder "Tabs from <date>" under the
+   * phone's default folder through the core's own `bookmark.createFromTabs` – quietly, so the
+   * toast is this one (§9.33): the count, the folder, and Open, which leaves the overview and
+   * shows the folder in the Bookmarks panel.
+   */
+  const bookmarkSelected = async (): Promise<void> => {
+    exitSelection()
+    const tabIds = pages.map((t) => t.id)
+    const folder = await cmd('bookmark.createFromTabs', {
+      tabIds,
+      title: bookmarkFolderTitle(new Date()),
+      parentId: defaultBookmarkFolderId(state.platform),
+      quiet: true
+    }).catch(() => null)
+    if (!folder) return
+    const activeId = active?.id ?? null
+    pushToast(bookmarkedMessage(tabIds.length, folder.title), 'info', {
+      icon: 'star',
+      action: {
+        label: 'Open',
+        onPick: () => {
+          closeOverview()
+          void openOverlay('bookmarks', activeId, null, folder.id)
+        }
+      }
+    })
+  }
+  /** Share (SH-12): the pages as a text list through the system share sheet. */
+  const shareSelected = (): void => {
+    exitSelection()
+    run('app.share', shareTabsPayload(pages))
+  }
+  // An action's name counts the picks IT acts on, the number the picker's title and the
+  // bookmark toast will say: Close every pick, Group the groupable ones, Bookmark and Share the
+  // pages (a pinned pick among five reads "Group 4 tabs"; a blank tab, "Bookmark 4 tabs").
+  const named = (verb: string, count: number): string =>
+    `${verb} ${count} ${count === 1 ? 'tab' : 'tabs'}`
+  const selectionActions: SelectionAction[] = [
+    {
+      id: 'close',
+      label: 'Close',
+      name: named('Close', chosen.length),
+      glyph: <X className="h-5 w-5" strokeWidth={1.75} aria-hidden />,
+      disabled: chosen.length === 0,
+      run: closeSelected
+    },
+    ...(privatePane
+      ? []
+      : [
+          {
+            id: 'group',
+            label: 'Group',
+            name: named('Group', groupable.length),
+            glyph: <Group className="h-5 w-5" strokeWidth={1.75} aria-hidden />,
+            disabled: groupable.length === 0,
+            run: () => setSheet({ kind: 'group-picker' })
+          }
+        ]),
+    {
+      id: 'bookmark',
+      label: 'Bookmark',
+      name: named('Bookmark', pages.length),
+      glyph: <Star className="h-5 w-5" strokeWidth={1.75} aria-hidden />,
+      disabled: pages.length === 0,
+      run: () => void bookmarkSelected()
+    },
+    {
+      id: 'share',
+      label: 'Share',
+      name: named('Share', pages.length),
+      glyph: <Share2 className="h-5 w-5" strokeWidth={1.75} aria-hidden />,
+      disabled: pages.length === 0,
+      run: shareSelected
+    }
+  ]
+
+  /**
+   * The bar's ⋯ menu's rows (§4, §5; `lib/overviewCommands.ts`): the core pops the menu while
+   * the overview stands and hands each picked row back as one command; the handlers are this
+   * render's, read through a ref so that the one subscription sees the latest grid. New Tab and
+   * New Private Tab are the New Tab card's tap (`newTabOn`: the phone's new tab page over the
+   * overview); Private Tabs (N) / Tabs (N) switches the view (§3); Select Tabs enters the mode;
+   * Search Tabs pins the field; Inactive Tabs and Recently Closed read their lists and open
+   * their sheets; Close All asks or closes as the setting says; the selection's three act on the
+   * picks.
+   */
+  const onCommand = (command: OverviewChromeCommand): void => {
+    switch (command) {
+      case 'new-tab':
+        newTabOn('tabs')
+        return
+      case 'new-private-tab':
+        newTabOn('private')
+        return
+      case 'switch-view':
+        pickOverviewPane(otherOverviewView(pane))
+        return
+      case 'select-tabs':
+        setSelection(startSelection())
+        return
+      case 'search-tabs':
+        openSearch()
+        return
+      case 'inactive-tabs':
+        void openInactiveTabs()
+        return
+      case 'recently-closed':
+        void openRecentlyClosed()
+        return
+      case 'close-all':
+        closeAllAsked()
+        return
+      case 'select-all':
+        setSelection((s) =>
+          selectAll(
+            s,
+            checkable.map((t) => t.id)
+          )
+        )
+        return
+      case 'deselect-all':
+        setSelection((s) => deselectAll(s))
+        return
+      case 'close-selected':
+        closeSelected()
+    }
+  }
+  const commandLatest = useRef(onCommand)
+  useLayoutEffect(() => {
+    commandLatest.current = onCommand
+  })
+  useEffect(() => {
+    if (!interactive) return
+    return onOverviewCommand((command) => commandLatest.current(command))
+  }, [interactive])
+  // The system back from a PICKED private view returns to the regular view (§3); a private view
+  // the overview opened on, following a private tab, is the overview's own state, and back
+  // leaves the overview as it does from the regular view.
+  const backToTabs = useCallback(() => pickOverviewPane('tabs'), [])
+  useBackSurface(
+    interactive && privatePane && picked === 'private' && !selecting
+      ? { name: 'overview-private-view', onCommit: backToTabs }
+      : null
+  )
+
+  const card = (tab: Tab): JSX.Element => (
+    <OverviewCard
+      key={tab.id}
+      tab={tab}
+      active={tab.id === active?.id}
+      position={placeOf(tab)}
+      count={ordered.length}
+      // The phone's hero flies into its own card's slot, so the card is hidden until the morph
+      // lands on it pixel-for-pixel. On the tablet nothing flies: the hero is the page's still
+      // under the layer, and its card is part of the grid that comes down whole – drawn from the
+      // descent's first frame and through the close's rise (§9.36; a slot that fills by a cut at
+      // the settle is no motion of §11's).
+      hidden={!tablet && tab.id === heroTabId && p < 1}
+      // The hero's card is built from the first frame whatever the window holds: the morph
+      // lands on it, the tablet's layer shows it as it comes down (W6-0). So are the cards the
+      // mount's guess puts in view (`guessed`, above): the one pass a right guess makes.
+      eager={tab.id === heroTabId || guessed.has(tab.id)}
+      hinted={tab.id === hintedTabId}
+      onPick={pick}
+      onClose={(t) => closeTabs([t])}
+      onSwipeClose={swipedAway}
+      lift={{
+        // A card in the select-tabs mode is neither picked up nor swiped away: a tap is a pick.
+        // Nor is one picked up while a query narrows the grid: the slots a drop would count
+        // are the whole pane's, not the grid's; a swipe still closes it.
+        enabled: interactive && !tab.pinned && !selecting && !searching,
+        swipeable: interactive && closesForReal(tab) && !selecting,
+        scroller: () => scrollRef.current,
+        onMenu: (t) => setSheet({ kind: 'tab', tabId: t.id }),
+        onHover: hoverAt,
+        onDrop: dropCard
+      }}
+      selection={
+        selecting ? { selected: isSelected(pruned, tab.id), onToggle: toggleCard } : undefined
+      }
+    />
+  )
+
+  // A saved card's sheet and the delete question read their row live: a group gone from under
+  // them (deleted elsewhere) leaves them nothing to show.
+  const rowSheet = sheet?.kind === 'group-row' ? rowOf(sheet.folderId) : null
+  const deleteSheet = sheet?.kind === 'delete-group' ? rowOf(sheet.folderId) : null
+
+  const heroActive = Boolean(hero && hero.id === active?.id)
+
+  // The morph's frames are written off React. `overview.progress` moves on every move of the
+  // finger and every frame of the spring, and rendering the grid for each – every card
+  // reconciled, the FLIP set collected, for two elements' styles – was most of a morph frame's
+  // script on the phone (PERF-5's profile). What the progress moves is written straight to the
+  // DOM: the root's scale and fade (a promoted layer, `.zen-overview`), and the hero's rect-lerp
+  // (a layout per frame by design, v2 §11.4), its radius and shadow between the page's and the
+  // card's, its fade into a folded group's card, its title row's height and fade. The writer
+  // is remade on every render, so it reads the render's own cell, area and hero; the store's
+  // subscription calls the latest one per frame, and each commit writes the frame it stands at
+  // – from the store when the stage's overview is up, from the prop otherwise (the tests, a
+  // preview render), so a component outside the stage still draws the progress it is given.
+  const morph = useRef<(p: number) => void>(() => {})
+  // The tablet's layer stays unseen until the live page is off the screen (MOT-04). On Android
+  // the chrome lies under the page views (`lib/cover.ts`): a layer rising before the host took
+  // the view down would show beside the page – in the sidebar's column – and hide under it, a
+  // torn picture. The page's still (the hero, outside this layer, at the page's frame) is drawn
+  // under the page from the first frame, so the view's going is a pixel-identical swap, and the
+  // layer shows from the frame after, at the finger's progress: `pageCovered`, the rule a sheet
+  // recedes the cover by, with its timeout for a host that never answers. The phone's morph
+  // waits the same way, unseen, its hero card standing exactly where the page is. A host whose
+  // chrome lies over its pages has nothing to wait for. Declared before the morph effect so that
+  // effect's first write reads the answer.
+  const covered = useRef(true)
+  const latestOverview = useRef(overview)
+  useLayoutEffect(() => {
+    latestOverview.current = overview
+  })
+  useLayoutEffect(() => {
+    if (!tablet) return
+    covered.current =
+      !chromeUnderPages(state.platform) ||
+      heroTabId === null ||
+      coveredNow(pageViewStore.get(), heroTabId)
+    if (covered.current) return
+    let live = true
+    const hold = pageCovered(heroTabId, state.platform)
+    void hold.promise.then(() => {
+      if (!live) return
+      covered.current = true
+      morph.current(liveProgress(latestOverview.current))
+    })
+    return () => {
+      live = false
+      hold.cancel()
+    }
+  }, [tablet, heroTabId, state.platform])
+  // The tablet layer's geometry – the slide's travel (the layer's height) and the backdrop's
+  // alignment (the window's rect and the box's) – read in one measure pass, then written, when
+  // the frame the layer stands in changes: at the mount, a fold, the sidebar's toggle, never on
+  // the grid's own commits (a query's keystroke, a card picked, the scroll's measure), which
+  // the morph effect below runs on – it has no deps, so each of them would have forced a
+  // layout for three reads. The slide is a transform alone, so the writer needs no read per
+  // frame, and the box the slide's transform never moves is what is measured. The height is
+  // also the pull's travel on the tablet (§11's 1:1, the gate's ruling on §9.36's drag): the
+  // stage reads the finger's displacement over it, so the layer's foot moves exactly as far as
+  // the finger – published for the layer's stay, and the phone's own gain is back when it goes.
+  const slideTravel = useRef(0)
+  useLayoutEffect(() => {
+    if (!tablet) {
+      slideTravel.current = 0
+      return
+    }
+    slideTravel.current = rootRef.current?.offsetHeight ?? 0
+    alignBackdrop(rootRef.current, boxRef.current)
+    setTabletOverviewTravel(slideTravel.current)
+    return () => setTabletOverviewTravel(null)
+  }, [tablet, area.x, area.y, area.width, area.height])
+  useLayoutEffect(() => {
+    const contentRadius =
+      parseFloat(
+        getComputedStyle(document.documentElement).getPropertyValue('--zen-content-radius')
+      ) || 12
+    const reduced = reducedMotion()
+    const shadowTo = cardShadow(isDark)
+    const headerHeight = cardHeaderHeight()
+    // The tablet's entrance (MOT-04, v2 §9.36): the layer comes DOWN from the toolbar's edge
+    // over the page – the overview is pulled down from the toolbar, and a surface arrives from
+    // where it lives (§11), the same way on a tap as under the finger's pull – its travel the
+    // box's height, on the same 0…1 the phone's morph reads (the spring's, or the pull's: the
+    // finger's displacement over this same height, so the foot moves as far as the finger, 1:1
+    // – §11's input rule), so the page's still stands where the page is under it the whole
+    // way and the sidebar fades beneath it; the dismissal is the same writer run back up. At 0
+    // the layer stands a full height above its rest, clipped by the box, so the page shows
+    // whole; under reduced motion the slide is the phone's fade at scale 1 (§11.3).
+    const slide = slideTravel.current
+    morph.current = (p) => {
+      const root = rootRef.current
+      if (root) {
+        // Unseen until the live page is off the screen (the hold above); the phone never writes it.
+        if (tablet) root.style.visibility = covered.current ? '' : 'hidden'
+        if (tablet && !reduced) {
+          root.style.opacity = '1'
+          root.style.transform = p >= 1 ? '' : `translateY(${-(1 - p) * slide}px)`
+        } else {
+          root.style.opacity = String(Math.min(1, p * 1.6))
+          // Under reduced motion the grid appears at scale 1 with a 120 ms fade (v2 §11.3).
+          root.style.transform = reduced || tablet ? '' : `scale(${0.94 + 0.06 * p})`
+        }
+      }
+      const el = heroRef.current
+      if (!el) return
+      if (tablet) {
+        // The still of the page, in the page's frame, for as long as the layer is short of
+        // covering it: no card grows out of it and none shrinks into it.
+        el.style.left = `${area.x}px`
+        el.style.top = `${area.y}px`
+        el.style.width = `${area.width}px`
+        el.style.height = `${area.height}px`
+        el.style.borderRadius = `${contentRadius}px`
+        el.style.boxShadow = shadowCss(FRAME_SHADOW)
+        el.style.opacity = '1'
+        const header = heroHeaderRef.current
+        if (header) {
+          header.style.height = '0px'
+          header.style.opacity = '0'
+        }
+        return
+      }
+      const r = lerpRect(area, heroCell.current ?? shrunk(area), p)
+      el.style.left = `${r.x}px`
+      el.style.top = `${r.y}px`
+      el.style.width = `${r.width}px`
+      el.style.height = `${r.height}px`
+      el.style.borderRadius = `${contentRadius + (CARD_RADIUS - contentRadius) * p}px`
+      el.style.boxShadow = shadowCss(lerpShadow(FRAME_SHADOW, shadowTo, p))
+      el.style.opacity = String(heroFades ? 1 - Math.max(0, (p - 0.55) / 0.45) : 1)
+      const header = heroHeaderRef.current
+      if (header) {
+        header.style.height = `${headerHeight * p}px`
+        header.style.opacity = String(p)
+      }
+    }
+    morph.current(liveProgress(overview))
+  })
+  useLayoutEffect(() => {
+    let last = -1
+    return stageStore.subscribe(() => {
+      const live = stageStore.get().overview
+      if (live.phase === 'closed') return
+      const p = clampProgress(live.progress)
+      if (p === last) return
+      last = p
+      morph.current(p)
+    })
+  }, [])
+
+  // The hero's box, radius, shadow and fade, and its title row's height and fade, are the morph
+  // effect's per frame (its first frame written in the commit, before the paint). On the phone
+  // it stands over the grid – the page's card flying to its slot; on the tablet under the layer
+  // that comes down over it – the page's still in the page's frame, so it comes first in the tree.
+  const heroNode = hero && p < 1 && (
+    <div
+      ref={heroRef}
+      className="zen-stage-card zen-overview-hero pointer-events-none absolute flex flex-col"
+    >
+      <div
+        ref={heroHeaderRef}
+        className="relative flex shrink-0 items-center gap-2 overflow-hidden pl-3 pr-1"
+      >
+        {heroActive && (
+          <div
+            className="absolute inset-0"
+            style={{ background: 'rgb(var(--zen-accent-rgb) / 0.14)' }}
+          />
+        )}
+        {heroMasked ? (
+          <VenetianMask
+            className="relative h-4 w-4 shrink-0 opacity-60"
+            strokeWidth={1.75}
+            aria-hidden
+          />
+        ) : (
+          <Favicon tab={hero} size={16} className="relative" />
+        )}
+        <span className="zen-overview-card-title relative min-w-0 flex-1 truncate text-[13px] font-medium">
+          {heroMasked ? PRIVATE_TAB_PLACEHOLDER : tabTitle(hero)}
+        </span>
+      </div>
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        <HeroPicture tab={hero} progress={p} still={tablet} />
+      </div>
+    </div>
+  )
+
+  return (
+    <>
+      {tablet && heroNode}
+      <div
+        ref={boxRef}
+        className="absolute"
+        style={{
+          left: 'var(--zen-inset-left)',
+          right: 'var(--zen-inset-right)',
+          // The bar's edge keeps the whole band free: the row and the group strip (TAB-14).
+          top:
+            edge === 'top'
+              ? 'calc(var(--zen-phone-band) + var(--zen-inset-top))'
+              : 'var(--zen-inset-top)',
+          bottom:
+            edge === 'bottom'
+              ? 'calc(var(--zen-phone-band) + var(--zen-inset-bottom))'
+              : 'var(--zen-inset-bottom)',
+          pointerEvents: interactive ? 'auto' : 'none',
+          // The tablet's layer comes down from above this box (MOT-04): the box is its clip, so
+          // the layer descends out of the box's head – the toolbar's edge – not over the toolbar.
+          overflow: tablet ? 'hidden' : undefined,
+          // The tablet's card aspect (§9.36), read by every cell in the box: the layer's and a
+          // dissolving group's shell beside it (`Departures`).
+          ...cardAspectStyle
+        }}
+      >
+        <div
+          ref={rootRef}
+          // Its scale and fade follow the progress from the morph effect, written per frame.
+          className="zen-overview absolute inset-0 flex flex-col"
+          // The overview backdrop is window chrome (v2 §9.29): its controls draw in the window family.
+          data-surface="window"
+          // One named landmark while the overview stands (it unmounts with it): TalkBack says
+          // "Tab overview" once on entry, and the harness waits on the name (`awaitOverview`)
+          // rather than on a control of the header's, which §1 took away.
+          role="region"
+          aria-label={OVERVIEW_LABELS.region}
+          // The tablet's mount (TABLET-14): the layer is opaque – it slides over the page – in
+          // the window's own tone, its gradient laid at the window's size and offset so that at
+          // rest it is the window's, seamless at the toolbar's edge (the geometry effect writes
+          // the size and offset; `background-attachment: fixed` would do it but for the
+          // transform, under which it is read as `scroll`). Its cards take the frame's aspect
+          // (§9.36): the ratio the cells read (`--zen-overview-card-aspect`, set on the box),
+          // the phone's 3 / 4 where it is unset.
+          data-tablet={tablet || undefined}
+          // The pane swipe listens here, above the slot it outlives (GN-19).
+          {...swipe}
+        >
+          {tablet && <div className="zen-texture zen-overview-texture" />}
+          {/* The one header row (§1): the title – the space switcher – and nothing trailing it;
+              the select-tabs mode's bar replaces it (§5). The bar's ⋯ is the overview's menu. */}
+          <header className="flex h-14 shrink-0 items-center gap-2.5 px-3" {...handle}>
+            {selecting ? (
+              <SelectionHeader
+                count={chosen.length}
+                everyPicked={everyPicked}
+                selectable={checkable.length > 0}
+                onToggleAll={toggleAll}
+                onDone={exitSelection}
+              />
+            ) : (
+              <OverviewTitle
+                view={pane}
+                space={space}
+                count={count}
+                dotColor={spaceSwatch(space, isDark)}
+                spacesOpen={sheet?.kind === 'spaces'}
+                onOpenSpaces={() => {
+                  noteSheetOpener()
+                  setSheet({ kind: 'spaces' })
+                }}
+              />
+            )}
+          </header>
+          {searchOpen && (
+            // The tab search's field, pinned under the header while it stands (§4; the tablet's
+            // too, §7); closing it gives the header row back.
+            <OverviewSearchField
+              value={search.query}
+              inputRef={searchInput}
+              onChange={changeQuery}
+              onClear={clearQuery}
+              onClose={closeSearch}
+            />
+          )}
+          <PaneSlot
+            // Each view is a slot's worth of its own – the grid or the empty view's note –
+            // coming up fresh on a 120 ms fade in while the still of the view before fades out
+            // over the same slot (v2 §11.4; §6: no slide); the cells start fresh with it.
+            pane={pane}
+            root={rootRef}
+            onLeave={leavePane}
+            className="zen-overview-pane relative flex min-h-0 flex-1 flex-col"
+          >
+            <PaneSlot
+              // The Space's slot (MOT-05): the grid comes up fresh per Space, sliding in from
+              // the side the Space stands on while the still of the last grid fades over it.
+              // See `gridKey`.
+              pane={gridKey}
+              root={rootRef}
+              onLeave={leavePane}
+              onEnter={enterSpace}
+              className="zen-overview-space relative flex min-h-0 flex-1 flex-col"
+            >
+              {tabsEmpty ? (
+                <TabsEmpty slot={gridKey} gridDrawn={gridDrawn} />
+              ) : (
+                <div
+                  ref={gridRef}
+                  className="zen-overview-grid min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-3 pb-4 pt-1"
+                  data-pane={pane}
+                  // The Private pane under the lock cover (INC-05): its grid is out of reach – no
+                  // focus, no touch, nothing for a screen reader – until the cover lifts; the
+                  // cards read the placeholder meanwhile (`CardBody`), in case a reader reaches one.
+                  // So is the grid while Quick Delete's wipe runs over it (MOT-24, `wiping`).
+                  inert={(privatePane && locked) || wiping || undefined}
+                  aria-hidden={(privatePane && locked) || undefined}
+                  // The card the page morphs into is scrolled into view: keep it clear of the fades.
+                  style={{
+                    touchAction: 'pan-y',
+                    overscrollBehavior: 'contain',
+                    scrollPaddingBlock: 16
+                  }}
+                  onScroll={(e) => {
+                    noteOverviewScroll(pane, e.currentTarget.scrollTop)
+                    measure()
+                    rewindow(true)
+                  }}
+                >
+                  {searching && found === 0 && (
+                    // No card matches (§9.34): §9.17's sentence where the grid was, the reach's
+                    // lists beneath it when they have rows – then the sentence names what is
+                    // missing, since the rows under it are tabs too.
+                    <p className="zen-overview-search-empty" data-testid="overview-search-empty">
+                      {foundAll === 0 ? 'No tabs found' : 'No open tabs found'}
+                    </p>
+                  )}
+                  {essentials.length > 0 && (
+                    <div className="mb-3 flex flex-wrap gap-2">
+                      {essentials.map((tab) => (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          className="zen-essential h-12 w-12"
+                          data-active={tab.id === active?.id}
+                          data-discarded={tab.discarded}
+                          aria-label={tabCardLabel(
+                            tabTitle(tab),
+                            placeOf(tab),
+                            ordered.length,
+                            tab.id === active?.id
+                          )}
+                          // An essential is no card: while tabs are being selected it takes no
+                          // pick and no tap (§9.30, laid out as it was).
+                          disabled={selecting}
+                          onClick={() => pick(tab)}
+                        >
+                          <Favicon tab={tab} size={22} />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div
+                    // Positioned: the box a dissolving group's shell is placed in. `GroupCard`
+                    // takes the shell out of the flow at its `offsetTop`, which is read against
+                    // the nearest positioned ancestor and ignores the scroller's scroll – against
+                    // this grid, which scrolls with the cells, the shell stands where the card
+                    // stood; against the pane outside the scroller it landed `scrollTop` px too
+                    // low, and the tracker held only the cells drawn under that lower box (#355's
+                    // finding, seed 49).
+                    className="relative grid gap-3"
+                    style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
+                  >
+                    {/*
+                    The cards under here are WINDOWED (`lib/overviewWindow.ts`, W6-0): a cell
+                    is a card when this grid's window – the token's – holds it, a sized
+                    placeholder until then. The group cards' members are the same cells, through
+                    `card`.
+                  */}
+                    <OverviewWindowContext.Provider value={token}>
+                      {pinned.map(card)}
+                      {groupCards.map(({ folder, tabs, gone }) => (
+                        <GroupCard
+                          key={folder.id}
+                          folder={folder}
+                          tabs={tabs}
+                          card={card}
+                          columns={columns}
+                          onMenu={(f) => setSheet({ kind: 'group', folderId: f.id })}
+                          onNewTab={newTabInGroup}
+                          onCloseGroup={closeGroup}
+                          onDelete={deleteGroupOf}
+                          forming={tabs.length > 0 && forming(folder, tabs)}
+                          dissolving={tabs.length === 0}
+                          held={gone?.count}
+                          onDissolved={dissolvedGroup}
+                          onRelease={subscribeRelease}
+                        />
+                      ))}
+                      {loose.map(card)}
+                    </OverviewWindowContext.Provider>
+                    {/* The SAVED groups (§2): cards with the saved ring at the grid's end,
+                          before New Tab; off the grid with it while a query stands (§9.34: a
+                          saved page is no match) and while tabs are being selected they stand,
+                          no card to pick. */}
+                    {!searching &&
+                      rows.saved.map((row) => (
+                        <SavedGroupCard
+                          key={`saved:${row.folder.id}`}
+                          row={row}
+                          onOpen={reopenSaved}
+                          onMenu={(r) => {
+                            noteSheetOpener()
+                            setSheet({ kind: 'group-row', folderId: r.folder.id })
+                          }}
+                        />
+                      ))}
+                    {!searching && <NewTabCard pane={pane} disabled={selecting} />}
+                  </div>
+                  {searching && !privatePane && (
+                    <OverviewSearchReach
+                      reach={reach}
+                      onRestore={restoreClosed}
+                      onOpenTab={openRemote}
+                    />
+                  )}
+                </div>
+              )}
+            </PaneSlot>
+            {privatePane && <PrivateLockCover shown={locked} />}
+          </PaneSlot>
+          <PaneStills stills={stills} onDone={stillDone} />
+          <SelectionActions shown={selecting} actions={selectionActions} />
+        </div>
+        <Departures state={state} activeTabId={active?.id ?? null} />
+        <LiftGhost state={state} activeTabId={active?.id ?? null} />
+      </div>
+      {!tablet && heroNode}
+      {interactive && sheet?.kind === 'tab' && state.tabs[sheet.tabId] && (
+        <TabSheet
+          state={state}
+          tab={state.tabs[sheet.tabId]}
+          groups={groups}
+          groupable={!privatePane}
+          others={regularAll.length - 1}
+          onClose={() => setSheet(null)}
+          onSelect={(tab) => setSelection(startSelection(tab.id))}
+          onNewGroup={(tab) => void makeGroup([tab.id], true)}
+          onCloseTab={(tab) => closeTabs([tab])}
+          onCloseOthers={closeOthers}
+        />
+      )}
+      {interactive && sheet?.kind === 'group-picker' && (
+        <GroupPickerSheet
+          count={groupable.length}
+          groups={groups.map((folder) => ({ folder, count: liveMembersOf(folder.id).length }))}
+          onClose={() => leaveSheet('group-picker')}
+          onPick={groupSelected}
+        />
+      )}
+      {interactive && sheet?.kind === 'group' && state.folders[sheet.folderId] && (
+        <GroupSheet
+          folder={state.folders[sheet.folderId]}
+          count={liveMembersOf(sheet.folderId).length}
+          onClose={() => leaveSheet('group')}
+          onNewTab={newTabInGroup}
+          onCloseGroup={closeGroup}
+          onDelete={deleteGroupOf}
+        />
+      )}
+      {interactive && rowSheet && (
+        <GroupRowSheet
+          row={rowSheet}
+          onClose={() => leaveSheet('group-row')}
+          onOpen={showGroup}
+          onCloseGroup={closeGroup}
+          onDelete={deleteGroupAsked}
+        />
+      )}
+      {interactive && deleteSheet && (
+        <DeleteGroupSheet
+          row={deleteSheet}
+          onClose={() => leaveSheet('delete-group')}
+          onConfirm={deleteGroup}
+        />
+      )}
+      {interactive && sheet?.kind === 'spaces' && (
+        <SpacesSheet state={state} isDark={isDark} onClose={() => leaveSheet('spaces')} />
+      )}
+      {interactive && sheet?.kind === 'close-all' && (
+        <CloseAllSheet
+          count={regularAll.length}
+          onClose={() => leaveSheet('close-all')}
+          onConfirm={closeAll}
+        />
+      )}
+      {interactive && sheet?.kind === 'recently-closed' && (
+        <RecentlyClosedSheet
+          initial={sheet.closed}
+          onClose={() => leaveSheet('recently-closed')}
+          onRestore={restoreClosed}
+        />
+      )}
+      {interactive && sheet?.kind === 'inactive-tabs' && (
+        <InactiveTabsSheet
+          initial={sheet.entries}
+          archiveDays={state.settings.inactiveTabsArchiveDays}
+          onClose={() => leaveSheet('inactive-tabs')}
+          onRestore={restoreArchived}
+        />
+      )}
+    </>
+  )
+}
+
+/**
+ * The header while tabs are being selected (TAB-08; v2 §9.6; §5): Android's contextual action
+ * bar in the overview's own 56 header – its content REPLACES the header row's (the title), never
+ * stacks under it. The leading X is the platform's action-mode close, named "Done" as Android names it
+ * (the back gesture does the same; a trailing Done is iOS's and is not drawn), the count in the
+ * title's place as a live region ("3 selected"; "Select tabs" before the first pick, so the
+ * mode announces itself), and Select all – Deselect all once every card is picked – as the one
+ * trailing §9.18 secondary `zen-v2-button`, in the window family (§9.29, the overview's button
+ * rule; the app has no text button). The panels' selection header (`PhoneSelectionHeader`) is
+ * the same shape; this one sits in the overview's header element, on the overview's handle, so
+ * it cannot be that component.
+ */
+function SelectionHeader({
+  count,
+  everyPicked,
+  selectable,
+  onToggleAll,
+  onDone
+}: {
+  count: number
+  /** Every card the grid offers is picked: the action reads Deselect all. */
+  everyPicked: boolean
+  /** The grid has cards to pick; without them Select all is disabled (§9.30). */
+  selectable: boolean
+  onToggleAll: () => void
+  onDone: () => void
+}): JSX.Element {
+  return (
+    <>
+      <button
+        type="button"
+        className="zen-toolbar-button -ml-1.5 h-9 w-9"
+        aria-label="Done"
+        data-testid="overview-select-done"
+        onClick={onDone}
+      >
+        <X className="h-5 w-5" strokeWidth={1.75} />
+      </button>
+      <span
+        className="zen-title min-w-0 flex-1 truncate tabular-nums"
+        aria-live="polite"
+        data-testid="overview-selected-count"
+      >
+        {selectionTitle(count)}
+      </span>
+      <button
+        type="button"
+        className="zen-v2-button"
+        disabled={!selectable}
+        data-testid="overview-select-all"
+        onClick={onToggleAll}
+      >
+        {everyPicked ? 'Deselect all' : 'Select all'}
+      </button>
+    </>
+  )
+}
+
+/** One action of the select-tabs mode's row (`SelectionActions`). */
+interface SelectionAction {
+  id: string
+  /** The one word under the glyph. */
+  label: string
+  /** What the button is called for assistive technology: the verb with the count ("Close 3 tabs"). */
+  name: string
+  glyph: ReactNode
+  /** Nothing among the picks for this action to act on: disabled at .4, laid out as it was (§9.30). */
+  disabled: boolean
+  run: () => void
+}
+
+/**
+ * The select-tabs mode's action row (TAB-08): a window-family strip (v2 §9.29) at the foot of
+ * the overview, above the bar – one band in the window fill, the group strip's tray at the
+ * card's radius, holding the actions as glyph-over-label buttons that share its width, named
+ * with their count for TalkBack. The strip's slot takes its height the moment the mode is on
+ * (one layout change; the grid's cells glide if the shorter grid moves them, §11.4) and the
+ * band slides up into the slot on `SPRING_GENTLE`, back down as the mode ends, the slot
+ * clipping it; the spring writes the transform per frame, promoted for those frames only.
+ * Under reduced motion the band fades its 120 ms in place instead (§11.3), on its own opacity
+ * transition, and leaves once that has run.
+ */
+function SelectionActions({
+  shown,
+  actions
+}: {
+  shown: boolean
+  actions: SelectionAction[]
+}): JSX.Element | null {
+  const [mounted, setMounted] = useState(shown)
+  if (shown && !mounted) setMounted(true)
+  const band = useRef<HTMLDivElement>(null)
+  const spring = useRef<SpringAnimation | null>(null)
+  const unmount = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useLayoutEffect(() => {
+    const el = band.current
+    if (!el) return
+    if (unmount.current !== null) {
+      clearTimeout(unmount.current)
+      unmount.current = null
+    }
+    spring.current ??= new SpringAnimation(
+      SPRING_GENTLE,
+      (x) => {
+        const b = band.current
+        if (!b) return
+        if (reducedMotion()) {
+          b.style.transform = ''
+          b.style.opacity = String(x)
+        } else {
+          b.style.transform = `translateY(${(1 - x) * 100}%)`
+          b.style.opacity = ''
+        }
+      },
+      (x) => {
+        const b = band.current
+        if (b) b.style.willChange = ''
+        if (x < 0.5)
+          unmount.current = setTimeout(() => setMounted(false), reducedMotion() ? 120 : 0)
+      }
+    )
+    const s = spring.current
+    // The band was just laid out at its start (below the slot, or unpainted): make sure the
+    // engine has seen it there, so the reduced-motion opacity transition has a from-value.
+    void el.getBoundingClientRect()
+    el.style.willChange = 'transform'
+    const { x, v } = s.current
+    s.start(x, v, shown ? 1 : 0)
+    return () => {
+      if (unmount.current !== null) {
+        clearTimeout(unmount.current)
+        unmount.current = null
+      }
+    }
+  }, [shown, mounted])
+  useEffect(
+    () => () => {
+      spring.current?.stop()
+    },
+    []
+  )
+  if (!mounted) return null
+  return (
+    <div className="zen-overview-actions" data-testid="overview-actions">
+      <div
+        ref={band}
+        className="zen-overview-actions-band"
+        style={reducedMotion() ? { opacity: 0 } : { transform: 'translateY(100%)' }}
+      >
+        {actions.map((action) => (
+          <button
+            key={action.id}
+            type="button"
+            className="zen-overview-action"
+            aria-label={action.name}
+            disabled={action.disabled}
+            data-testid={`overview-action-${action.id}`}
+            onClick={action.run}
+          >
+            {action.glyph}
+            <span>{action.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Group's picker (TAB-08): a 9.13 sheet of the pane's groups – "New group" first, then each
+ * group by its name and colour, with how many cards it holds – for the picks a group can take;
+ * the rows are the card menu's own ("Add to <name>"), so the two ways of grouping read alike.
+ * A picker's option row is sentence case (§9.1; the card menu's "New Group" is a menu item and
+ * Title Case, the design gate on #304). It is the overview's action sheet, on the frame's
+ * dialog host over the grid.
+ */
+function GroupPickerSheet({
+  count,
+  groups,
+  onClose,
+  onPick
+}: {
+  /** How many of the picked tabs will be grouped. */
+  count: number
+  groups: HeldGroup[]
+  onClose: () => void
+  /** A group was picked: its folder id, or null for a new group. */
+  onPick: (folderId: string | null) => void
+}): JSX.Element {
+  const actions: SheetAction[] = [
+    { id: 'new-group', label: 'New group', onPick: () => onPick(null) },
+    ...groups.map(({ folder, count: held }): SheetAction => ({
+      id: `group-${folder.id}`,
+      label: `Add to ${folder.name} (${held})`,
+      icon: <GroupGlyph folder={folder} />,
+      onPick: () => onPick(folder.id)
+    }))
+  ]
+  return (
+    <OverviewSheet
+      title={`Group ${count} ${count === 1 ? 'tab' : 'tabs'}`}
+      actions={actions}
+      onClose={onClose}
+    />
+  )
+}
+
+/** The card in the hand: follows the finger, tucks in over a target, flies into its slot. */
+function LiftGhost({
+  state,
+  activeTabId
+}: {
+  state: UIState
+  activeTabId: string | null
+}): JSX.Element | null {
+  const lift = liftStore.use()
+  if (lift.phase === 'idle' || !lift.ghost || !lift.tabId) return null
+  const tab = state.tabs[lift.tabId]
+  if (!tab) return null
+  // Two elements (motion spec §0.4): the SEAT follows the finger by a per-frame `translate` –
+  // `left`/`top` per frame laid the page out on every frame – and the CARD inside it carries the
+  // lift's scale, whose 120 ms stylesheet transition would otherwise smear the follow when both
+  // sat on one `transform`. The seat is snapped to the device pixel grid as the layout box was,
+  // so the card's text stays sharp wherever the follow rests.
+  const dpr = window.devicePixelRatio || 1
+  const x = Math.round(lift.ghost.x * dpr) / dpr
+  const y = Math.round(lift.ghost.y * dpr) / dpr
+  return (
+    <div
+      className="zen-overview-ghost-seat pointer-events-none fixed z-30"
+      style={{
+        width: lift.ghost.width,
+        height: lift.ghost.height,
+        transform: `translate(${x}px, ${y}px)`
+      }}
+    >
+      <div
+        className="zen-overview-card zen-overview-ghost flex h-full w-full flex-col overflow-hidden"
+        data-active={tab.id === activeTabId}
+        data-landing={lift.phase === 'dropping' || undefined}
+        style={{ transform: `scale(${lift.scale})` }}
+      >
+        <CardBody tab={tab} closable={false} />
+      </div>
+    </div>
+  )
+}
+
+function TabSheet({
+  state,
+  tab,
+  groups,
+  groupable,
+  others,
+  onClose,
+  onSelect,
+  onNewGroup,
+  onCloseTab,
+  onCloseOthers
+}: {
+  state: UIState
+  tab: Tab
+  groups: Folder[]
+  /** Whether the pane groups its cards (the private pane does not). */
+  groupable: boolean
+  /** How many other tabs "Close other tabs" would close. */
+  others: number
+  onClose: () => void
+  /** "Select Tabs": the select-tabs mode, with this card picked (TAB-08). */
+  onSelect: (tab: Tab) => void
+  onNewGroup: (tab: Tab) => void
+  onCloseTab: (tab: Tab) => void
+  onCloseOthers: (tab: Tab) => void
+}): JSX.Element {
+  const current = tab.folderId && state.folders[tab.folderId] ? tab.folderId : null
+  // The rows are menu items, so Title Case (v2 §9.1, the #207 ruling): "New Group", "Close Other
+  // Tabs (3)"; a group's own name is written as the user gave it. Select Tabs leads: it is the
+  // way to act on several cards, and the rows under it act on this one.
+  const actions: SheetAction[] = [
+    { id: 'select', label: 'Select Tabs', onPick: () => onSelect(tab) }
+  ]
+  if (groupable && !tab.pinned && !tab.essential) {
+    actions.push({ id: 'new-group', label: 'New Group', onPick: () => onNewGroup(tab) })
+    for (const g of groups) {
+      if (g.id === current) continue
+      actions.push({
+        id: `group-${g.id}`,
+        label: current ? `Move to ${g.name}` : `Add to ${g.name}`,
+        icon: <GroupGlyph folder={g} />,
+        onPick: () => run('tab.moveToFolder', { tabId: tab.id, folderId: g.id })
+      })
+    }
+    if (current)
+      actions.push({
+        id: 'ungroup',
+        label: 'Remove from Group',
+        onPick: () => run('tab.moveToFolder', { tabId: tab.id, folderId: null })
+      })
+  }
+  // Chrome's card hold offers Share and Add to bookmarks between its group rows and the close
+  // (TAB-28), and so does this one, for a tab that is a page (`pageTabs`, the select-tabs bar's
+  // rule: a blank tab, the new tab page and the browser's own pages have nothing to share or
+  // file). Share… runs once the sheet has landed – the share panel below Android 14, the
+  // system sheet from 14 (`share.open`, the tab's title and address) – so no sheet stands over
+  // a sheet; the bookmark row reads the tab's state and toggles it in place (`bookmark.toggle`:
+  // the core's toast says which folder took it, or Undo on the removal), no ellipsis since
+  // nothing opens. Menu items, so Title Case (§9.1); "Bookmark Tab" / "Remove Bookmark" are the
+  // desktop tab row's words – one pair across hosts (the gate's ruling on #562).
+  if (pageTabs([tab]).length > 0) {
+    actions.push(
+      { id: 'share', label: 'Share…', onPick: () => run('share.open', { tabId: tab.id }) },
+      {
+        id: 'bookmark',
+        label: tab.bookmarked ? 'Remove Bookmark' : 'Bookmark Tab',
+        onPick: () => run('bookmark.toggle', { tabId: tab.id })
+      }
+    )
+  }
+  if (!tab.pinned && !tab.essential && others > 0)
+    actions.push({
+      id: 'close-others',
+      label: `Close Other Tabs (${others})`,
+      destructive: true,
+      onPick: () => onCloseOthers(tab)
+    })
+  actions.push({
+    id: 'close',
+    label: 'Close Tab',
+    destructive: true,
+    onPick: () => onCloseTab(tab)
+  })
+  return <OverviewSheet title={tabTitle(tab)} actions={actions} onClose={onClose} />
+}
+
+/**
+ * A group card's sheet (its ⋯, or the header held; §2): the colour swatches (`GroupColorPalette`,
+ * the saved card's sheet shares them) over the group's actions (`groupActions`: Rename, New Tab
+ * in Group, Ungroup, Close Group, Delete Group – the same actions the card gives a reader as
+ * controls under touch exploration, by the same names).
+ */
+function GroupSheet({
+  folder,
+  count,
+  onClose,
+  onNewTab,
+  onCloseGroup,
+  onDelete
+}: {
+  folder: Folder
+  count: number
+  onClose: () => void
+  onNewTab: (folder: Folder) => void
+  onCloseGroup: (folder: Folder) => void
+  onDelete: (folder: Folder) => void
+}): JSX.Element {
+  const actions: SheetAction[] = groupActions(folder, count, {
+    newTabInGroup: onNewTab,
+    closeGroup: onCloseGroup,
+    deleteGroup: onDelete
+  }).map(({ id, label, destructive, run: onPick }) => ({ id, label, destructive, onPick }))
+  return (
+    <OverviewSheet
+      title={folder.name}
+      header={<GroupColorPalette folder={folder} />}
+      actions={actions}
+      onClose={onClose}
+    />
+  )
+}
+
+/**
+ * The last card of the grid, a cell like the others (`data-cell`): when cards are rearranged,
+ * closed or grouped it glides to its new place on the same spring as they do. In the private
+ * view it opens a private tab (INC-01). While tabs are being selected it is no card to pick and
+ * takes no tap (§9.30, in its place). While a query stands it is off the grid with the cards
+ * that do not match (§9.34), its face leaving as theirs do (`NewTabFace`, `Departures`).
+ */
+function NewTabCard({ pane, disabled }: { pane: OverviewPane; disabled?: boolean }): JSX.Element {
+  const isPrivate = pane === 'private'
+  return (
+    <button
+      type="button"
+      className="zen-overview-new flex flex-col items-center justify-center gap-2 text-[var(--zen-muted)] active:text-[var(--zen-fg)]"
+      style={{ aspectRatio: CARD_ASPECT }}
+      data-cell={NEW_TAB_CELL}
+      data-testid={isPrivate ? 'overview-new-private-tab' : 'overview-new-tab'}
+      disabled={disabled}
+      onClick={() => newTabOn(pane)}
+    >
+      <NewTabFace isPrivate={isPrivate} />
+    </button>
+  )
+}
+
+/**
+ * Ask for a new tab of the view's mode – the New Tab card's tap, the menu's New Tab and New
+ * Private Tab (§4): the phone's new tab page comes up over the overview (`App.tsx`'s
+ * `useNewTabEvent`; the tablet runs the core's command).
+ */
+function newTabOn(pane: OverviewPane): void {
+  window.dispatchEvent(
+    new CustomEvent('zen-new-tab', {
+      detail: pane === 'private' ? { containerId: PRIVATE_CONTAINER_ID } : {}
+    })
+  )
+}
+
+/**
+ * The regular view with nothing in it (TAB-34): §9.17's one sentence, "No open tabs", on the
+ * phone panels' note (`PhoneEmptyNote`: 15/400 at 69%, centred in the 32 gutter, top-anchored)
+ * in the window ink, its first line 48 under the header, with New tab as its one follow-up –
+ * the note's secondary button 16 beneath, 88 minimum at 40 – in place of the grid and its lone
+ * New Tab card; no title, no glyph, no message card (a standing state, not a message, as §9.34
+ * writes a list's empty room). Chrome's grid at none says the same. It stands inside the
+ * Space's slot, so a Space with no tabs slides in as a grid would (MOT-05). It is the pane's
+ * state, not the search's: while a query stands the grid keeps the room with its "No tabs
+ * found" and the reach's rows (`.zen-overview-tabs-empty` in main.css). The private view has no
+ * empty room: it stands only while a private tab is open (§4, `overviewPane`). Its 120 ms fade
+ * (§11.4) is the replacement's alone: the note that
+ * takes the grid's place in its own slot – the last card gone – is marked `data-in-place`, the
+ * fade rule's key; one that comes up with its pane, its Space or the overview carries no mark
+ * and rides their motion (§11.1: one object, one move). The mark is decided once, at the mount,
+ * before the first paint: `gridDrawn` (the overview's record of the slot whose grid the last
+ * commit drew) still reads the last commit's word here, a child's layout effect running before
+ * its parent's. It is set on the element, outside React's props, so a later render of the same
+ * note leaves what it came up as.
+ */
+function TabsEmpty({
+  slot,
+  gridDrawn
+}: {
+  slot: string
+  gridDrawn: RefObject<string | null>
+}): JSX.Element {
+  const el = useRef<HTMLDivElement | null>(null)
+  useLayoutEffect(() => {
+    if (gridDrawn.current === slot && el.current) el.current.dataset.inPlace = ''
+  }, [slot, gridDrawn])
+  return (
+    <div
+      ref={el}
+      className="zen-overview-tabs-empty relative min-h-0 flex-1"
+      data-pane="tabs"
+      data-testid="overview-tabs-empty"
+    >
+      <PhoneEmptyNote action={{ label: 'New tab', onSelect: () => newTabOn('tabs') }}>
+        No open tabs
+      </PhoneEmptyNote>
+    </div>
+  )
+}
+
+/**
+ * A card the search lets back into the grid enters as a closing card's exit run backwards
+ * (§11.4, `Departures`): from `scale(1 − .1)` and opacity 0 to rest on `SPRING_SNAPPY` over the
+ * exit's 120 px of travel – written to the cell's own `scale` and `opacity`, beside the
+ * `transform` the FLIP set writes for its glide, and cleared at rest; under reduced motion a
+ * 120 ms fade in place (§11.3). `running` holds the way to cut it short: the styles are cleared
+ * and the card stands as laid out.
+ */
+function enterCard(el: HTMLElement, running: Set<() => void>): void {
+  if (reducedMotion()) {
+    el.animate?.([{ opacity: 0 }, { opacity: 1 }], { duration: REDUCED_FADE_MS, easing: ZEN_EASE })
+    return
+  }
+  const settle = (): void => {
+    el.style.scale = ''
+    el.style.opacity = ''
+    el.style.willChange = ''
+    running.delete(cancel)
+  }
+  const spring = new SpringAnimation(
+    SPRING_SNAPPY,
+    (x) => {
+      const t = x / ENTER_TRAVEL
+      el.style.scale = String(1 - ENTER_SCALE * t)
+      el.style.opacity = String(Math.max(0, 1 - t))
+    },
+    settle
+  )
+  const cancel = (): void => {
+    spring.stop()
+    settle()
+  }
+  running.add(cancel)
+  el.style.willChange = 'transform, opacity'
+  spring.start(ENTER_TRAVEL, 0, 0)
+}
+
+/** The first browser state `pick` answers for, within `ms`; null once that time has passed. */
+function whenState<T>(pick: (state: UIState) => T | null, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    let done = false
+    const finish = (value: T | null): void => {
+      if (done) return
+      done = true
+      unsubscribe()
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const check = (): void => {
+      const s = browserStore.get().state
+      const value = s ? pick(s) : null
+      if (value !== null) finish(value)
+    }
+    const unsubscribe = browserStore.subscribe(check)
+    const timer = setTimeout(() => finish(null), ms)
+    check()
+  })
+}
+
+/**
+ * The hero's picture: the page's capture where the chrome has one, or the placeholder page,
+ * whose typography shrinks with the card (`TabPreview`'s `scale`: 1 at the page's size, .8 at
+ * the card's, in whole pixels). The one part of the hero React draws as the morph moves – a
+ * component of its own on the store's progress, so a frame renders it and nothing else – and
+ * only at the frames where a pixel size changes (`heroScale`: the scale the picture was last
+ * drawn at, kept while every size reads the same; seven or eight renders over the travel, not
+ * one per frame). `progress` is the frame for a render outside the stage (see `Props`).
+ */
+function HeroPicture({
+  tab,
+  progress,
+  still = false
+}: {
+  tab: Tab
+  progress: number
+  /** The hero keeps the page's size for the whole travel (the tablet's slide): no shrink to draw. */
+  still?: boolean
+}): JSX.Element {
+  const scale = stageStore.use((s) =>
+    still
+      ? 1
+      : heroScale(s.overview.phase === 'closed' ? progress : clampProgress(s.overview.progress))
+  )
+  return <TabPreview tab={tab} scale={scale} cover />
+}
+
+/**
+ * The tablet layer's backdrop laid as the window's (TABLET-14): the same `--zen-bg` at the
+ * window's size, shifted by the layer's box's offset in it, so the gradient under the grid is
+ * the one the toolbar and the sidebar stand on, seamless at the layer's edge once it rests. Read
+ * from the box, which the slide's transform never moves, in the commit's layout phase.
+ */
+function alignBackdrop(root: HTMLElement | null, box: HTMLElement | null): void {
+  if (!root || !box) return
+  const window_ = box.closest<HTMLElement>('.zen-window')
+  if (!window_) return
+  const w = window_.getBoundingClientRect()
+  const b = box.getBoundingClientRect()
+  root.style.backgroundSize = `${w.width}px ${w.height}px`
+  root.style.backgroundPosition = `${w.left - b.left}px ${w.top - b.top}px`
+}
+
+let heroScaleDrawn = 1
+function heroScale(p: number): number {
+  const scale = 1 - 0.2 * p
+  const [icon, title, host] = placeholderPx(scale)
+  const [iconDrawn, titleDrawn, hostDrawn] = placeholderPx(heroScaleDrawn)
+  if (icon !== iconDrawn || title !== titleDrawn || host !== hostDrawn) heroScaleDrawn = scale
+  return heroScaleDrawn
+}
+
+/** The morph's progress as drawn: 0 (the page) to 1 (the card); the drag's rubber band past both ends is not. */
+function clampProgress(progress: number): number {
+  return Math.min(1, Math.max(0, progress))
+}
+
+/**
+ * The progress a commit draws: the store's while the stage's overview is up (the one its
+ * frames follow), the prop's for a component rendered outside the stage.
+ */
+function liveProgress(overview: OverviewState): number {
+  const live = stageStore.get().overview
+  return clampProgress(live.phase !== 'closed' ? live.progress : overview.progress)
+}
+
+function lerpRect(a: Rect, b: Rect, t: number): Rect {
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    width: a.width + (b.width - a.width) * t,
+    height: a.height + (b.height - a.height) * t
+  }
+}
+
+/** Fallback destination when the hero has no card (a tab of another space): shrink in place. */
+function shrunk(area: Rect): Rect {
+  return {
+    x: area.x + area.width * 0.25,
+    y: area.y + area.height * 0.25,
+    width: area.width * 0.5,
+    height: area.height * 0.5
+  }
+}

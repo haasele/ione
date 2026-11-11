@@ -1,0 +1,447 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { MenuItemTemplate, MenuPopupOptions } from '../../../core/platform'
+
+/*
+ * The host's menus (`platform/menus.ts`). The context menus are native: a `data:` or remote
+ * picture becomes the item's 16 × 16 image. A favicon is square; a media session's artwork is
+ * often wider than tall, and the hub's tile covers such a picture (`object-fit: cover`) – so the
+ * host crops it to its centre square before the resize rather than squashing it. The "⋯" app
+ * menu is not native (design language v2 §6 "Menus"): its template goes to the renderer as a
+ * `menu.show` descriptor through `RendererMenuHost`, and a pick comes back by id. The macOS
+ * menu bar is set from the same templates: at once, and again with the favicons its rows carry
+ * once those the cache lacked are fetched (History › Recently Visited's, shortcuts-menus-157).
+ * On Windows and Linux every native template's labels carry an Alt mnemonic (`&`), chosen in
+ * `platform/menuMnemonics.ts` – the table has its own suite; here, that the marker reaches
+ * Electron and that macOS gets none.
+ */
+
+interface FakeImage {
+  size: { width: number; height: number }
+  ops: string[]
+  isEmpty: () => boolean
+  getSize: () => { width: number; height: number }
+  crop: (rect: { x: number; y: number; width: number; height: number }) => FakeImage
+  resize: (size: { width: number; height: number }) => FakeImage
+}
+
+function image(width: number, height: number, ops: string[] = []): FakeImage {
+  return {
+    size: { width, height },
+    ops,
+    isEmpty: () => width === 0 || height === 0,
+    getSize: () => ({ width, height }),
+    crop: (rect) =>
+      image(rect.width, rect.height, [
+        ...ops,
+        `crop ${rect.x},${rect.y} ${rect.width}×${rect.height}`
+      ]),
+    resize: (size) =>
+      image(size.width, size.height, [...ops, `resize ${size.width}×${size.height}`])
+  }
+}
+
+const built: Electron.MenuItemConstructorOptions[][] = []
+/** The options each built menu was popped up with, in order. */
+const popped: Electron.PopupOptions[] = []
+/** The picture each `data:` URL decodes to, by URL. */
+const decoded = new Map<string, FakeImage>()
+/** The picture each remote URL fetches, by URL. */
+const remote = new Map<string, FakeImage>()
+
+vi.mock('electron', () => ({
+  Menu: {
+    buildFromTemplate: (items: Electron.MenuItemConstructorOptions[]) => {
+      built.push(items)
+      return { popup: (options: Electron.PopupOptions) => popped.push(options) }
+    },
+    setApplicationMenu: vi.fn()
+  },
+  nativeImage: {
+    createFromDataURL: (src: string) => decoded.get(src) ?? image(0, 0),
+    createFromBuffer: (buffer: Buffer) => remote.get(buffer.toString('utf8')) ?? image(0, 0)
+  },
+  net: {
+    fetch: async (url: string) => ({
+      ok: remote.has(url),
+      arrayBuffer: async () => Buffer.from(url, 'utf8')
+    })
+  }
+}))
+
+const { ElectronMenus } = await import('../menus')
+
+/** The window's content size, the box a menu's position is kept inside. */
+const CONTENT = { width: 1600, height: 1000 }
+/** A live window, as the host's menus read it. */
+const host = (): { alive: boolean; win: object; contentSize: () => typeof CONTENT } => ({
+  alive: true,
+  win: {},
+  contentSize: () => CONTENT
+})
+
+/** A native (context) menu, as the host builds it for Electron. */
+async function popup(
+  items: MenuItemTemplate[],
+  options: Partial<MenuPopupOptions> = {}
+): Promise<Electron.MenuItemConstructorOptions[]> {
+  const menus = new ElectronMenus()
+  const win = { host: host(), send: vi.fn() } as never
+  menus.popup(items, { source: 'tab', win, ...options })
+  // A menu with uncached remote icons opens once they are fetched.
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const last = built.at(-1)
+  if (!last) throw new Error('no menu was built')
+  return last
+}
+
+const icon = (item: Electron.MenuItemConstructorOptions): FakeImage =>
+  item.icon as unknown as FakeImage
+
+const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+/** The desktop the host believes it is on; the suites read as Linux unless they say otherwise. */
+const onPlatform = (value: NodeJS.Platform): void => {
+  Object.defineProperty(process, 'platform', { value, configurable: true })
+}
+
+beforeEach(() => {
+  built.length = 0
+  popped.length = 0
+  decoded.clear()
+  remote.clear()
+  onPlatform('linux')
+})
+
+afterEach(() => {
+  if (platform) Object.defineProperty(process, 'platform', platform)
+})
+
+describe('the app menu is the renderer’s', () => {
+  it('sends the app menu’s template to the renderer as a descriptor – chords as hints, submenus nested – and never builds it natively; a pick runs the item', () => {
+    const menus = new ElectronMenus()
+    const send = vi.fn()
+    const win = { host: host(), send } as never
+    const settings = vi.fn()
+    const closed = vi.fn()
+    menus.popup(
+      [
+        { label: 'New Tab', accelerator: 'Ctrl+T', hint: 'Ctrl+T', click: vi.fn() },
+        { type: 'separator' },
+        {
+          label: 'History',
+          submenu: [{ label: 'Recently Closed', submenu: [{ label: 'Example', click: closed }] }]
+        },
+        { label: 'Settings', click: settings }
+      ],
+      { source: 'app', win, x: 200, y: 44, keyboard: true }
+    )
+    expect(built).toHaveLength(0)
+    expect(send).toHaveBeenCalledTimes(1)
+    const [event, descriptor] = send.mock.calls[0] as [
+      string,
+      import('@shared/types').MenuDescriptor
+    ]
+    expect(event).toBe('menu.show')
+    expect(descriptor.source).toBe('app')
+    expect(descriptor.keyboard).toBe(true)
+    expect(descriptor).toMatchObject({ x: 200, y: 44 })
+    expect(descriptor.items.map((i) => [i.type, i.label, i.hint ?? null])).toEqual([
+      ['normal', 'New Tab', 'Ctrl+T'],
+      ['separator', '', null],
+      ['normal', 'History', null],
+      ['normal', 'Settings', null]
+    ])
+    const recently = descriptor.items[2].submenu?.[0]
+    expect(recently?.label).toBe('Recently Closed')
+    expect(recently?.submenu?.[0].label).toBe('Example')
+    // The pick, by the id the descriptor gave the row, runs the template's handler here.
+    menus.activate(descriptor.id, descriptor.items[3].id)
+    expect(settings).toHaveBeenCalledTimes(1)
+    // The menu is spent: a second pick on it does nothing, and a close of a stale id neither.
+    menus.activate(descriptor.id, recently!.submenu![0].id)
+    expect(closed).not.toHaveBeenCalled()
+    menus.dismiss(descriptor.id)
+  })
+
+  it('a web app window’s "⋯" menu takes the same path', () => {
+    const menus = new ElectronMenus()
+    const send = vi.fn()
+    const win = { host: host(), send, chrome: 'app' } as never
+    menus.popup([{ label: 'Copy URL', click: vi.fn() }], { source: 'app', win })
+    expect(built).toHaveLength(0)
+    expect(send).toHaveBeenCalledWith('menu.show', expect.objectContaining({ source: 'app' }))
+  })
+
+  it('a context menu stays native, its label carrying the row’s Alt mnemonic', async () => {
+    const items = await popup([{ label: 'Reload', accelerator: 'Ctrl+R', hint: 'Ctrl+R' }])
+    expect(items).toEqual([
+      {
+        label: '&Reload',
+        enabled: undefined,
+        type: 'normal',
+        accelerator: 'Ctrl+R',
+        registerAccelerator: false
+      }
+    ])
+  })
+
+  it('an extension button’s context menu is a context menu: native at the button, not the "⋯" panel', () => {
+    const menus = new ElectronMenus()
+    const send = vi.fn()
+    const win = { host: host(), send } as never
+    menus.popup([{ label: 'Options', click: vi.fn() }], { source: 'extension', win, x: 300, y: 44 })
+    expect(send).not.toHaveBeenCalled()
+    expect(built).toHaveLength(1)
+    expect(built[0][0]).toMatchObject({ label: '&Options' })
+  })
+})
+
+describe('Alt mnemonics on the way to Electron (context-menus-118)', () => {
+  const template: MenuItemTemplate[] = [
+    { label: 'Back' },
+    { label: 'Forward' },
+    { type: 'separator' },
+    { label: 'Tom & Jerry', submenu: [{ label: 'Cut' }, { label: 'Copy' }] }
+  ]
+  const labels = (items: Electron.MenuItemConstructorOptions[]): (string | undefined)[] =>
+    items.map((item) => item.label)
+
+  it('Windows and Linux: one marked letter per row at every level, a literal & doubled', async () => {
+    for (const os of ['linux', 'win32'] as const) {
+      onPlatform(os)
+      const items = await popup(template)
+      expect(labels(items)).toEqual(['&Back', '&Forward', undefined, '&Tom && Jerry'])
+      expect(labels(items[3].submenu as Electron.MenuItemConstructorOptions[])).toEqual([
+        'Cu&t',
+        '&Copy'
+      ])
+    }
+  })
+
+  it('macOS: no marker – Electron’s Cocoa menus drop a lone & and read && as & – but the & is still doubled', async () => {
+    onPlatform('darwin')
+    const items = await popup(template)
+    expect(labels(items)).toEqual(['Back', 'Forward', undefined, 'Tom && Jerry'])
+    expect(labels(items[3].submenu as Electron.MenuItemConstructorOptions[])).toEqual([
+      'Cut',
+      'Copy'
+    ])
+  })
+
+  it('the macOS menu bar is escaped the same way and marked no more than the popups', () => {
+    onPlatform('darwin')
+    const menus = new ElectronMenus()
+    menus.setApplicationMenu!([
+      { label: 'File', submenu: [{ label: 'Save & Share' }, { label: 'Quit' }] }
+    ])
+    const [file] = built.at(-1)!
+    expect(file.label).toBe('File')
+    expect(labels(file.submenu as Electron.MenuItemConstructorOptions[])).toEqual([
+      'Save && Share',
+      'Quit'
+    ])
+  })
+})
+
+describe('native menu icons', () => {
+  it('resizes a square favicon to 16 without cropping', async () => {
+    decoded.set('data:image/png;base64,SQUARE', image(32, 32))
+    const [item] = await popup([{ label: 'Site', icon: 'data:image/png;base64,SQUARE' }])
+    expect(icon(item).ops).toEqual(['resize 16×16'])
+    expect(icon(item).size).toEqual({ width: 16, height: 16 })
+  })
+
+  it('crops a wide picture (a 16:9 artwork) to its centre square before the resize, as the hub’s tile covers it', async () => {
+    decoded.set('data:image/jpeg;base64,WIDE', image(1200, 630))
+    const [item] = await popup([{ label: 'Now Playing…', icon: 'data:image/jpeg;base64,WIDE' }])
+    expect(icon(item).ops).toEqual(['crop 285,0 630×630', 'resize 16×16'])
+  })
+
+  it('crops a tall picture the same way', async () => {
+    decoded.set('data:image/png;base64,TALL', image(300, 500))
+    const [item] = await popup([{ label: 'Now Playing…', icon: 'data:image/png;base64,TALL' }])
+    expect(icon(item).ops).toEqual(['crop 0,100 300×300', 'resize 16×16'])
+  })
+
+  it('treats a remote artwork the same, fetched before the menu opens', async () => {
+    remote.set('https://music.example.com/cover.jpg', image(640, 360))
+    const [item] = await popup([
+      { label: 'Now Playing…', icon: 'https://music.example.com/cover.jpg' }
+    ])
+    expect(icon(item).ops).toEqual(['crop 140,0 360×360', 'resize 16×16'])
+  })
+
+  it('leaves an item without a decodable picture icon-less', async () => {
+    const [item] = await popup([{ label: 'Now Playing…', icon: 'data:image/png;base64,BROKEN' }])
+    expect(item.icon).toBeUndefined()
+    const [plain] = await popup([{ label: 'Now Playing…', icon: null }])
+    expect(plain.icon).toBeUndefined()
+  })
+})
+
+describe('the macOS menu bar’s favicons (History › Recently Visited, shortcuts-menus-157)', () => {
+  let setApplicationMenu: ReturnType<typeof vi.fn>
+
+  beforeEach(async () => {
+    onPlatform('darwin')
+    setApplicationMenu = (await import('electron')).Menu.setApplicationMenu as ReturnType<
+      typeof vi.fn
+    >
+    setApplicationMenu.mockClear()
+  })
+
+  /** The fetches behind a set bar have landed. */
+  const fetched = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
+
+  /** The History menu with a Recently Visited block whose rows carry the favicons given. */
+  const bar = (rows: Array<[label: string, icon: string]>): MenuItemTemplate[] => [
+    {
+      label: 'History',
+      submenu: [
+        { label: 'Show Full History' },
+        { type: 'separator' },
+        { label: 'Recently Visited', enabled: false, note: true },
+        ...rows.map(([label, icon]): MenuItemTemplate => ({ label, icon, click: vi.fn() }))
+      ]
+    }
+  ]
+
+  /** The Recently Visited rows of the last bar built, by label and the ops of their icon. */
+  const visited = (): Array<[string, string[] | undefined]> => {
+    const history = built.at(-1)?.[0]
+    const rows = (history?.submenu as Electron.MenuItemConstructorOptions[]).slice(3)
+    return rows.map((row) => [row.label ?? '', row.icon ? icon(row).ops : undefined])
+  }
+
+  it('sets the bar at once without the favicons the cache lacks, fetches them behind it and sets it again with them in place', async () => {
+    remote.set('https://docs.example/favicon.ico', image(32, 32))
+    remote.set('https://mail.example/icon.png', image(64, 64))
+    const menus = new ElectronMenus()
+    expect(menus.setApplicationMenu).toBeDefined()
+    menus.setApplicationMenu!(
+      bar([
+        ['Docs', 'https://docs.example/favicon.ico'],
+        ['Mail', 'https://mail.example/icon.png'],
+        ['Gone', 'https://gone.example/favicon.ico']
+      ])
+    )
+    // The bar stands before any fetch: a state change never shows late in it.
+    expect(setApplicationMenu).toHaveBeenCalledTimes(1)
+    expect(visited()).toEqual([
+      ['Docs', undefined],
+      ['Mail', undefined],
+      ['Gone', undefined]
+    ])
+    await fetched()
+    // Set again once the favicons are in – 16 × 16 as the context menus draw them; the row whose
+    // fetch failed stays icon-less (and is not retried, as `popup()` leaves it).
+    expect(setApplicationMenu).toHaveBeenCalledTimes(2)
+    expect(visited()).toEqual([
+      ['Docs', ['resize 16×16']],
+      ['Mail', ['resize 16×16']],
+      ['Gone', undefined]
+    ])
+    // The same rows again: every favicon known, the bar set once.
+    menus.setApplicationMenu!(
+      bar([
+        ['Docs', 'https://docs.example/favicon.ico'],
+        ['Gone', 'https://gone.example/favicon.ico']
+      ])
+    )
+    expect(setApplicationMenu).toHaveBeenCalledTimes(3)
+    expect(visited()).toEqual([
+      ['Docs', ['resize 16×16']],
+      ['Gone', undefined]
+    ])
+    await fetched()
+    expect(setApplicationMenu).toHaveBeenCalledTimes(3)
+  })
+
+  it('a bar set while the favicons are in flight supersedes the older one, whose favicons set nothing again', async () => {
+    remote.set('https://old.example/favicon.ico', image(32, 32))
+    const menus = new ElectronMenus()
+    menus.setApplicationMenu!(bar([['Old', 'https://old.example/favicon.ico']]))
+    menus.setApplicationMenu!(bar([['New', 'data:image/png;base64,NEW']]))
+    expect(setApplicationMenu).toHaveBeenCalledTimes(2)
+    await fetched()
+    // Old's favicon landed; the bar shows New, and is not set a third time with Old's rows.
+    expect(setApplicationMenu).toHaveBeenCalledTimes(2)
+    expect(visited().map(([label]) => label)).toEqual(['New'])
+  })
+
+  it('a fetch that brought no favicon sets the bar no second time', async () => {
+    const menus = new ElectronMenus()
+    menus.setApplicationMenu!(bar([['Gone', 'https://gone.example/favicon.ico']]))
+    expect(setApplicationMenu).toHaveBeenCalledTimes(1)
+    await fetched()
+    expect(setApplicationMenu).toHaveBeenCalledTimes(1)
+    expect(visited()).toEqual([['Gone', undefined]])
+  })
+
+  it('exists on macOS alone: the other desktops have no menu bar to set', () => {
+    onPlatform('linux')
+    expect(new ElectronMenus().setApplicationMenu).toBeUndefined()
+  })
+})
+
+describe('where a native menu opens (shortcuts-menus-167, §9.23)', () => {
+  const items = [{ label: 'Reload', click: vi.fn() }]
+
+  it('a pointer’s menu opens at the pointer: no position, Electron reads the cursor', async () => {
+    await popup(items)
+    expect(popped).toHaveLength(1)
+    expect(popped[0]).not.toHaveProperty('x')
+    expect(popped[0]).not.toHaveProperty('y')
+    expect(popped[0]).not.toHaveProperty('sourceType')
+  })
+
+  it('a menu anchored to a point opens there, in the window’s DIP', async () => {
+    await popup(items, { x: 300.4, y: 44 })
+    expect(popped[0]).toMatchObject({ x: 300, y: 44 })
+  })
+
+  it('a keyboard menu hangs from the focused element’s bottom-left corner and says it is the keyboard’s, so Chromium selects the first item', async () => {
+    await popup(items, {
+      x: 112,
+      y: 54,
+      keyboard: true,
+      rect: { x: 12, y: 40, width: 200, height: 28 }
+    })
+    expect(popped[0]).toMatchObject({ x: 12, y: 68, sourceType: 'keyboard' })
+  })
+
+  it('an element out of the window anchors the menu at the window’s edge', async () => {
+    await popup(items, { keyboard: true, rect: { x: 12, y: -60, width: 200, height: 28 } })
+    expect(popped[0]).toMatchObject({ x: 12, y: 0, sourceType: 'keyboard' })
+  })
+
+  it('a keyboard menu, closing, tells the chrome to return the keyboard to the element it hung from (§9.23); a pointer’s menu says nothing', async () => {
+    const menus = new ElectronMenus()
+    const win = { host: host(), send: vi.fn() }
+    menus.popup(items, {
+      source: 'tab',
+      win: win as never,
+      keyboard: true,
+      rect: { x: 12, y: 40, width: 200, height: 28 }
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(popped[0].callback).toBeTypeOf('function')
+    // Nothing is said while the menu stands – only Electron's close callback speaks.
+    expect(win.send).not.toHaveBeenCalled()
+    popped[0].callback?.()
+    expect(win.send).toHaveBeenCalledTimes(1)
+    expect(win.send).toHaveBeenCalledWith('menu.keyboardReturn', undefined)
+
+    menus.popup(items, { source: 'tab', win: win as never, x: 300, y: 44 })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(popped[1]).not.toHaveProperty('callback')
+    expect(popped[1]).not.toHaveProperty('sourceType')
+  })
+
+  it('a menu asked for while the window is gone never opens', () => {
+    const menus = new ElectronMenus()
+    const win = { host: { ...host(), alive: false }, send: vi.fn() } as never
+    menus.popup(items, { source: 'tab', win, x: 10, y: 10 })
+    expect(built).toHaveLength(0)
+    expect(popped).toHaveLength(0)
+  })
+})

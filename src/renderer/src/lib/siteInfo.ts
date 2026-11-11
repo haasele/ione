@@ -1,0 +1,210 @@
+import type { Rect, Tab } from '@shared/types'
+import { pushBackSurface } from './back'
+import type { LevelId } from './siteInfoCopy'
+import { createStore } from './store'
+import {
+  captureActiveTab,
+  chromeNeedsKeyboard,
+  invalidateSnapshot,
+  returnFocusToPage,
+  uiStore
+} from './ui'
+import { run } from './api'
+
+export interface SiteInfoState {
+  /** Tab whose site the sheet describes (null → nothing open). */
+  tabId: string | null
+  /** Where the site icon that opened it is (window coordinates); anchors the desktop popover. */
+  anchor: Rect | null
+  /** Bumped by actions so the sheet reads the site again. */
+  revision: number
+  /**
+   * The level the surface opens on (omnibox-38): the overview from the site icon and the
+   * shield; Permissions from the site-information slot while it carries a live capture or the
+   * site's blocks, which speak of permissions and lead straight to their rows. Read once, as the
+   * surface mounts.
+   */
+  level: LevelId
+  /**
+   * The pill chip the open surface hangs from – the one that wears the pressed fill and reads
+   * `aria-expanded` while it is up (design language v2 §9.20, §9.29: one anchor per popover):
+   * the site-information slot, the shield or the shield's count; null when nothing in the pill
+   * opened it (the app menu's Page info, the phone's pill tap) and when nothing is open.
+   */
+  openedBy: SiteInfoAnchor | null
+  /**
+   * What the desktop popover shows: the site information, or – from the shield's count pill –
+   * the tracker report, the §9.20 list of the sites the engine blocked requests to on the page
+   * (PS-33). The phone's sheet reaches the report as a level of its own and ignores this.
+   */
+  view: SiteInfoView
+}
+
+/** The pill chips that open the site information on the desktop and anchor its popover. */
+export type SiteInfoAnchor = 'site' | 'shield' | 'count'
+
+export type SiteInfoView = 'site' | 'trackers'
+
+export const siteInfoStore = createStore<SiteInfoState>(
+  { tabId: null, anchor: null, revision: 0, level: 'overview', openedBy: null, view: 'site' },
+  'site-info'
+)
+
+/** The chip that opened the sheet from the keyboard's point of view; it gets the focus back. */
+let opener: HTMLElement | null = null
+
+/**
+ * What the mounted surface (the phone sheet on the `BottomSheet` chassis, or the desktop
+ * popover) exposes to this module: the sheet's own motion lives in the chassis, the levels
+ * inside it (certificate, cookies, permissions) in the component, so dismissal and the system
+ * back gesture are routed through here to whichever of the two should answer.
+ */
+export interface SiteInfoSurface {
+  /** Levels pushed above the root. */
+  depth(): number
+  /** Return one level (the back button, Escape). */
+  pop(): void
+  /** Slide the surface away; `finishClose` runs once it is gone. */
+  dismiss(): void
+  /** Predictive back on the top level: peek it away, commit, or spring back. */
+  backProgress(p: number): void
+  backCommit(): void
+  backCancel(): void
+}
+
+let surface: SiteInfoSurface | null = null
+
+export function registerSiteInfoSurface(next: SiteInfoSurface | null): void {
+  surface = next
+}
+
+/** The chip the open surface hangs from, for the popover's light dismiss (§9.20). */
+export function siteInfoOpener(): HTMLElement | null {
+  return opener
+}
+
+export function siteInfoIsOpen(): boolean {
+  return siteInfoStore.get().tabId !== null
+}
+
+/**
+ * Open the site information for `tab`, from the site icon at `anchor`. The live page is
+ * captured first so the dimmed snapshot can stand in behind the sheet (hosts hide page views
+ * under chrome overlays). `from` is the chip that opened it: when the sheet closes, the
+ * keyboard goes back there rather than to the page (design language v2 §9.22). `level` opens
+ * the surface on one of its levels rather than the overview (the site-information slot opens it
+ * on Permissions while it carries a capture or a block, omnibox-38); `by` names the pill chip
+ * that opened it, the one chip that reads pressed while it is up (§9.20); `view` is the tracker
+ * report when the shield's count opened it on the desktop.
+ */
+export async function openSiteInfo(
+  tab: Tab,
+  anchor: Rect | null = null,
+  from: HTMLElement | null = null,
+  {
+    level = 'overview',
+    by = null,
+    view = 'site'
+  }: { level?: LevelId; by?: SiteInfoAnchor | null; view?: SiteInfoView } = {}
+): Promise<void> {
+  if (siteInfoStore.get().tabId === tab.id) return
+  await captureActiveTab(tab.id)
+  run('focus.chrome', undefined)
+  opener = from
+  uiStore.set({ siteInfoOpen: true, drawerOpen: false })
+  siteInfoStore.set({ tabId: tab.id, anchor, revision: 0, level, openedBy: by, view })
+}
+
+/**
+ * Whether `chip` is the anchor of the open site information: the one pill chip to wear the
+ * pressed fill and `aria-expanded` (§9.20). False while nothing is open, and for every chip but
+ * the opener while something is.
+ */
+export function siteInfoAnchoredOn(s: SiteInfoState, chip: SiteInfoAnchor): boolean {
+  return s.tabId !== null && s.openedBy === chip
+}
+
+/** Dismiss with the spring (a tap outside, the back gesture, Escape). */
+export function closeSiteInfo(): void {
+  if (!siteInfoIsOpen()) return
+  if (surface) surface.dismiss()
+  else finishClose()
+}
+
+/** Drop the sheet at once: another surface took over or the layout changed. */
+export function dismissSiteInfo(): void {
+  if (!siteInfoIsOpen()) return
+  finishClose()
+}
+
+/** The surface has left the screen (its chassis reported the dismissal). */
+export function siteInfoDismissed(): void {
+  if (siteInfoIsOpen()) finishClose()
+}
+
+/** Escape, or the back button: one level up, or away. */
+export function stepBackSiteInfo(): void {
+  if (surface && surface.depth() > 0) surface.pop()
+  else closeSiteInfo()
+}
+
+/** An action changed the site's state: read it again. */
+export function refreshSiteInfo(): void {
+  siteInfoStore.set((s) => ({ revision: s.revision + 1 }))
+}
+
+/**
+ * Progress-driven dismissal for the system back gesture: the back-surface registry (`back.ts`)
+ * drives the surface through these as the swipe advances, for as long as the sheet is open.
+ * With a level pushed, the gesture peeks and pops that level; on the root it pulls the sheet.
+ */
+export const siteInfoBack = {
+  isOpen: (): boolean => siteInfoIsOpen(),
+  progress: (p: number): void => surface?.backProgress(p),
+  commit: (): void => {
+    if (surface) surface.backCommit()
+    else finishClose()
+  },
+  cancel: (): void => surface?.backCancel()
+}
+
+function finishClose(): void {
+  const from = opener
+  opener = null
+  siteInfoStore.set({ tabId: null, anchor: null, level: 'overview', openedBy: null, view: 'site' })
+  if (uiStore.get().siteInfoOpen) uiStore.set({ siteInfoOpen: false })
+  invalidateSnapshot()
+  // Escape, a click outside, the back gesture: the keyboard returns to the chip that opened the
+  // sheet while it is still in the document and no other chrome surface has taken over (the
+  // URL bar or a menu opening over the sheet dismisses it and keeps the keyboard); otherwise
+  // the page gets it back, as after every other surface.
+  if (from?.isConnected && !chromeNeedsKeyboard()) from.focus()
+  else returnFocusToPage()
+}
+
+const flags = globalThis as unknown as { __zenSiteInfoWired?: boolean }
+if (!flags.__zenSiteInfoWired) {
+  flags.__zenSiteInfoWired = true
+  // The open sheet is a back surface: the gesture peeks it away, commit dismisses, cancel presents.
+  let popBackSurface: (() => void) | null = null
+  siteInfoStore.subscribe(() => {
+    const open = siteInfoIsOpen()
+    if (open && !popBackSurface) {
+      popBackSurface = pushBackSurface({
+        name: 'site-info',
+        onProgress: siteInfoBack.progress,
+        onCommit: siteInfoBack.commit,
+        onCancel: siteInfoBack.cancel
+      })
+    } else if (!open && popBackSurface) {
+      popBackSurface()
+      popBackSurface = null
+    }
+  })
+  // Another chrome surface (URL bar, panel, drawer, menu) replaces the sheet outright.
+  uiStore.subscribe(() => {
+    const ui = uiStore.get()
+    if ((ui.urlbar.open || ui.overlay !== 'none' || ui.drawerOpen || ui.menu) && siteInfoIsOpen())
+      dismissSiteInfo()
+  })
+}

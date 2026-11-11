@@ -1,0 +1,1130 @@
+import type {
+  AppWindowInfo,
+  ChromeSurface,
+  ContentCover,
+  EventName,
+  Events,
+  FindResult,
+  FormFactor,
+  GlanceState,
+  HapticKind,
+  LayoutReport,
+  PopupSurfaceRoom,
+  QuitHoldState,
+  Rect,
+  Space,
+  WindowChrome,
+  WindowKind,
+  WindowMaterial,
+  WindowPrompt,
+  WindowState,
+  WindowTransparency
+} from '../shared/types'
+import type { Browser } from './browser'
+import type { PersistedWindow } from './state'
+import { getSpace, tabVisibleIn } from './model'
+import { formatWindowTitle, normalizeWindowName } from '../shared/windowTitle'
+import { isToolbarControl } from '../shared/toolbarPins'
+import { captionDoubleClickEffect } from './captionDoubleClick'
+import { COVER_REPORT_CEILING_MS } from './tabs'
+import {
+  CHROME_MENU_TARGETS,
+  type ChromeContextParams,
+  type ChromeMenuTarget,
+  type TabView,
+  type WindowHost
+} from './platform'
+
+/**
+ * Who may ask for the popup surface (`ZenWindow.setPopupSurface`): the autofill picker
+ * (`core/autofill.ts`) and the mini menu over a text selection (`core/selectionMenu.ts`).
+ */
+export type PopupSurfaceOwner = 'autofill' | 'selectionMenu'
+
+/** The owners front to back: the surface stands where the first one with a place asks. */
+export const POPUP_SURFACE_OWNERS: readonly PopupSurfaceOwner[] = ['autofill', 'selectionMenu']
+
+/**
+ * A page shown on the activate commit (`ZenWindow.showOnCommit`, W8-P0): the tab switched to or
+ * woken, shown at the frame's last reported rect the moment the core commits the activation,
+ * under the page the window had in front – the stand-in of design language v2 §11, held over it
+ * until the shown page's word that it has painted (`TabView.shownPainted`) or the failure
+ * ceiling (`COVER_REPORT_CEILING_MS`), then hidden: the reveal.
+ */
+interface EarlyShow {
+  /** The tab shown early. */
+  readonly tabId: string
+  /** The tab left in front, standing over the shown page until the reveal; null with none. */
+  readonly standInTabId: string | null
+  /**
+   * The first layout report placing the shown page has arrived: it counted the page among the
+   * views it showed (`layout.applied`'s `shown`), as the report that showed it would have.
+   */
+  reported: boolean
+  /** A layout report wanted the stand-in down meanwhile: its hide waits for the reveal. */
+  hideDeferred: boolean
+  /**
+   * The reveal has happened (the word came or the ceiling passed): the stand-in is no longer
+   * held, and a report that wants it down takes it down. The hold stands on, if at all, only
+   * until the first report placing the shown page has counted it shown.
+   */
+  revealed: boolean
+  /** Stop waiting for the word (the ceiling's timer). */
+  cancel: () => void
+}
+
+/**
+ * The room an owner's document asks for a tooltip's moment (`PopupSurfaceRoom`), out of its
+ * size report: two finite, non-negative numbers, or none (null, left out, or nonsense).
+ */
+export function parsePopupSurfaceRoom(raw: unknown): PopupSurfaceRoom | null {
+  if (!raw || typeof raw !== 'object') return null
+  const { below, width } = raw as Record<string, unknown>
+  if (!finiteNumber(below) || below < 0 || !finiteNumber(width) || width < 0) return null
+  return { below, width }
+}
+
+export function samePopupSurfaceRoom(
+  a: PopupSurfaceRoom | null,
+  b: PopupSurfaceRoom | null
+): boolean {
+  if (!a || !b) return a === b
+  return a.below === b.below && a.width === b.width
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+/**
+ * Whether `win`'s chrome has `surface` up to answer a page's request (`ZenWindow.surfaces`); a
+ * window that is gone – or a host object that never registered any – has none.
+ */
+export function surfaceMounted(
+  win: Pick<ZenWindow, 'surfaces'> | null | undefined,
+  surface: ChromeSurface
+): boolean {
+  return Boolean(win?.surfaces?.has(surface))
+}
+
+export interface WindowInit {
+  id: string
+  kind: WindowKind
+  chrome: WindowChrome
+  material: WindowMaterial
+  /** Draw the desktop's native frame and buttons (Settings › Appearance). */
+  nativeWindowControls: boolean
+  /**
+   * How see-through the frame is (`Settings.windowTransparency`; off where the host has no
+   * `HostCapabilities.windowTransparency`). The native window is made with it when the host
+   * creates it, so it is fixed for the window's life; the chrome's alpha follows the setting.
+   */
+  transparency: WindowTransparency
+  bounds: Rect | null
+  /** The display `bounds` were saved on (null: unknown, or the host has one display). */
+  displayId: number | null
+  maximized: boolean
+  activeSpaceId: string
+  /** The user space the window left for an agent's (`ZenWindow.lastUserSpaceId`); none by default. */
+  lastUserSpaceId?: string | null
+  selection: Record<string, string>
+  compact: boolean
+  /** The private space of a blank / private window (already registered in the model). */
+  localSpace: Space | null
+  /** Window to offset the new one from (new windows cascade like Firefox). */
+  cascadeFrom?: ZenWindow
+  /** The window this one was opened from (a popup's parent), when one was. */
+  opener?: ZenWindow
+  /** The web app a standalone window (`chrome` `app`) shows; browser windows leave it out. */
+  app?: AppWindowInfo | null
+  /** The name the user gave the window last session (`ZenWindow.name`); none for a new one. */
+  name?: string | null
+}
+
+/**
+ * One browser window. Its chrome renders Zen's sidebar, toolbar and overlays; tab pages are host
+ * views positioned wherever the chrome reports the content area to be.
+ *
+ * Windows share the tab model (Zen's window sync) but each keeps its own space / tab selection,
+ * Glance, find bar and compact-mode state. A tab's live page lives in one window at a time – the
+ * others show a dimmed preview until they are focused. The native frame (bounds, focus, the
+ * chrome's web view) is the host's `WindowHost`.
+ */
+export class ZenWindow {
+  readonly id: string
+  readonly kind: WindowKind
+  readonly chrome: WindowChrome
+  readonly material: WindowMaterial
+  /** The desktop's native frame at creation (Settings › Appearance › Use system window controls). */
+  readonly nativeWindowControls: boolean
+  /** The frame's see-through setting at creation (`WindowInit.transparency`). */
+  readonly transparency: WindowTransparency
+  /** The web app of a standalone window (`chrome` `app`): name, icon and scope; else null. */
+  app: AppWindowInfo | null
+  /**
+   * The name the user gave the window (Chrome's Name window…): what the OS title bar reads
+   * instead of the active tab's title and what tab search calls the window; null while it has
+   * none. Kept with the session for synced windows (`toPersisted`). A host with a single window
+   * (Android) carries it inert – nothing there sets or shows it.
+   */
+  name: string | null
+  host!: WindowHost
+  activeSpaceId: string
+  /**
+   * The user's space this window stood on when it moved onto an agent's (`TabManager.switchSpace`
+   * records it; an agent's `bringInFront` is how a window gets there), and the space it goes
+   * back to when that agent's space is left empty at the session's end or at a restore
+   * (`Browser.leaveEmptyAgentSpace`, `ProfileState.ensureValid`). Null while the window stands
+   * on a user's space – where it is IS the last user space. Kept with the session.
+   */
+  lastUserSpaceId: string | null
+  /** Per-space selected tab of this window (falls back to the space's last selection). */
+  readonly selection = new Map<string, string | null>()
+  readonly localSpace: Space | null
+  glance: GlanceState | null = null
+  findResult: FindResult | null = null
+  compactSidebarRevealed = false
+  /** The hidden top toolbar is out (compact mode or the window's fullscreen); the chrome's word. */
+  compactToolbarRevealed = false
+  compactEnabled: boolean
+  compactSidebarPersistent = false
+  htmlFullscreenTabId: string | null = null
+  /** Window pixels under the HTML fullscreen view kept for chrome docked there (the find bar). */
+  private fullscreenBottomInset = 0
+  /**
+   * The layout the chrome is showing, as it reports it (`window.formFactor`); the desktop layout
+   * until the chrome says otherwise. The app menu and the command list are built for it.
+   */
+  formFactor: FormFactor = 'desktop'
+  /**
+   * The page tab the class change closed in front (`PageService.reconcileLayout`: a tablet's
+   * page tab narrowed into the phone class became the page's overlay) – the page, the space it
+   * stood in and its slot among that space's regular tabs – for the chrome's hand-back when the
+   * window widens again (`page.open` with `handedBack`): the tab comes back where it was while
+   * that still fits. Null once used, or when nothing was handed over; never set on a host whose
+   * window keeps its class.
+   */
+  handedPage: { pageId: string; spaceId: string; index: number } | null = null
+  /**
+   * The surfaces this window's chrome has mounted (`ui.surface`): the install prompt, the screen
+   * picker, the share sheet. A page's request for one that is absent is answered at once as a
+   * cancel (`surfaceMounted`) rather than held for a chrome that is not there.
+   */
+  readonly surfaces = new Set<ChromeSurface>()
+  /**
+   * The Settings recorder in this window's chrome is listening for a chord: key presses from the
+   * chrome are its to capture, and no shortcut runs off them until it stops.
+   */
+  recordingShortcut = false
+  /**
+   * The tab whose strip row holds this window's keyboard (`strip.focus`; tabs-34), or null when
+   * the keyboard is off the strip's tab rows: the move chords act on this row while one is named,
+   * on the active tab otherwise.
+   */
+  stripFocusTabId: string | null = null
+  lastFocusedAt = 0
+  /** The host window's focus as of the last state change it reported, for telling a change. */
+  private focused = false
+  /**
+   * The host window is on the user's screen – neither minimised nor hidden – as of the last
+   * concealment change it reported ({@link onWindowVisibleChanged}, W6-F6's signal). A window is
+   * made to be shown, so it starts on screen; a host without a minimise never says otherwise.
+   */
+  private onScreen = true
+  /** The window-modal question the chrome is showing ("Close N tabs?"), owned by `WindowPrompts`. */
+  prompt: WindowPrompt | null = null
+  /** The quit chord held in this window ("Hold ⌘Q to Quit"), owned by `QuitHoldService`. */
+  quitHold: QuitHoldState | null = null
+  /**
+   * The user's request to close this window went through its checks (the tab-count warning,
+   * every page's `beforeunload`): the host may close it for real. Hosts whose native close
+   * request arrives first (the caption button, Alt+F4) hold it until this is set.
+   */
+  closeApproved = false
+  readonly initialBounds: Rect | null
+  readonly initialDisplayId: number | null
+  readonly initialMaximized: boolean
+  readonly cascadeFrom: ZenWindow | null
+  /**
+   * The window this one was opened from, for what a toolbar-only popup cannot hold itself: an
+   * internal page asked for from a popup opens in its opener (`PageService.hostWindowFor`).
+   */
+  readonly opener: ZenWindow | null
+  private savedBounds: Rect | null
+  private savedDisplayId: number | null
+  private lastLayout: LayoutReport | null = null
+  /**
+   * How far below their laid-out rects the placed views stand right now – the page-edge band's
+   * travel (`LayoutBand`, `setPageOffset`): 0 at rest, the band's offset less its seat while it
+   * moves.
+   */
+  private pageShift = 0
+  /**
+   * Where the content area last put a page alone (the size a page preloaded off screen lays
+   * out at; the frame's last reported rect a page shown on the activate commit takes,
+   * `showOnCommit` – `pageShift` below it, where the band has the page). Written where the
+   * layout report arrives, from its one placement, as laid out: the band's travel is not in it.
+   */
+  private lastContentRect: Rect | null = null
+  /** The page shown on the activate commit, under the page it replaces (`showOnCommit`). */
+  private earlyShow: EarlyShow | null = null
+  private pendingContentFocus = false
+  private closing = false
+  private chromeReadyOnce = false
+  /**
+   * Where each owner of the popup surface wants it, while it does: the surface is one document
+   * (`?surface=popup`), so it stands where the owner in front (`POPUP_SURFACE_OWNERS`' order)
+   * asks, and falls back to the next one's place as that owner lets go.
+   */
+  private readonly popupWanted = new Map<PopupSurfaceOwner, Rect>()
+
+  constructor(
+    private readonly browser: Browser,
+    init: WindowInit
+  ) {
+    this.id = init.id
+    this.kind = init.kind
+    this.chrome = init.chrome
+    this.material = init.material
+    this.nativeWindowControls = init.nativeWindowControls
+    this.transparency = init.transparency
+    this.app = init.app ?? null
+    this.name = normalizeWindowName(init.name)
+    this.activeSpaceId = init.activeSpaceId
+    this.lastUserSpaceId = init.lastUserSpaceId ?? null
+    this.localSpace = init.localSpace
+    this.compactEnabled = init.compact
+    for (const [spaceId, tabId] of Object.entries(init.selection))
+      this.selection.set(spaceId, tabId)
+    this.initialBounds = init.bounds
+    this.savedBounds = init.bounds
+    this.initialDisplayId = init.displayId
+    this.savedDisplayId = init.displayId
+    this.initialMaximized = init.maximized
+    this.cascadeFrom = init.cascadeFrom ?? null
+    this.opener = init.opener ?? null
+  }
+
+  get isPrivate(): boolean {
+    return this.kind === 'private'
+  }
+
+  get alive(): boolean {
+    return Boolean(this.host) && this.host.alive
+  }
+
+  get isClosing(): boolean {
+    return this.closing
+  }
+
+  /** Whether the chrome document has loaded (events reach it, the URL bar can be opened). */
+  get chromeReady(): boolean {
+    return this.chromeReadyOnce
+  }
+
+  /** Last known normal (non-maximised) bounds; what a reopened window comes back at. */
+  get bounds(): Rect | null {
+    return this.savedBounds
+  }
+
+  // ---------------------------------------------------------------------------
+  // Selection
+  // ---------------------------------------------------------------------------
+
+  /** The space this window is showing. */
+  activeSpace(): Space {
+    if (this.localSpace) return this.localSpace
+    const m = this.browser.state.model
+    return getSpace(m, this.activeSpaceId) ?? m.spaces[0]
+  }
+
+  /** Tab selected in `space` by this window, validated against the tabs the window can show. */
+  selectedTabIn(space: Space): string | null {
+    const m = this.browser.state.model
+    const valid = (id: string | null | undefined): id is string => {
+      if (!id) return false
+      const tab = m.tabs[id]
+      if (!tab || !tabVisibleIn(tab, this.id)) return false
+      if (tab.essential) return !space.windowId
+      return tab.spaceId === space.id
+    }
+    const own = this.selection.get(space.id)
+    if (valid(own)) return own
+    if (valid(space.activeTabId)) return space.activeTabId
+    return null
+  }
+
+  select(space: Space, tabId: string | null): void {
+    this.selection.set(space.id, tabId)
+    if (tabId) space.activeTabId = tabId
+  }
+
+  windowState(): WindowState {
+    const alive = this.alive
+    return {
+      id: this.id,
+      kind: this.kind,
+      chrome: this.chrome,
+      material: this.material,
+      nativeFrame: this.nativeWindowControls,
+      maximized: alive ? this.host.isMaximized() : this.initialMaximized,
+      fullscreen: alive ? this.host.isFullScreen() : false,
+      focused: alive ? this.host.isFocused() : false,
+      htmlFullscreenTabId: this.htmlFullscreenTabId,
+      prompt: this.prompt,
+      quitHold: this.quitHold,
+      app: this.app,
+      name: this.name
+    }
+  }
+
+  /**
+   * Name the window (Chrome's Name window…), or clear the name with null or an empty string.
+   * The title bar follows at once; a synced window keeps the name with the session.
+   */
+  setName(name: string | null): void {
+    const next = normalizeWindowName(name)
+    if (next === this.name) return
+    this.name = next
+    this.updateTitle()
+    this.browser.state.commit()
+  }
+
+  /**
+   * The chrome's empty caption room was double-clicked (the sidebar's empty space, tabs-47,
+   * shortcuts-menus-94): the window does what a double-clicked title bar does on this OS
+   * (`captionDoubleClickEffect`) – maximise or restore, minimise, or nothing. Nothing in
+   * fullscreen either, where there is no title bar to double-click.
+   */
+  captionDoubleClick(): void {
+    if (!this.alive || this.host.isFullScreen()) return
+    const { info, app } = this.browser.platform
+    switch (captionDoubleClickEffect(info.os, app.titleBarDoubleClickAction?.() ?? null)) {
+      case 'toggleMaximize':
+        if (this.host.isMaximized()) this.host.unmaximize()
+        else this.host.maximize()
+        return
+      case 'minimize':
+        this.host.minimize()
+        return
+      case 'none':
+        return
+    }
+  }
+
+  /** Visible tabs whose live page is attached to another window right now. */
+  foreignTabIds(): string[] {
+    const tabs = this.browser.tabs
+    return tabs.visibleTabIds(this).filter((id) => {
+      const owner = tabs.ownerOf(id)
+      return owner !== undefined && owner !== this
+    })
+  }
+
+  toPersisted(): PersistedWindow {
+    const selection: Record<string, string> = {}
+    for (const [spaceId, tabId] of this.selection) if (tabId) selection[spaceId] = tabId
+    return {
+      id: this.id,
+      bounds: this.savedBounds,
+      displayId: this.savedDisplayId,
+      maximized: this.alive ? this.host.isMaximized() : this.initialMaximized,
+      activeSpaceId: this.activeSpaceId,
+      lastUserSpaceId: this.lastUserSpaceId,
+      selection,
+      compact: this.compactEnabled,
+      name: this.name
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lifecycle callbacks from the host
+  // ---------------------------------------------------------------------------
+
+  /** The host window's size or position changed (debounced by the host). */
+  onBoundsChanged(): void {
+    if (!this.alive) return
+    if (!this.host.isMaximized() && !this.host.isFullScreen()) {
+      this.savedBounds = this.host.normalBounds() ?? this.savedBounds
+    }
+    // A maximised window keeps its normal bounds but may have moved to another display.
+    this.savedDisplayId = this.host.displayId?.() ?? this.savedDisplayId
+    if (this.kind === 'synced') this.browser.state.commit()
+    // An installed app's window opens where it last stood (Chrome remembers per app).
+    if (this.app?.appId) this.browser.webApps.rememberBounds(this.app.appId, this.savedBounds)
+    // So does a page's utility window (the task manager), per device.
+    if (this.chrome === 'page')
+      this.browser.rememberPageWindowBounds(this, this.savedBounds, this.savedDisplayId)
+  }
+
+  /** Maximised / fullscreen / focus flags changed. */
+  onWindowStateChanged(): void {
+    if (!this.alive) return
+    const focused = this.host.isFocused()
+    if (focused !== this.focused) {
+      this.focused = focused
+      // The desktop's `focus` / `blur`: automatic picture-in-picture hears the app being left.
+      this.browser.mediaSession.onWindowFocusChanged(this, focused)
+    }
+    this.browser.fullscreen.onWindowStateChanged(this)
+    this.browser.state.commitVolatile()
+  }
+
+  /**
+   * Whether the host window is on the user's screen: neither minimised nor hidden. Blur alone
+   * (the window on screen but not key) leaves this true, as it leaves the pages' visibility.
+   */
+  get isOnScreen(): boolean {
+    return this.onScreen
+  }
+
+  /**
+   * The host window was minimised or hidden (`visible` false), or restored or shown (true) – the
+   * same change the host forwards to the window's tab views so their pages read `hidden`
+   * (W6-F6). Told once per change: what waits for the window to be seen again – the first-time
+   * notice of an automatic picture-in-picture entry made on a minimise – hears the return here.
+   */
+  onWindowVisibleChanged(visible: boolean): void {
+    if (!this.alive || visible === this.onScreen) return
+    this.onScreen = visible
+    this.browser.mediaSession.onWindowVisibleChanged(this, visible)
+  }
+
+  onFocused(): void {
+    this.lastFocusedAt = Date.now()
+    this.browser.onWindowFocused(this)
+    this.onWindowStateChanged()
+  }
+
+  /**
+   * The host window lost the keyboard (to another app or another window). A quit hold running
+   * here ends first – its key up will never arrive – then the focus flag is republished.
+   */
+  onBlur(): void {
+    this.browser.quitHold.onWindowBlur(this)
+    this.browser.selectionMenu.onWindowBlur(this)
+    this.onWindowStateChanged()
+  }
+
+  /**
+   * The host window is about to close – for real: a host whose native close request comes first
+   * asks the browser (`requestWindowClose`) and closes once `closeApproved` is set.
+   */
+  onClosing(): void {
+    this.closing = true
+    this.onBoundsChanged()
+    this.browser.onWindowClosing(this)
+    this.browser.state.flushSync()
+  }
+
+  onClosed(): void {
+    this.dropEarlyShow()
+    this.browser.onWindowClosed(this)
+  }
+
+  /** The chrome document finished loading (also after a reload). */
+  onChromeReady(): void {
+    this.send('state', this.browser.state.snapshot(this))
+    if (this.chromeReadyOnce) return
+    this.chromeReadyOnce = true
+    this.browser.onChromeReady(this)
+  }
+
+  /**
+   * A right-click in the chrome document that the chrome itself did not handle (its sidebar,
+   * tab and bookmark rows show their menus through commands): the URL bar's field and pill and
+   * plain text fields get Chrome's menus for them. Asked for by the keyboard (Shift+F10, the
+   * Menu key), the menu hangs from the focused element, whose box the host reads for it.
+   */
+  onContextMenu(params: Omit<ChromeContextParams, 'target' | 'tabId' | 'control'>): void {
+    if (!this.alive) return
+    // Both reads go to the document at once; a host without one, or one that fails, reads null.
+    const ask = <T>(read: (() => Promise<T>) | undefined): Promise<T | null> =>
+      read
+        ? Promise.resolve()
+            .then(read)
+            .catch(() => null)
+        : Promise.resolve(null)
+    const { menuTargetAt, focusedRect } = this.host
+    const lookup = ask(menuTargetAt && (() => menuTargetAt.call(this.host, params.x, params.y)))
+    const focused = ask(
+      params.keyboard && focusedRect ? () => focusedRect.call(this.host) : undefined
+    )
+    void Promise.all([lookup, focused]).then(([hit, rect]) => {
+      if (!this.alive) return
+      const target = CHROME_MENU_TARGETS.find((t): t is ChromeMenuTarget => t === hit?.target)
+      // A control the bar does not know (a newer chrome's attribute) is no control at all.
+      const control = hit?.control
+      return this.browser.menus.showChromeContextMenu(
+        {
+          ...params,
+          ...(rect ? { rect } : {}),
+          target: target ?? null,
+          tabId: hit?.tabId ?? null,
+          control: isToolbarControl(control) ? control : null
+        },
+        this
+      )
+    })
+  }
+
+  // ---------------------------------------------------------------------------
+  // Views
+  // ---------------------------------------------------------------------------
+
+  /** Re-apply the last layout (used when core state such as HTML fullscreen changes). */
+  relayout(): void {
+    if (this.lastLayout) this.applyLayout(this.lastLayout)
+  }
+
+  /** Where the chrome last placed a tab's view (window coordinates), or null when it is not shown. */
+  viewRect(tabId: string): Rect | null {
+    const layout = this.lastLayout
+    if (!layout || layout.contentHidden) return null
+    if (layout.glance?.tabId === tabId) return layout.glance.rect
+    return layout.placements.find((p) => p.tabId === tabId)?.rect ?? null
+  }
+
+  /**
+   * The find bar opened (or closed) under a page in HTML fullscreen: the view gives up (or takes
+   * back) that strip at the bottom, the only chrome a fullscreen page shares the window with.
+   */
+  setFullscreenInset(bottom: number): void {
+    const next = Math.max(0, Math.round(bottom))
+    if (next === this.fullscreenBottomInset) return
+    this.fullscreenBottomInset = next
+    if (this.htmlFullscreenTabId) this.relayout()
+  }
+
+  /** Position tab views exactly where the renderer laid the content area out. */
+  applyLayout(report: LayoutReport): void {
+    // Whether the pages' hide is a switch away from them (the tab overview over them, OS-39):
+    // carried with every hide this report makes, and once more to the pages it would place –
+    // hidden already, under the stage that opened the overview – when the word turns on.
+    const wasSwitched = this.lastLayout?.switchedAway === true
+    const switched = report.switchedAway === true
+    this.lastLayout = report
+    if (!this.alive) return
+    const tabs = this.browser.tabs
+    const owned = tabs.viewsOwnedBy(this)
+    const fullscreenTabId = this.htmlFullscreenTabId
+    // The views this report takes down or brings back: told to the chrome once they are placed.
+    const hid: string[] = []
+    const shown: string[] = []
+    // The page-edge band's travel: the views stand `offset - seat` below their laid-out rects
+    // (`LayoutBand`); 0 at rest, where the seat is the offset.
+    const shift = bandShift(report)
+    this.pageShift = shift
+    const wanted = new Map<string, { rect: Rect; radius: number; cover: ContentCover }>()
+    if (!report.contentHidden) {
+      for (const p of report.placements)
+        wanted.set(p.tabId, {
+          rect: shifted(p.rect, shift),
+          radius: p.radius,
+          cover: p.cover ?? NO_COVER
+        })
+    }
+    const glance = report.glance
+    // A page shown on the activate commit (`showOnCommit`) stands as this report would have
+    // shown it only while the report places it alone, the page it replaced not among them: a
+    // report that wants the page down, the stand-in back, or the frame otherwise (the chrome
+    // over the content, a glance, an element fullscreen) is the layout's as before, this very
+    // report placing and hiding what it says, the early show over without a reveal of its own.
+    const early = this.earlyShow
+    if (
+      early &&
+      (!wanted.has(early.tabId) ||
+        (early.standInTabId !== null && wanted.has(early.standInTabId)) ||
+        glance !== null ||
+        (fullscreenTabId !== null && owned.has(fullscreenTabId)))
+    )
+      this.dropEarlyShow()
+    /**
+     * Place the tab's views at `rect` and show them, bottom to top (`TabManager.viewsOf`: the
+     * page, and the reader's cover over it while the two are laid out together – before the
+     * cover's first frame, and after the cover is taken down until the page's). A view shown
+     * from elsewhere joins the window on top (a page an agent held on its stage): the ones over
+     * it in the tab's order are raised over it again; `raise` orders them all over the rest.
+     * True when the view the layout owns (`viewsOwnedBy`) was hidden until now – or shown on
+     * the activate commit ahead of this, the first report placing it (`EarlyShow.reported`).
+     */
+    const place = (
+      tabId: string,
+      view: TabView,
+      rect: Rect,
+      radius: number,
+      cover: ContentCover,
+      raise = false
+    ): boolean => {
+      let shownNow = false
+      let reorder = raise
+      for (const v of tabs.viewsOf(tabId)) {
+        if (reorder) v.bringToFront()
+        v.setBounds(rect)
+        v.setBorderRadius(radius)
+        v.setCover?.(cover)
+        if (v.isVisible()) {
+          const held = this.earlyShow
+          if (v === view && held && held.tabId === tabId && !held.reported) {
+            held.reported = true
+            shownNow = true
+            if (held.revealed) this.dropEarlyShow()
+          }
+          continue
+        }
+        v.setVisible(true)
+        if (v === view) shownNow = true
+        reorder = true
+      }
+      return shownNow
+    }
+    /**
+     * Hide the tab's views. The page beneath a cover goes with the cover, the cover taken down
+     * with the page: left shown, either would stand at the tab's place – over whatever this
+     * report shows there, where it is the younger view – until its handshake ends. The stand-in
+     * over a page shown on the activate commit is counted down here, as the report says, and
+     * taken down at the reveal (`EarlyShow.hideDeferred`): hidden now, the ground – the shown
+     * page's background before its first paint – would show where it stood.
+     */
+    const hide = (tabId: string): void => {
+      const held = this.earlyShow
+      if (held && held.standInTabId === tabId && !held.revealed) {
+        held.hideDeferred = true
+        return
+      }
+      for (const v of tabs.viewsOf(tabId)) if (v.isVisible()) v.setVisible(false, switched)
+    }
+    if (fullscreenTabId && owned.has(fullscreenTabId)) {
+      // An element in HTML fullscreen covers the whole window, chrome included, save for the
+      // strip a docked find bar asked for.
+      this.browser.extensions.placeSidePanel(this, null)
+      const { width, height: full } = this.host.contentSize()
+      const height = Math.max(0, full - this.fullscreenBottomInset)
+      for (const [tabId, view] of owned) {
+        if (view.isDestroyed()) continue
+        if (tabId === fullscreenTabId) {
+          if (place(tabId, view, { x: 0, y: 0, width, height }, 0, NO_COVER, true))
+            shown.push(tabId)
+        } else if (view.isVisible()) {
+          hide(tabId)
+          hid.push(tabId)
+        }
+      }
+      this.send('layout.applied', { contentHidden: false, hid, shown })
+      return
+    }
+    // The extension side panel sits beside the page and hides with it.
+    this.browser.extensions.placeSidePanel(
+      this,
+      report.contentHidden ? null : (report.sidePanel ?? null)
+    )
+    if (report.placements.length === 1) this.lastContentRect = roundRect(report.placements[0].rect)
+    // Whether a page that was showing goes away under this report – under the chrome, which is
+    // over the content (`contentHidden`; the reader's cover is another thing, `TabManager.cover`)
+    // – and whether one of those pages held the keyboard as it went.
+    let hidUnderChrome = false
+    let typingHidUnderChrome = false
+    // The switch word turning on over pages hidden already – the stage hid them as the overview
+    // began to open, and that hide carried no switch: the pages this report would place (the
+    // ones under the overview) hear it now, hidden as they are; no other hidden page does.
+    const switchedNow =
+      switched && !wasSwitched ? new Set(report.placements.map((p) => p.tabId)) : null
+    for (const [tabId, view] of owned) {
+      if (view.isDestroyed()) continue
+      const placement = wanted.get(tabId)
+      const isGlance = glance?.tabId === tabId
+      if (isGlance) continue
+      if (placement) {
+        if (
+          place(
+            tabId,
+            view,
+            roundRect(placement.rect),
+            Math.round(placement.radius),
+            placement.cover
+          )
+        )
+          shown.push(tabId)
+      } else if (view.isVisible()) {
+        if (view.isFocused?.()) typingHidUnderChrome = true
+        hide(tabId)
+        hid.push(tabId)
+        hidUnderChrome = true
+      } else if (switchedNow?.has(tabId)) {
+        for (const v of tabs.viewsOf(tabId)) v.setVisible(false, true)
+      }
+    }
+    if (glance) {
+      const view = owned.get(glance.tabId)
+      if (view && !view.isDestroyed()) {
+        if (
+          place(
+            glance.tabId,
+            view,
+            roundRect(shifted(glance.rect, shift)),
+            Math.round(glance.radius),
+            glance.cover ?? NO_COVER,
+            true
+          )
+        )
+          shown.push(glance.tabId)
+      }
+    }
+    // The chrome sequences its page cover – the picture where the live page was – against the
+    // host's frames from this (lib/pageView.ts).
+    this.send('layout.applied', { contentHidden: report.contentHidden, hid, shown })
+    if (this.pendingContentFocus && !report.contentHidden) this.focusContent()
+    // A view placed again may have come up above the popup surface: put it back on top. The
+    // mini menu's pill follows the view it hangs over (and goes down while chrome covers it):
+    // while the pill is the surface's front owner, its placing below is the one push (the host
+    // re-adds the view on every push), so the surface is not pushed twice per layout.
+    const popup = this.popupBounds
+    if (popup && this.popupFrontOwner !== 'selectionMenu') this.host.setPopupSurface?.(popup)
+    this.browser.selectionMenu.onLayout(this)
+    // With no page visible (empty space / chrome overlay / preview of a page shown in another
+    // window / a page tab the chrome itself draws) keyboard input must go to the chrome,
+    // otherwise shortcuts stop working.
+    const showsOwnPage = [...wanted.keys()].some((id) => owned.has(id))
+    if (report.contentHidden) {
+      // The chrome is over the page: the keyboard goes with it, but only when a page that was
+      // showing loses its place under this report (one that hides nothing new leaves the
+      // keyboard where it is) and never while a document of another surface holds it – an
+      // extension popup's view, focused while still hidden, would blur and close. A page the
+      // user was typing in gets the keyboard back with the layout that shows it again, so
+      // chrome that only rests over the page for a while (the tab hover card, the compact
+      // sidebar's reveal) leaves no lost keyboard behind; chrome that asks for the page's focus
+      // itself as it closes asks for the same thing.
+      if (hidUnderChrome && !this.keyboardHeldElsewhere(owned)) {
+        if (typingHidUnderChrome) this.pendingContentFocus = true
+        this.focusChrome()
+      }
+    } else if (!showsOwnPage && !glance && !this.keyboardHeldElsewhere(owned)) {
+      // The same guard here: a chrome page tab (Settings) reports no placement on every layout
+      // – a resize, a sheet – and an extension popup open over it must keep the keyboard.
+      this.focusChrome()
+    }
+  }
+
+  /**
+   * The page-edge band's frame (motion spec §3.4, §6): the page is `offset` from the frame's top
+   * edge now. The views the last layout placed move to `offset - seat` below their laid-out
+   * rects – their bounds alone: no resize, no show or hide, no radius, no handshake with the
+   * chrome – so a frame of the band's travel costs one bounds write per view. The seat is the
+   * last report's (`LayoutBand`): a frame that lands before the layout the band's `depart`
+   * asked for is placed against the rects it was laid out with, and the report that follows
+   * carries the offset of its own moment. Nothing moves while the chrome covers the page or a
+   * page is in HTML fullscreen – no band stands there.
+   */
+  setPageOffset(offset: number): void {
+    const layout = this.lastLayout
+    if (!this.alive || !layout || layout.contentHidden) return
+    const tabs = this.browser.tabs
+    const owned = tabs.viewsOwnedBy(this)
+    const fullscreenTabId = this.htmlFullscreenTabId
+    if (fullscreenTabId && owned.has(fullscreenTabId)) return
+    const shift = offset - (layout.band?.seat ?? 0)
+    if (shift === this.pageShift) return
+    this.pageShift = shift
+    const move = (tabId: string, rect: Rect): void => {
+      const view = owned.get(tabId)
+      if (!view || view.isDestroyed()) return
+      const bounds = roundRect(shifted(rect, shift))
+      for (const v of tabs.viewsOf(tabId)) if (v.isVisible()) v.setBounds(bounds)
+    }
+    for (const p of layout.placements) if (p.tabId !== layout.glance?.tabId) move(p.tabId, p.rect)
+    if (layout.glance) move(layout.glance.tabId, layout.glance.rect)
+  }
+
+  /**
+   * Show the page of `tabId` – the tab switched to or woken – on the activate commit, at the
+   * frame's last reported rect, under the page the window has in front (W8-P0, the Design
+   * Lead's ruling on the jank audit's finding G). The layout has shown a switched or woken view
+   * only once the chrome's report arrived – the state to the chrome, its layout, the report back:
+   * two round trips after the commit, 5 ms at 1x and 20 ms at 4x CPU throttle behind the state,
+   * and a woken page's first paint 60–70 ms later than it could be. Shown here, the page starts
+   * painting on the commit; the report still arrives and still sets the bounds (`applyLayout`),
+   * nothing else of the chrome's order changes.
+   *
+   * At the FRAME's last reported rect (`lastContentRect`: the one placement of the last report,
+   * the rect `setBounds` received), never the view's own last box – a view hidden while the
+   * window was resized or the sidebar folded, or parked, has a stale one; and only while that
+   * rect is the frame's now: the last report placed one page, alone, not under the chrome
+   * (`contentHidden`), no glance, no element fullscreen, and the tab is such a page too (not a
+   * split's member, whose pane the report alone knows; one view, no reader's cover). Anything
+   * else is shown by the report as before. The rect is taken where the frame has the page at
+   * this moment: `pageShift` below the laid-out rect while the page-edge band travels
+   * (`setPageOffset`, motion spec §3.4), as the stand-in over it stands, and the laid-out rect
+   * itself at rest.
+   *
+   * The stand-in (design language v2 §11's cover rule; #587's mirror): the page the window had
+   * in front stays OVER the shown page – raised above it – from this commit until the shown
+   * page's word that it has painted (`TabView.shownPainted`: a frame drawn and the document's
+   * first paint) or the failure ceiling `COVER_REPORT_CEILING_MS`, whichever comes first, then
+   * the stand-in is hidden: the reveal. The user never sees the shown view's ground – its
+   * background colour before the first frame, a woken page's white – or a stale frame. The
+   * layout report that arrives meanwhile counts the stand-in down as it always did
+   * (`layout.applied`'s `hid`), and the engine's hide waits for the reveal. Under reduced
+   * motion as otherwise the reveal is a cut, as the cover rule's swap is: no motion of its own.
+   *
+   * A page shown at least once before – the tab was looked at and switched away from – is warm:
+   * its document holds a frame of what it shows, so it has no ground to hide and there is no
+   * word to wait for. It takes the same placement and the work is done (`TabView.everShown`):
+   * no stand-in is raised over it, no `shownPainted` asked, no ceiling held – the report that
+   * follows hides the page it replaced, as it always did. The view shown is the younger of the
+   * two at the common switch, so it draws over the page in front until then. Only a view's
+   * first show – a background-loaded or woken tab's, its document never on screen – is cold
+   * and takes the handshake above.
+   *
+   * Only on a host that shows on the commit (`TabViewHost.showsOnCommit`, the desktop's): a
+   * view's first show when it gives the word (`shownPainted`), a warm one when it says it has
+   * been shown (`everShown`). The rest keep the report's show.
+   */
+  showOnCommit(tabId: string): void {
+    // A hold still standing (the user switched again within the frame): revealed now – its
+    // stand-in's deferred hide applied – before the page in front takes the stand-in's part.
+    this.revealEarlyShow()
+    if (!this.alive || this.browser.platform.views.showsOnCommit !== true) return
+    const layout = this.lastLayout
+    const rect = this.lastContentRect
+    if (!layout || !rect || layout.contentHidden || layout.glance || this.htmlFullscreenTabId)
+      return
+    if (layout.placements.length !== 1 || rect.width <= 0 || rect.height <= 0) return
+    const front = layout.placements[0]
+    if (front.tabId === tabId) return
+    const tabs = this.browser.tabs
+    const tab = tabs.tab(tabId)
+    if (!tab || tab.splitGroupId) return
+    const views = tabs.viewsOf(tabId)
+    const view = views.length === 1 ? views[0] : undefined
+    if (!view || view.isDestroyed() || tabs.ownerOf(tabId) !== this || view.isVisible()) return
+    // A page shown at least once before (a warm tab): its document holds a frame of what it
+    // shows, so there is no ground for the page in front to hide and no word to wait for.
+    // Placed and shown at once; the report that follows hides the page it replaced.
+    if (view.everShown?.() === true) {
+      view.setBounds(roundRect(shifted(rect, this.pageShift)))
+      view.setBorderRadius(Math.round(front.radius))
+      view.setCover?.(front.cover ?? NO_COVER)
+      view.setVisible(true)
+      return
+    }
+    if (!view.shownPainted) return
+    const standIn = tabs.viewsOwnedBy(this).get(front.tabId)
+    const standInTabId =
+      standIn && !standIn.isDestroyed() && standIn.isVisible() ? front.tabId : null
+    view.setBounds(roundRect(shifted(rect, this.pageShift)))
+    view.setBorderRadius(Math.round(front.radius))
+    view.setCover?.(front.cover ?? NO_COVER)
+    view.setVisible(true)
+    // The page left in front over the shown one: the younger view draws over the older, so it
+    // is raised above the shown page explicitly.
+    if (standInTabId)
+      for (const v of tabs.viewsOf(standInTabId)) if (v.isVisible()) v.bringToFront()
+    let done = false
+    const ceiling = setTimeout(() => this.revealEarlyShow(hold), COVER_REPORT_CEILING_MS)
+    const hold: EarlyShow = {
+      tabId,
+      standInTabId,
+      reported: false,
+      hideDeferred: false,
+      revealed: false,
+      cancel: () => {
+        done = true
+        clearTimeout(ceiling)
+      }
+    }
+    // A revealed hold still waiting on its report gives way: the report that comes places this
+    // page, not that one.
+    this.dropEarlyShow()
+    this.earlyShow = hold
+    view.shownPainted().then(
+      () => {
+        if (!done) this.revealEarlyShow(hold)
+      },
+      // A rejection (the page gone) is no word: the ceiling stands.
+      () => undefined
+    )
+  }
+
+  /**
+   * The reveal: the early show's word came, its ceiling passed, or another early show takes its
+   * place. The stand-in goes down where a layout report asked for that meanwhile
+   * (`hideDeferred`); one no report has taken down yet stays until the report that does. The
+   * hold itself stands on until the first report placing the shown page has counted it shown
+   * (`layout.applied`'s `shown`, as the report that showed it would have), then is dropped.
+   */
+  private revealEarlyShow(hold: EarlyShow | null = this.earlyShow): void {
+    if (!hold || this.earlyShow !== hold || hold.revealed) return
+    hold.revealed = true
+    hold.cancel()
+    if (hold.reported) this.earlyShow = null
+    if (!hold.hideDeferred || !hold.standInTabId || !this.alive) return
+    for (const v of this.browser.tabs.viewsOf(hold.standInTabId))
+      if (!v.isDestroyed() && v.isVisible()) v.setVisible(false)
+  }
+
+  /** The early show is over: no word waited for, no hide deferred (the layout owns the views). */
+  private dropEarlyShow(): void {
+    const hold = this.earlyShow
+    if (!hold) return
+    this.earlyShow = null
+    hold.cancel()
+  }
+
+  /**
+   * Whether the keyboard is held by a document that is neither this window's chrome nor one of
+   * the tab views it shows. Hosts that cannot tell get the old answer: the keyboard moves.
+   */
+  private keyboardHeldElsewhere(owned: Map<string, TabView>): boolean {
+    if (this.host.focusedDocument?.() !== 'other') return false
+    for (const view of owned.values()) {
+      if (view.isDestroyed()) continue
+      // A view that cannot say may well be the one holding it.
+      if (!view.isFocused || view.isFocused()) return false
+    }
+    return true
+  }
+
+  /**
+   * Give keyboard focus to the active page (after the chrome handled an action). If the page is
+   * still hidden behind chrome UI, the focus is applied once the next layout shows it again.
+   */
+  focusContent(): void {
+    const active = this.browser.tabs.activeTabFor(this)
+    if (!active) {
+      this.focusChrome()
+      return
+    }
+    if (!this.lastLayout || this.lastLayout.contentHidden) {
+      this.pendingContentFocus = true
+      return
+    }
+    this.pendingContentFocus = false
+    // Focusing a page focuses its window as well (Electron, on Linux and macOS): when the user
+    // has gone to another window meanwhile, the keyboard stays there.
+    if (!this.host.isFocused()) return
+    const view = this.browser.tabs.view(active.id)
+    const ownsView = this.browser.tabs.ownerOf(active.id) === this
+    // A view without a committed document has no renderer to deliver shortcuts through.
+    if (ownsView && view && view.hasDocument()) view.focus()
+    else this.focusChrome()
+  }
+
+  focusChrome(): void {
+    if (this.alive) this.host.focusChrome()
+  }
+
+  /** Whether the host can float the popup surface (the desktop picker) above the page views. */
+  get hasPopupSurface(): boolean {
+    return typeof this.host.setPopupSurface === 'function'
+  }
+
+  /** The window's content size in CSS pixels: what anchored surfaces are clamped inside. */
+  viewportSize(): { width: number; height: number } {
+    return this.host.contentSize()
+  }
+
+  /**
+   * Place the popup surface at `bounds` (window CSS pixels) for `owner`, or let go of it (null).
+   * One surface, two owners: the autofill picker (in front – a login being filled outranks a
+   * menu over the text beside it) and the mini menu over a selection. The surface stands where
+   * the owner in front asks; an owner behind it is remembered and takes over as the front one
+   * lets go; the surface goes down with the last owner. The surface's document draws the same
+   * order (`PopupSurface`: the picker when `UIState.autofill.picker` stands, else the menu).
+   */
+  setPopupSurface(bounds: Rect | null, owner: PopupSurfaceOwner = 'autofill'): void {
+    if (bounds) this.popupWanted.set(owner, bounds)
+    else this.popupWanted.delete(owner)
+    if (this.alive) this.host.setPopupSurface?.(this.popupBounds)
+  }
+
+  /** Where the popup surface stands – the front owner's bounds – or null while nobody wants it. */
+  private get popupBounds(): Rect | null {
+    const owner = this.popupFrontOwner
+    return owner ? (this.popupWanted.get(owner) ?? null) : null
+  }
+
+  /** The owner in front of the popup surface (`POPUP_SURFACE_OWNERS`' order), or null while nobody wants it. */
+  private get popupFrontOwner(): PopupSurfaceOwner | null {
+    for (const owner of POPUP_SURFACE_OWNERS) {
+      if (this.popupWanted.has(owner)) return owner
+    }
+    return null
+  }
+
+  haptic(kind: HapticKind): void {
+    if (this.alive) this.host.haptic?.(kind)
+  }
+
+  send<K extends EventName>(name: K, payload: Events[K]): void {
+    if (this.alive) this.host.send(name, payload)
+  }
+
+  /**
+   * Push the native window title (`<active tab title> — Ione`, or `<name> — Ione` for a
+   * window the user named) to the host; the host throttles.
+   */
+  updateTitle(): void {
+    if (!this.alive) return
+    this.host.setTitle(
+      formatWindowTitle(
+        this.browser.tabs.activeTitleFor(this),
+        this.isPrivate,
+        this.app?.name,
+        this.name
+      )
+    )
+  }
+
+  /** Whether the chrome currently covers the content (used by hosts for input routing). */
+  get contentHidden(): boolean {
+    return this.lastLayout?.contentHidden ?? false
+  }
+
+  /** Where a single page last sat in this window (null before the first layout). */
+  contentRect(): Rect | null {
+    return this.lastContentRect
+  }
+
+  /**
+   * Snapshot of a tab, used to keep a dimmed preview behind overlays (URL bar, Glance) and for
+   * tabs whose live page is shown in another window. A page hidden under the chrome has none,
+   * unless `fresh` asks for it as it is now (it changed under the zoom bubble); Electron paints
+   * a hidden view on request, a host that cannot answers null and the chrome keeps its picture.
+   */
+  async snapshot(tabId: string, fresh = false): Promise<string | null> {
+    const view = this.browser.tabs.view(tabId)
+    if (!view || (!fresh && !view.isVisible())) return null
+    return view.snapshot()
+  }
+
+  /**
+   * The picture of the toolbox docked in a tab's box (§9.29), beside `snapshot`'s of the page,
+   * under the same terms; null where the host has none to give (no toolbox docked there, a
+   * host without an in-frame toolbox).
+   */
+  async snapshotDevtools(tabId: string, fresh = false): Promise<string | null> {
+    const view = this.browser.tabs.view(tabId)
+    if (!view?.snapshotDevtools || (!fresh && !view.isVisible())) return null
+    return view.snapshotDevtools()
+  }
+}
+
+function roundRect(r: Rect): Rect {
+  return {
+    x: Math.round(r.x),
+    y: Math.round(r.y),
+    width: Math.max(0, Math.round(r.width)),
+    height: Math.max(0, Math.round(r.height))
+  }
+}
+
+/** How far below their laid-out rects a report's views stand: the band's offset less its seat. */
+function bandShift(report: LayoutReport): number {
+  return report.band ? report.band.offset - report.band.seat : 0
+}
+
+function shifted(r: Rect, dy: number): Rect {
+  return dy === 0 ? r : { ...r, y: r.y + dy }
+}
+
+const NO_COVER: ContentCover = { top: 0, bottom: 0 }

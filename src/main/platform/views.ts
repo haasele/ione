@@ -1,0 +1,4033 @@
+import {
+  BaseWindow,
+  ClipboardItem,
+  View,
+  WebContentsView,
+  app,
+  clipboard,
+  dialog,
+  nativeImage,
+  nativeTheme,
+  net,
+  screen,
+  type BrowserWindow,
+  type BrowserWindowConstructorOptions,
+  type LoadURLOptions,
+  type Session,
+  type WebContents,
+  type WebFrameMain,
+  type WebPreferences
+} from 'electron'
+import { join } from 'node:path'
+import { writeFile } from 'node:fs/promises'
+import type {
+  CertificateDetails,
+  ColorScheme,
+  DevtoolsDock,
+  KeyBinding,
+  NavigationSnapshot,
+  NavigationSnapshotEntry,
+  NewTabPageCommand,
+  NewTabPageState,
+  PageDialogResponse,
+  Rect,
+  SavePageFormat,
+  Tab
+} from '../../shared/types'
+import {
+  DEVTOOLS_DOCK_HOOK_SCRIPT,
+  DEVTOOLS_PAGE_BOUNDS_HOOK_SCRIPT,
+  DEVTOOLS_SEAM_SCRIPT,
+  devtoolsBandRect,
+  devtoolsMoveScript,
+  dockFromConsoleMessage,
+  pageBoundsFromConsoleMessage
+} from './devtoolsFrontend'
+import { relayDevtoolsQuitChord } from './devtoolsKeys'
+import { DevtoolsQuitHoldNotice, devtoolsQuitHoldNotice } from './devtoolsQuitHoldNotice'
+import { isDockedInFrame } from '../../shared/devtoolsDock'
+import { refusedFromDocument } from '../../shared/internalPages'
+import { PAGE_HOST_CHANNEL } from '../../shared/pageScript'
+import type { LookalikeVerdict, SafeBrowsingHit } from '../../shared/privacy'
+import { isCertificateError, type SiteCertificate } from '../../shared/siteInfo'
+import { inPlaceErrorPageScript } from '../../shared/zenPages'
+import { certificateSiteOf } from '../../core/security'
+import type { PageHint } from '../../shared/fullscreenHint'
+import { QUIT_HOLD_CHANNEL, type QuitHoldPanel } from '../../shared/quitHoldPanel'
+import {
+  DISMISSED_ANSWER,
+  LEAVE_SITE_CHANNEL,
+  type PageDialogAnswer,
+  type PageDialogCall
+} from '../../shared/pageDialogIpc'
+import type { FormsCommand } from '../../shared/forms'
+import {
+  cdpEffectiveFamilies,
+  cdpEffectiveFamilyChanges,
+  chromiumEffectiveFontPreferences,
+  DEFAULT_FONT_SETTINGS,
+  effectiveFonts,
+  effectiveFontsAsMade,
+  effectiveSizesMove,
+  electronGenericFontDefaults,
+  FONT_RESTYLE_SCRIPT,
+  sanitizeFontSettings,
+  type CdpFamilies,
+  type ChromiumFontPreferences,
+  type EffectiveFonts,
+  type ExtensionFontLayer,
+  type PageFontSettings
+} from '../../shared/fonts'
+import { defer } from '../../core/platform'
+import { standinScale } from '../../shared/pageStandin'
+import { clientSide, imageDimensions, type PageViewport } from '../../shared/capture'
+import { hasForeignDebuggerOwner, recycleDebugger } from './pageDebugger'
+import { imagePostLoadOptions, imageResourceFrames, type ResourceFrameTree } from './imagePost'
+import type { ImagePost, ImageResource } from '../../shared/imageUpload'
+import { IMAGE_THUMBNAIL_WORLD_ID } from '../../shared/privateWorld'
+import { PrivateWorldRelay } from './privateWorld'
+import { HangMonitor } from './hangMonitor'
+import { SiteCertificates } from './siteCertificates'
+import { awaitFirstPaint, frameDrawn, hasPainted, shownPainted } from './firstPaint'
+import {
+  emulatedColorScheme,
+  emulatedMediaParams,
+  type EmulatedColorScheme
+} from './pageColorScheme'
+import type { PdfRenderOptions } from '../../shared/print'
+import type {
+  AgentCapture,
+  AgentCaptureOptions,
+  AgentUploadFile,
+  ScreenshotOptions,
+  AgentFrame,
+  AgentInputEvent,
+  EditCommand,
+  InputModifier,
+  InsertedCssOrigin,
+  KeyEventInput,
+  NavigationCommitDetails,
+  NavigationIntent,
+  PageFlags,
+  PageHostMessage,
+  PageMessage,
+  PagePromptRequest,
+  TabView,
+  TabViewEvents,
+  TabViewHost,
+  WindowHost,
+  WindowOpenDisposition,
+  WindowOpenTicket
+} from '../../core/platform'
+import type { SessionManager } from './sessions'
+import { requestDetails, type ContentRulesLookup } from './contentRules'
+import { downloadDir } from './downloads'
+import {
+  answerFileChooser,
+  armFrameChoosers,
+  ATTACH_FRAMES,
+  DETACH_FRAMES,
+  dropFiles,
+  INTERCEPT_FILE_CHOOSERS,
+  setInputFiles,
+  type FileChooserOpened,
+  type FrameAttached
+} from './agentPrompts'
+import { savePageDialogOptions, savePageTarget } from './savePage'
+import { StartupHold } from './startupHold'
+import { uniquePath } from './uniquePath'
+import { frameById, frameIdOf } from './extensionApi/frames'
+import type { ElectronWindow } from './window'
+import { flashUntilFocused } from './windowAttention'
+
+const pagePreload = join(__dirname, '../preload/page.js')
+
+/** How long a page gets to hand over a frame before an overlay opens without its picture. */
+const SNAPSHOT_TIMEOUT_MS = 600
+/**
+ * The stand-in's TRIGGER, in device pixels (design language v2 draft §9.5): a capture whose area
+ * is at or under it is encoded as captured, 1:1 – no CSS-pixel width clamp; one past it is
+ * scaled down to `SNAPSHOT_TARGET_PIXELS` before the encode (`snapshot`, `standinScale`). Set
+ * where the two costs that matter reach their budgets on the runner-class machine (a 4-core
+ * Xeon, the packaged build): the JPEG 90 encode, which holds the main thread, about two frames
+ * (5–7 ms per Mpx: 35 ms at the 6.05 Mpx edge), and the renderer's decode, which gates the swap,
+ * about three (6–9 ms per Mpx: 54 ms there). 6.2 Mpx serves every DPR-1 monitor through a
+ * 3440 × 1440 ultrawide and a DPR-2 laptop's 1600 × 1000 window (3072 × 1968, 6.05 Mpx – the
+ * documented edge, crisp) at 1:1; a 4K monitor at 200 % (3712 × 2128 of page, 7.9 Mpx) is past
+ * it. The trigger follows the decode alone should the encode ever leave the main thread. The
+ * numbers behind it are in `snapshot`'s JSDoc.
+ */
+const SNAPSHOT_MAX_PIXELS = 6_200_000
+/**
+ * The TARGET a capture past the trigger is scaled down to, in device pixels, with Skia's
+ * Hamming-1 filter (`quality: 'good'`) rather than the default Lanczos-3 (`'best'`). Two numbers
+ * and not one because a resize pays for itself only when it removes more than about a fifth of
+ * the pixels on the swap (Hamming-1 costs 2–3.5 ms per input Mpx against the 6–9 per Mpx of
+ * decode and 5–7 of encode it saves) or nearly half on the held stall (against the encode alone;
+ * Lanczos-3, at 3.5–6.5 ms per input Mpx, costs about the encode it saves and pays there never),
+ * so a single scale-to-the-ceiling policy hands the frames just past the ceiling a .8–1 scale
+ * that loses on every axis – time, bytes and edges (a 4K-at-200 % page scaled to the trigger
+ * measured 85.7 ms held against 42.1 for its 1:1 encode; a 2560 × 1440 page taken to 2.5 Mpx
+ * 38.7 against 19.2, both softer) – hence trigger + target. 3.7 Mpx is a 2560 × 1440 monitor's
+ * own area, so the drop lands on a picture no softer than that monitor's 1:1 (the 4K-at-200 %
+ * page, 3712 × 2128, comes down to 2540 × 1456 at .68), and Hamming-1 on a picture already being
+ * softened costs a point of fidelity for half Lanczos-3's time.
+ */
+const SNAPSHOT_TARGET_PIXELS = 3_700_000
+/** The stand-in's JPEG quality (`snapshot`: the numbers behind it). */
+const SNAPSHOT_JPEG_QUALITY = 90
+
+/**
+ * The window corners a parked view can keep its pixel in (`park`): 0 the window's bottom-right
+ * (the box's top-left pixel inside), 1 bottom-left (the box's top-right pixel), 2 top-right (its
+ * bottom-left), 3 top-left (its bottom-right). Each parked view of a window takes its own, so no
+ * view's pixel sits under another's – a view whose whole inside lies under another view is
+ * OCCLUDED to Chromium, as good as hidden. A fifth parked view shares a corner.
+ *
+ * That pixel is on screen: the layer's rounded-corner mask (`setBorderRadius`) is laid over the
+ * view's clipped rect, not its box, so at any radius the one pixel shows a circle inscribed in it
+ * (measured: about 78% of the page's colour) – no radius hides it, and none is tried. Windows 11
+ * and macOS round the window's own corners over that pixel; a frameless X11 window shows it.
+ */
+const PARK_CORNERS = 4
+
+/**
+ * A staged page's frame (`stagedFrame`): the widget is shown as painting before the frame is
+ * asked for (`setBackgroundThrottling`, the same un-hide the session's prepare does – a
+ * navigation undoes it), then how long a frame of its renderer's is waited for before it is
+ * shown as painting once more, and how long after that before the capture gives up.
+ */
+const STAGED_FRAME_FIRST_MS = 800
+const STAGED_FRAME_RETRY_MS = 2000
+
+/**
+ * How long a capture or stand-in holds the page's capture turn (`onTurn`) at the most. A copy
+ * that never answers – a full page's DevTools paint begun in front and moved onto the stage
+ * under it, where `captureBeyondViewport` does not answer – lets the turn go after this and
+ * finishes, or not, on its own. The frame path's whole budget (`STAGED_FRAME_FIRST_MS` and
+ * `STAGED_FRAME_RETRY_MS`, then the viewport read) lies well within it, so a live frame
+ * subscription is never overtaken.
+ */
+const CAPTURE_TURN_MS = 10_000
+
+/** Keys that never count as a gesture in Chromium's user-activation model. */
+const NON_ACTIVATING_KEYS = new Set(['Escape', 'Shift', 'Control', 'Alt', 'Meta', 'AltGr'])
+
+/**
+ * Whether an input event on its way to the page grants it user activation: mouse and touch
+ * presses, taps and key presses other than Escape and bare modifiers (as in Chromium).
+ */
+export function isActivatingInput(input: Electron.InputEvent): boolean {
+  switch (input.type) {
+    case 'mouseDown':
+    case 'pointerDown':
+    case 'touchEnd':
+    case 'gestureTap':
+      return true
+    case 'rawKeyDown':
+    case 'keyDown': {
+      // Electron hands keyboard events over in the `before-input-event` shape (`key`); the typed
+      // structure says `keyCode`. Accept either.
+      const k = input as Partial<Electron.KeyboardInputEvent> & { key?: string }
+      const key = k.key ?? k.keyCode ?? ''
+      return !NON_ACTIVATING_KEYS.has(key)
+    }
+    default:
+      return false
+  }
+}
+
+/**
+ * What the host knows about a navigation it started itself, for `webNavigation.onCommitted`'s
+ * transition type; consumed by the next main-frame commit.
+ */
+export interface ViewNavigationHint {
+  reload?: boolean
+  history?: boolean
+  typed?: boolean
+}
+
+/** What Electron hands `createWindow`: the window options plus the page Chromium made, if any. */
+type ChildWindowOptions = BrowserWindowConstructorOptions & { webContents?: WebContents }
+
+/**
+ * A navigation the host started (address bar, back, reload) that the page's `beforeunload` may
+ * object to; replayed when the user chooses to leave. Stale after this long.
+ */
+const HOST_NAVIGATION_TTL_MS = 30_000
+/** A `confirmUnload` whose page neither goes nor objects by then is treated as not objecting. */
+const UNLOAD_CHECK_TIMEOUT_MS = 5_000
+/** A favicon fetch for the cache (`fetchFavicon`) that has not answered by then is given up. */
+const FAVICON_FETCH_MS = 10_000
+/**
+ * An entry's page state (scroll offset, form values) is kept up to this size; a larger one –
+ * a page with a huge form – is left out rather than written into the profile on every commit.
+ */
+const PAGE_STATE_MAX_CHARS = 64 * 1024
+/**
+ * How long End process's word on a view holds (`noteEndedByUser`): `forcefullyCrashRenderer` is
+ * followed by `render-process-gone` within the tick; a mark this old was never collected and
+ * must not colour a later crash of the page's own.
+ */
+export const ENDED_BY_USER_MS = 5_000
+
+/** A stored entry: URL and title, plus the engine's page state when it has one worth keeping. */
+function snapshotEntry(entry: Electron.NavigationEntry): NavigationSnapshotEntry {
+  const out: NavigationSnapshotEntry = { url: entry.url, title: entry.title }
+  const state = entry.pageState
+  if (typeof state === 'string' && state !== '' && state.length <= PAGE_STATE_MAX_CHARS) {
+    out.pageState = state
+  }
+  return out
+}
+
+interface HostNavigation {
+  at: number
+  reload: boolean
+  replay: () => void
+}
+
+/** A `confirmUnload` in flight: settled by the page going away or by the user's answer. */
+interface UnloadCheck {
+  promise: Promise<boolean>
+  settle: (leave: boolean) => void
+}
+
+/**
+ * The page fonts every new page view is made with (Settings › Appearance › Customize fonts,
+ * CT-25): the setting as the core last handed it over (`ElectronTabViewHost.applyFonts`), in
+ * the engine's terms. Web preferences are read once, as a page's contents are made; a page
+ * already open takes a change over the DevTools protocol (`ElectronTabView.applyFonts`).
+ */
+let pageFonts: ChromiumFontPreferences = chromiumEffectiveFontPreferences(
+  effectiveFonts(DEFAULT_FONT_SETTINGS, null)
+)
+/** The user's setting as the core last handed it over (`ElectronTabViewHost.applyFonts`). */
+let userFontSettings: PageFontSettings = DEFAULT_FONT_SETTINGS
+/**
+ * What the extensions holding `chrome.fontSettings` control, over the user's setting
+ * (`ElectronTabViewHost.applyExtensionFonts`); null while none does.
+ */
+let extensionFonts: ExtensionFontLayer | null = null
+/** The fonts behind `pageFonts` (what an open page is brought to): the setting with the extensions' layer over it. */
+let pageFontSettings: EffectiveFonts = effectiveFonts(DEFAULT_FONT_SETTINGS, null)
+/** The families a page has where the setting names none: Chrome's for this OS, as Electron installs them. */
+const FONT_DEFAULTS = electronGenericFontDefaults(process.platform)
+
+/** One string per font setting, so a page knows whether it has the one that stands. */
+function fontsKey(fonts: EffectiveFonts): string {
+  return JSON.stringify(fonts)
+}
+
+/**
+ * The emulation overrides a page view keeps on the page's shared session
+ * (`ElectronTabView.setEmulation`): the dark theme for sites' auto dark mode, the Appearance
+ * setting's `prefers-color-scheme` where the engine does not carry it to pages itself, and the
+ * JavaScript site setting's switch (`refreshScripts`), and an AI agent's hold on the page's file
+ * choosers (`interceptAgentPrompts`).
+ */
+type EmulationOverride = 'autoDark' | 'colorScheme' | 'scripts' | 'fileChooser'
+
+/** A DevTools protocol command as the view sends it. */
+interface CdpCommand {
+  method: string
+  params: Record<string, unknown>
+  /** Sent first on every session the command goes on (a domain it needs enabled). */
+  before?: readonly CdpCommand[]
+}
+
+/** The page's file choosers, its cross-site frames' included, come to the session. */
+const FILE_CHOOSERS_INTERCEPTED: CdpCommand = { ...ATTACH_FRAMES, before: INTERCEPT_FILE_CHOOSERS }
+
+async function sendCdp(dbg: Electron.Debugger, command: CdpCommand): Promise<void> {
+  for (const first of command.before ?? []) await dbg.sendCommand(first.method, first.params)
+  await dbg.sendCommand(command.method, command.params)
+}
+
+const AUTO_DARK_MODE_ON: CdpCommand = {
+  method: 'Emulation.setAutoDarkModeOverride',
+  params: { enabled: true }
+}
+
+/**
+ * The JavaScript site setting's block (PS-64): the browser-side emulation handler takes
+ * `javascript_enabled` out of the page's web preferences, which the renderer reads at every
+ * script's execution – a document that starts under it runs none of its own, as under Chrome's
+ * JAVASCRIPT content setting. One difference, measured on the real build (services pass 10): the
+ * parser still sees scripting as on, so `<noscript>` content stays hidden where Chrome shows it.
+ */
+const SCRIPTS_OFF: CdpCommand = {
+  method: 'Emulation.setScriptExecutionDisabled',
+  params: { value: true }
+}
+
+/** What takes each override off a session that stays. */
+const EMULATION_RELEASE: Record<EmulationOverride, CdpCommand> = {
+  autoDark: { method: 'Emulation.setAutoDarkModeOverride', params: {} },
+  colorScheme: { method: 'Emulation.setEmulatedMedia', params: emulatedMediaParams(null) },
+  scripts: { method: 'Emulation.setScriptExecutionDisabled', params: { value: false } },
+  fileChooser: {
+    ...DETACH_FRAMES,
+    before: [{ method: 'Page.setInterceptFileChooserDialog', params: { enabled: false } }]
+  }
+}
+
+function sameCommand(a: CdpCommand | null, b: CdpCommand | null): boolean {
+  if (a === null || b === null) return a === b
+  return a.method === b.method && JSON.stringify(a.params) === JSON.stringify(b.params)
+}
+
+/** The fonts behind a page's `fontsKey` (what it has), for the restyle decision in `sendFonts`. */
+function fontsOf(key: string): EffectiveFonts {
+  const parsed = JSON.parse(key) as Partial<EffectiveFonts>
+  const settings = sanitizeFontSettings(parsed.settings)
+  const size = typeof parsed.settings?.size === 'number' ? parsed.settings.size : settings.size
+  const minimumSize =
+    typeof parsed.settings?.minimumSize === 'number'
+      ? parsed.settings.minimumSize
+      : settings.minimumSize
+  return {
+    // An extension's size is Chrome's integer, not the setting's 9–72: kept as sent.
+    settings: { ...settings, size, minimumSize },
+    fixedSize: typeof parsed.fixedSize === 'number' ? parsed.fixedSize : 0,
+    extras: parsed.extras ?? {},
+    scripts: parsed.scripts ?? {}
+  }
+}
+
+/** What every tab page runs with; `session` picks the container (omitted for pages that exist). */
+function pageWebPreferences(session?: Session): WebPreferences {
+  return {
+    ...(session ? { session } : {}),
+    ...pageFonts,
+    preload: pagePreload,
+    sandbox: true,
+    contextIsolation: true,
+    nodeIntegration: false,
+    // Preloads reach sub-frames too: the extension API layer's preload installs `chrome.*`
+    // in extension iframes (content-script UIs, extension pages embedding their own
+    // frames); `page.ts` keeps to the top document.
+    nodeIntegrationInSubFrames: true,
+    webSecurity: true,
+    allowRunningInsecureContent: false,
+    spellcheck: true,
+    safeDialogs: true,
+    autoplayPolicy: 'document-user-activation-required',
+    backgroundThrottling: true,
+    scrollBounce: true,
+    enableWebSQL: false,
+    // A link dropped on the page navigates it, as Chrome's content area does (dnd-13: a
+    // bookmark off the bar, the address out of another window's pill): Blink loads the dragged
+    // URL only where the page left the drop alone, so a page that takes drops itself keeps
+    // them. Electron's default is off; the view's `will-navigate` still refuses zen:// from a page.
+    navigateOnDragDrop: true
+  }
+}
+
+/**
+ * A tab page hosted in a `WebContentsView`. The view is a child of whichever window currently
+ * owns the tab's live page (Zen's window sync moves it between windows). Built by
+ * `ElectronTabViewHost`, which wires the core's events once the tab exists – a page Chromium
+ * created for `window.open` is adopted after the fact.
+ *
+ * Two of the tree's four "covers" meet in this class (the glossary: `TabManager`, "The reader's
+ * cover"): the READER'S COVER, a view of this class standing over a tab's page (`cover`,
+ * `createCover`), and the CHROME OVER THE CONTENT, under which a shown view is PARKED rather
+ * than hidden (`park`, `parkable`, `hideParked`; never "covered" here).
+ */
+export class ElectronTabView implements TabView {
+  /** Captured up front: on Electron 44 `view.webContents` is already undefined when `destroyed` fires. */
+  readonly webContentsId: number
+  /**
+   * The page's `WebContents`, captured at creation. `WebContentsView.webContents` stops returning
+   * the object once the contents are destroyed (a page closing itself, window close, quit), so
+   * every method reads this stable reference instead – the object stays usable for
+   * `isDestroyed()` and its id after teardown, and the core's late calls cannot throw.
+   */
+  private readonly wc: WebContents
+  private host: ElectronWindow | null = null
+  private visible = false
+  /**
+   * Whether the page has ever been put on screen since its view was created (`TabView.
+   * everShown`, the activation cover's fast path): set when the engine's view is first shown,
+   * kept through every hide. A view only created, claimed or loaded in the background stays
+   * false until a layout first shows it.
+   */
+  private shownOnce = false
+  /**
+   * Whether the engine's view is a child of its window's `contentView`. A view joins the window
+   * the first time it is shown, asked for the keyboard or brought to the front, not when it is
+   * attached: Electron 44 hands a new `WebContentsView` the window's keyboard once its renderer
+   * is up, hidden or not, and a view that is in no window has no keyboard to take (the popup
+   * surface in `window.ts` keeps out of the window the same way). Hidden after being shown, the
+   * view stays in the window (`setVisible(false)`: no re-embedding on the next tab switch), so
+   * the hand-back in the `focus` handler stays as the backstop for that case.
+   */
+  private inWindow = false
+  /**
+   * An agent works this page while the layout hides it (`setAgentDriven`). Hidden, the view
+   * stands shown on the owner's stage instead – a window that is never shown
+   * (`ElectronTabViewHost.stageFor`) – so the page has a layout viewport and paints frames for
+   * the agent's snapshots and captures: out of the user's window it has no pixel on their screen
+   * and no keyboard of theirs to take. `staged` is the stage it stands on, null off it.
+   */
+  private agentDriven = false
+  private staged: BaseWindow | null = null
+  /** The box the staged view stands in (`stageBox`), for `restage` to tell a move; null off the stage. */
+  private stagedBox: Rect | null = null
+  /**
+   * Captures of a staged page take turns (`capture`): a page has one frame subscription, and
+   * the frame one capture waits for must not be taken down by another's end.
+   */
+  private stagedTurn: Promise<unknown> = Promise.resolve()
+  /** Whether the engine may throttle this page in the background, as last told (`setBackgroundThrottling`). */
+  private throttling = true
+  /**
+   * The engine's view left a window or the stage and is yet to join a window: the next
+   * `enterWindow`/`bringToFront` re-stacks it (`restack`). Chromium 152 (Electron 44) on Linux
+   * puts a `WebContentsView` arriving from another window at the BOTTOM of the new window's
+   * native z-order and never re-sorts it – `NativeViewHostAura::AddedToWidget` stacks the
+   * reparented aura window at the bottom without the `ReorderNativeViews` a first attach gets
+   * (`kNativeViewHostManagesLayers`, on by default there only) – so it sits under the window's
+   * chrome view: the page paints, reads `visible`, and the user sees the chrome's blank page area
+   * in its place (the stage's hand-off on the packaged build: 0 of 4 page-area pixels the page's
+   * colour 2 s after the switch; a tab moved between windows the same, since before the stage).
+   */
+  private arrivesFromElsewhere = false
+  private navigationHint: ViewNavigationHint | null = null
+  /**
+   * The main-frame certificate the current navigation was refused over (`certificate-error`),
+   * handed to the core with the `did-fail-load` that follows so the interstitial can show it.
+   */
+  private refusedCertificate: { url: string; certificate: CertificateDetails } | null = null
+  /**
+   * The address the main-frame navigation under way is currently bound for: what
+   * `did-start-navigation` named, then each `did-redirect-navigation` target. A redirect is
+   * reported to the core as `onRedirected(from here, to there)` (history-23); null between
+   * navigations.
+   */
+  private navigatingUrl: string | null = null
+  /**
+   * The tab's history as the main-frame navigation under way found it, and whether the page's
+   * own document started the navigation (`did-start-navigation`'s `initiator` a frame of this
+   * view): read at the commit to tell the core whether the document replaced the one before it
+   * (`NavigationCommitDetails`, history-23). Null between navigations.
+   */
+  private commitBaseline: { length: number; index: number; byPage: boolean } | null = null
+  /**
+   * When the task manager's End process told this view its renderer is about to be crashed on
+   * the user's word (`ElectronTaskHost.end` → `noteEndedByUser`): the `render-process-gone` that
+   * follows is reported as `ended`, not as the engine's `crashed`. A mark older than
+   * `ENDED_BY_USER_MS` is stale (the renderer never went) and a later real crash reads as one.
+   */
+  private endedByUserAt: number | null = null
+  /**
+   * A `window.open` / `target=_blank` the core may turn into a tab (`onCreatedNavigationTarget`);
+   * returns the function that withdraws the announcement when it does not.
+   */
+  onNavigationTarget: ((source: WebContents, url: string) => () => void) | null = null
+  private events!: TabViewEvents
+  /**
+   * DevTools frontends already dressed (`dressDevtools`): each opening makes a new frontend
+   * `WebContents`, and a dock change must not dress the standing one twice.
+   */
+  private readonly dressedFrontends = new WeakSet<WebContents>()
+  /**
+   * Where this view's toolbox stands (§9.29): the dock it was last opened or moved at from
+   * here, then whatever the frontend's own buttons said (`dockFromConsoleMessage`). Reported
+   * to the core with `onDevtoolsOpened`, and it decides whether the toolbox has a picture in
+   * the frame's box (`snapshotDevtools`). Null before the first opening.
+   */
+  private devtoolsDock: DevtoolsDock | null = null
+  /**
+   * The page's hole in a docked frontend's box, in the box's DIP – the frontend's own word
+   * (`setInspectedPageBounds`, read back through `DEVTOOLS_PAGE_BOUNDS_HOOK_SCRIPT`), the rect
+   * Electron sizes the page's view to. With the box it names the toolbox's band, the part of
+   * the frontend `snapshotDevtools` pictures. Null before the frontend has said, and between
+   * toolboxes.
+   */
+  private devtoolsPageBounds: Rect | null = null
+  /** The view's box as the chrome last laid it out (`setBounds`), in DIP; null before the first. */
+  private bounds: Rect | null = null
+  /**
+   * The window corner the engine's view stands parked in under the chrome rather than hidden
+   * (`park`: the chrome is over the content, `contentHidden`): shown, at its size, with one
+   * pixel still inside the window; null when not parked. Never set while `visible` is.
+   */
+  private parked: number | null = null
+  /**
+   * The view's window is minimised or hidden (W6-F6): the engine's view is hidden to Chromium
+   * whatever the core's layout says, so the page reads `document.visibilityState` `hidden` as a
+   * Chrome tab does. A view PARKED under the chrome (W6-F5) is hidden for real too – parking
+   * keeps a page visible under Ione's OWN chrome, not under a minimised or hidden window. The
+   * core's flag (`visible`, `isVisible`, the `hid`/`shown` accounting) is untouched throughout;
+   * `applyWindowVisible(true)` puts the engine's view back where the core's layout left it when
+   * the window returns (shown, re-parked under the chrome still over the content, or hidden as
+   * the flag says).
+   */
+  private windowConcealed = false
+  /** The user chose to leave: the next `beforeunload` objection is overruled. */
+  private leaveApproved = false
+  /** The last navigation this host started, for the "Leave site?" replay. */
+  private hostNavigation: HostNavigation | null = null
+  /** What the page itself was about to do, as its preload reported it (`navigate-intent`). */
+  private pageIntent: { at: number; intent: NavigationIntent } | null = null
+  private unloadCheck: UnloadCheck | null = null
+  /**
+   * The core asked for the keyboard (`focus()`) and the page has not answered yet. A tab being
+   * activated is focused first and shown when the chrome reports the layout, a frame or two
+   * later: its `focus` event arrives while it is still hidden, and is its own.
+   */
+  private keyboardAsked = false
+
+  /**
+   * The page fonts this page has (`fontsKey`): the setting its web preferences were made from,
+   * then whatever a live change brought it to. Compared with the setting on each change and
+   * each navigation (`applyFonts`, `refreshFonts`).
+   */
+  private fontsApplied = fontsKey(effectiveFontsAsMade(pageFontSettings))
+  /**
+   * The families the page has by slot (and per script), so `Page.setFontFamilies` (once per
+   * agent) names only what changes. Web preferences carry no per-script family: a page is made
+   * without them and takes the extensions' over the protocol once its first navigation commits.
+   */
+  private familiesApplied: CdpFamilies = cdpEffectiveFamilies(
+    effectiveFontsAsMade(pageFontSettings),
+    FONT_DEFAULTS
+  )
+  /** What the page's web preferences were made from: where the engine takes it back to. */
+  private readonly fontsBorn = this.fontsApplied
+  private readonly familiesBorn = this.familiesApplied
+  /** Live font changes in flight, one after the other. */
+  private fontsTurn: Promise<void> = Promise.resolve()
+
+  /**
+   * Ione's hang monitor for this page (tabs-45), on duty while the page carries a DevTools
+   * session – Chromium reports no hang for such a page (`hangMonitor.ts` says why) – and stands
+   * on screen in a focused window (`refreshHangWatch`). Its words and Chromium's own
+   * `unresponsive`/`responsive` go through one relay (`relayHang`).
+   */
+  private readonly hangMonitor = new HangMonitor({
+    probe: () => this.hangProbe(),
+    eligible: () => this.hangWatchable(),
+    onHang: (hung) => this.relayHang(hung)
+  })
+  /** Whether a hang of this page's renderer stands reported to the core (`relayHang`). */
+  private hangRelayed = false
+  /**
+   * The session's client paused the renderer at a breakpoint (`Debugger.paused` on the shared
+   * session: an extension's `chrome.debugger`); no answer is due from a paused page, so the
+   * hang monitor stands down until `Debugger.resumed`.
+   */
+  private pausedByDebugger = false
+
+  /**
+   * @param cover Whether this view is the reader's cover over a tab's page
+   *   (`ElectronTabViewHost.createCover`) rather than the tab's page. A cover answers to the
+   *   tab's id for its messages and requests, but is not the tab's page to `viewForTab`, and
+   *   the followers that speak of the tab's page to extensions (`webNavigation`, the privacy
+   *   hooks, the user-script worlds) leave it out: to an extension the tab never navigated.
+   */
+  constructor(
+    readonly view: WebContentsView,
+    private readonly owner: ElectronTabViewHost,
+    readonly cover = false
+  ) {
+    this.wc = this.view.webContents
+    this.webContentsId = this.wc.id
+    this.view.setVisible(false)
+    // A hold of this view's outlives the session (`sessionDetached`).
+    this.wc.debugger?.on?.('detach', () => {
+      this.pausedByDebugger = false
+      this.sessionDetached()
+    })
+    this.wc.debugger?.on?.('message', (_e, method: string, params: unknown, sessionId?: string) => {
+      if (method === 'Debugger.paused' && !sessionId) this.pausedByDebugger = true
+      else if (method === 'Debugger.resumed' && !sessionId) this.pausedByDebugger = false
+      else if (method === 'Target.attachedToTarget' && this.emulationApplied.has('fileChooser'))
+        void armFrameChoosers(this.wc.debugger, (params ?? {}) as FrameAttached).catch(() => {})
+      else if (method === 'Page.fileChooserOpened' && this.emulationApplied.has('fileChooser'))
+        void answerFileChooser(
+          (fn) => this.withDebugger(fn),
+          (params ?? {}) as FileChooserOpened,
+          this.events?.onFileChooser?.bind(this.events),
+          () => this.win,
+          sessionId || undefined
+        ).catch(() => {})
+    })
+    this.wc.on('blur', () => {
+      this.keyboardAsked = false
+      const win = this.win
+      if (win) this.owner.keyboardLeft(win, this.wc)
+    })
+    this.wc.on('focus', () => {
+      const asked = this.keyboardAsked
+      this.keyboardAsked = false
+      if (asked || this.visible) {
+        this.events?.onFocused?.()
+        return
+      }
+      // A page that is not on screen took the keyboard without the core asking for it. Electron
+      // 44 gives a new WebContentsView the keyboard once its renderer is up, hidden or not, so a
+      // tab opened in the background (a middle-clicked link, `target=_blank`) would leave the
+      // next Ctrl+1..9 or Ctrl+W with a page nobody sees: a hidden widget drops its key events.
+      // A view that has never been shown is kept out of the window for this (`inWindow`); the
+      // hand-back here is the backstop for one hidden after it was shown (`setVisible(false)`
+      // leaves it in the window) and for whatever else gives a hidden view the keyboard.
+      // Deferred, and asked again then: the core may activate this very tab meanwhile. Not
+      // reported as the page taking the keyboard either (`onFocused`), or the chrome would let
+      // go of the control it is typing in over a focus that is handed back a moment later – the
+      // empty pane's URL field (split-04) lost its cursor to the blank page made for the pane.
+      defer(() => {
+        const win = this.win
+        if (!win || this.wc.isDestroyed() || !this.wc.isFocused()) return
+        if (this.visible || this.keyboardAsked) {
+          // Shown or asked for meanwhile: the keyboard is the page's own after all.
+          this.events?.onFocused?.()
+          return
+        }
+        this.owner.keyboardTaken(win, this.wc)
+      })
+    })
+  }
+
+  get webContents(): WebContents {
+    return this.wc
+  }
+
+  /** The window the view is currently a child of (null while detached). */
+  private get win(): BrowserWindow | null {
+    const bw = this.host?.win
+    return bw && !bw.isDestroyed() ? bw : null
+  }
+
+  /** Connect the page's events to its tab; called exactly once, right after the tab exists. */
+  wire(events: TabViewEvents): void {
+    this.events = events
+    const wc = this.wc
+    const ev = events
+    const id = wc.id
+    this.fontsRenderer = this.rendererPid()
+    wc.on('did-start-loading', () => ev.onStartLoading())
+    wc.on('did-stop-loading', () => ev.onStopLoading())
+    wc.on('did-navigate', (_e, url) => {
+      this.navigatingUrl = null
+      ev.onNavigated(url, false, this.commitDetails(wc))
+      this.fontsAfterNavigation()
+    })
+    wc.on('did-navigate-in-page', (_e, url, isMainFrame) => {
+      if (isMainFrame) ev.onNavigated(url, true)
+    })
+    wc.on('page-title-updated', (_e, title) => ev.onTitleUpdated(title))
+    wc.on('page-favicon-updated', (_e, favicons) => ev.onFaviconUpdated(favicons))
+    wc.on('did-fail-load', (_e, code, description, url, isMainFrame) => {
+      if (!isMainFrame || wc.isDestroyed()) return
+      this.navigatingUrl = null
+      this.commitBaseline = null
+      const refused = this.refusedCertificate
+      this.refusedCertificate = null
+      // The certificate the failure is about: refused for this site in this navigation.
+      const certificate =
+        refused &&
+        isCertificateError(code) &&
+        certificateSiteOf(refused.url) === certificateSiteOf(url)
+          ? refused.certificate
+          : null
+      ev.onFailLoad(code, description, url, isCertificateError(code) ? { certificate } : undefined)
+    })
+    wc.on('render-process-gone', (_e, details) => {
+      // The hang went with the renderer (the core drops its mark with `onCrashed`); the monitor
+      // starts afresh for the renderer the page is reloaded into.
+      this.hangRelayed = false
+      this.hangMonitor.reset()
+      ev.onCrashed(this.takeEndedByUser() ? 'ended' : details.reason, details.exitCode)
+    })
+    // Chromium's hang monitor speaks for the contents whose input went unanswered (tabs-45) –
+    // for a page with no DevTools session on it; Ione's own (`hangMonitor`) for one with –
+    // and both through one relay. The pages sharing that renderer hang with it, so the host
+    // tells the core of every one of them, as Chrome's "Pages unresponsive" lists them – and of
+    // every one answering again.
+    wc.on('unresponsive', () => this.relayHang(true))
+    wc.on('responsive', () => this.relayHang(false))
+    wc.on('audio-state-changed', (e) => ev.onAudioStateChanged(e.audible))
+    wc.on('media-started-playing', () => ev.onMediaStateChanged(true))
+    wc.on('media-paused', () => ev.onMediaStateChanged(false))
+    wc.on('enter-html-full-screen', () => ev.onEnterHtmlFullscreen())
+    wc.on('leave-html-full-screen', () => ev.onLeaveHtmlFullscreen())
+    wc.on('devtools-opened', () => {
+      this.dressDevtools()
+      ev.onDevtoolsOpened(this.devtoolsDock ?? undefined)
+    })
+    wc.on('devtools-closed', () => {
+      // The frontend is gone with its layout; the next one says where its hole is.
+      this.devtoolsPageBounds = null
+      ev.onDevtoolsClosed()
+    })
+    wc.on('found-in-page', (_e, result) => ev.onFoundInPage(result))
+    wc.on('zoom-changed', (_e, direction) => ev.onZoomChanged(direction))
+    wc.on('context-menu', (_e, params) => {
+      // Extension context menus need Chrome's frame view of the click: the top document's URL,
+      // the clicked sub-frame's URL (empty for the top document) and its frame id.
+      const frame = params.frame ?? null
+      const frameId = frame ? frameIdOf(frame) : 0
+      // `linkText` and `mediaFlags` ride along in the spread for the link and media menus.
+      ev.onContextMenu({
+        ...params,
+        pageURL: params.pageURL || wc.getURL(),
+        frameURL: frameId === 0 ? '' : params.frameURL,
+        frameId
+      })
+    })
+    wc.on('before-input-event', (event, input) => {
+      const key: KeyEventInput = {
+        type: input.type as KeyEventInput['type'],
+        key: input.key,
+        control: input.control,
+        alt: input.alt,
+        shift: input.shift,
+        meta: input.meta,
+        isAutoRepeat: input.isAutoRepeat
+      }
+      if (ev.onKey(key)) event.preventDefault()
+    })
+    // `focus` is reported (`onFocused`) by the constructor's listener, which tells the page
+    // taking the keyboard from a hidden view being handed it by mistake.
+    wc.on('update-target-url', (_e, url) => ev.onTargetUrl(url))
+    wc.on('will-prevent-unload', (event) => this.onWillPreventUnload(event))
+    // Internal pages are the user's to open, never a web page's (Chrome's rule for chrome://):
+    // a document's own navigation to zen:// or ione:// is refused; loadURL (typed, a menu, a
+    // deep link) does not raise this event and goes through. One rule with Android's WebView.
+    wc.on('will-navigate', (event, url) => {
+      if (refusedFromDocument(wc.getURL(), url)) {
+        event.preventDefault()
+        return
+      }
+      // An app window's page leaving its app: the core opens the address in a browser tab.
+      if (ev.onWillNavigate(url)) event.preventDefault()
+    })
+    wc.on('did-start-navigation', (details) => {
+      if (!details.isMainFrame) return
+      // The row's throbber learns here whether the load is a same-document one (tabs-41).
+      ev.onStartNavigation?.(details.url, details.isSameDocument)
+      // The page is unloading (its `beforeunload` let it): nothing is left to replay.
+      if (details.isSameDocument) return
+      this.navigatingUrl = details.url
+      this.commitBaseline = {
+        length: wc.navigationHistory.length(),
+        index: wc.navigationHistory.getActiveIndex(),
+        byPage: this.startedByThisPage(wc, details.initiator ?? null)
+      }
+      this.leaveApproved = false
+      this.hostNavigation = null
+      this.pageIntent = null
+      // A refused certificate belongs to the navigation it happened in (which asks after this).
+      this.refusedCertificate = null
+      // The JavaScript site setting for the document on its way, before its response is read.
+      this.refreshScripts(details.url)
+    })
+    // A server redirect inside the navigation under way (Chromium's `DidRedirectNavigation`):
+    // the core keeps the hop and records the chain with the commit (history-23).
+    wc.on('did-redirect-navigation', (details) => {
+      if (!details.isMainFrame || details.isSameDocument) return
+      const from = this.navigatingUrl
+      this.navigatingUrl = details.url
+      if (from && from !== details.url) ev.onRedirected?.(from, details.url)
+      this.refreshScripts(details.url)
+    })
+    wc.on('dom-ready', () => ev.onDomReady())
+    // By the time this fires `this.view.webContents` no longer returns the object (Electron drops
+    // the view's reference before emitting), which is why the captured `wc` is used throughout.
+    wc.on('destroyed', () => {
+      this.hangMonitor.dispose()
+      ev.onDestroyed()
+      this.owner.forget(id)
+    })
+    // Trusted input on its way to the page: the core's user-activation clock for pop-ups.
+    wc.on('input-event', (_e, input) => {
+      if (isActivatingInput(input)) ev.onUserActivation()
+    })
+    wc.setWindowOpenHandler(({ url, disposition, features, referrer, postBody }) => {
+      // Announced before the core creates the tab, so the new view finds the pending target.
+      const cancelTarget = this.onNavigationTarget?.(wc, url)
+      // Electron does not say whether the user asked; the core knows from the activation clock
+      // and its pop-up blocker answers null for a window the page may not open.
+      const ticket = ev.onOpenWindow(
+        url,
+        disposition as WindowOpenDisposition,
+        null,
+        features ?? ''
+      )
+      if (!ticket) {
+        cancelTarget?.()
+        return { action: 'deny' }
+      }
+      // Chromium's own bare window never shows. The page it creates for a script `window.open`
+      // keeps its opener link and is adopted into the Ione tab or window the core asked for; a
+      // link's new window (Shift+click) gets a fresh page there. Only security preferences are
+      // inherited, so the page preload is handed down explicitly. Like Chrome, the new page is
+      // not torn down when its opener navigates away or closes.
+      return {
+        action: 'allow',
+        outlivesOpener: true,
+        overrideBrowserWindowOptions: { webPreferences: pageWebPreferences() },
+        // Electron passes the page it created (if any) alongside the window options.
+        createWindow: (options) =>
+          this.owner.openTicket(ticket, this, (options as ChildWindowOptions).webContents, {
+            httpReferrer: referrer,
+            ...(postBody
+              ? {
+                  postData: postBody.data,
+                  extraHeaders: `content-type: ${postBody.contentType}${
+                    postBody.boundary ? `; boundary=${postBody.boundary}` : ''
+                  }`
+                }
+              : {})
+          })
+      }
+    })
+  }
+
+  /**
+   * Whether `initiator` (`did-start-navigation`'s) is a frame of this view's own page: the
+   * page navigated itself. Null is the browser's navigation (a typed address, back / forward, a
+   * reload); a frame of another view is an opener's (`window.open`'s first load).
+   */
+  private startedByThisPage(wc: WebContents, initiator: WebFrameMain | null): boolean {
+    if (!initiator || wc.isDestroyed()) return false
+    return wc.mainFrame.framesInSubtree.some(
+      (f) => f.processId === initiator.processId && f.routingId === initiator.routingId
+    )
+  }
+
+  /**
+   * How the document that just committed stands to the one before it, measured against the
+   * baseline `did-start-navigation` took: the entry list neither longer nor moved along is
+   * Chromium's `did_replace_entry` (a new document adds an entry after the current one; back /
+   * forward move along it). Nothing when no start was seen.
+   */
+  private commitDetails(wc: WebContents): NavigationCommitDetails | undefined {
+    const base = this.commitBaseline
+    this.commitBaseline = null
+    if (!base || wc.isDestroyed()) return undefined
+    const history = wc.navigationHistory
+    return {
+      replacedEntry: history.length() === base.length && history.getActiveIndex() === base.index,
+      initiatedByPage: base.byPage
+    }
+  }
+
+  /**
+   * A message from the page script (routed here by the platform's IPC handler). `sender` is
+   * the frame that posted it; a selection report is stamped with that frame's id
+   * (`extensionApi/frames`: 0 for the top frame) so the core can keep the top document's alone –
+   * the report's own words are not trusted for it.
+   */
+  dispatchPageMessage(message: PageMessage, sender?: WebFrameMain): void {
+    if (message.type === 'navigate-intent') {
+      // The page is about to navigate itself; kept for the "Leave site?" flow, not the core's.
+      if (message.intent) this.pageIntent = { at: Date.now(), intent: message.intent }
+      return
+    }
+    if (message.type === 'selection') {
+      // Without a sender frame the report cannot be placed; the menu's model needs the top frame's.
+      if (!sender) return
+      let frameId: number
+      try {
+        frameId = frameIdOf(sender)
+      } catch {
+        // The frame went away between the post and the read (a disposed `WebFrameMain` throws).
+        return
+      }
+      message = { ...message, frameId }
+    }
+    this.events.onPageMessage(message)
+  }
+
+  /** The request engine upgraded this page's navigation from `from` to `to` (HTTPS-only mode). */
+  noteUpgraded(from: string, to: string): void {
+    this.events.onUpgraded(from, to)
+  }
+
+  /** The request engine refused this page's navigation to `url` on Safe Browsing's word. */
+  noteUnsafeNavigation(url: string, hit: SafeBrowsingHit): void {
+    this.events.onUnsafeNavigation(url, hit)
+  }
+
+  /** The request engine held this page's navigation to `url` on the core's lookalike verdict (PS-18). */
+  noteLookalikeNavigation(url: string, verdict: LookalikeVerdict): void {
+    this.events.onLookalikeNavigation?.(url, verdict)
+  }
+
+  // --- an AI agent's native prompts -----------------------------------------
+
+  interceptAgentPrompts(on: boolean): void {
+    this.setEmulation('fileChooser', on ? FILE_CHOOSERS_INTERCEPTED : null)
+  }
+
+  async setInputFiles(selector: string, files: AgentUploadFile[]): Promise<void> {
+    if (this.wc.isDestroyed()) throw new Error('the page is gone')
+    await this.withDebugger((dbg) => setInputFiles(dbg, selector, files))
+  }
+
+  async dropFiles(x: number, y: number, files: AgentUploadFile[]): Promise<void> {
+    if (this.wc.isDestroyed()) throw new Error('the page is gone')
+    await this.withDebugger((dbg) => dropFiles(dbg, x, y, files))
+  }
+
+  /** The page's preload asks whose its `window.print()` or File System Access picker is. */
+  askPagePrompt(prompt: PagePromptRequest): 'agent' | 'user' {
+    if (this.wc.isDestroyed()) return 'user'
+    return this.events?.onPagePrompt?.(prompt) ?? 'user'
+  }
+
+  // --- dialogs and beforeunload ----------------------------------------------
+
+  /**
+   * The page called `alert`, `confirm` or `prompt` (its preload asks over synchronous IPC, so
+   * the page waits). `frameUrl` is the calling frame's; the dialog is titled after its site.
+   */
+  async askDialog(call: PageDialogCall, frameUrl: string): Promise<PageDialogAnswer> {
+    if (this.wc.isDestroyed()) return DISMISSED_ANSWER
+    // A dialog in a window the user is not in flashes its taskbar button until they come
+    // (os-19); the window in front is left alone. A page an agent drives off screen asks the
+    // agent, never the user.
+    if (this.host && !this.agentDriven) flashUntilFocused(this.host.win)
+    const response: PageDialogResponse = await this.events.onDialog({
+      kind: call.kind,
+      message: call.message,
+      defaultValue: call.defaultValue,
+      frameUrl,
+      pageUrl: this.wc.getURL()
+    })
+    return { accepted: response.accepted, value: response.value }
+  }
+
+  /**
+   * The page's `beforeunload` handler objects to it going away. Electron decides synchronously,
+   * so the page is kept (the event is not prevented) and the chrome asks; when the user chooses
+   * to leave, the action is redone with the objection overruled: the host's own navigation from
+   * its record, the page's own by the page (its preload replays what it was about to do), and a
+   * close by the core, which carries on with the destroy once its check resolves.
+   */
+  private onWillPreventUnload(event: Electron.Event): void {
+    if (this.leaveApproved) {
+      this.leaveApproved = false
+      event.preventDefault()
+      return
+    }
+    const wc = this.wc
+    const check = this.unloadCheck
+    const now = Date.now()
+    const host =
+      this.hostNavigation && now - this.hostNavigation.at < HOST_NAVIGATION_TTL_MS
+        ? this.hostNavigation
+        : null
+    const page =
+      this.pageIntent && now - this.pageIntent.at < HOST_NAVIGATION_TTL_MS
+        ? this.pageIntent.intent
+        : null
+    this.hostNavigation = null
+    this.pageIntent = null
+    const reload = !check && (host ? host.reload : page?.navigationType === 'reload')
+    // The question is a dialog too: a background window flashes for it (os-19). The core brings
+    // the window to the front for the tab-modal question; where the OS refuses the focus, the
+    // flash stands until the user comes. An agent's page leaves without asking anyone.
+    if (this.host && !this.agentDriven) flashUntilFocused(this.host.win)
+    void this.events.onLeaveSite(reload).then((leave) => {
+      if (check) {
+        check.settle(leave)
+        return
+      }
+      if (!leave || wc.isDestroyed()) return
+      this.leaveApproved = true
+      if (host) host.replay()
+      else wc.send(LEAVE_SITE_CHANNEL)
+    })
+  }
+
+  /**
+   * Run the page's `beforeunload` handlers by closing with `waitForBeforeUnload`: a page that does
+   * not object is gone at once (the core hears `destroyed` and closes the tab); one that objects
+   * stays, and the answer to the chrome's question settles the promise.
+   */
+  confirmUnload(): Promise<boolean> {
+    const wc = this.wc
+    if (wc.isDestroyed()) return Promise.resolve(true)
+    if (this.unloadCheck) return this.unloadCheck.promise
+    let settle: (leave: boolean) => void = () => undefined
+    const promise = new Promise<boolean>((resolve) => {
+      const onGone = (): void => settle(true)
+      // A renderer that never answers (hung) does not hold the close up, as in Chrome.
+      const timer = setTimeout(() => settle(true), UNLOAD_CHECK_TIMEOUT_MS)
+      settle = (leave) => {
+        if (this.unloadCheck?.promise !== promise) return
+        this.unloadCheck = null
+        clearTimeout(timer)
+        wc.off('destroyed', onGone)
+        resolve(leave)
+      }
+      wc.once('destroyed', onGone)
+      wc.once('will-prevent-unload', () => clearTimeout(timer))
+    })
+    this.unloadCheck = { promise, settle }
+    wc.close({ waitForBeforeUnload: true })
+    return promise
+  }
+
+  private recordHostNavigation(reload: boolean, replay: () => void): void {
+    this.hostNavigation = { at: Date.now(), reload, replay }
+  }
+
+  // --- navigation -----------------------------------------------------------
+
+  loadURL(url: string): void {
+    // Address-bar entries and programmatic loads both arrive here; Chrome reports the latter as
+    // `link` too, so no `typed` claim is made without knowing the source.
+    this.navigationHint = {}
+    this.recordHostNavigation(false, () => this.loadURL(url))
+    // The run's first documents wait for the extension layer's first publish (`startupHold.ts`);
+    // the hold is open for the run once it opened, and the page may have gone while it waited.
+    this.owner.startupHold.run(() => {
+      if (this.wc.isDestroyed()) return
+      void this.wc.loadURL(url).catch(() => undefined)
+    })
+  }
+
+  /**
+   * The image-search upload (CT-32): `loadURL` with the baked body as raw post data and its
+   * content type as the request's header (`imagePostLoadOptions`) – Chrome's
+   * `CoreTabHelper::PostContentToURL` navigates the same way, `UploadRawData` and a
+   * content-type header on a browser-initiated POST. The same hold and replay as a load.
+   */
+  postURL(url: string, post: ImagePost): void {
+    this.navigationHint = {}
+    this.recordHostNavigation(false, () => this.postURL(url, post))
+    const options = imagePostLoadOptions(post)
+    this.owner.startupHold.run(() => {
+      if (this.wc.isDestroyed()) return
+      void this.wc.loadURL(url, options).catch(() => undefined)
+    })
+  }
+
+  /**
+   * The encoded bytes of an image the page loaded, from the renderer: the DevTools protocol's
+   * `Page.getResourceContent` reads the frame's resource – the response the page's own request
+   * got, its cookies and referrer already spent – so a cross-origin image whose host sends no
+   * CORS header, which no script in the page may read, uploads all the same (Chrome reads its
+   * renderer's decoded bitmap; this is the nearest the API offers). The main frame's tree
+   * first, then each child frame the tree lists (a same-process sub-frame's image). `'too-large'`
+   * when the listing puts the image above the cap (nothing is transferred); null when the image
+   * is in no frame's resource tree (evicted, or never an element's), or when the page's session
+   * is an extension's (`pageDebugger.ts`: not ours to enable domains on).
+   *
+   * `Page` is enabled for the read (`getResourceContent` needs it). It is disabled after only on
+   * a session the read attached for itself and still holds alone at the end – one that dies with
+   * its detach a moment later. A session that stood before the read (the dark theme hold's, the
+   * governor's, a fonts change in flight) or that a hold took over during it keeps `Page` as the
+   * read leaves it: Blink's `InspectorPageAgent::disable()` clears the whole of the agent's state,
+   * and the fonts CT-25 set on a long-lived session (`sendFonts`) live there – the agent's
+   * `Restore()` re-applies them in a new renderer after a cross-site swap from that state alone,
+   * which `fontsAfterNavigation` trusts when it finds the session attached across the swap.
+   */
+  async readImageResource(
+    url: string,
+    maxBytes: number
+  ): Promise<ImageResource | 'too-large' | null> {
+    const wc = this.wc
+    if (wc.isDestroyed() || hasForeignDebuggerOwner(wc.id)) return null
+    // Whether `withDebugger` attaches for this read (nothing held the session before it).
+    const ownSession = this.cdpPending === 0 && !wc.debugger.isAttached()
+    try {
+      return await this.withDebugger(async (dbg) => {
+        await dbg.sendCommand('Page.enable')
+        try {
+          const tree = (await dbg.sendCommand('Page.getResourceTree')) as {
+            frameTree: ResourceFrameTree
+          }
+          const listed = imageResourceFrames(tree.frameTree, url)
+          if (listed.some((l) => l.contentSize !== null && l.contentSize > maxBytes))
+            return 'too-large'
+          // The main frame last as a guess when no listing names the image (the agent also
+          // looks the address up in the memory cache).
+          const candidates: Array<{ frameId: string; mimeType: string }> = [...listed]
+          if (!candidates.some((c) => c.frameId === tree.frameTree.frame.id))
+            candidates.push({ frameId: tree.frameTree.frame.id, mimeType: '' })
+          for (const { frameId, mimeType } of candidates) {
+            const content = (await dbg
+              .sendCommand('Page.getResourceContent', { frameId, url })
+              .catch(() => null)) as { content: string; base64Encoded: boolean } | null
+            if (!content || !content.base64Encoded || !content.content) continue
+            // Base64 grows the bytes by a third: the cap on the bytes themselves.
+            if (content.content.length * 0.75 > maxBytes) return 'too-large'
+            return { base64: content.content, mimeType }
+          }
+          return null
+        } finally {
+          // The read's own session, nobody else on it: `Page` off again before the detach. A
+          // hold that joined meanwhile (`cdpPending` above the read's one) keeps the session,
+          // and with it whatever `Page` state was set on it.
+          if (ownSession && this.cdpPending === 1)
+            await dbg.sendCommand('Page.disable').catch(() => undefined)
+        }
+      })
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * `certificate-error` refused the main frame's certificate for `url`: kept for the failure
+   * Chromium reports next, so the core can render the interstitial with it.
+   */
+  expectCertificateFailure(url: string, certificate: CertificateDetails): void {
+    this.refusedCertificate = { url, certificate }
+  }
+
+  /**
+   * The certificate interstitial, written into the empty document Chromium committed for the
+   * failed load rather than loaded as a document of its own: the entry stays the failed
+   * address's, so the tab shows that address, back leads to the page before and a load of the
+   * address asks for it again. The error document is complete by the time `did-fail-load`
+   * reports, so the script runs at once; the page preload is in that document and relays the
+   * interstitial's controls like in any other. The document takes the app's colour scheme
+   * (`errorPageAttributesScript`), as the pages the protocol serves do.
+   */
+  showErrorPage(url: string): void {
+    if (this.wc.isDestroyed()) return
+    void this.wc
+      .executeJavaScript(inPlaceErrorPageScript(new URL(url), this.owner.colorScheme), true)
+      .catch(() => undefined)
+  }
+
+  /** The hint for the next main-frame commit, consumed once (`webNavigation.onCommitted`). */
+  takeNavigationHint(): ViewNavigationHint {
+    const hint = this.navigationHint ?? {}
+    this.navigationHint = null
+    return hint
+  }
+
+  getURL(): string {
+    return this.wc.getURL()
+  }
+
+  getTitle(): string {
+    return this.wc.getTitle()
+  }
+
+  canGoBack(): boolean {
+    return this.wc.navigationHistory.canGoBack()
+  }
+
+  canGoForward(): boolean {
+    return this.wc.navigationHistory.canGoForward()
+  }
+
+  goBack(): void {
+    this.recordHostNavigation(false, () => this.goBack())
+    this.wc.navigationHistory.goBack()
+  }
+
+  goForward(): void {
+    this.recordHostNavigation(false, () => this.goForward())
+    this.wc.navigationHistory.goForward()
+  }
+
+  goToIndex(index: number): void {
+    if (this.wc.isDestroyed()) return
+    const history = this.wc.navigationHistory
+    if (index < 0 || index >= history.length()) return
+    this.recordHostNavigation(false, () => this.goToIndex(index))
+    history.goToIndex(index)
+  }
+
+  navigationEntries(): NavigationSnapshot {
+    const wc = this.wc
+    if (wc.isDestroyed()) return { entries: [], index: -1 }
+    const history = wc.navigationHistory
+    return {
+      entries: history.getAllEntries().map((e) => snapshotEntry(e)),
+      index: history.getActiveIndex()
+    }
+  }
+
+  async restoreNavigation(snapshot: NavigationSnapshot): Promise<void> {
+    const wc = this.wc
+    if (wc.isDestroyed()) return
+    // A restored tab's first document, held like `loadURL`'s (`startupHold.ts`).
+    await this.owner.startupHold.whenOpen()
+    if (wc.isDestroyed()) return
+    const entries = snapshot.entries.filter((e) => typeof e.url === 'string' && e.url !== '')
+    const index = Math.min(Math.max(snapshot.index, 0), entries.length - 1)
+    const current = entries[index]
+    if (!current) return
+    // `navigationHistory.restore` arrived in Electron 34; older hosts (and a rejected restore,
+    // e.g. on an entry the renderer refuses) fall back to loading the current entry alone.
+    const history = wc.navigationHistory as Partial<Electron.NavigationHistory>
+    if (typeof history.restore === 'function') {
+      try {
+        await history.restore({ entries, index })
+        return
+      } catch {
+        if (wc.isDestroyed()) return
+      }
+    }
+    await wc.loadURL(current.url).catch(() => undefined)
+  }
+
+  reload(ignoreCache: boolean): void {
+    this.recordHostNavigation(true, () => this.reload(ignoreCache))
+    if (ignoreCache) this.wc.reloadIgnoringCache()
+    else this.wc.reload()
+  }
+
+  /**
+   * The "Page unresponsive" prompt's Exit page (tabs-45): Electron kills the renderer as a
+   * crash would, and `render-process-gone` (`killed` or `crashed`) follows for every page it
+   * hosted. A renderer that is gone already (the first of several pages sharing it took it)
+   * is nothing to kill; Electron may throw for it, and that is nothing either.
+   */
+  endRenderer(): void {
+    if (this.wc.isDestroyed()) return
+    try {
+      this.wc.forcefullyCrashRenderer()
+    } catch {
+      // Already gone.
+    }
+  }
+
+  /** The core's word on this page's renderer standing still, or moving again (`rendererHung`). */
+  reportHung(hung: boolean): void {
+    if (this.wc.isDestroyed()) return
+    if (hung) this.events.onUnresponsive?.()
+    else this.events.onResponsive?.()
+  }
+
+  /**
+   * One relay for the two monitors' words on this page's renderer: Chromium's, for a page with
+   * no DevTools session (`unresponsive`/`responsive`), and Ione's (`hangMonitor`), for a page
+   * with one – never both at once, since each speaks only where the other does not. A hang is
+   * passed on every time it is said: said again after Chromium's delay it is the prompt back
+   * after Wait, and the core's mark takes a repeat as it stands. `responsive` answers a hang
+   * reported; without one it is Chromium's word on a hang it never reported (a session was on
+   * the page when its input went unanswered), and nothing to the core.
+   */
+  private relayHang(hung: boolean): void {
+    if (this.wc.isDestroyed()) return
+    if (!hung && !this.hangRelayed) return
+    this.hangRelayed = hung
+    this.owner.rendererHung(this, hung)
+  }
+
+  /**
+   * Whether Ione's hang monitor is the one to speak for this page right now: it carries a
+   * DevTools session (with none, Chromium reports the hang itself) that is not paused at a
+   * breakpoint, and no toolbox is open on it – the toolbox's user pauses the page at will, a
+   * breakpoint is no hang, and Chrome shows no prompt for a page under DevTools either.
+   */
+  private hangWatchable(): boolean {
+    const wc = this.wc
+    if (wc.isDestroyed() || this.pausedByDebugger) return false
+    return wc.debugger.isAttached() && !wc.isDevToolsOpened()
+  }
+
+  /**
+   * The monitor's probe: the cheapest thing the renderer's main thread must answer. Over the
+   * page's session when it is Ione's – `Runtime.evaluate` of a literal, by value, enables no
+   * domain and leaves nothing attached to the page's contexts – and through the main frame's
+   * own `executeJavaScript` (a literal: nothing of the page's is read or written) when the
+   * session is an extension's, whose agent state is not ours to touch. The frame's call, not
+   * `webContents.executeJavaScript`: that one waits for the page to stop loading first, and a
+   * slow load is no hang. A hung renderer answers neither; the monitor's timeout is the
+   * detector.
+   */
+  private hangProbe(): Promise<unknown> {
+    const wc = this.wc
+    if (wc.isDestroyed()) return Promise.reject(new Error('The page is gone'))
+    const dbg = wc.debugger
+    if (dbg.isAttached() && !hasForeignDebuggerOwner(wc.id))
+      return dbg.sendCommand('Runtime.evaluate', { expression: '1', returnByValue: true })
+    return wc.mainFrame.executeJavaScript('1')
+  }
+
+  /**
+   * Whether the hang monitor watches this page: on screen in a focused window – Chromium
+   * reports no hang for a page that does not show, and the prompt belongs to the window
+   * looking at the page. Read again on every flip of either (`setVisible`, the window's
+   * focus, `attachTo`).
+   */
+  private refreshHangWatch(): void {
+    const win = this.win
+    this.hangMonitor.setActive(this.visible && win !== null && win.isFocused())
+  }
+
+  /** Whether `win` is the window this view is attached to (its focus is this page's to follow). */
+  hostedBy(win: BrowserWindow): boolean {
+    return this.win === win
+  }
+
+  /** The window this view is in gained or lost the focus (`ElectronTabViewHost.watchFocus`). */
+  windowFocusChanged(): void {
+    this.refreshHangWatch()
+  }
+
+  /** The OS process of this page's renderer, for the pages that share it; null when it has none. */
+  rendererProcess(): number | null {
+    return this.rendererPid()
+  }
+
+  stop(): void {
+    this.wc.stop()
+  }
+
+  /**
+   * The task manager is about to crash this view's renderer on the user's word (End process):
+   * the `render-process-gone` that follows reads `ended` (`takeEndedByUser`), and the core's
+   * unload toast says the page was ended, not that it crashed.
+   */
+  noteEndedByUser(now: number = Date.now()): void {
+    this.endedByUserAt = now
+  }
+
+  /** Whether the renderer going away now is End process's doing; the mark is spent either way. */
+  private takeEndedByUser(now: number = Date.now()): boolean {
+    const at = this.endedByUserAt
+    this.endedByUserAt = null
+    return at !== null && now - at <= ENDED_BY_USER_MS
+  }
+
+  hasDocument(): boolean {
+    const url = this.wc.getURL()
+    return url !== '' && url !== 'about:blank'
+  }
+
+  // --- media / zoom / find ----------------------------------------------------
+
+  setMuted(muted: boolean): void {
+    this.wc.setAudioMuted(muted)
+  }
+
+  isCurrentlyAudible(): boolean {
+    return this.wc.isCurrentlyAudible()
+  }
+
+  setZoom(factor: number): void {
+    this.wc.setZoomFactor(factor)
+  }
+
+  getZoom(): number {
+    return this.wc.getZoomFactor()
+  }
+
+  findInPage(text: string, forward: boolean, newSession: boolean): void {
+    // Electron: findNext=true begins a new session, false continues the current one.
+    this.wc.findInPage(text, { forward, findNext: newSession })
+  }
+
+  stopFind(action: 'clearSelection' | 'keepSelection'): void {
+    this.wc.stopFindInPage(action)
+  }
+
+  executeJavaScript(code: string, frameId?: number): Promise<unknown> {
+    if (frameId) {
+      const frame = frameById(this.wc, frameId)
+      if (!frame || frame.detached)
+        return Promise.reject(new Error(`Frame ${frameId} is no longer part of the page`))
+      return frame.executeJavaScript(code, true)
+    }
+    return this.wc.executeJavaScript(code, true)
+  }
+
+  /**
+   * The browser's private world (`shared/privateWorld.ts`, `IMAGE_THUMBNAIL_WORLD_ID`): the
+   * page's built-ins are out of the script's reach and the script out of the page's, while the
+   * document, its origin and its cookies are the page's. The top frame through Electron's
+   * `webContents.executeJavaScriptInIsolatedWorld`; a sub-frame through its own preload
+   * (`PrivateWorldRelay`, the frame's `webFrame.executeJavaScriptInIsolatedWorld` with the same
+   * id), since Electron 44's `WebFrameMain` evaluates in the main world only. Never the main
+   * world: a frame that is gone rejects.
+   */
+  executeJavaScriptInPrivateWorld(code: string, frameId?: number): Promise<unknown> {
+    if (frameId) {
+      const frame = frameById(this.wc, frameId)
+      if (!frame || frame.detached)
+        return Promise.reject(new Error(`Frame ${frameId} is no longer part of the page`))
+      return this.owner.privateWorld.execute(frame, code)
+    }
+    return this.wc.executeJavaScriptInIsolatedWorld(IMAGE_THUMBNAIL_WORLD_ID, [{ code }], true)
+  }
+
+  insertCSS(css: string, origin: InsertedCssOrigin = 'user'): Promise<string> {
+    return this.wc.insertCSS(css, { cssOrigin: origin })
+  }
+
+  removeInsertedCSS(key: string): Promise<void> {
+    return this.wc.removeInsertedCSS(key)
+  }
+
+  sendPageFlags(flags: PageFlags): void {
+    this.wc.send('zen:page-flags', flags)
+  }
+
+  sendFormsCommand(command: FormsCommand): void {
+    if (!this.wc.isDestroyed()) this.wc.send('zen:forms', command)
+  }
+
+  /** To the top document's page script (`preload/page.ts` listens on `PAGE_HOST_CHANNEL`). */
+  postToPage(message: PageHostMessage): void {
+    if (!this.wc.isDestroyed()) this.wc.send(PAGE_HOST_CHANNEL, message)
+  }
+
+  setZapMode(on: boolean): void {
+    this.wc.send('zen:zap', on)
+  }
+
+  setCaretBrowsingEnabled(enabled: boolean): void {
+    // One call into the renderer's web preferences (Chromium's `caret_browsing_enabled`); a
+    // page that is already there is left alone.
+    if (this.wc.isDestroyed() || this.wc.isCaretBrowsingEnabled() === enabled) return
+    this.wc.setCaretBrowsingEnabled(enabled)
+  }
+
+  showHint(hint: PageHint | null): void {
+    if (!this.wc.isDestroyed()) this.wc.send('zen:page-hint', hint)
+  }
+
+  /**
+   * "Hold ⌘Q to quit" over the page, or its way down (`preload/page.ts` listens on `zen:quit-hold`).
+   * Not while the chord is down in a detached toolbox: the notice is drawn there, where the
+   * keyboard is (§9.23, `DevtoolsQuitHoldNotice`), and the page behind the toolbox draws none;
+   * the way down still goes, for a panel that stood before the keyboard moved.
+   */
+  showQuitHold(panel: QuitHoldPanel | null): void {
+    if (this.wc.isDestroyed()) return
+    if (panel && this.owner.quitHoldNotice.inToolbox()) return
+    this.wc.send(QUIT_HOLD_CHANNEL, panel)
+  }
+
+  /** Fresh `NewTabPageState` for a `zen://newtab` page (its preload listens on this channel). */
+  sendNewTabState(state: NewTabPageState): void {
+    if (!this.wc.isDestroyed()) this.wc.send('zen:newtab-state', state)
+  }
+
+  /** What a `zen://newtab` page's tile menu picked, for the page to carry out. */
+  sendNewTabCommand(command: NewTabPageCommand): void {
+    if (!this.wc.isDestroyed()) this.wc.send('zen:newtab-command', command)
+  }
+
+  setBackgroundColor(color: string): void {
+    this.view.setBackgroundColor(color)
+  }
+
+  focus(): void {
+    this.keyboardAsked = true
+    // A tab being activated is focused a frame before the layout shows it, and a view in no
+    // window has no keyboard to be given (`WebContents.focus` is a no-op there): into the window
+    // first, hidden, and its own `focus` event is the asked-for one.
+    const win = this.win
+    if (win) this.enterWindow(win)
+    this.wc.focus()
+  }
+
+  isFocused(): boolean {
+    return !this.wc.isDestroyed() && this.wc.isFocused()
+  }
+
+  /**
+   * The page's icon for the favicon cache (HB-47): fetched through the page's own session
+   * (`ses.fetch`), so the site's cookies go with the request as they do with Chrome's favicon
+   * fetch; the body read up to `maxBytes` and refused past it. The response's type goes with the
+   * bytes; the core sniffs the image type itself (`favicon.ico` served as `text/plain` is common).
+   */
+  async fetchFavicon(
+    url: string,
+    maxBytes: number
+  ): Promise<{ bytes: Uint8Array; mime: string } | null> {
+    if (this.wc.isDestroyed()) return null
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), FAVICON_FETCH_MS)
+    try {
+      const response = await this.wc.session.fetch(url, {
+        signal: controller.signal,
+        credentials: 'include',
+        cache: 'default',
+        redirect: 'follow'
+      })
+      if (!response.ok) return null
+      const declared = Number(response.headers.get('content-length') ?? '0')
+      if (declared > maxBytes) return null
+      const bytes = new Uint8Array(await response.arrayBuffer())
+      if (bytes.length === 0 || bytes.length > maxBytes) return null
+      return { bytes, mime: response.headers.get('content-type') ?? '' }
+    } catch {
+      return null
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  isDestroyed(): boolean {
+    return this.wc.isDestroyed()
+  }
+
+  destroy(): void {
+    this.detach()
+    if (!this.wc.isDestroyed()) {
+      this.wc.close({ waitForBeforeUnload: false })
+    }
+  }
+
+  // --- placement ---------------------------------------------------------------
+
+  /**
+   * Make the view the window's: it joins the window's `contentView` when it is first shown
+   * (`setVisible`), asked for the keyboard (`focus`) or brought to the front, not here – see
+   * `inWindow`. A view attached while shown (a page moving between windows keeps its state)
+   * joins at once.
+   */
+  attachTo(host: WindowHost): void {
+    const target = host as ElectronWindow
+    if (this.host === target) return
+    this.detach()
+    this.host = target
+    const win = this.win
+    if (!win) return
+    this.owner.watchKeyboard(win)
+    this.owner.watchFocus(win)
+    // Adopt the new window's own concealed state (W6-F6): a view taken into a window that is
+    // itself minimised or hidden must not paint. The window's later frame events keep it current.
+    this.windowConcealed =
+      typeof win.isMinimized === 'function' && typeof win.isVisible === 'function'
+        ? win.isMinimized() || !win.isVisible()
+        : false
+    if (this.visible) this.enterWindow(win)
+    else this.enterStage()
+    this.refreshHangWatch()
+  }
+
+  detach(): void {
+    // A view parked under this window's chrome leaves it hidden: the engine's view must not be
+    // a shown one when another window takes it in (`enterWindow` from `focus`, `bringToFront`).
+    this.hideParked()
+    this.leaveStage()
+    const win = this.win
+    if (win && this.inWindow) {
+      win.contentView.removeChildView(this.view)
+      this.arrivesFromElsewhere = true
+    }
+    this.inWindow = false
+    this.host = null
+    // Off a window, the view is concealed by none; the window it next joins sets this afresh.
+    this.windowConcealed = false
+    this.refreshHangWatch()
+  }
+
+  /** Into the window's `contentView` (on top), once; a view already there is left where it is. */
+  private enterWindow(win: BrowserWindow): void {
+    if (this.inWindow) return
+    this.leaveStage()
+    win.contentView.addChildView(this.view)
+    this.inWindow = true
+    this.restack(win)
+  }
+
+  /**
+   * Re-sorts the window's native z-order after a view that stood elsewhere joined it
+   * (`arrivesFromElsewhere`): adding and removing a throwaway `View` runs the views tree's
+   * `ReorderLayers` → `Widget::ReorderNativeViews`, which puts the page's aura window back in
+   * child order (on top of the chrome's). Re-adding the view itself does not – Electron's
+   * `AddChildView` of a child already at its index returns before any reorder – and a layer of
+   * its own (`setBackgroundBlur`) would stay on the view for good. A view's first join, and a
+   * view hidden and shown within its window, are stacked right by Chromium and skip this.
+   */
+  private restack(win: BrowserWindow): void {
+    if (!this.arrivesFromElsewhere) return
+    this.arrivesFromElsewhere = false
+    const nudge = new View()
+    win.contentView.addChildView(nudge)
+    win.contentView.removeChildView(nudge)
+  }
+
+  /**
+   * Onto the owner's stage, shown at the box the layout would give the page in front (its own
+   * last one, else the box a page of the same window stands in, else the window's content): a
+   * hidden view an agent drives, in a live window, not parked under the chrome – parking keeps
+   * it painting already, and `hideParked` brings it here when the chrome leaves the content.
+   * Out of the user's window first: a view is one `contentView`'s at a time.
+   */
+  private enterStage(): void {
+    if (!this.agentDriven || this.staged || this.visible || this.parked !== null) return
+    const win = this.win
+    if (!win) return
+    const box = this.stageBox(win)
+    if (this.inWindow) {
+      win.contentView.removeChildView(this.view)
+      this.inWindow = false
+    }
+    this.staged = this.owner.stageFor(this, box)
+    this.stagedBox = box
+    this.view.setBounds({ x: 0, y: 0, width: box.width, height: box.height })
+    this.view.setVisible(true)
+  }
+
+  /**
+   * The box a staged page stands in: the page area as the window's layout last placed a page
+   * alone in front (`ZenWindow.contentRect`, the freshest word – a hidden view hears no
+   * `setBounds` from the layout, so its own last box may predate a resize or a chrome change),
+   * else the view's own last box, else the owner's guess from the window's pages.
+   */
+  private stageBox(win: BrowserWindow): Rect {
+    const zen = this.host?.zen
+    const area = zen && typeof zen.contentRect === 'function' ? zen.contentRect() : null
+    if (area && area.width > 0 && area.height > 0) return area
+    return this.bounds ?? this.owner.pageAreaOf(win)
+  }
+
+  /**
+   * A staged page takes the box it would have in front now (`stageBox`), when that moved since
+   * it went on – the user resized the window or folded the sidebar meanwhile. The session
+   * prepares a tab before each action (`setAgentDriven` again): the viewport an agent's next
+   * snapshot or capture reads is the one the page would have in front, at the cost of a compare.
+   */
+  private restage(): void {
+    const win = this.win
+    const stage = this.staged
+    if (!win || !stage || stage.isDestroyed()) return
+    const box = this.stageBox(win)
+    const was = this.stagedBox
+    if (was && was.width === box.width && was.height === box.height) return
+    this.stagedBox = box
+    this.owner.stageRoom(stage, box)
+    this.view.setBounds({ x: 0, y: 0, width: box.width, height: box.height })
+  }
+
+  /**
+   * Off the stage, hidden and in no window; `enterWindow` puts it back before the user. Also
+   * the owner's word that the page went (`forget`), so the stage does not keep a dead view.
+   */
+  leaveStage(): void {
+    const stage = this.staged
+    if (!stage) return
+    this.staged = null
+    this.stagedBox = null
+    this.arrivesFromElsewhere = true
+    this.view.setVisible(false)
+    if (!stage.isDestroyed()) stage.contentView.removeChildView(this.view)
+    this.owner.stageLeft(this)
+    if (this.bounds) this.view.setBounds(this.bounds)
+  }
+
+  /** The box the layout last gave the view, for the stage's sizing of a page never laid out. */
+  laidOutBox(): Rect | null {
+    return this.bounds
+  }
+
+  setBounds(rect: Rect): void {
+    this.bounds = rect
+    // A staged view keeps the stage's box and takes this one as it leaves (`leaveStage`).
+    if (this.staged) return
+    // A parked view takes its new box parked: the layout that shows it again sets the box first
+    // and `setVisible(true)` puts the view in it.
+    this.view.setBounds(this.parked === null ? rect : this.parkedBox(rect, this.parked))
+  }
+
+  setBorderRadius(radius: number): void {
+    this.view.setBorderRadius(radius)
+  }
+
+  /**
+   * Show or hide the page. Always passed on to the engine's view (a shown page has its visibility
+   * re-asserted this way after a thaw); the owner hears of a flip, so the resource governor can
+   * put its CPU clamp on a page that went behind and take it off one that came in front.
+   *
+   * A page taken down because the chrome is over the content – the window's `contentHidden` at
+   * the time of the call: the omnibox dropdown, a menu, a sheet or dialog, the first-run tour, a
+   * drag – is parked rather than hidden (`park`). The views composite above the chrome, so the
+   * chrome cannot draw over a page and asks for it to go away instead; but a `WebContentsView`
+   * hidden, detached, sized to nothing or moved wholly off the window is HIDDEN to Chromium (its
+   * aura occlusion tracker), and Chromium starts a page's speculation-rules prefetches only while
+   * the page's `WebContents` is VISIBLE (`PrefetchDocumentManager::CanPrefetchNow`) – a prefetch
+   * the page asked for meanwhile waits in `PrefetchScheduler`'s queue, and nothing re-runs that
+   * queue when the page is shown again: it starts only once the page next changes its candidates,
+   * which for most pages is never. Chrome keeps the page visible under its own popups, and a
+   * speculation rule in a page loaded under Ione's omnibox dropdown (the address on the command
+   * line, a fresh profile) never prefetched at all. A parked view keeps its size and stays shown
+   * with one corner pixel in a corner of the window (`PARK_CORNERS`: the one pixel of it on
+   * screen), which Chromium counts as VISIBLE: the page keeps painting,
+   * `document.visibilityState` stays `visible`, its prefetches run, and the view comes back with
+   * `setVisible(true)` untouched, as Chrome's pages do from under a popup. The window's host ends
+   * the parking of a view the next layout with the chrome off the content leaves out
+   * (`hideParked`: a tab switched under the chrome). The page hidden by a tab switch, a chrome
+   * page tab or a move between windows (the chrome off the content) is hidden as before.
+   *
+   * A page whose background throttling is off – an agent session's, the user looking at the
+   * tab as the session prepared it (`setBackgroundThrottling(false)`) – is hidden with the
+   * throttling on for the hide and off again after it (`hide`; the hide the chrome leaving the
+   * content leaves behind, `hideParked`, is the same hide and takes the same way). Electron's
+   * `allow_disabling_blink_scheduler_throttling_per_renderview` patch takes every
+   * page-visibility update as `visible` while throttling is off, so a plain hide would leave
+   * the page reading `visible` to its scripts (`document.visibilityState`, `visibilitychange`)
+   * until its next navigation – on the stage or hidden in the window – where Chrome's tab
+   * switched from reads `hidden`. With the throttling on the hide reaches the page; the
+   * throttling off again shows the widget as painting once more (Electron's
+   * `SetBackgroundThrottling` shows a hidden widget on any call) and touches nothing the page
+   * reads. Measured (Electron 44, Linux) with the whole sequence in one task: `hidden` on the
+   * stage at once, `hidden` in the window and on the stage a prepare later, the frames flowing
+   * either way; the plain hide `visible`. The `throttling` setting stands as the session last
+   * said it.
+   */
+  setVisible(visible: boolean): void {
+    const flipped = this.visible !== visible
+    const wasShown = this.visible
+    this.visible = visible
+    if (visible) {
+      // The first showing puts the view into the window, at the box the layout gave it just
+      // before (`setBounds`), as the popup surface is placed: added, then shown.
+      const win = this.win
+      if (win) this.enterWindow(win)
+      const parked = this.parked !== null
+      if (parked) this.unpark()
+      // A window minimised or hidden keeps its pages hidden to Chromium whatever the layout says
+      // (W6-F6): the engine's view stays down until the window returns (`applyWindowVisible`).
+      if (!this.windowConcealed) {
+        this.view.setVisible(true)
+        // On screen at least once: a later switch to the page may go without the activation
+        // handshake (`everShown`, `ZenWindow.showOnCommit`).
+        this.shownOnce = true
+        if (parked) this.pointerBack()
+      }
+    } else if (this.parkable(wasShown)) {
+      this.park()
+    } else {
+      if (this.parked !== null) this.unpark()
+      this.hide()
+    }
+    if (flipped) {
+      this.refreshHangWatch()
+      this.owner.visibilityChanged(this)
+    }
+  }
+
+  /**
+   * The engine's view down, then onto the stage if an agent drives the page (`enterStage`): the
+   * hide of a tab switch, a chrome page tab or a move between windows (`setVisible`), and of the
+   * chrome leaving the content over a page switched away from under it (`hideParked`). A page whose
+   * throttling is off is hidden with the throttling on and given it back off after, whatever
+   * the hide did (a `finally`; the page gone meanwhile is left alone) – see `setVisible` for why.
+   */
+  private hide(): void {
+    const wc = this.wc
+    const held = !this.throttling && !wc.isDestroyed()
+    if (held) wc.setBackgroundThrottling(true)
+    try {
+      this.view.setVisible(false)
+      this.enterStage()
+    } finally {
+      if (held && !wc.isDestroyed()) wc.setBackgroundThrottling(false)
+    }
+  }
+
+  /**
+   * The view's window was minimised or hidden (`false`) or restored / shown (`true`), told by
+   * the window host on the frame's own events (W6-F6). A concealed window's pages read `hidden`
+   * as a Chrome tab's do: the engine's view goes down for real, a view parked under the chrome
+   * (W6-F5) included – parking keeps a page visible under Ione's own popup, not under a
+   * minimised or hidden window. One page does not: a page whose throttling is off (a session's,
+   * the user looking at it as the window went away) reads `visible` in the concealed window
+   * until its next navigation – Electron's patch rewrites this hide as it does a tab switch's
+   * (`setVisible`), with no regard for what hid the widget; this hide is left plain for now, and
+   * the wrap `hide` puts round a tab switch's would close it. The window back, the engine's view
+   * returns to where the core's layout left it: parked at its corner under the chrome still over
+   * the content, shown, or hidden as the core's flag says. The core's flag (`visible`,
+   * `isVisible`, the `hid`/`shown` accounting the governor and snapshot logic read) is not
+   * touched, and no visibility flip is announced – the core's view of which page is in front
+   * does not change when its window is put away and brought back.
+   *
+   * Occlusion by another application's window is Chromium's own to track (Windows and macOS
+   * natively; none on X11, where Chrome itself does not); nothing is synthesised here for it, and
+   * a window merely blurred while on screen is not concealed.
+   */
+  applyWindowVisible(visible: boolean): void {
+    const concealed = !visible
+    if (this.windowConcealed === concealed) return
+    this.windowConcealed = concealed
+    if (this.staged) {
+      // On the stage the view is in no window of the user's: it paints on for the agent while
+      // theirs is away, and the flag stands current for its return before them (`setVisible`).
+    } else if (concealed) {
+      // Down to Chromium, parked or not: a parked view's box goes back to its own so nothing of
+      // it is left a pixel on screen behind the hidden window.
+      if (this.parked !== null && this.bounds) this.view.setBounds(this.bounds)
+      this.view.setVisible(false)
+    } else if (this.parked !== null && this.bounds) {
+      // The window is back with the chrome still over the content: the view is parked again, a
+      // pixel in its corner, so Chromium keeps it visible and its prefetches run (W6-F5).
+      this.view.setBounds(this.parkedBox(this.bounds, this.parked))
+      this.view.setVisible(true)
+    } else {
+      this.view.setVisible(this.visible)
+    }
+    this.refreshHangWatch()
+  }
+
+  /**
+   * Whether a hide asked for now is one to park for: the window's chrome is over the content
+   * (`contentHidden`) and the engine's view is on screen in it (a page never shown, or shown in
+   * no window, has nothing to keep visible). In a window minimised or hidden the engine's view
+   * is down whatever the layout says (W6-F6), so "on screen" is what the core's flag held before
+   * this call (`wasShown`) or the parking already on: a layout re-applied under the chrome while
+   * the window is away keeps the parking for the window's return rather than dropping it for a
+   * plain hide.
+   */
+  private parkable(wasShown: boolean): boolean {
+    const host = this.host
+    const onScreen = this.windowConcealed
+      ? wasShown || this.parked !== null
+      : this.view.getVisible()
+    return (
+      host !== null &&
+      this.win !== null &&
+      this.inWindow &&
+      this.bounds !== null &&
+      onScreen &&
+      host.zen.contentHidden
+    )
+  }
+
+  /**
+   * The box a parked view stands in: its own size, moved so that only one of its corner pixels
+   * is still inside the window, in the window content's corner `corner` (`PARK_CORNERS`). The
+   * page's box ends short of the window's edge (the frame around it), so it is the window's
+   * corner pixel and not the box's that the view keeps – anything more of the view inside the
+   * window would show beside the frame.
+   */
+  private parkedBox(rect: Rect, corner: number): Rect {
+    const win = this.win
+    const [width, height] = win ? win.getContentSize() : [rect.x + rect.width, rect.y + rect.height]
+    const right = corner % 2 === 0
+    const bottom = corner < 2
+    return {
+      x: right ? width - 1 : -(rect.width - 1),
+      y: bottom ? height - 1 : -(rect.height - 1),
+      width: rect.width,
+      height: rect.height
+    }
+  }
+
+  /**
+   * The pointer's moves are told where hiding would have told them. Aura synthesizes a mouse
+   * move to whatever lies under the pointer when a view under it is hidden or shown, and none
+   * when one is moved: parked by a bounds change alone, the view leaves the chrome under the
+   * pointer with the pointer's last position over the chrome itself – wherever it last moved
+   * over a strip or a bar – and its hover state stays there, so a bubble opening under that
+   * spot counted as hovered and never closed (the zoom bubble waits under the pointer). The
+   * chrome hears a move at the pointer's place as the view goes (`park`), and when the view
+   * comes back under the pointer the chrome hears the pointer leave and the page hears where it
+   * stands (`pointerBack`), as aura's exit and move would say. Nothing while a chrome mouse
+   * button is down (a tab row's drag puts the chrome over the content): aura's synthesized
+   * moves wait for the release too, and the chrome holds the pointer's capture through the drag
+   * anyway.
+   */
+  private park(): void {
+    const rect = this.bounds
+    if (!rect) return
+    if (this.parked === null) this.parked = this.owner.claimParkingCorner(this)
+    const pointer = this.pointerOver(rect)
+    this.view.setBounds(this.parkedBox(rect, this.parked))
+    if (pointer) {
+      this.host?.win.webContents.sendInputEvent({ type: 'mouseMove', x: pointer.x, y: pointer.y })
+    }
+  }
+
+  private unpark(): void {
+    this.parked = null
+    this.owner.releaseParkingCorner(this)
+    if (this.bounds) this.view.setBounds(this.bounds)
+  }
+
+  /** The view is back in its box from parking, shown: the pointer over it is the page's again. */
+  private pointerBack(): void {
+    const rect = this.bounds
+    const host = this.host
+    if (!rect || !host) return
+    const pointer = this.pointerOver(rect)
+    if (!pointer) return
+    host.win.webContents.sendInputEvent({ type: 'mouseLeave', x: pointer.x, y: pointer.y })
+    this.wc.sendInputEvent({ type: 'mouseMove', x: pointer.x - rect.x, y: pointer.y - rect.y })
+  }
+
+  /**
+   * Where the pointer stands over the view's box `rect`, in DIP from the window content's
+   * top-left corner (the chrome page's own coordinates); null with the pointer elsewhere, a
+   * chrome mouse button down, or no window to measure against.
+   */
+  private pointerOver(rect: Rect): { x: number; y: number } | null {
+    const host = this.host
+    if (!host || host.pointerButtonHeld()) return null
+    try {
+      const cursor = screen.getCursorScreenPoint()
+      const content = host.win.getContentBounds()
+      const x = cursor.x - content.x
+      const y = cursor.y - content.y
+      const over = x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
+      return over ? { x, y } : null
+    } catch {
+      return null
+    }
+  }
+
+  /** Whether the engine's view stands parked under the chrome, and in which corner. */
+  parkedCorner(): number | null {
+    return this.parked
+  }
+
+  /** The window the view is parked in, for the owner's handing out of corners. */
+  windowOf(): BrowserWindow | null {
+    return this.win
+  }
+
+  /**
+   * The chrome left the content (a layout applied with `contentHidden` off) without the layout
+   * showing this view: it was switched away from under the chrome, and is hidden now the way a
+   * tab switch hides a page (`hide`: onto the stage if an agent drives it, with the throttling
+   * on for the hide if a session holds it). Nothing for a view that is not parked. The window's
+   * host walks every view of the window with it (`TabManager.allViewsOwnedBy`): the page beneath
+   * the reader's cover too, hidden on the cover's word while the chrome was over the content.
+   */
+  hideParked(): void {
+    if (this.parked === null) return
+    this.unpark()
+    this.hide()
+  }
+
+  isVisible(): boolean {
+    // The core's flag, as W6-F5 left it: a window minimised or hidden takes the engine's view
+    // down (`applyWindowVisible`) without changing which page the core has in front, so the
+    // engine's own visibility is not consulted while the window is concealed (W6-F6).
+    return this.visible && (this.windowConcealed || this.view.getVisible())
+  }
+
+  bringToFront(): void {
+    // Re-adding moves the view to the top of the z-order; a view not in the window yet (a tab
+    // glanced at or made fullscreen before it was ever shown) joins there.
+    const win = this.win
+    if (!win) return
+    this.leaveStage()
+    win.contentView.addChildView(this.view)
+    this.inWindow = true
+    this.restack(win)
+  }
+
+  // --- page operations -----------------------------------------------------------
+
+  /**
+   * The toolbox at `dock` (design language v2 §9.29): Electron docks it inside the page's own
+   * view – the frontend covers the view and lays the page out in the hole its split widget
+   * leaves, `bottom`, `right` or `left` – or gives it a window of its own (`undocked`, Chrome's
+   * undock, with the dock buttons still in its menu; `detach`, which loses them, is the Browser
+   * Console's alone). The dock names are Electron's own modes. Passing one makes Electron
+   * persist it as the frontend's `currentDockState`, so the toolbox's own buttons and the app
+   * menu's rows read the same state.
+   */
+  openDevTools(mode: 'toggle' | 'inspect' | 'console', dock: DevtoolsDock): void {
+    const wc = this.wc
+    if (wc.isDestroyed()) return
+    if (mode === 'toggle' && wc.isDevToolsOpened()) {
+      wc.closeDevTools()
+      return
+    }
+    if (!wc.isDevToolsOpened()) this.devtoolsDock = dock
+    wc.openDevTools({ mode: dock, activate: true })
+    if (mode === 'inspect') wc.inspectElement(0, 0)
+  }
+
+  /**
+   * Chrome's "Inspect": the inspector opens on the node under the click, at the remembered dock
+   * when it was closed. `inspectElement` takes the `context-menu` event's own coordinates.
+   */
+  inspectElementAt(x: number, y: number, dock: DevtoolsDock): void {
+    const wc = this.wc
+    if (wc.isDestroyed()) return
+    if (!wc.isDevToolsOpened()) {
+      this.devtoolsDock = dock
+      wc.openDevTools({ mode: dock, activate: true })
+    }
+    wc.inspectElement(x, y)
+  }
+
+  /**
+   * Move an open toolbox to `dock` (the app menu's rows): through the frontend's own
+   * `DockController`, the path its buttons take, so the toolbox keeps its panel and drawer and
+   * persists the state as the user's – and says the new dock on its console, the read-back the
+   * core hears (`onDevtoolsDockChanged`). Should this Chromium keep the module elsewhere, the
+   * toolbox is closed and reopened at the dock instead – one blink of the toolbox, and a line on
+   * the app's log naming the tab and the dock, so a Chromium that takes this path is noticed.
+   */
+  setDevtoolsDock(dock: DevtoolsDock): void {
+    const wc = this.wc
+    if (wc.isDestroyed() || !wc.isDevToolsOpened()) return
+    this.devtoolsDock = dock
+    const frontend = wc.devToolsWebContents
+    const reopen = (why: string): void => {
+      if (wc.isDestroyed()) return
+      const tabId = this.owner.tabIdForWebContents(wc) ?? `webContents ${wc.id}`
+      console.warn(`[zen] devtools: reopening the toolbox of ${tabId} at ${dock} – ${why}`)
+      wc.closeDevTools()
+      wc.openDevTools({ mode: dock, activate: true })
+    }
+    if (!frontend || frontend.isDestroyed()) {
+      reopen('the frontend is gone')
+      return
+    }
+    frontend
+      .executeJavaScript(devtoolsMoveScript(dock), true)
+      .catch((error: unknown) =>
+        reopen(
+          `the frontend refused the move: ${error instanceof Error ? error.message : String(error)}`
+        )
+      )
+  }
+
+  /**
+   * The toolbox as §9.29 has it, each time one opens (`devtools-opened`, after the frontend has
+   * loaded): the seam between the page and a docked toolbox takes the chrome's `--v2-border`
+   * hairline, and the frontend's own dock buttons are read back – it says the new dock on its
+   * console, the host tells the core (`onDevtoolsDockChanged`), so the menu's checked row is
+   * where the toolbox stands. Nothing else of the toolbox is touched: it draws its own theme.
+   */
+  private dressDevtools(): void {
+    const frontend = this.wc.devToolsWebContents
+    if (!frontend || frontend.isDestroyed() || this.dressedFrontends.has(frontend)) return
+    this.dressedFrontends.add(frontend)
+    // The quit chord typed into the toolbox (session-08, review F3): the frontend's keys raise
+    // `before-input-event` on nothing – its delegate is Electron's `InspectableWebContents`,
+    // which hands only the keys the frontend left unhandled on, to the menu bar – so the
+    // frontend says the chord's key down and the key up after it on its console, and they go to
+    // the key table for this page's window as the page's own keys do (`devtoolsKeys.ts`). The
+    // held-key notice hears each key first: a hold armed from the toolbox while it stands
+    // undocked is drawn in the toolbox, where the keyboard is (§9.23).
+    relayDevtoolsQuitChord(frontend, this.owner.quitChord, (key) => void this.events?.onKey(key), {
+      notice: this.owner.quitHoldNotice,
+      window: () => this.win,
+      detached: () => this.devtoolsDock === 'undocked'
+    })
+    frontend.on('console-message', (event) => {
+      const hole = pageBoundsFromConsoleMessage(event.message)
+      if (hole) {
+        this.devtoolsPageBounds = hole
+        return
+      }
+      const dock = dockFromConsoleMessage(event.message)
+      if (!dock) return
+      this.devtoolsDock = dock
+      this.events?.onDevtoolsDockChanged?.(dock)
+    })
+    frontend.executeJavaScript(DEVTOOLS_DOCK_HOOK_SCRIPT, true).catch(() => undefined)
+    frontend.executeJavaScript(DEVTOOLS_PAGE_BOUNDS_HOOK_SCRIPT, true).catch(() => undefined)
+    frontend.executeJavaScript(DEVTOOLS_SEAM_SCRIPT, true).catch(() => undefined)
+  }
+
+  downloadURL(url: string, options?: { saveAs?: boolean }): void {
+    if (options?.saveAs) this.owner.downloads?.expectSaveAs(url)
+    this.wc.downloadURL(url)
+  }
+
+  reloadFrame(frameId: number): void {
+    const frame = frameById(this.wc, frameId)
+    if (frame && !frame.detached) frame.reload()
+  }
+
+  /**
+   * The editing command goes to the page's focused frame whether or not the page holds the
+   * window's focus (the app menu that asks stands in the chrome document): the frame tree keeps
+   * its focused frame, and Blink keeps the selection, while another view has the focus.
+   */
+  editCommand(command: EditCommand): void {
+    if (this.wc.isDestroyed()) return
+    this.wc[command]()
+  }
+
+  clearCache(): Promise<void> {
+    return this.wc.session.clearCache()
+  }
+
+  print(): void {
+    this.wc.print()
+  }
+
+  /**
+   * The preview's render: `printToPDF` takes the paper in inches, the margins in inches, the
+   * scale as a factor and the ranges as Chrome's text – the form `pdfRenderOptions` already
+   * gives. Header and footer are Chromium's own template (title and date above, address and page
+   * numbers below), as Chrome's preview shows them.
+   */
+  async printToPDF(options: PdfRenderOptions): Promise<Uint8Array> {
+    const buffer = await this.wc.printToPDF({
+      landscape: options.landscape,
+      printBackground: options.printBackground,
+      scale: options.scale,
+      pageSize: { width: options.pageSize.width, height: options.pageSize.height },
+      margins: {
+        top: options.margins.top,
+        right: options.margins.right,
+        bottom: options.margins.bottom,
+        left: options.margins.left
+      },
+      ...(options.pageRanges ? { pageRanges: options.pageRanges } : {}),
+      displayHeaderFooter: options.displayHeaderFooter,
+      preferCSSPageSize: options.preferCSSPageSize
+    })
+    return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+  }
+
+  /**
+   * Save Page As in `format` (CT-27): the OS dialog on the format's one filter, then
+   * `webContents.savePage` with the matching type – HTMLComplete writes the document and its
+   * `_files` folder, HTMLOnly the document, MHTML one archive. The dialog answers a path and
+   * not the filter (Electron 44's `SaveDialogReturnValue`), which is why the format is picked in
+   * the menu before it opens; a name typed without an extension gets the format's (GTK's dialog
+   * leaves it off).
+   */
+  async savePage(suggestedName: string, format: SavePageFormat): Promise<string | null> {
+    const options = savePageDialogOptions(format, join(downloadDir(), suggestedName))
+    const win = this.win
+    const result = win
+      ? await dialog.showSaveDialog(win, options)
+      : await dialog.showSaveDialog(options)
+    if (result.canceled || !result.filePath) return null
+    const target = savePageTarget(result.filePath, format)
+    await this.wc.savePage(target.path, target.saveType)
+    return target.path
+  }
+
+  /**
+   * JPEG snapshot of the page, used to keep a preview behind overlays: dimmed under the URL bar,
+   * Glance and a dialog, plain under a popover or the app menu (§6), where it stands in for the
+   * live page for as long as the menu is up. A page that has not painted yet (still in its TLS
+   * handshake, waiting on a sign-in) gives `capturePage` nothing to copy and the promise never
+   * settles: the overlay that asked must not wait on it, so an unanswered capture counts as no
+   * picture.
+   *
+   * Quality 90: at 65 the encoder haloed the text edges under an undimmed menu (#299's 5–7 % of
+   * pixels off). Measured on the packaged build over a 1600×1000 window of prose: 90 takes the
+   * frame's pixels more than 32 levels off the live page from 14.3 % to 13.8 % (10.6 → 8.6 % on
+   * the default layout's 1352-wide page, where nothing is resampled), the mean channel error down
+   * 9 % / 23 %, for 8.0 ms and 413 KB against 6.7 ms and 228 KB – PNG would be exact where the
+   * page is not resampled, at 51 ms an encode, over the frame budget.
+   *
+   * The size (v2 draft §9.5, the stand-in's rule): the frame's capture at device pixels, 1:1 up
+   * to a trigger area (`SNAPSHOT_MAX_PIXELS`, 6.2 Mpx) and past it scaled down, both sides
+   * alike, to a target (`SNAPSHOT_TARGET_PIXELS`, 3.7 Mpx) with Hamming-1 – never a CSS-pixel
+   * width clamp: under an undimmed popover the page must read as the page, and a resample
+   * softens every text edge where a lower quality only costs the gradients. The 1400 clamp this
+   * replaces resampled every frame wider than 1400 and, `capturePage` handing the device pixels
+   * over as a 1x bitmap, every DPR-2 frame to a fifth of its pixels. Measured on the packaged
+   * build (a 4-core Xeon under Xvfb, `--disable-gpu`; the #340 prose fixture; medians of 25
+   * after 3 warm-ups; the text-edge crop is 420 × 144 CSS px of 16 px prose, its share of pixels
+   * more than 32 levels off the live page): at 1920 × 1200 the page (1856 × 1184, 2.20 Mpx)
+   * encodes 1:1 in 13.9 ms at 595 KB with the crop at 13.5 % (the codec alone), where the clamp
+   * cost 11.9 ms of resize + 7.5 ms of encode for 24.3 %; at 2560 × 1440 (3.55 Mpx) 1:1 is
+   * 19.2 ms at 657 KB for 13.5 %, against the clamp's 31.0 %; at DPR 2 (1600 × 1000 DIP,
+   * 3072 × 1968, 6.05 Mpx – the trigger's edge) 1:1 is 34.9 ms at 1.2 MB for 5.6 % with the
+   * renderer's decode at 54 ms, against the clamp's 19.7 %; a 4K monitor at 200 % (1920 × 1080
+   * DIP, 3712 × 2128, 7.9 Mpx) is past the trigger and drops to 2540 × 1456: 20.9 ms of
+   * Hamming-1 resize + 20.7 ms of encode at 760 KB for 13.0 %, the decode 29.9 ms – the main
+   * thread held for what the 1:1 encode alone holds it (42.1 ms, for 1.3 MB, a 53 ms decode and
+   * 5.4 %), the swap gated a frame and a half sooner, the payload near halved; Lanczos-3 to the
+   * same target would hold it 68.9 ms, and scaling to the trigger 85.7, worse than 1:1 on every
+   * axis. The capture itself is the frame's cost whatever the policy – 16 ms at 1920 and 2560,
+   * 32–36 ms at DPR 2 – and is awaited, not held. Skia's Lanczos-3 resample (the default quality,
+   * 3.5–6.5 ms per input Mpx) costs about what the encode of the source would (5–7 per Mpx), so a
+   * frame scaled by it pays more than it saves on the main thread; Hamming-1 (1.9–3.5) halves the
+   * resize and is what the target is reached with. The picture is drawn at the page's CSS size
+   * whatever its pixels (the page cover, `CoverImage`, `object-cover`), so a 1:1 capture at DPR
+   * 2 does not double. The Android host's picture is its own copy and encode
+   * (`TabWebView.snapshot`).
+   *
+   * A staged page (an agent's, hidden from the user) is pictured from a frame of its renderer's
+   * own, on the page's capture turn, as `capture` pictures it – never `capturePage`'s copy,
+   * which would flip the page to `visible` (see `capture`). Two callers picture a hidden page
+   * this way: the agent's screenshot tool when `capture` answered nothing, and the tab strip's
+   * hover card (`ZenWindow.snapshot` with `fresh`) over the agent's tab. Encoded the same, and
+   * bounded as the frame is, not as the copy is: `STAGED_FRAME_FIRST_MS` and then
+   * `STAGED_FRAME_RETRY_MS`, 2.8 s at the most, against the copy's `SNAPSHOT_TIMEOUT_MS` of
+   * 600 ms. The copy is one paint of a widget already painting, and a late one is worth nothing
+   * to the page cover; a staged renderer is first shown as painting, and one that shows nothing
+   * for the first wait – a navigation since – is shown once more, which is what gets a frame of
+   * it at all. The tool's fallback follows a capture that took the same path; the hover card's
+   * preview of the agent's tab comes on the frame's terms, up to that long, for the page's
+   * visibility kept.
+   */
+  snapshot(): Promise<string | null> {
+    if (!this.staged) return snapshotOf(this.wc)
+    return this.onTurn(() => this.stagedFrame()).then(encodeSnapshot, () => null)
+  }
+
+  /**
+   * The picture of the developer toolbox docked in this view's box (§9.29), for the page cover
+   * (the chrome's picture of the page) to lay under the page's picture: the frontend's own
+   * `capturePage`, cut to the toolbox's band – the part of the box beside the page's hole, the
+   * seam at its edge – where the frontend has said where its hole is (`devtoolsPageBounds`, with
+   * the view's box: `devtoolsBandRect`), the whole box otherwise. The page cover anchors the
+   * picture to the band's side of the box, so the cut and the whole lay out the same; the cut
+   * keeps the pair of pictures at the box's own pixels (§9.5's budget: the page's hole is in the
+   * page's picture already – at DPR 2 a 1600 × 1000 box is 6 Mpx once, not 9 with the hole
+   * pictured twice). Null with no toolbox up, an undocked one (a window of its own, nothing of it
+   * in the frame) or a frontend that is gone; encoded as the page's picture is (`snapshot`).
+   */
+  snapshotDevtools(): Promise<string | null> {
+    const wc = this.wc
+    if (wc.isDestroyed() || !wc.isDevToolsOpened()) return Promise.resolve(null)
+    if (!this.devtoolsDock || !isDockedInFrame(this.devtoolsDock)) return Promise.resolve(null)
+    const frontend = wc.devToolsWebContents
+    if (!frontend || frontend.isDestroyed()) return Promise.resolve(null)
+    const band = this.bounds
+      ? devtoolsBandRect(this.devtoolsDock, this.devtoolsPageBounds, this.bounds)
+      : null
+    return snapshotOf(frontend, band ?? undefined)
+  }
+
+  /**
+   * The visible area through `capturePage`, or the whole document through the DevTools
+   * protocol (`captureBeyondViewport`, cut at `MAX_CAPTURE_HEIGHT`); a full page the debugger
+   * cannot paint (DevTools holds it, the page is gone) falls back to the visible area.
+   */
+  async screenshot(fileName: string, options: ScreenshotOptions = {}): Promise<string | null> {
+    try {
+      let png: Buffer | null = null
+      if (options.fullPage) {
+        try {
+          const capture = await this.captureWithDevtools(
+            { mode: 'fullPage', format: 'png' },
+            'image/png',
+            this.fullPageCut()
+          )
+          png = Buffer.from(capture.data, 'base64')
+        } catch {
+          /* the visible area below */
+        }
+      }
+      if (!png) {
+        const image = await this.wc.capturePage()
+        if (image.isEmpty()) return null
+        png = nativeImage.createFromBuffer(image.toPNG()).toPNG()
+      }
+      // Two screenshots in one second keep both files (`… (1).png`), as a download would.
+      const filePath = uniquePath(downloadDir(), fileName)
+      await writeFile(filePath, png)
+      return filePath
+    } catch {
+      return null
+    }
+  }
+
+  async copyImageAt(x: number, y: number): Promise<boolean> {
+    try {
+      this.wc.copyImageAt(x, y)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  replaceMisspelling(word: string): void {
+    this.wc.replaceMisspelling(word)
+  }
+
+  addWordToDictionary(word: string): void {
+    this.wc.session.addWordToSpellCheckerDictionary(word)
+  }
+
+  // --- AI agents -------------------------------------------------------------------
+
+  /**
+   * Trusted input for agents. It goes through the DevTools protocol's Input domain: unlike
+   * `webContents.sendInputEvent`, which hands events straight to the main frame's widget, CDP
+   * routes them through Chromium's input router, so a point inside a cross-origin iframe reaches
+   * the frame's own process – as a person's click would – and the keyboard goes to the focused
+   * frame. Coordinates are CSS pixels of the top viewport (CDP takes them as such at any zoom).
+   * When the debugger cannot be attached the widget-level API is the fallback (in DIPs, main
+   * frame only).
+   *
+   * Either way the event waits for the page's first paint (`awaitFirstPaint`): before it, the
+   * renderer drops every press and key – not moves – and acks them as handled, so a click
+   * sent to a loaded, placed page whose display compositor has not produced a frame yet would
+   * be lost with a success. The wait is bounded; past it the event goes anyway.
+   */
+  async sendInput(event: AgentInputEvent): Promise<void> {
+    const wc = this.wc
+    if (wc.isDestroyed()) return
+    if (event.type !== 'mouseMove' && (await awaitFirstPaint(wc)) === 'gone') return
+    try {
+      await this.withDebugger((dbg) => dispatchInputViaCdp(dbg, event))
+      return
+    } catch {
+      /* no debugger for this page: fall back to the widget */
+    }
+    if (wc.isDestroyed()) return
+    const zoom = wc.getZoomFactor()
+    const px = (v: number): number => Math.round(v * zoom)
+    switch (event.type) {
+      case 'mouseMove':
+        wc.sendInputEvent({ type: 'mouseMove', x: px(event.x), y: px(event.y) })
+        return
+      case 'click': {
+        const modifiers = electronModifiers(event.modifiers)
+        const x = px(event.x)
+        const y = px(event.y)
+        wc.sendInputEvent({ type: 'mouseMove', x, y, modifiers })
+        await nextTick()
+        for (let i = 1; i <= Math.max(1, event.clickCount); i++) {
+          wc.sendInputEvent({
+            type: 'mouseDown',
+            x,
+            y,
+            button: event.button,
+            clickCount: i,
+            modifiers
+          })
+          wc.sendInputEvent({
+            type: 'mouseUp',
+            x,
+            y,
+            button: event.button,
+            clickCount: i,
+            modifiers
+          })
+          await nextTick()
+        }
+        return
+      }
+      case 'key': {
+        const keyCode = electronKeyCode(event.key)
+        const modifiers = electronModifiers(event.modifiers)
+        wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers })
+        if (event.key.length === 1 || event.key === 'Enter')
+          wc.sendInputEvent({ type: 'char', keyCode, modifiers })
+        wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers })
+        await nextTick()
+        return
+      }
+      case 'text':
+        await wc.insertText(event.text)
+    }
+  }
+
+  /**
+   * Whether the page's renderer takes real input yet: it has presented its first frame, or its
+   * document is one Chromium never holds back (`firstPaint.ts`, the same reading `sendInput`
+   * waits on). A page that does not answer within a second, or errors, counts as painted – the
+   * question is a guard on top of what worked before, not a new way to fail.
+   */
+  hasPainted(): Promise<boolean> {
+    return hasPainted(this.wc)
+  }
+
+  /**
+   * The document's word that it has drawn a frame with what it holds now (`TabView.frameDrawn`;
+   * `firstPaint.ts`): a double `requestAnimationFrame` through the main frame, never resolving
+   * for a view that draws no frame – the asker (`TabManager.afterFrame`) holds the ceiling.
+   */
+  frameDrawn(): Promise<number> {
+    return frameDrawn(this.wc)
+  }
+
+  /**
+   * The page's word that the document it is to show has a frame on screen (`TabView.
+   * shownPainted`; `firstPaint.ts`): the frame word and the document's first `paint` entry
+   * together, asked of the committed document now or of the one a woken tab's load commits
+   * next. Offered, the core shows a tab switched to or woken on the activate commit at the
+   * frame's last reported rect, the page left in front standing over it until this word or the
+   * ceiling (`ZenWindow.showOnCommit`, W8-P0).
+   */
+  shownPainted(): Promise<number> {
+    return shownPainted(this.wc)
+  }
+
+  /**
+   * Whether this page has ever been put on screen since its view was created (`TabView.
+   * everShown`, the activation cover's fast path): the first `setVisible(true)` that reached
+   * the engine's view says so, every hide after it changes nothing. A woken tab's new view and
+   * a background-loaded one answer false until the layout first shows them.
+   */
+  everShown(): boolean {
+    return this.shownOnce
+  }
+
+  /** The preload's isolated world: pages cannot see the agent runtime or tamper with it. */
+  executeIsolatedJavaScript(code: string): Promise<unknown> {
+    return this.wc.executeJavaScriptInIsolatedWorld(ISOLATED_WORLD_ID, [{ code }], true)
+  }
+
+  /**
+   * The page's frame tree for agents: the top frame first, then every sub-frame (parents before
+   * children, siblings in insertion order), each with Chrome's frame id (see `frameIdOf`).
+   */
+  frames(): AgentFrame[] {
+    const wc = this.wc
+    if (wc.isDestroyed()) return []
+    const focused = wc.focusedFrame
+    const out: AgentFrame[] = []
+    for (const frame of wc.mainFrame.framesInSubtree) {
+      if (frame.detached) continue
+      const parent = frame.parent
+      out.push({
+        id: frameIdOf(frame),
+        parentId: parent ? frameIdOf(parent) : null,
+        url: frame.url,
+        origin: frame.origin,
+        name: frame.name,
+        focused: focused !== null && focused.frameTreeNodeId === frame.frameTreeNodeId
+      })
+    }
+    return out
+  }
+
+  /**
+   * Run `fn` with a DevTools session on the page, for the duration of the action only – the way
+   * the resource governor holds its sessions (`resources/lifecycle.ts`): attached on demand when
+   * the first action starts, detached when the last pending action ends, so no session lingers
+   * on a page between tool calls. A session another client already holds (DevTools, the
+   * governor's overrides) is used as is and left in place. Actions only send commands of the
+   * domain they need (`Input.*`, `Page.*`); nothing here enables `Runtime`, so the page sees no
+   * debugger-side script evaluation and nothing becomes attached to its JavaScript contexts.
+   */
+  private async withDebugger<T>(fn: (dbg: Electron.Debugger) => Promise<T>): Promise<T> {
+    const dbg = this.wc.debugger
+    if (this.cdpPending === 0 && !dbg.isAttached()) {
+      dbg.attach('1.3')
+      this.cdpAttachedHere = true
+    }
+    this.cdpPending++
+    try {
+      return await fn(dbg)
+    } finally {
+      this.cdpPending--
+      if (this.cdpPending === 0 && this.cdpAttachedHere) {
+        this.cdpAttachedHere = false
+        if (!this.wc.isDestroyed() && dbg.isAttached()) {
+          try {
+            dbg.detach()
+          } catch {
+            /* already detached */
+          }
+        }
+      }
+    }
+  }
+
+  /** Actions in flight that hold the debugger through `withDebugger`. */
+  private cdpPending = 0
+  /** Whether the current session was opened by `withDebugger` (and is ours to close). */
+  private cdpAttachedHere = false
+
+  // --- page fonts (CT-25) -----------------------------------------------------------
+
+  /**
+   * Bring an open page to the page fonts that stand (`pageFontSettings`), over the DevTools
+   * protocol: the web preferences a page's contents were made with cannot be changed after,
+   * so `Page.setFontFamilies` and `Page.setFontSizes` do what a new page's preferences do. The
+   * session is Ione's shared one (`pageDebugger.ts`: the resource governor's overrides keep
+   * it open on most pages); a page an extension's `chrome.debugger` holds is left alone, and
+   * takes the change on its next load (`did-navigate` tries again; the setting's description
+   * says so). The minimum font size has no protocol command: an open page keeps its floor until
+   * its contents are remade (a sleeping tab waking, a new tab).
+   *
+   * `Page.setFontFamilies` may be sent once per agent lifetime ("Font families can only be set
+   * once"): a page with no session of the governor's gets a fresh agent for every change (the
+   * session is attached for the commands and detached after); on a long-lived session a second
+   * family change recycles the session (`recycleDebugger`: the governor puts its overrides back
+   * on the new one) and the fonts and the dark theme hold are re-sent on it.
+   *
+   * A size change restyles the open document by itself; a family change alone does not (Blink
+   * recomputes only the elements whose style depends on font metrics, `FONT_RESTYLE_SCRIPT`
+   * says why), so the top document is asked to, from the preload's isolated world, once the
+   * commands are in. A same-process sub-frame's document follows at its next restyle (the
+   * recorded limit; a frame in another process keeps the fonts it was made with until its next
+   * load, as before).
+   */
+  refreshFonts(): void {
+    if (this.wc.isDestroyed()) return
+    const wanted = fontsKey(pageFontSettings)
+    if (wanted === this.fontsApplied) return
+    const fonts = pageFontSettings
+    this.fontsTurn = this.fontsTurn.then(() => this.sendFonts(fonts, wanted)).catch(() => {})
+  }
+
+  /**
+   * The engine re-applied the page's web preferences (a colour scheme flip re-reads them, and
+   * with them the fonts the page was made with): what a live change brought is gone, so the
+   * page reads as made and is brought to the setting again where it differs.
+   */
+  fontsChangedByEngine(): void {
+    this.fontsApplied = this.fontsBorn
+    this.familiesApplied = this.familiesBorn
+    this.refreshFonts()
+  }
+
+  /** The renderer process the page's fonts were last accounted for in (seeded in `wire`). */
+  private fontsRenderer: number | null = null
+
+  private rendererPid(): number | null {
+    try {
+      return this.wc.getOSProcessId() || null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * A navigation committed. Within one renderer the page's settings – and a live font change
+   * with them – outlive the document; a new renderer starts from the web preferences the
+   * contents were made with, unless a DevTools session stayed attached across the swap and
+   * restored what it had set (the agent's state travels with the session). So a swap without a
+   * session reads the page as made, and the setting goes out again where it differs.
+   */
+  private fontsAfterNavigation(): void {
+    if (this.wc.isDestroyed()) return
+    const renderer = this.rendererPid()
+    const swapped = this.fontsRenderer !== null && renderer !== this.fontsRenderer
+    this.fontsRenderer = renderer
+    if (swapped && !this.wc.debugger.isAttached()) {
+      this.fontsApplied = this.fontsBorn
+      this.familiesApplied = this.familiesBorn
+    }
+    this.refreshFonts()
+  }
+
+  private async sendFonts(fonts: EffectiveFonts, key: string): Promise<void> {
+    if (this.wc.isDestroyed()) return
+    // An extension's session is left alone: the change waits for the page's next load.
+    if (hasForeignDebuggerOwner(this.wc.id)) return
+    const families = cdpEffectiveFamilies(fonts, FONT_DEFAULTS)
+    // Only the slots that move are named: a family the user never chose keeps the engine's face.
+    const changes = cdpEffectiveFamilyChanges(this.familiesApplied, families)
+    const sizes = chromiumEffectiveFontPreferences(fonts)
+    // What the page shows follows a size on its own; a family alone must be asked for.
+    const restyle = changes !== null && !effectiveSizesMove(fontsOf(this.fontsApplied), fonts)
+    try {
+      await this.withDebugger(async (session) => {
+        if (changes) {
+          try {
+            await session.sendCommand('Page.setFontFamilies', changes)
+          } catch (error) {
+            if (!/only be set once/i.test(String(error))) throw error
+            // A long-lived session (the governor's overrides, the dark theme hold) set families
+            // before: a fresh agent takes the new ones, the holds' overrides go back on it.
+            await this.recycleSession()
+            await session.sendCommand('Page.setFontFamilies', changes)
+          }
+          this.familiesApplied = families
+        }
+        await session.sendCommand('Page.setFontSizes', {
+          fontSizes: { standard: sizes.defaultFontSize, fixed: sizes.defaultMonospaceFontSize }
+        })
+      })
+      this.fontsApplied = key
+      if (restyle && !this.wc.isDestroyed())
+        await this.wc.executeJavaScriptInIsolatedWorld(ISOLATED_WORLD_ID, [
+          { code: FONT_RESTYLE_SCRIPT }
+        ])
+    } catch {
+      /* the page went away, or the engine refused: the next load or change tries again */
+    }
+  }
+
+  /**
+   * A fresh agent while an action holds the session (`withDebugger`): the governor drops the
+   * session and puts its own overrides back on a new one (`recycleDebugger`); where it had none
+   * the page is left detached and the hold attaches again. The emulation overrides are re-sent,
+   * being the session's.
+   */
+  private async recycleSession(): Promise<void> {
+    await recycleDebugger(this.wc)
+    if (this.wc.isDestroyed()) return
+    const dbg = this.wc.debugger
+    if (!dbg.isAttached()) {
+      dbg.attach('1.3')
+      this.cdpAttachedHere = true
+    }
+    // Attached already: by this view's own `sessionDetached` (the hold's, `cdpAttachedHere`
+    // stands) or by the governor putting an override back (its own; it detaches it when that
+    // goes, and a hold of this view's attaches again then).
+    for (const command of this.emulationApplied.values()) await sendCdp(dbg, command)
+  }
+
+  /**
+   * The page's shared session went from under a hold of this view's – the governor's CPU clamp
+   * lifting as the page came in front (the clamp sits on background pages only, so a page in
+   * front keeps Chromium's hang monitor), a recycle, another client: the emulation overrides
+   * went with it, so the hold attaches again and puts them back. A page with no hold is left
+   * with no session, which is what the governor wants of a page in front. Electron emits
+   * `detach` after it has let go, so `attach` is free to take the page again here.
+   */
+  private sessionDetached(): void {
+    if (this.wc.isDestroyed()) return
+    if (this.emulationApplied.size === 0 && this.cdpPending === 0) return
+    const dbg = this.wc.debugger
+    if (dbg.isAttached()) return
+    try {
+      dbg.attach('1.3')
+    } catch {
+      // Another client (DevTools, an extension) holds the page: the overrides are off it, and
+      // the hold ends with them; the next change tries again.
+      this.emulationApplied.clear()
+      this.releaseEmulationHold()
+      return
+    }
+    this.cdpAttachedHere = true
+    for (const [override, command] of this.emulationApplied) {
+      void sendCdp(dbg, command).catch(() => {
+        if (this.emulationApplied.get(override) === command) this.emulationApplied.delete(override)
+        this.releaseEmulationHold()
+      })
+    }
+  }
+
+  // --- emulation overrides on the page's session ---------------------------------------
+
+  /**
+   * The emulation overrides this view keeps on the page's session – the dark theme for sites'
+   * auto dark mode (`refreshDarkening`) and, where the engine does not carry the Appearance
+   * setting to pages itself, its `prefers-color-scheme` (`refreshColorScheme`) – each as the
+   * command that puts it on, which is also what puts it back on a new session: an override
+   * belongs to the session and goes with it (`recycleSession`, `sessionDetached`). Between
+   * them they take one hold of the debugger (`cdpPending`) for as long as any is on;
+   * `withDebugger` shares the attachment with captures and input.
+   */
+  private readonly emulationApplied = new Map<EmulationOverride, CdpCommand>()
+  /** Whether the overrides count as one pending action in `cdpPending` (their hold). */
+  private emulationHold = false
+  /** Resolves once the send in flight is done (the next change waits for it). */
+  private emulationTurn: Promise<void> = Promise.resolve()
+
+  /** Intend `command` as the page's `override` (null: none); the page follows in turn. */
+  private setEmulation(override: EmulationOverride, command: CdpCommand | null): void {
+    if (this.wc.isDestroyed()) return
+    if (sameCommand(this.emulationApplied.get(override) ?? null, command)) return
+    if (command) this.emulationApplied.set(override, command)
+    else this.emulationApplied.delete(override)
+    this.emulationTurn = this.emulationTurn.then(() => this.sendEmulation(override)).catch(() => {})
+  }
+
+  /** Send the override as it is intended now (a change queued behind another reads the latest). */
+  private async sendEmulation(override: EmulationOverride): Promise<void> {
+    if (this.wc.isDestroyed()) return
+    const dbg = this.wc.debugger
+    const command = this.emulationApplied.get(override)
+    if (command) {
+      // Take a hold of the debugger for as long as any override is on.
+      if (!this.emulationHold) {
+        if (this.cdpPending === 0 && !dbg.isAttached()) {
+          try {
+            dbg.attach('1.3')
+            this.cdpAttachedHere = true
+          } catch {
+            this.emulationApplied.delete(override)
+            return
+          }
+        }
+        this.cdpPending++
+        this.emulationHold = true
+      }
+      try {
+        await sendCdp(dbg, command)
+      } catch {
+        /* the page went away, or the debugger is not ours: release the hold, retry on the next change */
+        if (this.emulationApplied.get(override) === command) this.emulationApplied.delete(override)
+      }
+    } else {
+      const release = EMULATION_RELEASE[override]
+      try {
+        if (dbg.isAttached()) await sendCdp(dbg, release)
+      } catch {
+        /* already gone */
+      }
+    }
+    this.releaseEmulationHold()
+  }
+
+  /** No override is on any more: the hold ends, and the session it opened goes with it. */
+  private releaseEmulationHold(): void {
+    if (!this.emulationHold || this.emulationApplied.size > 0) return
+    this.emulationHold = false
+    this.cdpPending--
+    if (this.cdpPending === 0 && this.cdpAttachedHere) {
+      this.cdpAttachedHere = false
+      const dbg = this.wc.debugger
+      if (!this.wc.isDestroyed() && dbg.isAttached()) {
+        try {
+          dbg.detach()
+        } catch {
+          /* already detached */
+        }
+      }
+    }
+  }
+
+  // --- dark theme for sites (CT-18) -------------------------------------------------
+
+  /** The core's policy for this page's site ("Apply dark theme to sites" and its exceptions). */
+  private darkening = false
+
+  /**
+   * Dark theme for sites: Chromium's auto dark mode over the DevTools protocol
+   * (`Emulation.setAutoDarkModeOverride`), the engine behind Chrome Android's "Auto-darken web
+   * content" – the page's colours are inverted and its images left alone, and a page with a dark
+   * style of its own (`color-scheme: dark`) is left to it. Like the WebView's algorithmic
+   * darkening it acts only while the chrome is dark (`nativeTheme` follows the Appearance
+   * setting; a flip re-applies through the host). Chromium's `WebContentsForceDark` feature
+   * switch would darken Ione's own chrome too, hence the per-page override.
+   */
+  setDarkening(on: boolean): void {
+    this.darkening = on
+    this.refreshDarkening()
+  }
+
+  /** The chrome's scheme or the policy changed: bring the page in line. */
+  refreshDarkening(): void {
+    const wanted = this.darkening && nativeTheme.shouldUseDarkColors
+    this.setEmulation('autoDark', wanted ? AUTO_DARK_MODE_ON : null)
+  }
+
+  // --- the Appearance setting's colour scheme -------------------------------------------
+
+  /**
+   * The Appearance setting's Light or Dark for the page where the engine does not carry it to
+   * pages itself (`emulatedColorScheme`: Linux, where `nativeTheme.themeSource` flips the native
+   * UI and `shouldUseDarkColors` but no renderer's `prefers-color-scheme`): the setting's value
+   * as an emulated media feature on the page's session, released when the setting returns to
+   * System. Applied as the view is made and on every change of the setting.
+   */
+  refreshColorScheme(): void {
+    const scheme = this.owner.pageColorScheme
+    this.setEmulation(
+      'colorScheme',
+      scheme ? { method: 'Emulation.setEmulatedMedia', params: emulatedMediaParams(scheme) } : null
+    )
+  }
+
+  // --- the JavaScript site setting (PS-64) --------------------------------------------
+
+  /**
+   * JavaScript for the document about to load at `url`: the site setting's block goes on the
+   * page's session as `Emulation.setScriptExecutionDisabled` (`SCRIPTS_OFF`) as the navigation
+   * starts – and again at each redirect hop, for the address the page ends at – and comes off
+   * the same way for a document the setting allows, so a blocked site's answer never outlives
+   * its document. Electron 44 has no per-view switch of its own: a page's web preferences are
+   * fixed at creation, and the emulation override is the one runtime path (the same primitive
+   * as the dark theme for sites). What it does not reach: a page an extension's `chrome.debugger`
+   * or DevTools already holds when the hold attaches keeps its scripts until the next load
+   * (`setEmulation` drops the override then); the preload's isolated world still runs (Blink
+   * lets isolated worlds execute under the block, as Chrome's content scripts do), the page's
+   * own scripts, `javascript:` URLs and `webContents.executeJavaScript` in the main world do
+   * not. Same-document navigations change no document and are left alone.
+   */
+  private refreshScripts(url: string): void {
+    if (this.wc.isDestroyed()) return
+    const blocked = this.owner.scriptsBlocked(url, this.wc.session)
+    this.setEmulation('scripts', blocked ? SCRIPTS_OFF : null)
+  }
+
+  setBackgroundThrottling(allowed: boolean): void {
+    this.throttling = allowed
+    if (!this.wc.isDestroyed()) this.wc.setBackgroundThrottling(allowed)
+  }
+
+  /**
+   * The agent's word on driving this page while it is hidden (`TabView.setAgentDriven`): on,
+   * a hidden view goes onto the stage now and each time the layout hides it; off, it leaves the
+   * stage and stays plainly hidden, as a page no agent drives.
+   */
+  setAgentDriven(driven: boolean): void {
+    this.agentDriven = driven
+    if (!driven) this.leaveStage()
+    else if (this.staged) this.restage()
+    else this.enterStage()
+  }
+
+  /**
+   * Full-page and region captures go through the DevTools protocol (`captureBeyondViewport`
+   * paints what is scrolled out of view); the viewport uses the cheaper `capturePage`. When the
+   * debugger cannot be attached (DevTools already open), the paint fails, or the session is an
+   * extension's (`pageDebugger.ts`: `captureBeyondViewport` sets and clears a device-metrics
+   * override, which would clobber the extension's own, so such a page is left to it), a full
+   * page or region falls back to cropping the viewport paint and the answer says so
+   * (`fallback: 'viewport'`).
+   *
+   * `capturePage` paints the whole widget, the page's classic scrollbar gutters included
+   * (Linux, Windows; macOS's overlay scrollbars take no room); the visible-area picture – the
+   * `viewport` mode and the fallback stand-in alike – is cut to the layout viewport minus the
+   * gutters (`visibleAreaClip`), as Chrome's visible-area capture is, and a region's crop is
+   * cut at that area's edge: the gutter is never part of a picture. Without the page's
+   * geometry (it did not answer) the bitmap stands as it is.
+   *
+   * A staged page (an agent's, hidden from the user) is pictured from a frame of its renderer's
+   * own (`stagedFrame`), not `capturePage`'s copy: the copy counts as a capturer on the page –
+   * `stayHidden` or not – and the page-visibility update that count brings makes a page whose
+   * background throttling is off, an agent's page, read `visible` until its next navigation
+   * (Electron's `allow_disabling_blink_scheduler_throttling_per_renderview` patch takes every
+   * update as `visible` while throttling is off; a new document starts from the window's real
+   * state again). Measured on a staged page (Electron 44, Linux): `document.visibilityState`
+   * `hidden` through any number of frame subscriptions, `visible` from the first `capturePage`
+   * on, with or without `stayHidden`, and after every later update. A frame changes nothing
+   * about the page. The same patch would have a page hidden while its throttling is off – the
+   * user looked at the agent's tab and switched away – read `visible` on the stage until it
+   * navigates; the hide puts the throttling on for its moment (`setVisible`). Captures take
+   * turns (`onTurn`), staged or not: one frame subscription per page. A capture begun in front
+   * can end on the stage – a tab switch during the DevTools paint of a full page, which then
+   * fails and falls through to the frame – and a second subscription begun meanwhile would
+   * replace the first's in the engine, its frame never coming; on the turn, the second waits
+   * (for `CAPTURE_TURN_MS` at the most: a copy that never answers holds no one behind it).
+   */
+  async capture(options: AgentCaptureOptions): Promise<AgentCapture | null> {
+    if (this.wc.isDestroyed()) return null
+    return this.onTurn(() => this.paint(options))
+  }
+
+  /**
+   * `work` on the page's capture turn (`stagedTurn`): after the last capture or stand-in
+   * picture has answered, whichever way, and before the next. A turn never rejects the chain,
+   * and holds it for `CAPTURE_TURN_MS` at the most, counted from when its work begins: one
+   * stuck past that goes on alone and the next begins – the two unserialised, as every capture
+   * was before the turn – rather than every later capture and stand-in of the page held behind
+   * it.
+   */
+  private onTurn<T>(work: () => Promise<T>): Promise<T> {
+    let release: () => void = () => undefined
+    const released = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const run = (): Promise<T> => {
+      const timer = setTimeout(release, CAPTURE_TURN_MS)
+      const done = new Promise<T>((resolve) => resolve(work()))
+      const settle = (): void => {
+        clearTimeout(timer)
+        release()
+      }
+      done.then(settle, settle)
+      return done
+    }
+    const turn = this.stagedTurn.then(run, run)
+    this.stagedTurn = released
+    return turn
+  }
+
+  private async paint(options: AgentCaptureOptions): Promise<AgentCapture | null> {
+    const wc = this.wc
+    if (wc.isDestroyed()) return null
+    const format = options.format
+    const mimeType = format === 'png' ? 'image/png' : 'image/jpeg'
+    let fallback: AgentCapture['fallback']
+    if (options.mode !== 'viewport') {
+      // A staged page's picture is its viewport: `captureBeyondViewport` in a window never
+      // shown does not answer, and a call left hanging keeps its device-metrics override on.
+      if (!this.staged && !hasForeignDebuggerOwner(wc.id)) {
+        try {
+          return await this.captureWithDevtools(options, mimeType, this.fullPageCut())
+        } catch {
+          /* fall through to capturePage */
+        }
+      }
+      fallback = 'viewport'
+    }
+    try {
+      let image = this.staged ? await this.stagedFrame() : await wc.capturePage()
+      if (!image || image.isEmpty()) return null
+      // `capturePage` hands the device pixels over as a 1x bitmap: CSS px times the page's device
+      // pixel ratio (the display's scale times the zoom – `window.devicePixelRatio` carries both).
+      const geometry = await this.viewport()
+      const bitmap = image.getSize()
+      const visible = geometry
+        ? visibleAreaClip(geometry, bitmap)
+        : { x: 0, y: 0, width: bitmap.width, height: bitmap.height }
+      if (options.mode === 'region' && options.region) {
+        // The region's CSS px minus the scroll offset, cut at the visible area's edge: the
+        // gutter is never part of a region.
+        const scroll = geometry ?? { scrollX: 0, scrollY: 0 }
+        const ratio = geometry?.devicePixelRatio ?? wc.getZoomFactor()
+        const r = options.region
+        const x = Math.max(0, Math.round((r.x - scroll.scrollX) * ratio))
+        const y = Math.max(0, Math.round((r.y - scroll.scrollY) * ratio))
+        const width = Math.min(visible.width - x, Math.round(r.width * ratio))
+        const height = Math.min(visible.height - y, Math.round(r.height * ratio))
+        if (width <= 0 || height <= 0) return null
+        image = image.crop({ x, y, width, height })
+      } else if (visible.width < bitmap.width || visible.height < bitmap.height) {
+        image = image.crop(visible)
+      }
+      const size = image.getSize()
+      const buffer = format === 'png' ? image.toPNG() : image.toJPEG(75)
+      const result: AgentCapture = {
+        data: buffer.toString('base64'),
+        mimeType,
+        width: size.width,
+        height: size.height
+      }
+      if (fallback) result.fallback = fallback
+      return result
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * One frame of a staged page's renderer, as `capturePage` paints: the whole widget in device
+   * pixels – within a pixel at a fractional scale, where the frame's size is rounded and the
+   * copy's ceiled (1250 × 916 against 1250 × 917 at 1.25; `visibleAreaClip` floors, so no crop
+   * exceeds the bitmap) – from the engine's frame subscription (the viz video capturer asks the
+   * renderer for its current frame at once, so a page that changes nothing still answers). The
+   * widget is shown as painting first (`setBackgroundThrottling` with the setting as it stands:
+   * Electron gives a hidden widget `WasShown` on the call, the page's own state untouched – the
+   * un-hide the session's prepare does, which a navigation since undoes; a hidden widget answers
+   * no frame, and un-hidden it answers within a frame or two rather than after a wait). A
+   * renderer that still shows nothing for `STAGED_FRAME_FIRST_MS` – a navigation committed after
+   * the un-hide – is shown as painting once more and waited for `STAGED_FRAME_RETRY_MS`; null
+   * when it still shows nothing, or the view left the stage meanwhile. The subscription is ended
+   * off its own callback.
+   */
+  private stagedFrame(): Promise<Electron.NativeImage | null> {
+    const wc = this.wc
+    return new Promise((resolve) => {
+      let settled = false
+      let kicked = false
+      let timer: ReturnType<typeof setTimeout> | null = null
+      const finish = (image: Electron.NativeImage | null): void => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        // Ended off the subscriber's own callback, and answered only then: the next capture's
+        // subscription (`stagedTurn`) must not be the one this end takes down.
+        defer(() => {
+          try {
+            if (!wc.isDestroyed()) wc.endFrameSubscription()
+          } catch {
+            /* the subscription is gone with the page */
+          }
+          resolve(image)
+        })
+      }
+      const unhide = (): void => wc.setBackgroundThrottling(this.throttling)
+      const wait = (ms: number): void => {
+        timer = setTimeout(() => {
+          if (kicked || !this.staged || wc.isDestroyed()) {
+            finish(null)
+            return
+          }
+          kicked = true
+          unhide()
+          wait(STAGED_FRAME_RETRY_MS)
+        }, ms)
+      }
+      try {
+        unhide()
+        wc.beginFrameSubscription(false, (image) => finish(image))
+      } catch {
+        finish(null)
+        return
+      }
+      wait(STAGED_FRAME_FIRST_MS)
+    })
+  }
+
+  /**
+   * The page's geometry for the chrome's capture overlay (`shared/capture.ts`): read in the
+   * isolated world (the page sees no script of ours), with the zoom factor from the engine.
+   * `window.devicePixelRatio` in a Chromium page is the display's scale times the page zoom,
+   * so it is the device pixels per page CSS pixel as `capturePage`'s bitmap has them. A page
+   * that has not finished loading holds script evaluation until it has: an unanswered read
+   * within `VIEWPORT_TIMEOUT_MS` counts as no geometry.
+   */
+  async viewport(): Promise<PageViewport | null> {
+    const wc = this.wc
+    if (wc.isDestroyed()) return null
+    try {
+      const raw = await Promise.race([
+        wc.executeJavaScriptInIsolatedWorld(ISOLATED_WORLD_ID, [{ code: VIEWPORT_SCRIPT }], true),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), VIEWPORT_TIMEOUT_MS))
+      ])
+      return pageViewportFrom(raw, wc.getZoomFactor())
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * The certificate behind the page: the one its session verified for the page's host
+   * (`SiteCertificates`; Electron emits nothing on the DevTools protocol's Security domain, so
+   * a session on the page has nothing to ask). Null when the page is not https, or no
+   * handshake of the session's has named or covered its host.
+   */
+  certificate(): Promise<SiteCertificate | null> {
+    const wc = this.wc
+    if (wc.isDestroyed()) return Promise.resolve(null)
+    return Promise.resolve(this.owner.certificates.lookup(wc.session, wc.getURL()))
+  }
+
+  /**
+   * A full page or a region of the document through `Page.captureScreenshot`. The rectangle is
+   * measured in CSS pixels of the document (`AgentCaptureOptions.region`, the layout metrics'
+   * `cssContentSize`) and handed over as `protocolClip` has it – in the page's zoomed pixels,
+   * which is how Chromium reads a clip – so the picture is the rectangle at the page's device
+   * pixel ratio, as `capturePage`'s bitmap is, whatever the zoom. `maxHeight` cuts a full page
+   * in CSS pixels. The size reported is the picture's own, from its header.
+   */
+  private captureWithDevtools(
+    options: AgentCaptureOptions,
+    mimeType: string,
+    maxHeight = MAX_CAPTURE_HEIGHT
+  ): Promise<AgentCapture> {
+    return this.withDebugger(async (dbg) => {
+      const zoom = zoomFactorOf(this.wc)
+      const metrics = (await dbg.sendCommand('Page.getLayoutMetrics')) as {
+        cssContentSize?: { width: number; height: number }
+        contentSize?: { width: number; height: number }
+      }
+      const content = cssContentSize(metrics, zoom)
+      const cut = Math.max(1, Math.min(maxHeight, MAX_CAPTURE_HEIGHT))
+      const area =
+        options.mode === 'region' && options.region
+          ? options.region
+          : {
+              x: 0,
+              y: 0,
+              width: Math.max(1, Math.round(content.width)),
+              height: Math.max(1, Math.min(Math.round(content.height), cut))
+            }
+      const clip = protocolClip(area, zoom)
+      const result = (await dbg.sendCommand('Page.captureScreenshot', {
+        format: options.format,
+        quality: options.format === 'jpeg' ? 75 : undefined,
+        clip,
+        captureBeyondViewport: true,
+        fromSurface: true
+      })) as { data: string }
+      const size = imageDimensions(Buffer.from(result.data, 'base64')) ?? {
+        width: Math.round(clip.width),
+        height: Math.round(clip.height)
+      }
+      return { data: result.data, mimeType, width: size.width, height: size.height }
+    })
+  }
+
+  /** Where this page's full-page paint is cut, for its zoom on the most scaled display. */
+  private fullPageCut(): number {
+    return fullPageCut(zoomFactorOf(this.wc), largestDisplayScale())
+  }
+}
+
+/**
+ * The stand-in picture of `wc`'s current paint (`snapshot`, `snapshotDevtools`): `capturePage`
+ * within `SNAPSHOT_TIMEOUT_MS`, scaled past the trigger, a JPEG data URL; null for a capture
+ * that came empty, late or not at all.
+ */
+/**
+ * The stand-in of `wc`'s visible area – or of `rect` alone (DIP of the view's box; a docked
+ * toolbox's band, `snapshotDevtools`) – on the terms `snapshot` documents: the 600 ms race, the
+ * §9.5 trigger and target, JPEG 90 as a data URL; null for a capture that never comes.
+ */
+async function snapshotOf(wc: WebContents, rect?: Rect): Promise<string | null> {
+  try {
+    const image = await Promise.race([
+      rect ? wc.capturePage(rect) : wc.capturePage(),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), SNAPSHOT_TIMEOUT_MS))
+    ])
+    return encodeSnapshot(image)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The stand-in's encoding of a captured frame (`ElectronTabView.snapshot`): JPEG at
+ * `SNAPSHOT_JPEG_QUALITY`, 1:1 in device pixels up to `SNAPSHOT_MAX_PIXELS` and scaled down to
+ * `SNAPSHOT_TARGET_PIXELS` past it; null for no frame or an empty one.
+ */
+function encodeSnapshot(image: Electron.NativeImage | null): string | null {
+  try {
+    if (!image || image.isEmpty()) return null
+    const size = image.getSize()
+    // `capturePage` hands the device pixels over as a 1x bitmap (`getScaleFactors()` is [1],
+    // `getSize()` device pixels); the representation's scale is read all the same, so the
+    // arithmetic stays in device pixels should a capture ever come with one of its own.
+    const scales = image.getScaleFactors()
+    const fit = standinScale(size.width, size.height, scales.length ? Math.max(...scales) : 1, {
+      trigger: SNAPSHOT_MAX_PIXELS,
+      target: SNAPSHOT_TARGET_PIXELS
+    })
+    // Past the trigger: Hamming-1 (`good`), not the default Lanczos-3 – half the time on a
+    // picture that is being softened anyway (`SNAPSHOT_TARGET_PIXELS`).
+    const scaled =
+      fit.scale < 1
+        ? image.resize({ width: fit.width, height: fit.height, quality: 'good' })
+        : image
+    return `data:image/jpeg;base64,${scaled.toJPEG(SNAPSHOT_JPEG_QUALITY).toString('base64')}`
+  } catch {
+    return null
+  }
+}
+
+/** The most scaled display's factor; 1 when the screen module cannot say (before the app is ready). */
+function largestDisplayScale(): number {
+  try {
+    return Math.max(...screen.getAllDisplays().map((d) => d.scaleFactor), 1)
+  } catch {
+    return 1
+  }
+}
+
+/** Chromium refuses textures much taller than this; very long pages are cut, not failed. */
+const MAX_CAPTURE_HEIGHT = 12_000
+/** The same limit in painted pixels, for a capture at the page's zoom on a scaled display. */
+const MAX_CAPTURE_PIXELS = 16_000
+
+/** The page's zoom factor, 1 for a view that cannot say (destroyed, or a host without one). */
+function zoomFactorOf(wc: WebContents): number {
+  try {
+    const zoom = wc.getZoomFactor()
+    return Number.isFinite(zoom) && zoom > 0 ? zoom : 1
+  } catch {
+    return 1
+  }
+}
+
+/**
+ * The document's size in CSS pixels from `Page.getLayoutMetrics`: `cssContentSize` says so
+ * directly; an older protocol's `contentSize` is in the page's zoomed pixels and is divided by
+ * the zoom.
+ */
+function cssContentSize(
+  metrics: {
+    cssContentSize?: { width: number; height: number }
+    contentSize?: { width: number; height: number }
+  },
+  zoom: number
+): { width: number; height: number } {
+  if (metrics.cssContentSize) return metrics.cssContentSize
+  if (metrics.contentSize)
+    return { width: metrics.contentSize.width / zoom, height: metrics.contentSize.height / zoom }
+  return { width: 0, height: 0 }
+}
+
+/**
+ * A rectangle of the document, in CSS pixels, as `Page.captureScreenshot`'s clip. Chromium lays
+ * a zoomed page out in CSS pixels times the zoom factor and reads the clip in those (the page's
+ * zoomed pixels: at 150 % the box at CSS (200, 900) is asked for at (300, 1350)); `scale` stays
+ * 1 because the protocol adds the display's scale on its own, so the picture comes back at the
+ * page's device pixel ratio – the display's scale times the zoom, `window.devicePixelRatio` –
+ * as `capturePage`'s bitmap does. Measured in Electron 44 (Chromium 152): a CSS-pixel clip at
+ * 150 % painted the area two thirds of the way to the box, and `scale: zoom` only enlarged it.
+ */
+export function protocolClip(
+  rect: { x: number; y: number; width: number; height: number },
+  zoom: number
+): { x: number; y: number; width: number; height: number; scale: 1 } {
+  const z = Number.isFinite(zoom) && zoom > 0 ? zoom : 1
+  return {
+    x: rect.x * z,
+    y: rect.y * z,
+    width: rect.width * z,
+    height: rect.height * z,
+    scale: 1
+  }
+}
+
+/**
+ * Where a full-page paint is cut, in CSS pixels: at `MAX_CAPTURE_HEIGHT`, or sooner so the
+ * painted picture – the document at the page's zoom times the display's scale – stays under
+ * Chromium's texture height on the most scaled display.
+ */
+export function fullPageCut(zoom: number, displayScale: number): number {
+  const z = Number.isFinite(zoom) && zoom > 0 ? zoom : 1
+  const d = Number.isFinite(displayScale) && displayScale > 0 ? displayScale : 1
+  return Math.max(1, Math.min(MAX_CAPTURE_HEIGHT, Math.floor(MAX_CAPTURE_PIXELS / (z * d))))
+}
+
+/** A page that has not finished loading holds script evaluation; the geometry read gives up after this. */
+const VIEWPORT_TIMEOUT_MS = 1500
+
+/**
+ * The page's geometry, read in the isolated world: the layout viewport's scroll offset and
+ * size (`innerWidth` × `innerHeight`, the scrollbar gutters included), the same minus the
+ * gutters (`cw` × `ch`: the scrolling element's `clientWidth` × `clientHeight` – the root's in
+ * standards mode, the body's in quirks mode, either way the viewport less a rendered
+ * scrollbar), whether the document runs right-to-left (`direction: rtl` on the root – for the
+ * chrome's information; the main frame's scrollbar stays on the right either way, see
+ * `visibleAreaClip`), `devicePixelRatio` (the display's scale times the page zoom in a Chromium
+ * page) and the document's scrollable size (the larger of the root's and the body's, never
+ * smaller than the viewport). One expression, so a single evaluation answers it.
+ */
+const VIEWPORT_SCRIPT = `(function () {
+  var d = document.documentElement, b = document.body, s = document.scrollingElement || d
+  return {
+    sx: window.scrollX, sy: window.scrollY,
+    vw: window.innerWidth, vh: window.innerHeight,
+    cw: s ? s.clientWidth : 0, ch: s ? s.clientHeight : 0,
+    rtl: !!d && getComputedStyle(d).direction === 'rtl',
+    dpr: window.devicePixelRatio,
+    dw: Math.max(d ? d.scrollWidth : 0, b ? b.scrollWidth : 0, window.innerWidth),
+    dh: Math.max(d ? d.scrollHeight : 0, b ? b.scrollHeight : 0, window.innerHeight)
+  }
+})()`
+
+/**
+ * `VIEWPORT_SCRIPT`'s answer as the chrome's `PageViewport`, with the engine's zoom factor
+ * (the page cannot read its own). Null for anything but a full answer with finite numbers – a
+ * page that did not answer in time, a view with no document – and null too for a viewport
+ * of no size (a view not yet laid out), which nothing could be captured from. The area minus
+ * the gutters (`cw` / `ch`) is taken within the visible area and is the visible area itself
+ * when not reported (an answer from before it was read) or not laid out (0): no gutter then.
+ */
+export function pageViewportFrom(raw: unknown, zoom: number): PageViewport | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  const num = (key: string): number | null => {
+    const v = r[key]
+    return typeof v === 'number' && Number.isFinite(v) ? v : null
+  }
+  const sx = num('sx')
+  const sy = num('sy')
+  const vw = num('vw')
+  const vh = num('vh')
+  const dpr = num('dpr')
+  const dw = num('dw')
+  const dh = num('dh')
+  if (sx === null || sy === null || vw === null || vh === null || dw === null || dh === null)
+    return null
+  if (!(vw > 0) || !(vh > 0)) return null
+  const z = Number.isFinite(zoom) && zoom > 0 ? zoom : 1
+  return {
+    scrollX: Math.max(0, sx),
+    scrollY: Math.max(0, sy),
+    width: vw,
+    height: vh,
+    clientWidth: clientSide(num('cw'), vw),
+    clientHeight: clientSide(num('ch'), vh),
+    rtl: r.rtl === true,
+    zoom: z,
+    devicePixelRatio: dpr !== null && dpr > 0 ? dpr : z,
+    documentWidth: Math.max(dw, vw),
+    documentHeight: Math.max(dh, vh)
+  }
+}
+
+/**
+ * The part of a `capturePage` bitmap that is page content – the layout viewport minus the
+ * scrollbar gutters, as Chrome's visible-area capture paints it – in the bitmap's pixels: the
+ * page's `clientWidth` × `clientHeight` at its device pixel ratio (the display's scale times
+ * the zoom, which is what the bitmap is in), cut at the bitmap's edge and anchored at the
+ * bitmap's top-left corner: Chromium draws the main frame's vertical scrollbar in the
+ * right-hand columns and a horizontal one in the bottom rows whatever the document's direction
+ * (Blink puts a right-to-left main frame's scrollbar on the left only under its
+ * `placeRTLScrollbarsOnLeftSideInMainFrame` setting, which Chrome and Electron leave off –
+ * measured on the packaged build with `dir="rtl"` on the root, on the body and by CSS; only
+ * an element's own scroller follows `direction`). With overlay scrollbars
+ * (`clientWidth === width`) this is the whole bitmap.
+ *
+ * Floored, not rounded: `clientWidth` is an integer of CSS pixels, so at a fractional ratio
+ * (150 %: a 15 px scrollbar is 10 CSS px, but 769 content rows are 512.67 CSS px, reported as
+ * 513) the product can overshoot the content by up to half a CSS pixel – rounding would keep a
+ * one-pixel sliver of the scrollbar's track (measured in the proof at 150 %); flooring drops
+ * at most one row or column of page content instead, which nothing can see. At an integer
+ * ratio the cut is exact either way.
+ */
+export function visibleAreaClip(
+  viewport: Pick<PageViewport, 'clientWidth' | 'clientHeight' | 'devicePixelRatio'>,
+  bitmap: { width: number; height: number }
+): { x: number; y: number; width: number; height: number } {
+  const ratio =
+    Number.isFinite(viewport.devicePixelRatio) && viewport.devicePixelRatio > 0
+      ? viewport.devicePixelRatio
+      : 1
+  const width = Math.max(1, Math.min(bitmap.width, Math.floor(viewport.clientWidth * ratio)))
+  const height = Math.max(1, Math.min(bitmap.height, Math.floor(viewport.clientHeight * ratio)))
+  return { x: 0, y: 0, width, height }
+}
+
+/** Electron runs `contextIsolation` preloads in world 999. */
+const ISOLATED_WORLD_ID = 999
+
+function nextTick(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 12))
+}
+
+function electronModifiers(mods: InputModifier[]): Array<'shift' | 'control' | 'alt' | 'meta'> {
+  const out: Array<'shift' | 'control' | 'alt' | 'meta'> = []
+  for (const m of mods) {
+    if (m === 'Shift') out.push('shift')
+    else if (m === 'Control') out.push('control')
+    else if (m === 'Alt') out.push('alt')
+    else if (m === 'Meta') out.push('meta')
+  }
+  return out
+}
+
+/** CDP's `Input.*` modifier bit field: Alt=1, Ctrl=2, Meta=4, Shift=8. */
+function cdpModifiers(mods: InputModifier[]): number {
+  let bits = 0
+  for (const m of mods) {
+    if (m === 'Alt') bits |= 1
+    else if (m === 'Control') bits |= 2
+    else if (m === 'Meta') bits |= 4
+    else if (m === 'Shift') bits |= 8
+  }
+  return bits
+}
+
+/** Named keys agents press: DOM `code` and Windows virtual key code (what `keyCode` reports). */
+const CDP_NAMED_KEYS: Record<string, { code: string; vk: number; text?: string }> = {
+  Enter: { code: 'Enter', vk: 13, text: '\r' },
+  Tab: { code: 'Tab', vk: 9, text: '\t' },
+  Escape: { code: 'Escape', vk: 27 },
+  Backspace: { code: 'Backspace', vk: 8 },
+  Delete: { code: 'Delete', vk: 46 },
+  Insert: { code: 'Insert', vk: 45 },
+  ArrowUp: { code: 'ArrowUp', vk: 38 },
+  ArrowDown: { code: 'ArrowDown', vk: 40 },
+  ArrowLeft: { code: 'ArrowLeft', vk: 37 },
+  ArrowRight: { code: 'ArrowRight', vk: 39 },
+  Home: { code: 'Home', vk: 36 },
+  End: { code: 'End', vk: 35 },
+  PageUp: { code: 'PageUp', vk: 33 },
+  PageDown: { code: 'PageDown', vk: 34 },
+  Shift: { code: 'ShiftLeft', vk: 16 },
+  Control: { code: 'ControlLeft', vk: 17 },
+  Alt: { code: 'AltLeft', vk: 18 },
+  Meta: { code: 'MetaLeft', vk: 91 },
+  CapsLock: { code: 'CapsLock', vk: 20 },
+  ContextMenu: { code: 'ContextMenu', vk: 93 }
+}
+
+/** US layout: printable characters → DOM `code` and virtual key code (shifted ones share both). */
+const CDP_CHAR_KEYS: Record<string, { code: string; vk: number }> = {
+  ' ': { code: 'Space', vk: 32 },
+  '`': { code: 'Backquote', vk: 192 },
+  '~': { code: 'Backquote', vk: 192 },
+  '-': { code: 'Minus', vk: 189 },
+  _: { code: 'Minus', vk: 189 },
+  '=': { code: 'Equal', vk: 187 },
+  '+': { code: 'Equal', vk: 187 },
+  '[': { code: 'BracketLeft', vk: 219 },
+  '{': { code: 'BracketLeft', vk: 219 },
+  ']': { code: 'BracketRight', vk: 221 },
+  '}': { code: 'BracketRight', vk: 221 },
+  '\\': { code: 'Backslash', vk: 220 },
+  '|': { code: 'Backslash', vk: 220 },
+  ';': { code: 'Semicolon', vk: 186 },
+  ':': { code: 'Semicolon', vk: 186 },
+  "'": { code: 'Quote', vk: 222 },
+  '"': { code: 'Quote', vk: 222 },
+  ',': { code: 'Comma', vk: 188 },
+  '<': { code: 'Comma', vk: 188 },
+  '.': { code: 'Period', vk: 190 },
+  '>': { code: 'Period', vk: 190 },
+  '/': { code: 'Slash', vk: 191 },
+  '?': { code: 'Slash', vk: 191 },
+  '!': { code: 'Digit1', vk: 49 },
+  '@': { code: 'Digit2', vk: 50 },
+  '#': { code: 'Digit3', vk: 51 },
+  $: { code: 'Digit4', vk: 52 },
+  '%': { code: 'Digit5', vk: 53 },
+  '^': { code: 'Digit6', vk: 54 },
+  '&': { code: 'Digit7', vk: 55 },
+  '*': { code: 'Digit8', vk: 56 },
+  '(': { code: 'Digit9', vk: 57 },
+  ')': { code: 'Digit0', vk: 48 }
+}
+
+/** A DOM key name as the `Input.dispatchKeyEvent` fields Chromium wants. */
+function cdpKey(key: string): { key: string; code: string; vk: number; text: string | undefined } {
+  const named = CDP_NAMED_KEYS[key]
+  if (named) return { key, code: named.code, vk: named.vk, text: named.text }
+  const fn = /^F(\d{1,2})$/.exec(key)
+  if (fn && Number(fn[1]) >= 1 && Number(fn[1]) <= 24)
+    return { key, code: key, vk: 111 + Number(fn[1]), text: undefined }
+  if (key.length !== 1) return { key, code: key, vk: 0, text: undefined }
+  if (/[a-z]/i.test(key))
+    return { key, code: `Key${key.toUpperCase()}`, vk: key.toUpperCase().charCodeAt(0), text: key }
+  if (/\d/.test(key)) return { key, code: `Digit${key}`, vk: key.charCodeAt(0), text: key }
+  const punct = CDP_CHAR_KEYS[key]
+  return { key, code: punct?.code ?? '', vk: punct?.vk ?? 0, text: key }
+}
+
+/**
+ * Deliver an agent input event through the DevTools protocol (`Input.dispatchMouseEvent`,
+ * `Input.dispatchKeyEvent`, `Input.insertText`); each command resolves once the page has
+ * handled the event.
+ */
+async function dispatchInputViaCdp(dbg: Electron.Debugger, event: AgentInputEvent): Promise<void> {
+  switch (event.type) {
+    case 'mouseMove':
+      await dbg.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: event.x,
+        y: event.y,
+        button: 'none'
+      })
+      return
+    case 'click': {
+      const modifiers = cdpModifiers(event.modifiers)
+      const { x, y, button } = event
+      await dbg.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x,
+        y,
+        button: 'none',
+        modifiers
+      })
+      for (let i = 1; i <= Math.max(1, event.clickCount); i++) {
+        await dbg.sendCommand('Input.dispatchMouseEvent', {
+          type: 'mousePressed',
+          x,
+          y,
+          button,
+          clickCount: i,
+          modifiers
+        })
+        await dbg.sendCommand('Input.dispatchMouseEvent', {
+          type: 'mouseReleased',
+          x,
+          y,
+          button,
+          clickCount: i,
+          modifiers
+        })
+      }
+      return
+    }
+    case 'key': {
+      const modifiers = cdpModifiers(event.modifiers)
+      const k = cdpKey(event.key)
+      // A keyDown that carries text is what produces the keypress/input; with Control, Alt or
+      // Meta held the key is a shortcut and types nothing (a bare rawKeyDown instead).
+      const shortcut = (modifiers & 7) !== 0
+      const base = {
+        key: k.key,
+        code: k.code,
+        windowsVirtualKeyCode: k.vk,
+        nativeVirtualKeyCode: k.vk,
+        modifiers
+      }
+      await dbg.sendCommand('Input.dispatchKeyEvent', {
+        ...base,
+        type: !shortcut && k.text ? 'keyDown' : 'rawKeyDown',
+        ...(!shortcut && k.text ? { text: k.text, unmodifiedText: k.text } : {})
+      })
+      await dbg.sendCommand('Input.dispatchKeyEvent', { ...base, type: 'keyUp' })
+      return
+    }
+    case 'text':
+      await dbg.sendCommand('Input.insertText', { text: event.text })
+  }
+}
+
+/** DOM key names → Electron accelerator key codes. */
+function electronKeyCode(key: string): string {
+  switch (key) {
+    case 'ArrowUp':
+      return 'Up'
+    case 'ArrowDown':
+      return 'Down'
+    case 'ArrowLeft':
+      return 'Left'
+    case 'ArrowRight':
+      return 'Right'
+    case ' ':
+      return 'Space'
+    default:
+      return key
+  }
+}
+
+/** The downloads host's side of "Save … As…": the next transfer of the URL asks where to save. */
+export interface SaveAsDownloads {
+  expectSaveAs(url: string): void
+}
+
+/** Creates `WebContentsView`s and maps their web contents back to tabs. */
+export class ElectronTabViewHost implements TabViewHost {
+  /**
+   * The core shows a tab switched to or woken on the activate commit, at the frame's last
+   * reported rect: a page shown before (`ElectronTabView.everShown`) at once, with nothing over
+   * it; a first show under the page it replaces until the shown page's word that it has painted
+   * (`ElectronTabView.shownPainted`) or the ceiling (`ZenWindow.showOnCommit`, W8-P0). The
+   * desktop's views bear it: they composite above the chrome in the window's z-order, the page
+   * left in front raised over the shown one is exactly the stand-in, and nothing of the chrome's
+   * own cover protocol stands between a view's show and its frame.
+   */
+  readonly showsOnCommit = true
+  private readonly byWebContentsId = new Map<number, ElectronTabView>()
+  private readonly byTabId = new Map<string, ElectronTabView>()
+  private readonly tabIds = new Map<number, string>()
+  private readonly viewListeners = new Set<(view: ElectronTabView) => void>()
+  private readonly visibilityListeners = new Set<(view: ElectronTabView) => void>()
+  /** The window corners the views parked under the chrome hold (`claimParkingCorner`). */
+  private readonly parkingCorners = new Map<ElectronTabView, number>()
+  /**
+   * The stage the hidden pages agents drive stand on (`ElectronTabView.enterStage`): one window
+   * for all of them, never shown, not focusable and off the taskbar – a window of its own has no
+   * pixel on the user's screen and none of their keyboard to hand a page – made for the first
+   * such page and destroyed with the last (`stageLeft`), so no window is left standing when
+   * the user closes theirs (`window-all-closed`). Sized to the largest page on it.
+   */
+  private stage: BaseWindow | null = null
+  private readonly stagedViews = new Set<ElectronTabView>()
+  /** Per window, the page or chrome that last lost the keyboard – a hidden page gives it back there. */
+  private readonly lastKeyboard = new WeakMap<BrowserWindow, WebContents>()
+  private readonly keyboardWatched = new WeakSet<BrowserWindow>()
+  /** Windows whose focus the pages' hang monitors follow (`watchFocus`). */
+  private readonly focusWatched = new WeakSet<BrowserWindow>()
+  /**
+   * The hold on the run's first documents until the extension layer's first publish
+   * (`startupHold.ts`): the pages' first `loadURL` / `restoreNavigation` go through it. Open
+   * unless the platform closes it at start (`ElectronPlatform.start`).
+   */
+  startupHold = new StartupHold()
+  /** The certificates the sessions verified, by host, for the site-information card (`certificate`). */
+  readonly certificates = new SiteCertificates()
+  /**
+   * The sub-frame way into the browser's private world (`executeJavaScriptInPrivateWorld`);
+   * the platform feeds it the frames' answers (`PRIVATE_WORLD_CHANNELS.answer`).
+   */
+  readonly privateWorld = new PrivateWorldRelay()
+  /**
+   * The chord bound to `app.quit` as the key table has it now, for a toolbox's quit-chord relay
+   * (`devtoolsKeys.ts`); the platform supplies it once the core is up (`ElectronPlatform.start`).
+   */
+  quitChord: () => KeyBinding | null = () => null
+  /**
+   * The held-key notice over a detached toolbox (`devtoolsKeys.ts`): where the quit chord is
+   * down, for the page's panel to yield to the toolbox's. The process's one, unless a test's.
+   */
+  quitHoldNotice: DevtoolsQuitHoldNotice = devtoolsQuitHoldNotice
+
+  constructor(
+    private readonly sessions: SessionManager,
+    readonly downloads: SaveAsDownloads | null = null
+  ) {
+    sessions.configure((ses) => this.certificates.watch(ses))
+    // Dark theme for sites acts only while the chrome is dark: a scheme flip (the OS, the
+    // Appearance setting) turns every page's override on or off.
+    nativeTheme.on('updated', () => {
+      for (const view of this.byWebContentsId.values()) {
+        view.refreshDarkening()
+        // The engine re-reads every page's web preferences on a scheme flip, which takes a
+        // live font change back to the fonts the page was made with: sent again.
+        view.fontsChangedByEngine()
+      }
+    })
+  }
+
+  /**
+   * The page fonts (CT-25) for every page view to come – the web preferences they are made
+   * with – and for every page open now, live where the page's debugger is free
+   * (`ElectronTabView.refreshFonts`).
+   */
+  applyFonts(fonts: PageFontSettings): void {
+    userFontSettings = fonts
+    this.refontPages()
+  }
+
+  /**
+   * The extensions' layer beside the setting (`chrome.fontSettings`, `platform/extensionApi/
+   * fontSettings.ts`): the per-script families, the cursive, fantasy and math families and the
+   * fixed-width size the extensions holding the permission control – the preferences the page
+   * fonts setting has no slot for – laid over the fonts every page has, open pages over the
+   * protocol (`Page.setFontFamilies` with `forScripts`, `Page.setFontSizes`), new ones through
+   * their web preferences, exactly as the setting itself is. The setting is never written:
+   * null takes the layer off and the fonts stand again as the pages had them.
+   */
+  applyExtensionFonts(layer: ExtensionFontLayer | null): void {
+    extensionFonts = layer
+    this.refontPages()
+  }
+
+  private refontPages(): void {
+    pageFontSettings = effectiveFonts(userFontSettings, extensionFonts)
+    pageFonts = chromiumEffectiveFontPreferences(pageFontSettings)
+    for (const view of this.byWebContentsId.values()) view.refreshFonts()
+  }
+
+  /** The Appearance setting's colour scheme, as the core last handed it to the engine (`applyColorScheme`). */
+  private scheme: ColorScheme = 'system'
+  /** The `prefers-color-scheme` page views emulate for it, where the engine does not carry it (`emulatedColorScheme`). */
+  private emulatedScheme: EmulatedColorScheme | null = null
+
+  /** The Appearance setting's colour scheme: what Ione's own documents in the pages paint. */
+  get colorScheme(): ColorScheme {
+    return this.scheme
+  }
+
+  /** The `prefers-color-scheme` every page view puts on its session right now; null leaves pages to the engine. */
+  get pageColorScheme(): EmulatedColorScheme | null {
+    return this.emulatedScheme
+  }
+
+  /**
+   * The Appearance setting's colour scheme (Light / Dark / System), handed over with
+   * `nativeTheme.themeSource` (`Platform.theme.setSource`): the `zen://` documents take it from
+   * here, and on `platform`s whose engine does not carry the source to pages
+   * (`emulatedColorScheme`) every page view, open now or to come, emulates it
+   * (`ElectronTabView.refreshColorScheme`).
+   */
+  applyColorScheme(scheme: ColorScheme, platform: NodeJS.Platform = process.platform): void {
+    this.scheme = scheme
+    const emulated = emulatedColorScheme(platform, scheme)
+    if (emulated === this.emulatedScheme) return
+    this.emulatedScheme = emulated
+    for (const view of this.byWebContentsId.values()) view.refreshColorScheme()
+  }
+
+  /** The page fonts every new page view is made with right now (for the tests). */
+  static currentFonts(): PageFontSettings {
+    return userFontSettings
+  }
+
+  /**
+   * The core's per-site content settings the views enforce themselves (the JavaScript switch,
+   * `ElectronTabView.refreshScripts`); the platform sets it once the core is up. Null: nothing
+   * is blocked (the views made before the core answers, and the tests).
+   */
+  contentRules: ContentRulesLookup | null = null
+
+  /** Whether the JavaScript site setting blocks a document at `url` in `ses`'s container. */
+  scriptsBlocked(url: string, ses: Session): boolean {
+    if (!this.contentRules || !/^(https?|file):/i.test(url)) return false
+    const containerId = this.sessions.containerOf(ses)
+    return !this.contentRules.allows(
+      'javascript',
+      url,
+      containerId ? requestDetails(containerId) : undefined
+    )
+  }
+
+  /** Follow the window's own chrome for the keyboard, as every tab page in it is followed. */
+  watchKeyboard(win: BrowserWindow): void {
+    if (this.keyboardWatched.has(win)) return
+    this.keyboardWatched.add(win)
+    win.webContents.on('blur', () => this.keyboardLeft(win, win.webContents))
+  }
+
+  /**
+   * Follow the window's focus for the hang monitors of the pages in it (one listener per window,
+   * whatever the number of pages): a page is watched for a hang only while its window is the
+   * focused one, the prompt being that window's.
+   */
+  watchFocus(win: BrowserWindow): void {
+    if (this.focusWatched.has(win)) return
+    this.focusWatched.add(win)
+    const refresh = (): void => {
+      for (const view of this.byWebContentsId.values()) {
+        if (view.hostedBy(win)) view.windowFocusChanged()
+      }
+    }
+    win.on('focus', refresh)
+    win.on('blur', refresh)
+  }
+
+  keyboardLeft(win: BrowserWindow, contents: WebContents): void {
+    this.lastKeyboard.set(win, contents)
+  }
+
+  /**
+   * A page not on screen has the keyboard: back to the page or chrome that lost it, when that
+   * is still something the user can see; the chrome otherwise (its shortcuts always work).
+   */
+  keyboardTaken(win: BrowserWindow, taker: WebContents): void {
+    if (win.isDestroyed()) return
+    if (!win.isFocused()) {
+      // Focusing a page focuses its window as well (Linux, macOS): when the user is in another
+      // window, the keyboard stays there and the hidden page is looked at again on their return.
+      win.once('focus', () => {
+        const view = this.byWebContentsId.get(taker.id)
+        if (view && !view.isVisible() && !taker.isDestroyed() && taker.isFocused()) {
+          this.keyboardTaken(win, taker)
+        }
+      })
+      return
+    }
+    const previous = this.lastKeyboard.get(win)
+    const view = previous ? this.byWebContentsId.get(previous.id) : undefined
+    const visible =
+      previous !== undefined &&
+      !previous.isDestroyed() &&
+      previous !== taker &&
+      (previous === win.webContents || (view !== undefined && view.isVisible()))
+    if (visible) previous.focus()
+    else win.webContents.focus()
+  }
+
+  createView(tab: Tab, events: TabViewEvents, host: WindowHost): TabView {
+    return this.make(tab, events, host, false)
+  }
+
+  /**
+   * The reader's cover (`TabViewHost.createCover`): a page like any other of the tab's session,
+   * routed to the tab for its messages and requests (`tabIdForWebContents`), but not the tab's
+   * page to `viewForTab` – the capture host and the extension layer reach the page beneath
+   * through it, as Chrome's do under its reading mode overlay – and marked (`cover`) so the
+   * layer's followers of every view can leave it out; the layer reads the tab's address, title
+   * and status from the page beneath meanwhile (`TabManager.coveredPage`).
+   */
+  createCover(tab: Tab, events: TabViewEvents, host: WindowHost): TabView {
+    return this.make(tab, events, host, true)
+  }
+
+  /** A live page of the tab's session, wired, attached and mapped; the tab's own or its cover. */
+  private make(tab: Tab, events: TabViewEvents, host: WindowHost, cover: boolean): TabView {
+    const view = new ElectronTabView(
+      new WebContentsView({
+        webPreferences: pageWebPreferences(this.sessions.forTab(tab))
+      }),
+      this,
+      cover
+    )
+    view.wire(events)
+    view.attachTo(host)
+    this.track(view, tab.id, !cover)
+    return view
+  }
+
+  /**
+   * A page's renderer stopped answering, or answers again (tabs-45): every live page in that
+   * renderer is told – they hang and recover together – `view` first. A view whose process the
+   * engine cannot name (gone between the event and the read) speaks for itself alone.
+   */
+  rendererHung(view: ElectronTabView, hung: boolean): void {
+    const process = view.rendererProcess()
+    const shared =
+      process === null
+        ? []
+        : [...this.byWebContentsId.values()].filter(
+            (other) => other !== view && other.rendererProcess() === process
+          )
+    for (const each of [view, ...shared]) each.reportHung(hung)
+  }
+
+  /** Follow every tab view for its lifetime (the ones already alive included). */
+  onViewCreated(listener: (view: ElectronTabView) => void): () => void {
+    this.viewListeners.add(listener)
+    for (const view of this.byWebContentsId.values()) listener(view)
+    return () => this.viewListeners.delete(listener)
+  }
+
+  /**
+   * Hear of every page shown or hidden (`ElectronTabView.setVisible` flipping): the chrome's
+   * layout shows the page in front of each window – both panes of a split, a glance – and hides
+   * the rest, so this is the word on which pages are in front anywhere.
+   */
+  onVisibilityChanged(listener: (view: ElectronTabView) => void): () => void {
+    this.visibilityListeners.add(listener)
+    return () => this.visibilityListeners.delete(listener)
+  }
+
+  visibilityChanged(view: ElectronTabView): void {
+    for (const listener of this.visibilityListeners) listener(view)
+  }
+
+  /**
+   * Complete the core's answer to a page opening a window (Electron's `createWindow` callback).
+   * The new tab adopts `guest`, the opener-linked page Chromium made for a script `window.open`;
+   * a window opened from a link has no page yet and gets a fresh one in the opener's session,
+   * pointed at the URL. Returns the page Electron should consider the child window's.
+   *
+   * The adopted page is given the tab page preferences again: Electron applies a `webPreferences`
+   * handed in next to an existing `webContents` to that page (`CreateFromWebPreferences`), and
+   * without them the page preload the window-open handler named never runs in the pop-up – no
+   * tab-modal dialogs, no password forms, no `window.chrome` completion, so a "Sign in with
+   * Google" pop-up was refused where the same page in a tab was not.
+   */
+  openTicket(
+    ticket: WindowOpenTicket,
+    opener: ElectronTabView,
+    guest: WebContents | undefined,
+    load: LoadURLOptions
+  ): WebContents {
+    const view = new ElectronTabView(
+      guest
+        ? new WebContentsView({ webContents: guest, webPreferences: pageWebPreferences() })
+        : new WebContentsView({
+            webPreferences: pageWebPreferences(opener.webContents.session)
+          }),
+      this
+    )
+    const { tab, events } = ticket.adopt(view)
+    view.wire(events)
+    this.track(view, tab.id)
+    // A link's new window navigates from here (Electron only does so for windows it creates);
+    // the referrer and any form body come along as they would in Chrome.
+    if (!guest) void view.webContents.loadURL(ticket.url, load).catch(() => undefined)
+    return guest ?? view.webContents
+  }
+
+  /** A page went away; its web contents id no longer maps to a tab. */
+  forget(webContentsId: number): void {
+    const view = this.byWebContentsId.get(webContentsId)
+    const tabId = this.tabIds.get(webContentsId)
+    this.byWebContentsId.delete(webContentsId)
+    this.tabIds.delete(webContentsId)
+    if (tabId !== undefined && this.byTabId.get(tabId) === view) this.byTabId.delete(tabId)
+    if (view) this.parkingCorners.delete(view)
+    view?.leaveStage()
+  }
+
+  /** The stage `view` goes onto, with room for `box` (`ElectronTabView.enterStage`). */
+  stageFor(view: ElectronTabView, box: Rect): BaseWindow {
+    let stage = this.stage
+    if (!stage || stage.isDestroyed()) {
+      stage = new BaseWindow({
+        show: false,
+        focusable: false,
+        skipTaskbar: true,
+        frame: false,
+        enableLargerThanScreen: true,
+        hiddenInMissionControl: true,
+        width: box.width,
+        height: box.height
+      })
+      stage.excludedFromShownWindowsMenu = true
+      this.stage = stage
+    } else {
+      this.stageRoom(stage, box)
+    }
+    this.stagedViews.add(view)
+    stage.contentView.addChildView(view.view)
+    return stage
+  }
+
+  /** Room on `stage` for a page of `box`: the stage grows to the largest page on it, and never shrinks. */
+  stageRoom(stage: BaseWindow, box: Rect): void {
+    const [width, height] = stage.getContentSize()
+    if (box.width > width || box.height > height)
+      stage.setContentSize(Math.max(width, box.width), Math.max(height, box.height))
+  }
+
+  /** `view` left the stage (`ElectronTabView.leaveStage`, or its page went): the last one takes the stage down. */
+  stageLeft(view: ElectronTabView): void {
+    this.stagedViews.delete(view)
+    if (this.stagedViews.size > 0) return
+    const stage = this.stage
+    this.stage = null
+    if (stage && !stage.isDestroyed()) stage.destroy()
+  }
+
+  /**
+   * The box a page of `win` stands in when shown, for a view the layout never placed (a tab
+   * opened in the background): the one a placed page of the window has, else the window's whole
+   * content – so the staged page's viewport is the one it would have in front.
+   */
+  pageAreaOf(win: BrowserWindow): Rect {
+    for (const other of this.byWebContentsId.values()) {
+      const box = other.windowOf() === win ? other.laidOutBox() : null
+      if (box && box.width > 0 && box.height > 0) return box
+    }
+    const [width, height] = win.getContentSize()
+    return { x: 0, y: 0, width: width || 1280, height: height || 800 }
+  }
+
+  /**
+   * The window corner for a view parking under the chrome (`ElectronTabView.park`): the
+   * lowest no other view parked in the same window holds, and the last one when all are held. A
+   * view already parked keeps its corner.
+   */
+  claimParkingCorner(view: ElectronTabView): number {
+    const held = this.parkingCorners.get(view)
+    if (held !== undefined) return held
+    const win = view.windowOf()
+    const taken = new Set<number>()
+    for (const [other, at] of this.parkingCorners) {
+      if (other !== view && other.windowOf() === win) taken.add(at)
+    }
+    let free = 0
+    while (free < PARK_CORNERS - 1 && taken.has(free)) free++
+    this.parkingCorners.set(view, free)
+    return free
+  }
+
+  /** The view left its parking corner (`ElectronTabView.unpark`). */
+  releaseParkingCorner(view: ElectronTabView): void {
+    this.parkingCorners.delete(view)
+  }
+
+  /**
+   * Map the page to its tab, give it the Appearance setting's scheme where pages emulate it,
+   * then let the followers (the extension API layer) see the view. A cover (`primary` false)
+   * answers to the tab's id but does not become the tab's page (`viewForTab`).
+   */
+  private track(view: ElectronTabView, tabId: string, primary = true): void {
+    this.byWebContentsId.set(view.webContentsId, view)
+    if (primary) this.byTabId.set(tabId, view)
+    this.tabIds.set(view.webContentsId, tabId)
+    view.refreshColorScheme()
+    for (const listener of this.viewListeners) listener(view)
+  }
+
+  /**
+   * A preloaded new tab page became a real tab: its messages (and the extension API's view of
+   * it) now route to that tab instead of the placeholder it loaded under.
+   */
+  retargetView(view: TabView, tabId: string): void {
+    const target = view as ElectronTabView
+    if (this.byWebContentsId.get(target.webContentsId) !== target) return
+    const previous = this.tabIds.get(target.webContentsId)
+    if (previous !== undefined && this.byTabId.get(previous) === target)
+      this.byTabId.delete(previous)
+    this.tabIds.set(target.webContentsId, tabId)
+    this.byTabId.set(tabId, target)
+  }
+
+  tabIdForWebContents(wc: WebContents): string | undefined {
+    return this.tabIds.get(wc.id)
+  }
+
+  viewForWebContents(wc: WebContents): ElectronTabView | undefined {
+    return this.byWebContentsId.get(wc.id)
+  }
+
+  /**
+   * End process (`ElectronTaskHost.end`) is about to crash the renderer behind these web
+   * contents: when they are a tab view's, the view is told so its renderer going away reads as
+   * `ended`. False for web contents that are no tab's (an extension's page, a window's chrome).
+   */
+  noteEndedByUser(webContentsId: number): boolean {
+    const view = this.byWebContentsId.get(webContentsId)
+    if (!view) return false
+    view.noteEndedByUser()
+    return true
+  }
+
+  /** Every live tab view. */
+  all(): Iterable<ElectronTabView> {
+    return this.byWebContentsId.values()
+  }
+
+  /** The live view of the tab `tabId` (what a request's `tabId` names). */
+  viewForTab(tabId: string): ElectronTabView | undefined {
+    return this.byTabId.get(tabId)
+  }
+}
+
+/** Copy an image on the clipboard from a URL (data: or remote). */
+export async function copyImageFromUrl(url: string): Promise<boolean> {
+  try {
+    let image: Electron.NativeImage
+    if (url.startsWith('data:')) {
+      image = nativeImage.createFromDataURL(url)
+    } else {
+      const res = await net.fetch(url)
+      image = nativeImage.createFromBuffer(Buffer.from(await res.arrayBuffer()))
+    }
+    if (image.isEmpty()) return false
+    // Electron 44 replaced clipboard.writeImage with the W3C-shaped clipboard.write(ClipboardItem[]).
+    const png = new Uint8Array(image.toPNG())
+    await clipboard.write([
+      new ClipboardItem({ 'image/png': new Blob([png], { type: 'image/png' }) })
+    ])
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function defaultDownloadsDirectory(): string {
+  return app.getPath('downloads')
+}

@@ -1,0 +1,191 @@
+/**
+ * `chrome.permissions` grant logic: which API permissions and host patterns an extension holds,
+ * split from the manifest into required and optional sets the way Chrome does (MV2 mixes hosts
+ * into `permissions`; MV3 separates `host_permissions`), plus `contains` / `request` / `remove`
+ * set arithmetic. Pure functions; the host persists the grants.
+ */
+import { type ExtensionManifest, permissionVersionWarning } from '../manifest'
+import { compileMatchPattern, patternContains } from './matchPattern'
+
+export interface PermissionSet {
+  permissions: string[]
+  origins: string[]
+}
+
+export interface ManifestPermissionSets {
+  required: PermissionSet
+  optional: PermissionSet
+}
+
+/** Whether a manifest `permissions` entry names a host pattern rather than an API permission. */
+export function isHostPattern(entry: string): boolean {
+  return entry === '<all_urls>' || entry.includes('://') || entry.startsWith('file:')
+}
+
+export function emptyPermissionSet(): PermissionSet {
+  return { permissions: [], origins: [] }
+}
+
+/** The API permissions of `permissions` that Chrome grants to a manifest of this version. */
+export function availablePermissions(permissions: string[], manifestVersion: 2 | 3): string[] {
+  return permissions.filter((p) => permissionVersionWarning(p, manifestVersion) === null)
+}
+
+/**
+ * Required and optional sets of a manifest, host patterns separated from API permissions, without
+ * the API permissions Chrome refuses to the manifest's version.
+ */
+export function manifestPermissionSets(manifest: ExtensionManifest): ManifestPermissionSets {
+  const required = emptyPermissionSet()
+  const optional = emptyPermissionSet()
+  const manifestVersion: 2 | 3 = manifest.manifest_version === 2 ? 2 : 3
+  const sort = (entries: string[] | undefined, into: PermissionSet): void => {
+    for (const entry of entries ?? []) {
+      if (typeof entry !== 'string') continue
+      if (isHostPattern(entry)) into.origins.push(entry)
+      else if (permissionVersionWarning(entry, manifestVersion) === null)
+        into.permissions.push(entry)
+    }
+  }
+  sort(manifest.permissions, required)
+  sort(manifest.host_permissions, required)
+  sort(manifest.optional_permissions, optional)
+  sort(manifest.optional_host_permissions, optional)
+  return { required: dedupe(required), optional: dedupe(optional) }
+}
+
+/** Coerce a `Permissions` argument into a normalised set; `null` when it is malformed. */
+export function normalizePermissionSet(input: unknown): PermissionSet | null {
+  if (input === null || typeof input !== 'object') return null
+  const obj = input as { permissions?: unknown; origins?: unknown }
+  const set = emptyPermissionSet()
+  for (const [key, target] of [
+    ['permissions', set.permissions],
+    ['origins', set.origins]
+  ] as const) {
+    const value = obj[key]
+    if (value === undefined) continue
+    if (!Array.isArray(value) || value.some((v) => typeof v !== 'string')) return null
+    target.push(...(value as string[]))
+  }
+  return dedupe(set)
+}
+
+// A host permission's pattern at the granularity Chrome grants it: the origin. Chrome's
+// permissions parser rewrites every host permission's path to "/*" (permissions_parser.cc) and
+// `permissions.request` does the same to the origins it is handed, so a manifest's optional host
+// permission "*://*/" (any scheme, any host, the root path) covers a request for "*://*/*" –
+// Markdown Viewer's "Allow All" is exactly that pair. `<all_urls>` and strings that are not a
+// pattern pass through.
+export function hostPermissionPattern(pattern: string): string {
+  if (pattern === '<all_urls>') return pattern
+  const separator = pattern.indexOf('://')
+  if (separator <= 0) return pattern
+  const slash = pattern.indexOf('/', separator + 3)
+  if (slash < 0) return pattern
+  return `${pattern.slice(0, slash)}/*`
+}
+
+/** Whether the host permission `granted` covers `wanted`, both read at origin granularity. */
+export function hostPermissionContains(granted: string, wanted: string): boolean {
+  return patternContains(hostPermissionPattern(granted), hostPermissionPattern(wanted))
+}
+
+/** Whether a host pattern is of the file scheme (`file:///*` and the other `file:` forms). */
+export function isFileSchemePattern(pattern: string): boolean {
+  return pattern.startsWith('file:')
+}
+
+/**
+ * The active set Chrome answers `getAll` and `contains` from: the granted set less its
+ * file-scheme host patterns while the user has not allowed the extension file access
+ * (`extension.isAllowedFileSchemeAccess` false). Chrome withholds `file://` patterns from an
+ * extension's active permissions until then (the pattern stays required and granted; `remove`
+ * of it is refused as required), so an extension that trims its grants by what `getAll` lists –
+ * Markdown Viewer's start-up workaround removes every origin not in its stored state – never
+ * asks to remove its required `file:///*`. `<all_urls>` stays listed whole, as Chrome lists it;
+ * whether a file page is reachable under it is the page-access gate's matter, not this list's.
+ */
+export function activePermissionSet(granted: PermissionSet, fileAccess: boolean): PermissionSet {
+  if (fileAccess) return granted
+  return {
+    permissions: granted.permissions,
+    origins: granted.origins.filter((origin) => !isFileSchemePattern(origin))
+  }
+}
+
+/** Whether `granted` covers every permission and origin in `wanted`. */
+export function permissionSetContains(granted: PermissionSet, wanted: PermissionSet): boolean {
+  for (const permission of wanted.permissions) {
+    if (!granted.permissions.includes(permission)) return false
+  }
+  for (const origin of wanted.origins) {
+    if (!granted.origins.some((g) => hostPermissionContains(g, origin))) return false
+  }
+  return true
+}
+
+export function addPermissionSets(a: PermissionSet, b: PermissionSet): PermissionSet {
+  return dedupe({
+    permissions: [...a.permissions, ...b.permissions],
+    origins: [...a.origins, ...b.origins]
+  })
+}
+
+/** Remove `removed` from `granted`; origins only go when the exact pattern was granted. */
+export function removePermissionSet(granted: PermissionSet, removed: PermissionSet): PermissionSet {
+  return {
+    permissions: granted.permissions.filter((p) => !removed.permissions.includes(p)),
+    origins: granted.origins.filter((o) => !removed.origins.includes(o))
+  }
+}
+
+/** The part of `wanted` that is not granted yet. */
+export function missingPermissions(granted: PermissionSet, wanted: PermissionSet): PermissionSet {
+  return {
+    permissions: wanted.permissions.filter((p) => !granted.permissions.includes(p)),
+    origins: wanted.origins.filter(
+      (o) => !granted.origins.some((g) => hostPermissionContains(g, o))
+    )
+  }
+}
+
+/** Validation Chrome performs on `permissions.request`: only optional/required entries qualify. */
+export function requestablePermissions(
+  manifest: ManifestPermissionSets,
+  wanted: PermissionSet
+): { ok: true } | { ok: false; error: string } {
+  for (const permission of wanted.permissions) {
+    if (
+      !manifest.optional.permissions.includes(permission) &&
+      !manifest.required.permissions.includes(permission)
+    ) {
+      return {
+        ok: false,
+        error: `Only permissions specified in the manifest may be requested.`
+      }
+    }
+  }
+  for (const origin of wanted.origins) {
+    if (compileMatchPattern(origin) === null) {
+      return {
+        ok: false,
+        error: `Invalid value for origin pattern ${origin}: Missing scheme separator.`
+      }
+    }
+    const allowed = [...manifest.optional.origins, ...manifest.required.origins].some((g) =>
+      hostPermissionContains(g, origin)
+    )
+    if (!allowed) {
+      return {
+        ok: false,
+        error: `Only permissions specified in the manifest may be requested.`
+      }
+    }
+  }
+  return { ok: true }
+}
+
+function dedupe(set: PermissionSet): PermissionSet {
+  return { permissions: [...new Set(set.permissions)], origins: [...new Set(set.origins)] }
+}

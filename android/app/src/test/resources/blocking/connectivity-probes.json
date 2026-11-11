@@ -1,0 +1,11 @@
+{
+  "id": "builtin:connectivity-probes",
+  "source": "builtin",
+  "priority": 5,
+  "enabled": true,
+  "ruleCount": 9,
+  "document": "sets/builtin_connectivity-probes-7aac8b3b.json",
+  "tag": "3bd-294aa8d07061223c",
+  "hasFilterText": false,
+  "filterCount": 0
+}

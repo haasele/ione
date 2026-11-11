@@ -1,0 +1,423 @@
+import { describe, expect, it } from 'vitest'
+import mainCss from '../../renderer/src/assets/main.css?raw'
+import {
+  chromeTokenCss,
+  NEW_TAB_AWAIT_STATE_ATTR,
+  NEW_TAB_AWAIT_STATE_STYLE,
+  NEW_TAB_PAGE_STYLE,
+  NEW_TAB_RULES_END,
+  NEW_TAB_RULES_START,
+  PRIVATE_COOKIES,
+  PRIVATE_EXPLAINER,
+  newTabPageHtml,
+  newTabSharedCss,
+  privateCookiesDescription,
+  privateCookiesLockedByExtension
+} from '../newTabPage'
+import { PRIVATE_ACCENT, PRIVATE_ACCENT_RGB } from '../newTabPageScript'
+import { PRIVATE_THEME, resolveTheme, themeCssVariables } from '../theme'
+import { zenPageHtml } from '../zenPages'
+
+/** Custom-property names declared (`--x:`) in `css`. */
+function declared(css: string): Set<string> {
+  return new Set(css.match(/--[a-z0-9-]+(?=\s*:)/g) ?? [])
+}
+
+/** Custom-property names read (`var(--x`) in `css`. */
+function read(css: string): Set<string> {
+  return new Set([...css.matchAll(/var\(\s*(--[a-z0-9-]+)/g)].map((m) => m[1]))
+}
+
+describe('zen://newtab tokens', () => {
+  const tokens = chromeTokenCss()
+  const shared = newTabSharedCss()
+
+  it("cuts the one .zen-ntp-* vocabulary out of main.css, up to the phone page's additions", () => {
+    // The block the phone page draws with (§9.29: one vocabulary on both platforms): the field's
+    // surface, the tile's fill and states, the caption's and fallbacks' ink, the scrim.
+    expect(mainCss.indexOf(NEW_TAB_RULES_START)).toBeGreaterThan(0)
+    expect(mainCss.indexOf(NEW_TAB_RULES_END)).toBeGreaterThan(mainCss.indexOf(NEW_TAB_RULES_START))
+    expect(shared.startsWith(NEW_TAB_RULES_START)).toBe(true)
+    expect(shared).toMatch(
+      /\.zen-ntp-field \{\n\s+border: 0;\n\s+border-radius: var\(--v2-radius-sheet\);\n\s+background: var\(--v2-urlbar\);\n\s+box-shadow: var\(--v2-shadow-panel\);\n\s+color: var\(--v2-text\);\n\s+\}/
+    )
+    expect(shared).toMatch(
+      /\.zen-ntp-tile \{\n\s+border-radius: var\(--v2-radius-card\);\n\s+background: var\(--v2-control-fill\);/
+    )
+    expect(shared).toMatch(
+      /@media \(hover: hover\) \{\n\s+\.zen-v2-shortcut:hover \.zen-ntp-tile \{\n\s+background: var\(--v2-control-fill-hover\);/
+    )
+    expect(shared).toMatch(
+      /\.zen-v2-shortcut:active \.zen-ntp-tile \{[^}]*transform: scale\(0\.96\);/
+    )
+    expect(shared).toMatch(/\.zen-ntp-caption \{[^}]*color: var\(--v2-control-text-deemphasized\);/)
+    expect(shared).toMatch(/\.zen-ntp-letter \{[^}]*font-size: var\(--v2-font-heading\);/)
+    expect(shared).toMatch(/\.zen-ntp-empty \{[^}]*font-size: var\(--v2-font-body\);/)
+    expect(shared).toMatch(
+      /\.zen-ntp-scrim \{\n\s+background: linear-gradient\(180deg, rgb\(0 0 0 \/ 0\.1\), rgb\(0 0 0 \/ 0\.45\)\);/
+    )
+    // Nothing of the phone's: no size, no form-factor gate, no wallpaper, no stagger, no preview.
+    expect(shared).not.toContain('data-form-factor')
+    expect(shared).not.toMatch(/(?<![a-z-])(height|width): \d/)
+    expect(shared).not.toMatch(
+      /zen-ntp-(site|preview|grow|placeholder|preset|icon-loaded|field-main)/
+    )
+    expect(shared).not.toContain('--zen-bg')
+    expect(shared).not.toContain('/*')
+    expect(shared).not.toContain('@layer')
+    // Gone markers degrade to no shared rules rather than a broken cut.
+    expect(newTabSharedCss('')).toBe('')
+    expect(newTabSharedCss(mainCss.replace(NEW_TAB_RULES_END, '/* gone */'))).toBe('')
+  })
+
+  it('takes the chrome token blocks from main.css, light and dark, comments dropped', () => {
+    const blocks = tokens.split('\n')
+    expect(blocks.length).toBeGreaterThanOrEqual(4)
+    expect(blocks[0]).toMatch(/^:root \{ .*--zen-bg: #f2f1f5;.*--zen-ease: /)
+    expect(blocks[1]).toMatch(/^:root\[data-theme='dark'\] \{ .*--zen-danger: #ff8080;/)
+    expect(tokens).toMatch(/^:root \{ .*--v2-page: #fbfbfe;/m)
+    expect(tokens).toMatch(/^:root\[data-theme='dark'\] \{ .*--v2-page: #1c1b22;/m)
+    expect(tokens).not.toContain('/*')
+    // Every v2 token main.css defines is there, so the page can read any of them.
+    for (const name of declared(mainCss))
+      if (name.startsWith('--v2-')) expect(tokens).toContain(name)
+    // Only `:root` and `data-surface` token blocks: no chrome rule leaks into the page.
+    for (const block of blocks)
+      expect(block).toMatch(/^(:root(\[[^\]]*\])?|\[data-surface='(window|page)'\]) \{ [^{}]* \}$/)
+    expect(tokens).toMatch(/^\[data-surface='page'\] \{ --v2-control-text: var\(--v2-text\);/m)
+    expect(tokens).not.toContain('zen-v2-')
+    expect(tokens).not.toContain('@')
+  })
+
+  it('stops at the first rule that is not a token block', () => {
+    const css =
+      ':root {\n  --v2-a: 1;\n}\n:root[data-x] {\n  --v2-b: 2;\n}\n.zen-thing {\n  color: red;\n}\n:root {\n  --late: 3;\n}\n'
+    expect(chromeTokenCss(css)).toBe(':root { --v2-a: 1; }\n:root[data-x] { --v2-b: 2; }')
+    expect(() => chromeTokenCss('.a { color: red }')).toThrow(/:root/)
+  })
+
+  it('defines no token of its own and reads only tokens main.css or the theme provides', () => {
+    // Over a picture the page re-declares the window's ink and fills (white, §9.29) – existing
+    // names with the picture's values, as the phone page does – and nothing else.
+    expect([...declared(NEW_TAB_PAGE_STYLE)].sort()).toEqual([
+      '--v2-window-fill',
+      '--v2-window-fill-hover',
+      '--zen-fg',
+      '--zen-fg-rgb'
+    ])
+    for (const name of declared(NEW_TAB_PAGE_STYLE)) expect(declared(mainCss)).toContain(name)
+    const imageBlock = NEW_TAB_PAGE_STYLE.slice(
+      NEW_TAB_PAGE_STYLE.indexOf("body[data-bg='image'] {")
+    )
+    expect(imageBlock.slice(0, imageBlock.indexOf('}'))).toContain('--zen-fg: #fff;')
+    const provided = new Set([
+      ...declared(tokens),
+      ...Object.keys(themeCssVariables(resolveTheme(null, false)))
+    ])
+    const pageCss = shared + NEW_TAB_PAGE_STYLE
+    expect(declared(shared).size).toBe(0)
+    for (const name of read(pageCss)) expect(provided, name).toContain(name)
+    // And every token the page reads it reads from the v2 set, the theme or the motion face
+    // (`--zen-ease` and the three durations beside it), never a v1 surface colour.
+    for (const name of read(pageCss))
+      expect(name, name).toMatch(
+        /^--(v2-|zen-(fg|fg-rgb|ease|motion-(state|pop|message)|shadow-2)$)/
+      )
+  })
+
+  it('serves the tokens, then the shared rules, then the page rules in one inline stylesheet', () => {
+    const html = newTabPageHtml()
+    const style = html.slice(html.indexOf('<style>') + 7, html.indexOf('</style>'))
+    expect(style.startsWith(tokens)).toBe(true)
+    expect(style.endsWith(NEW_TAB_PAGE_STYLE)).toBe(true)
+    expect(style.slice(tokens.length, style.length - NEW_TAB_PAGE_STYLE.length).trim()).toBe(shared)
+    expect(html).toContain("default-src 'none'")
+    expect(html).not.toContain('<script')
+  })
+
+  it('carries the private accent the chrome sets on a private window', () => {
+    const rule = mainCss.slice(mainCss.indexOf(".zen-window[data-window-kind='private'] {"))
+    const body = rule.slice(0, rule.indexOf('}'))
+    expect(body).toContain(`--zen-accent: ${PRIVATE_ACCENT};`)
+    expect(body).toContain(`--zen-accent-rgb: ${PRIVATE_ACCENT_RGB};`)
+    // The private theme itself is dark in both schemes, so the page's dark tokens apply over it.
+    expect(resolveTheme(PRIVATE_THEME, false).isDark).toBe(true)
+    expect(resolveTheme(PRIVATE_THEME, true).isDark).toBe(true)
+  })
+
+  it("takes the touch layouts' numbers under a coarse pointer (NTP-35): the field 56, Customise the 40 control, the tiles 64", () => {
+    // The desktop's numbers stand outside the query: the field 48, the button the 32 control.
+    expect(NEW_TAB_PAGE_STYLE).toMatch(/\.zen-ntp-field \{[^}]*height: 48px;/)
+    expect(NEW_TAB_PAGE_STYLE).toMatch(/\.zen-v2-button \{[^}]*height: var\(--v2-control\);/)
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /@media \(pointer: coarse\) \{\s*\.zen-ntp-field \{ height: 56px; \}\s*\.zen-customize \{ height: 40px; border-radius: 6px; \}\s*\}/
+    )
+    // The tile is the 64 square on every pointer: no coarse rule touches it.
+    expect(NEW_TAB_PAGE_STYLE).toMatch(/\.zen-ntp-tile \{[^}]*width: 64px; height: 64px; \}/)
+    const coarse = NEW_TAB_PAGE_STYLE.slice(NEW_TAB_PAGE_STYLE.indexOf('@media (pointer: coarse)'))
+    expect(coarse.slice(0, coarse.indexOf('\n  }'))).not.toContain('zen-ntp-tile')
+  })
+
+  it('hides with the attribute whatever display a class sets (the grid is a grid)', () => {
+    expect(NEW_TAB_PAGE_STYLE).toMatch(/^\s*\[hidden\] \{ display: none !important; \}$/m)
+    expect(NEW_TAB_PAGE_STYLE).toMatch(/\.zen-grid \{\s*display: grid;/)
+    // The grid, the empty sentence and the explainer start hidden; the script shows one of them.
+    const html = newTabPageHtml()
+    expect(html).toMatch(/<div class="zen-grid" id="zen-grid" role="list"[^>]* hidden>/)
+    expect(html).toMatch(/<p class="zen-ntp-empty" id="zen-empty" hidden>/)
+    expect(html).toMatch(/<section class="zen-ntp-private" id="zen-private"[^>]* hidden>/)
+  })
+
+  it('is the window (§9.29): a window-family root, the field and toast page surfaces on it', () => {
+    const html = newTabPageHtml()
+    expect(html).toContain('<body data-surface="window">')
+    expect(html).toMatch(/<form class="zen-ntp-field" id="zen-search"[^>]* data-surface="page">/)
+    expect(html).toMatch(
+      /<div class="zen-toast" id="zen-toast" role="status" data-surface="page" hidden>/
+    )
+    // One vocabulary with the phone page (the shared rules give the look, the page its sizes):
+    // tiles, captions and Customise in the window family, the field a page surface.
+    expect(NEW_TAB_PAGE_STYLE).toMatch(/\.zen-ntp-tile \{[^}]*width: 64px; height: 64px;/)
+    expect(shared).toMatch(/\.zen-ntp-tile \{[^}]*background: var\(--v2-control-fill\);/)
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-ntp-icon \{ width: 32px; height: 32px; border-radius: 8px; \}/
+    )
+    expect(shared).toMatch(
+      /\.zen-v2-shortcut:hover \.zen-ntp-tile \{\n\s+background: var\(--v2-control-fill-hover\);/
+    )
+    expect(shared).toMatch(/\.zen-ntp-caption \{[^}]*color: var\(--v2-control-text-deemphasized\);/)
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-grid \{[^}]*repeat\(4, minmax\(0, 104px\)\); gap: 12px;/
+    )
+    expect(NEW_TAB_PAGE_STYLE).toMatch(/\.zen-ntp-field \{[^}]*height: 48px;/)
+    expect(shared).toMatch(
+      /\.zen-ntp-field \{[^}]*border: 0;[^}]*border-radius: var\(--v2-radius-sheet\);[^}]*background: var\(--v2-urlbar\);[^}]*box-shadow: var\(--v2-shadow-panel\);/
+    )
+    // The page's layout repeats none of the shared look, so the two never disagree.
+    expect(NEW_TAB_PAGE_STYLE).not.toMatch(
+      /^\s*\.zen-ntp-(field|tile|caption|empty|letter|scrim) \{[^}]*(background|color|border-radius|box-shadow|font-size):/m
+    )
+    expect(NEW_TAB_PAGE_STYLE).not.toMatch(/\.zen-v2-shortcut:(hover|active) \.zen-ntp-tile/)
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-customize \{ position: fixed; right: 12px; bottom: 12px;/
+    )
+    expect(html).toMatch(
+      /<button type="button" class="zen-v2-button zen-customize" id="zen-customize"/
+    )
+    // No card, no hairline around a tile, no label inside the square.
+    expect(shared + NEW_TAB_PAGE_STYLE).not.toMatch(/\.zen-ntp-tile \{[^}]*border: 1px/)
+    expect(shared + NEW_TAB_PAGE_STYLE).not.toContain('--v2-card')
+  })
+
+  it('says what a private window keeps, where the tiles would be (§9.23 title block)', () => {
+    const html = newTabPageHtml()
+    expect(html).toContain(`<h2 id="zen-private-title">${PRIVATE_EXPLAINER.title}</h2>`)
+    expect(html).toContain(`<p>${PRIVATE_EXPLAINER.description}</p>`)
+    expect(PRIVATE_EXPLAINER.title).toBe("You're in a private window")
+    expect(PRIVATE_EXPLAINER.description).not.toMatch(/[—–]/)
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-ntp-private h2 \{[^}]*font-size: var\(--v2-font-heading\); line-height: 22px; font-weight: var\(--v2-weight-heading\);/
+    )
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-ntp-private p \{ margin: 4px 0 0; color: var\(--v2-control-text-deemphasized\); \}/
+    )
+  })
+
+  it('carries the private page\'s "Block third-party cookies" row: the shared row and switch in the window family', () => {
+    const html = newTabPageHtml()
+    // Under the title block, hidden until a private state shows it; the shared row's static
+    // form (§9.34: `data-static`, no role) holding a real switch button labelled by the row.
+    const explainer = html.indexOf('<section class="zen-ntp-private"')
+    const row = html.indexOf(
+      '<div class="zen-v2-row zen-ntp-cookies" id="zen-cookies" data-static hidden>'
+    )
+    expect(row).toBeGreaterThan(explainer)
+    expect(row).toBeLessThan(html.indexOf('<p class="zen-ntp-empty"'))
+    expect(html).toContain(
+      `<label class="zen-ntp-cookies-label" id="zen-cookies-label" for="zen-cookies-switch">${PRIVATE_COOKIES.label}</label>`
+    )
+    expect(html).toContain(
+      `<p class="zen-ntp-cookies-desc" id="zen-cookies-desc">${PRIVATE_COOKIES.description}</p>`
+    )
+    expect(html).toContain(
+      '<button type="button" class="zen-v2-switch" id="zen-cookies-switch" role="switch" aria-checked="false" aria-describedby="zen-cookies-desc"></button>'
+    )
+    // Sentence case, no dash, each a sentence with its full stop (the lead's amendment of 08:40);
+    // the locked copy names where the lock is – the pane by its actual
+    // name behind the language's path glyph (the lead's ruling on #522), or the extension whose
+    // `chrome.privacy` hold locks the switch at either pole (services pass 10: "Blocked" under
+    // `false`, "Allowed" under `true`), "an extension" without a name.
+    expect(PRIVATE_COOKIES.label).toBe('Block third-party cookies')
+    expect(PRIVATE_COOKIES.description).toBe('Blocks third-party cookies in private windows.')
+    expect(PRIVATE_COOKIES.lockedDescription).toBe(
+      'Blocked in every window by Settings › Privacy and Security.'
+    )
+    for (const text of Object.values(PRIVATE_COOKIES)) expect(text).not.toMatch(/[—–>]/)
+    expect(privateCookiesLockedByExtension(true, 'uBlock Origin')).toBe(
+      'Blocked in every window by the extension uBlock Origin.'
+    )
+    expect(privateCookiesLockedByExtension(false, 'Cookie Shield')).toBe(
+      'Allowed in every window by the extension Cookie Shield.'
+    )
+    expect(privateCookiesLockedByExtension(true, '  ')).toBe(
+      'Blocked in every window by an extension.'
+    )
+    expect(privateCookiesLockedByExtension(false, '')).toBe(
+      'Allowed in every window by an extension.'
+    )
+    expect(privateCookiesDescription({ blocked: false, locked: false })).toBe(
+      PRIVATE_COOKIES.description
+    )
+    expect(
+      privateCookiesDescription({ blocked: true, locked: false, lockedByExtension: 'x' })
+    ).toBe(PRIVATE_COOKIES.description)
+    expect(privateCookiesDescription({ blocked: true, locked: true })).toBe(
+      PRIVATE_COOKIES.lockedDescription
+    )
+    expect(
+      privateCookiesDescription({ blocked: true, locked: true, lockedByExtension: 'Cookie Shield' })
+    ).toBe('Blocked in every window by the extension Cookie Shield.')
+    // The allow pole: off and locked, the sentence in the desktop's own noun.
+    expect(
+      privateCookiesDescription({
+        blocked: false,
+        locked: true,
+        lockedByExtension: 'Cookie Shield'
+      })
+    ).toBe('Allowed in every window by the extension Cookie Shield.')
+    // The row: the primitive's geometry (§9.21 padding from the token, the row's min height), the
+    // title block's measure 8 below it (§9.26), label 15 in the window ink, description 13 at 69 %.
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-v2-row \{[^}]*min-height: var\(--v2-row\); padding: var\(--v2-row-pad\) 16px;[^}]*color: var\(--v2-control-text\);/
+    )
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-ntp-cookies \{ width: min\(560px, 100%\); margin: 8px 0 0; \}/
+    )
+    expect(NEW_TAB_PAGE_STYLE).toMatch(/\.zen-ntp-private \{[^}]*width: min\(560px, 100%\);/)
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-ntp-cookies-desc \{[^}]*-webkit-line-clamp: 2;[^}]*color: var\(--v2-control-text-deemphasized\);[^}]*font-size: var\(--v2-font-small\); line-height: var\(--v2-line-small\);/
+    )
+    // The switch: main.css's geometry (36 × 20, radius 10, a 16 thumb inset 2, travel 16, 150 ms)
+    // read in the window family – the window ink at 25 %, the surface's accent, the on-accent ink.
+    const primitive = mainCss.slice(mainCss.indexOf('\n.zen-v2-switch {'))
+    expect(primitive).toMatch(/width: 36px;\s+height: 20px;[^}]*border-radius: 10px;/)
+    expect(primitive).toMatch(
+      /\.zen-v2-switch::after \{[^}]*top: 2px;\s+left: 2px;\s+width: 16px;\s+height: 16px;/
+    )
+    expect(primitive).toMatch(/translateX\(16px\)/)
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-v2-switch \{[^}]*width: 36px; height: 20px;[^}]*border-radius: 10px;\s+background: rgb\(var\(--zen-fg-rgb\) \/ 0\.25\);\s+transition: background 150ms var\(--zen-ease\);/
+    )
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-v2-switch::after \{[^}]*top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;\s+background: var\(--v2-on-accent\);\s+transition: transform 150ms var\(--zen-ease\), background 150ms var\(--zen-ease\);/
+    )
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-v2-switch\[aria-checked='true'\] \{ background: var\(--v2-control-accent\); \}/
+    )
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /\.zen-v2-switch\[aria-checked='true'\]::after \{ background: var\(--v2-on-accent\); transform: translateX\(16px\); \}/
+    )
+    // Disabled is §9.30's one number, and it does not animate: only the knob and track transition.
+    expect(NEW_TAB_PAGE_STYLE).toMatch(/\.zen-v2-switch:disabled \{ opacity: 0\.4; \}/)
+    const rowRules = NEW_TAB_PAGE_STYLE.slice(
+      NEW_TAB_PAGE_STYLE.indexOf('.zen-v2-row {'),
+      NEW_TAB_PAGE_STYLE.indexOf('.zen-v2-switch:disabled')
+    )
+    expect(rowRules).not.toMatch(/transition:[^;]*opacity/)
+    // Window family only: no page ink or fill on the row or the switch (§9.29).
+    expect(rowRules).not.toMatch(/--v2-(text|fill|page|accent)\b/)
+  })
+})
+
+/**
+ * NTP-35 (#563, the lead's conditions of form): the Android host fills the served document after
+ * its first paint (`pageScript.ts` hands no state synchronously), so on that host the document
+ * awaits its state TRANSPARENT and comes in WHOLE – filled, its icons in hand – on the language's
+ * 120 ms opacity fade (§11.4), the same fade under reduced motion (§11.3: a fade is not a cut). The
+ * desktop's document is byte-identical to what it was: the option is off there, and the phone never
+ * loads this document at all.
+ */
+describe("zen://newtab: the awaiting document (NTP-35, the tablet's served page)", () => {
+  const plain = newTabPageHtml()
+  const awaiting = newTabPageHtml({ awaitState: true })
+
+  it("the desktop's document is as it was: no attribute, none of the awaiting rules", () => {
+    expect(NEW_TAB_AWAIT_STATE_ATTR).toBe('data-await-state')
+    expect(plain.startsWith('<!doctype html><html lang="en"><head>')).toBe(true)
+    expect(plain).not.toContain(NEW_TAB_AWAIT_STATE_ATTR)
+    expect(plain).not.toContain(':root { transition: opacity')
+    expect(newTabPageHtml({})).toBe(plain)
+    expect(newTabPageHtml({ awaitState: false })).toBe(plain)
+  })
+
+  it('the awaiting document carries the attribute on its root and the awaiting rules, and nothing else differs', () => {
+    expect(awaiting.startsWith('<!doctype html><html lang="en" data-await-state><head>')).toBe(true)
+    // Transparent while awaiting; the opacity change runs the language's 120 ms fade – under
+    // reduced motion too (the rule below).
+    expect(NEW_TAB_AWAIT_STATE_STYLE).toContain(
+      ':root { transition: opacity 120ms var(--zen-ease); }'
+    )
+    expect(NEW_TAB_AWAIT_STATE_STYLE).toContain(':root[data-await-state] { opacity: 0; }')
+    expect(NEW_TAB_AWAIT_STATE_STYLE).toContain(
+      ':root { transition: opacity 120ms var(--zen-ease) !important; }'
+    )
+    expect(awaiting).toContain(`${NEW_TAB_PAGE_STYLE}${NEW_TAB_AWAIT_STATE_STYLE}</style>`)
+    // Only the attribute and the appended rules: the page itself is the desktop's, so a fix to
+    // either document is a fix to both.
+    expect(
+      awaiting.replace(' data-await-state><head>', '><head>').replace(NEW_TAB_AWAIT_STATE_STYLE, '')
+    ).toBe(plain)
+    expect(awaiting.split('data-await-state').length - 1).toBe(2)
+  })
+
+  it('under reduced motion the root keeps its 120 ms opacity fade and nothing else on the page transitions (§11.3: a fade is not a cut)', () => {
+    // The page's remover takes every transition, the root's among them (`*` covers the root,
+    // `!important` outranks the appended rule whatever its place in the sheet) – so the arrival's
+    // fade is re-declared under the query, `!important` past the remover (`:root` outranks `*` at
+    // equal importance), in the one form the §11.3 guard (`lib/__tests__/reducedMotion.test.ts`)
+    // admits: opacity alone, one segment, 120 ms written out, `!important`.
+    expect(NEW_TAB_PAGE_STYLE).toMatch(
+      /@media \(prefers-reduced-motion: reduce\) \{\n\s+\*, ::before, ::after, ::backdrop \{ transition-property: none !important;/
+    )
+    expect(NEW_TAB_AWAIT_STATE_STYLE).toMatch(
+      /@media \(prefers-reduced-motion: reduce\) \{\n\s+:root \{ transition: opacity 120ms var\(--zen-ease\) !important; \}\n\s+\}/
+    )
+    const kept = NEW_TAB_AWAIT_STATE_STYLE.match(
+      /:root \{ transition: (opacity 120ms var\(--zen-ease\)) !important; \}/
+    )
+    const segments = (kept?.[1] ?? '').split(',').map((s) => s.trim().split(/\s+/))
+    expect(segments).toHaveLength(1)
+    expect(segments[0][0]).toBe('opacity')
+    expect(segments[0].filter((t) => /^\d+m?s$/.test(t))).toEqual(['120ms'])
+    // The awaiting document's reduced-motion blocks, whole: the page's remover, the Undo toast's
+    // kept fade (the page's own), and the root's kept fade – no other motion survives the query.
+    const blocks = [
+      ...awaiting.matchAll(/@media \(prefers-reduced-motion: reduce\) \{([\s\S]*?)\n {2}\}/g)
+    ].map((m) => m[1])
+    expect(blocks).toHaveLength(2)
+    expect(
+      blocks.flatMap((b) =>
+        b
+          .trim()
+          .split('\n')
+          .map((l) => l.trim())
+      )
+    ).toEqual([
+      '*, ::before, ::after, ::backdrop { transition-property: none !important; animation: none !important; }',
+      '.zen-toast { animation: zen-fade 120ms var(--zen-ease) !important; }',
+      ':root { transition: opacity 120ms var(--zen-ease) !important; }'
+    ])
+    // The desktop's document has no arrival fade to keep: its one reduced-motion block is the page's own.
+    expect(plain.match(/prefers-reduced-motion/g)).toHaveLength(1)
+  })
+
+  it("the Android host's page is the awaiting document; every other host's is the desktop's", () => {
+    expect(zenPageHtml('zen://newtab', undefined, undefined, undefined, 'system', 'android')).toBe(
+      awaiting
+    )
+    expect(zenPageHtml('zen://newtab')).toBe(plain)
+    expect(zenPageHtml('zen://newtab', undefined, undefined, undefined, 'system', 'desktop')).toBe(
+      plain
+    )
+  })
+})

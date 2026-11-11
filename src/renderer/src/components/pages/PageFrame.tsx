@@ -1,0 +1,298 @@
+import type { JSX, KeyboardEvent, MouseEvent, ReactNode, RefObject, UIEvent } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Search, X } from 'lucide-react'
+import { cn } from '@renderer/lib/utils'
+
+/**
+ * Width of the page from which a two-pane page shows both its panes (v2 §10.2, §10.5): the
+ * Settings tab's nav and content columns, the bookmarks manager's folder column and list.
+ */
+export const TWO_PANE_MIN_WIDTH = 720
+
+/*
+ * The frame of a chrome page tab that is a list – History, the bookmarks manager, Downloads
+ * (design language v2 §10.1, the page family of §9.29): the page fills the content frame on
+ * `--v2-page` with no header bar, no X and no panel chrome. Its column scrolls under a sticky
+ * header that holds the page's 22/600 title block (§9.26, with the page's actions in its
+ * trailing slot, §9.23) and, under it, the §9.12 search field; §9.7's hairline draws along the
+ * header's bottom edge once the column has scrolled under it and goes again at the top. The
+ * body is the Settings content column's geometry (§10.5, §5): the text column at most 664 wide
+ * inside 32 side margins – the page's 16 plus the rows' own 16 gutter, a 728 box – left-aligned
+ * as Zen's, so a row's hover fill runs 16 past its text on both sides and the title, the field,
+ * the group headings and the rows' labels share one left edge at 32 while the title's actions,
+ * the field's end and the rows' trailing controls share the column's other edge at 696 (§10.1:
+ * one column for every desktop page tab). Groups are §9.27 sub-headings (the
+ * shared `.zen-v2-heading`, 15/600) over `.zen-v2-row` rows (§9.21), the first 8 under the
+ * pinned header (§10.3) – in the body itself or in the page's one `.zen-page-list` div (the
+ * keyboard walk's root); the empty state is §9.17's one sentence. Every class here is layout:
+ * the controls are the `zen-v2-*` primitives.
+ */
+
+/**
+ * The page: a flex column filling the host, its scroll container carrying `data-scrolled` while
+ * the column is scrolled (the sticky header's hairline reads it). `header` is what stays put;
+ * the children are the body; `footer`, when a page has one (the task manager's End process,
+ * §9.11), is pinned at the page's foot outside the scroll, carrying `data-more` while rows are
+ * still below the fold (its hairline reads it, the header's mirror). The header's measured
+ * height is the page's `--zen-page-header-height`, so a body element that stays put under it
+ * (a table's column header) knows where to stick.
+ */
+export function PageColumn({
+  testId,
+  className,
+  header,
+  footer,
+  scrollRef,
+  onKeyDown,
+  children
+}: {
+  testId?: string
+  className?: string
+  header: ReactNode
+  footer?: ReactNode
+  scrollRef?: RefObject<HTMLDivElement | null>
+  onKeyDown?: (e: KeyboardEvent<HTMLDivElement>) => void
+  children: ReactNode
+}): JSX.Element {
+  const [scrolled, setScrolled] = useState(false)
+  const [more, setMore] = useState(false)
+  const page = useRef<HTMLDivElement | null>(null)
+  const head = useRef<HTMLElement | null>(null)
+  const scroller = useRef<HTMLDivElement | null>(null)
+  const measure = useCallback((el: HTMLDivElement) => {
+    setScrolled(el.scrollTop > 0)
+    setMore(el.scrollTop + el.clientHeight < el.scrollHeight - 1)
+  }, [])
+  const onScroll = useCallback((e: UIEvent<HTMLDivElement>) => measure(e.currentTarget), [measure])
+  const hasFooter = Boolean(footer)
+  // A pinned footer reads whether rows stand below the fold before any scroll, and as the page
+  // or its list changes size.
+  useEffect(() => {
+    const el = scroller.current
+    if (!hasFooter || !el || typeof ResizeObserver === 'undefined') return
+    measure(el)
+    const observer = new ResizeObserver(() => measure(el))
+    observer.observe(el)
+    for (const child of el.children) observer.observe(child)
+    return () => observer.disconnect()
+  }, [hasFooter, measure])
+  // The header's height, as it stands and as it changes (a description wrapping, the text zoom).
+  useEffect(() => {
+    const root = page.current
+    const el = head.current
+    if (!root || !el || typeof ResizeObserver === 'undefined') return
+    const publish = (): void =>
+      root.style.setProperty('--zen-page-header-height', `${el.offsetHeight}px`)
+    publish()
+    const observer = new ResizeObserver(publish)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+  return (
+    <div
+      ref={page}
+      className={cn('zen-page', className)}
+      data-testid={testId}
+      onKeyDown={onKeyDown}
+    >
+      <div
+        ref={(el) => {
+          scroller.current = el
+          if (scrollRef) scrollRef.current = el
+        }}
+        className="zen-page-scroll"
+        data-scrolled={scrolled || undefined}
+        onScroll={onScroll}
+      >
+        <header ref={head} className="zen-page-header">
+          {header}
+        </header>
+        <div className="zen-page-body">{children}</div>
+      </div>
+      {footer && (
+        <footer className="zen-page-footer" data-more={more || undefined}>
+          <div className="zen-page-footer-actions">{footer}</div>
+        </footer>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The title block (§9.26, §10.2): the page's name 22/600 on its 28 line, padding 16 16 12, an
+ * optional description 15 at 69% 4 under it, and the page's actions – `zen-v2-button`
+ * secondaries – in the trailing slot on the title's line (§9.23). The name is the page's `h1`.
+ */
+export function PageTitleBlock({
+  title,
+  description,
+  actions,
+  titleId
+}: {
+  title: string
+  description?: ReactNode
+  actions?: ReactNode
+  titleId?: string
+}): JSX.Element {
+  return (
+    <div className="zen-page-title-block">
+      <div className="zen-page-title-row">
+        <h1 id={titleId} className="zen-page-title">
+          {title}
+        </h1>
+        {actions && <div className="zen-page-title-actions">{actions}</div>}
+      </div>
+      {description && <p className="zen-page-title-desc">{description}</p>}
+    </div>
+  )
+}
+
+/**
+ * The page's search field (§9.12, as "Find in Settings" draws it): the 32 px `--v2-field` with
+ * its 16 px glyph and, while there is a query, the clear icon button. Escape clears the query,
+ * and with none to clear leaves the field (the focus returns to the page), so a second Escape
+ * is the chrome's again – or, with `passEmptyEscape`, is left to the page's frame at once (a
+ * page window closes on it: an empty field never swallows the key there).
+ */
+export function PageSearchField({
+  value,
+  onChange,
+  placeholder,
+  label = placeholder,
+  field,
+  testId,
+  autoFocus = false,
+  passEmptyEscape = false
+}: {
+  value: string
+  onChange: (value: string) => void
+  placeholder: string
+  label?: string
+  field?: RefObject<HTMLInputElement | null>
+  testId?: string
+  autoFocus?: boolean
+  passEmptyEscape?: boolean
+}): JSX.Element {
+  return (
+    <div className="zen-page-search">
+      <Search className="zen-page-search-glyph" aria-hidden="true" />
+      <input
+        ref={field}
+        type="text"
+        role="searchbox"
+        className="zen-v2-field zen-page-search-field"
+        data-testid={testId}
+        placeholder={placeholder}
+        aria-label={label}
+        inputMode="search"
+        enterKeyHint="search"
+        autoCapitalize="off"
+        autoCorrect="off"
+        spellCheck={false}
+        autoFocus={autoFocus}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key !== 'Escape') return
+          if (!value && passEmptyEscape) return
+          e.preventDefault()
+          e.stopPropagation()
+          if (value) onChange('')
+          else e.currentTarget.blur()
+        }}
+      />
+      {value && (
+        <button
+          type="button"
+          className="zen-page-search-clear zen-v2-icon-button"
+          aria-label="Clear search"
+          onClick={() => {
+            onChange('')
+            field?.current?.focus()
+          }}
+        >
+          <X aria-hidden="true" />
+        </button>
+      )}
+    </div>
+  )
+}
+
+/**
+ * A group on the page (§9.27, §10.3): the shared 15/600 heading with an optional aside (a count,
+ * 13 at 69% tabular) and an optional trailing control (a §9.3 icon button whose 28 box does not
+ * grow the heading's 20 line), then its rows. The section is named by its heading: `heading` is
+ * its text, rendered as the `h2` carrying `headingId`; a group whose heading line is its own
+ * element (the bookmarks manager's breadcrumb, whose last segment is the `h2`) hands it in as
+ * `headingElement` instead. A heading line with a menu of its own (History's device groups) takes
+ * it through `onHeadingContextMenu`: a right-click anywhere on the line, or the menu key while the
+ * focus is in it (Chromium raises `contextmenu` at the focused element – the line's control). A
+ * heading whose subject has a glyph (a device's kind) leads with it through `lead`: a decorative
+ * box on the rows' favicon column (`.zen-page-heading-lead`), the heading's text on their text edge.
+ */
+export function PageGroup({
+  heading,
+  headingElement,
+  lead,
+  aside,
+  control,
+  headingId,
+  className,
+  onHeadingContextMenu,
+  children,
+  ...data
+}: {
+  heading?: ReactNode
+  headingElement?: ReactNode
+  lead?: ReactNode
+  aside?: ReactNode
+  control?: ReactNode
+  headingId?: string
+  className?: string
+  onHeadingContextMenu?: (e: MouseEvent<HTMLDivElement>) => void
+  children: ReactNode
+} & Record<`data-${string}`, string | number | boolean | undefined>): JSX.Element {
+  return (
+    <section className={cn('zen-page-group', className)} aria-labelledby={headingId} {...data}>
+      <div className="zen-v2-heading zen-page-heading" onContextMenu={onHeadingContextMenu}>
+        {lead && (
+          <span className="zen-page-heading-lead" aria-hidden>
+            {lead}
+          </span>
+        )}
+        {headingElement ?? (
+          <h2 id={headingId} className="zen-page-heading-text">
+            {heading}
+          </h2>
+        )}
+        {aside !== undefined && aside !== null && (
+          <span className="zen-page-heading-aside">{aside}</span>
+        )}
+        {control}
+      </div>
+      {children}
+    </section>
+  )
+}
+
+/**
+ * The page's empty state (§9.17): one sentence, sentence case, no full stop, 15/400 at 69%,
+ * centred in a 32 gutter, its line 32 under the header; an optional single follow-up 16 beneath
+ * it – a secondary button – only where there is one obvious next step.
+ */
+export function PageEmpty({
+  children,
+  action,
+  testId
+}: {
+  children: ReactNode
+  action?: ReactNode
+  testId?: string
+}): JSX.Element {
+  return (
+    <div className="zen-page-empty" role="status" data-testid={testId}>
+      <p>{children}</p>
+      {action && <div className="zen-page-empty-action">{action}</div>}
+    </div>
+  )
+}

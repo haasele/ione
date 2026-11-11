@@ -1,0 +1,1669 @@
+import { JsonStore } from './store/JsonStore'
+import type { PermissionPromptHost, StoreIO } from './platform'
+import type {
+  DeviceGrant,
+  DeviceKind,
+  PermissionPrompt,
+  PermissionPromptAnswer,
+  PermissionRule,
+  RevokedSitePermissions
+} from '../shared/types'
+import {
+  FILE_SITE,
+  MEDIA_ROWS,
+  allowOnceFor,
+  builtInDefault,
+  contentSettingId,
+  isDeviceKind,
+  promptLabelFor,
+  tracksLastVisit,
+  type ContentDecision,
+  type ContentDefault
+} from '../shared/contentSettings'
+import { newId } from '../shared/ids'
+import { isSameSite } from '../shared/url'
+
+export type PermissionDecision = PermissionRule['decision']
+type Decision = PermissionDecision
+
+/**
+ * What the unused-sites sweep knows of one `allow` (PS-41; Chrome's `RuleMetaData`): the coarse
+ * last-visit stamp, and whether the user allowed the site again after a revocation.
+ */
+type RuleMeta = Pick<PermissionRule, 'lastVisitedAt' | 'keepGranted'>
+
+interface Persisted {
+  version: 1
+  decisions: Record<string, PermissionDecision>
+  /** The devices sites are connected to (`DeviceGrant`); absent in files from before them. */
+  devices?: DeviceGrant[]
+  /**
+   * Sites told once about a permission that acts without asking (`origin|permission` keys, the
+   * oldest first): the desktop's first automatic picture-in-picture toast (MW-28). Absent in
+   * files from before it.
+   */
+  noticed?: string[]
+  /**
+   * The unused-sites clock of the `allow` decisions the sweep can reach (PS-41), by decision key,
+   * beside `decisions` so the file's shape stays v1: a file from before it, or without any, loads
+   * as it did, and its rules carry no stamp until a visit stamps them.
+   */
+  meta?: Record<string, RuleMeta>
+  /** Permissions the sweep took, one record per site, kept 30 days (PS-41). Absent when none. */
+  revokedUnused?: RevokedSitePermissions[]
+}
+
+const DAY_MS = 24 * 3_600_000
+
+/**
+ * Safety check and the sweep: a granted permission on a site not visited for this long is unused
+ * (Chrome's `kUnusedSitePermissionsRevocationThreshold`, 60 days).
+ */
+export const UNUSED_PERMISSION_MS = 60 * DAY_MS
+
+/** How long a revoked-permissions record is kept for review (Chrome's clean-up threshold, 30 days). */
+export const REVOKED_PERMISSIONS_KEPT_MS = 30 * DAY_MS
+
+/**
+ * The visit stamp's precision (Chrome's `GetCoarseVisitedTimePrecision`, 7 days): a stamp names
+ * the week of the visit, never the moment, so `permissions.json` keeps no visit log.
+ */
+export const VISIT_STAMP_PRECISION_MS = 7 * DAY_MS
+
+/** `now` floored to the week (`VISIT_STAMP_PRECISION_MS` since the epoch): the stamp a visit leaves. */
+export function coarseVisitTime(now: number): number {
+  return Math.floor(now / VISIT_STAMP_PRECISION_MS) * VISIT_STAMP_PRECISION_MS
+}
+
+/** What one run of the unused-sites sweep did. */
+export interface UnusedPermissionsSweepResult {
+  /** The records the sweep made or grew this run, by site. */
+  revoked: RevokedSitePermissions[]
+  /** Records past their `expiresAt` that went. */
+  expired: number
+}
+
+/** What the host knows of a device when it asks whether a site is connected to it, or connects it. */
+export interface DeviceIdentity {
+  /** The engine's id in this session (`deviceId`, a serial `portId`, a Bluetooth address). */
+  deviceId: string
+  name: string
+  vendorId?: number | null
+  productId?: number | null
+  serialNumber?: string | null
+}
+
+/**
+ * Where a device question or grant comes from: a private window or tab names its container, and
+ * the grant then lives with that private session (`grantDevice`), as an answer given in private
+ * does (`PermissionRequestDetails.privateContainerId`).
+ */
+export type DeviceGrantDetails = Pick<PermissionRequestDetails, 'privateContainerId'> & {
+  /**
+   * The pick was an AI agent's, on this tab of its: the connection lasts while the tab is the
+   * agent's (`forgetAgentTab`) and is never written or listed, whatever the user remembers.
+   */
+  agentTabId?: string
+}
+
+/**
+ * A decision changed: `origin` is null when it was a permission's default. `container` names
+ * the private container whose answer or device pick the change is (an answer given in private,
+ * the session's end forgetting it), so a listener keeping the regular profile's own state – the
+ * quiet mark a dismissed notification prompt leaves (`webNotifications.ts`) – can leave it be;
+ * a store-backed change carries none. In-memory only: the change is never persisted or sent.
+ */
+export interface PermissionChange {
+  permission: string
+  origin: string | null
+  container?: string
+}
+
+/**
+ * Rules extensions set (`chrome.contentSettings`), consulted before the user's answers as
+ * Chrome's extension provider ranks above its preference provider: the catalogue id of the
+ * permission (`geolocation`, `notifications`, `popups`…), the requesting URL and the request's
+ * details (the embedding page, for a frame). Null when no extension has a rule for the site.
+ */
+export type PermissionOverride = (
+  permission: string,
+  requestingUrl: string,
+  details?: PermissionRequestDetails
+) => ContentDefault | null
+
+/**
+ * The "origin" of a permission's default decision (Chrome's content-setting default). Never a real
+ * origin, so `listForOrigin` and `resetOrigin` cannot reach it.
+ */
+const DEFAULT_ORIGIN = '*'
+
+/** Facts about one request that shape the prompt, or the key the answer is remembered under. */
+export interface PermissionRequestDetails {
+  /**
+   * Tab whose page asks. Prompts queue per tab and go away when it navigates; an "Allow once"
+   * lasts while this tab stays on the site.
+   */
+  tabId?: string
+  /** `media`: the capture devices the request is for (both when the host does not say). */
+  mediaTypes?: Array<'video' | 'audio'>
+  /** Top-level page the request happens in, when the requesting frame is embedded in another site. */
+  embedderUrl?: string
+  /**
+   * Whether the requesting page holds transient user activation (a click or key press within the
+   * last few seconds), where the host can tell: Electron never says, so the desktop reads the
+   * core's activation clock (`PopupBlocker.activation`). Left out when the host cannot tell, and
+   * the request is then treated as Chrome treats a gestured one. Read by the storage-access
+   * rows, whose request the web platform refuses outright without a gesture.
+   */
+  userGesture?: boolean
+  /** `openExternal`: the URL that would be handed to another application. */
+  externalUrl?: string
+  /** `fileSystem`: the file or directory the page wants and how it wants it. */
+  filePath?: string
+  isDirectory?: boolean
+  fileAccessType?: 'writable' | 'readable'
+  /** `fileSystem` checks: a page of the site has seen a gesture, so a refusal may come with a question. */
+  pageActivated?: boolean
+  /**
+   * `fileSystem` checks: the file was chosen in a save dialog a moment ago (the host recognises
+   * the file the engine emptied on the spot), which is the user's permission to write it.
+   */
+  pickedForSaving?: boolean
+  /**
+   * The request comes from a private window or tab, named by its container. Chrome's Incognito
+   * rule: the site's stored decisions and the defaults are read as they are (a block stands), but
+   * nothing the user answers in private is written to the store – an Allow lasts the private
+   * session, a Block the same, and a dismissed prompt never earns the site a stored block. The
+   * hosts set it from the request's session (`PRIVATE_CONTAINER_ID`); the session's end calls
+   * `forgetContainer`.
+   */
+  privateContainerId?: string
+}
+
+/** `PermissionService.agentPrompts`. */
+export interface AgentPermissionPrompts {
+  /** Whether the tab's prompts are its agent's. */
+  takes(tabId: string): boolean
+  /** The agent's answer to the request, or null when the request is the user's to answer. */
+  ask(
+    request: PermissionPrompt,
+    details: PermissionRequestDetails
+  ): Promise<PermissionPromptAnswer | null> | null
+}
+
+export interface PermissionPromptCopy {
+  message: string
+  detail: string
+  okLabel: string
+  cancelLabel: string
+}
+
+/**
+ * A "Block" for these is a one-time answer: the site can ask again. Refusing to hand a link to
+ * another application once should not silence that application on the site for good.
+ */
+const ONE_SHOT_DENY = new Set(['openExternal'])
+
+/**
+ * Chrome blocks a permission for a site once its prompt was dismissed this many times in a row
+ * without an answer (the "ignored prompts" embargo).
+ */
+export const DISMISSALS_BEFORE_BLOCK = 3
+
+/**
+ * First-use notices remembered at most (the oldest go first when the cap is reached), as the
+ * install banner's engagement records are capped: a bounded file, and a site told long ago is
+ * told once more at worst.
+ */
+export const MAX_NOTICES = 200
+
+/** Longest URL or path shown inside a prompt. */
+const MAX_SHOWN = 80
+
+/**
+ * Chromium-style permission prompts with per-origin persistence. What a site gets without a
+ * decision of its own comes from the content-settings catalogue (`shared/contentSettings`):
+ * an answer (fullscreen is granted, USB refused) or a question, which the chrome shows as a
+ * non-modal per-tab prompt with Allow / Block / Allow once; the user may change any default in
+ * Settings, and every answer is remembered here.
+ *
+ * Keys are `${origin}|${permission}` where the permission may carry a qualifier after a colon
+ * (`openExternal:zoommtg`, `storage-access:https://embedder.example`), so one answer never covers
+ * a different scheme or a different embedding site. The origin is the site of `permissionSite`:
+ * local files share the one `file://` site, and pages without a site (`zen://`, `chrome-error://`)
+ * store nothing and are asked nothing; they get what the catalogue grants without a prompt.
+ *
+ * `permissions.json` is also the store of record for content settings the user sets without a
+ * prompt (ad and tracker blocking per site, and its default): the same `origin|permission` keys,
+ * so the site-information sheet lists and resets them like any other decision.
+ */
+export class PermissionService {
+  private decisions: Record<string, PermissionDecision> = {}
+  /** The devices sites are connected to, in the order they were granted. */
+  private devices: DeviceGrant[] = []
+  private readonly store: JsonStore<Persisted>
+  private readonly pending = new Map<string, Promise<boolean>>()
+  private readonly listeners = new Set<(change: PermissionChange) => void>()
+  /** Files the user chose in a save dialog this session (`origin|path`): writable, as in Chrome. */
+  private readonly savedFiles = new Set<string>()
+  /** "Allow once" grants: decision keys per tab, dropped when the tab leaves the site or closes. */
+  private readonly sessionAllows = new Map<string, Set<string>>()
+  /**
+   * Answers given in private (Chrome's Incognito rule): decision keys to decisions, per private
+   * container, never written to the store; a container's map goes with its session
+   * (`forgetContainer`). Read after the store, so a stored block is inherited and a stored allow
+   * too, and a private answer speaks only where the store is silent.
+   */
+  private readonly privateDecisions = new Map<string, Map<string, PermissionDecision>>()
+  /**
+   * Devices picked in a chooser of a private window or tab, per private container: the same
+   * Incognito rule for the device kinds. Never written to the store, read after it
+   * (`hasDeviceGrant`), gone with the session (`forgetContainer`). No list reads them –
+   * `deviceGrants` and `deviceGrantsFor` are the store's, as Chrome's Incognito shows no
+   * exceptions of its own.
+   */
+  private readonly privateDeviceGrants = new Map<string, DeviceGrant[]>()
+  /**
+   * Devices an AI agent picked on one of its tabs, per tab: in memory only, read last
+   * (`hasDeviceGrant`), gone when the tab stops being the agent's (`forgetAgentTab`). The engine
+   * asks per site, not per tab, so the site may use the device from another tab meanwhile.
+   */
+  private readonly agentDeviceGrants = new Map<string, DeviceGrant[]>()
+  /** Prompts dismissed without an answer, per decision key (reset by an answer). */
+  private readonly dismissals = new Map<string, number>()
+  /** Requests answered from a stored allow this session, per key (the notification review). */
+  private readonly hits = new Map<string, number>()
+  /**
+   * Sites told once about a permission that acts without asking (`noticed`), the oldest first:
+   * kept with the answers, device-local as they are, gone with the site's reset as they are.
+   */
+  private notices: string[] = []
+  /**
+   * The unused-sites clock (PS-41), by decision key, of the `allow` decisions the sweep can reach
+   * (`tracksLastVisit`): stamped when the user allows, refreshed by every page visit to the site.
+   */
+  private meta: Record<string, RuleMeta> = {}
+  /** Permissions the sweep took, one record per site, in the order they were made. */
+  private revoked: RevokedSitePermissions[] = []
+  /**
+   * The records an "Allow again" removed this session, by site, so its Undo can put each back
+   * with its old times (Chrome's undo carries the row's data; ours remembers it). In memory only.
+   */
+  private readonly regranted = new Map<string, RevokedSitePermissions>()
+  private override: PermissionOverride | null = null
+  /**
+   * The AI agents' side of the prompts (`AgentService.routePrompt`): a request of an agent's tab
+   * goes to its agent instead of the chrome, and its answer is never remembered for the user.
+   * The browser sets it once the agents exist; left unset, every prompt is the user's.
+   */
+  agentPrompts: AgentPermissionPrompts | null = null
+
+  constructor(
+    io: StoreIO,
+    private readonly prompts: PermissionPromptHost,
+    private readonly now: () => number = Date.now
+  ) {
+    this.store = new JsonStore<Persisted>(io, 'permissions.json', 500)
+    const data = this.store.readSync()
+    if (data?.version === 1 && data.decisions) this.decisions = data.decisions
+    if (data?.version === 1 && Array.isArray(data.devices))
+      this.devices = data.devices.filter(isDeviceGrant).map(sanitizeGrant)
+    if (data?.version === 1 && Array.isArray(data.noticed))
+      this.notices = data.noticed
+        .filter((key): key is string => typeof key === 'string' && key.includes('|'))
+        .slice(-MAX_NOTICES)
+    if (data?.version === 1 && data.meta !== undefined)
+      this.meta = sanitizeMeta(data.meta, this.decisions)
+    if (data?.version === 1 && Array.isArray(data.revokedUnused))
+      this.revoked = sanitizeRevoked(data.revokedUnused)
+  }
+
+  /**
+   * Synchronous check (`Notification.permission`, or the engine's own status question before it
+   * would prompt); never prompts, a question counts as no. Two exceptions: File System Access
+   * (`checkFileSystem`), and the device kinds, where the engine asks whether the site may open a
+   * chooser at all before it enumerates (`CanRequestDevicePermission`) – `ask` is that chooser,
+   * so only `deny` says no there; which device the site then gets is `hasDeviceGrant`'s.
+   */
+  check(permission: string, requestingOrigin: string, details?: PermissionRequestDetails): boolean {
+    if (permission === 'fileSystem') return this.checkFileSystem(requestingOrigin, details ?? {})
+    if (permission === 'storage-access' && sameSiteEmbedding(requestingOrigin, details)) return true
+    if (permission === 'media')
+      return mediaRows(details).every(
+        (row) => this.resolve(row, requestingOrigin, details) === 'allow'
+      )
+    if (isDeviceKind(permission))
+      return this.resolve(permission, requestingOrigin, details) !== 'deny'
+    return this.resolve(permission, requestingOrigin, details) === 'allow'
+  }
+
+  // ---------------------------------------------------------------------------
+  // Device grants: the data of the `usb` / `serial` / `hid` / `bluetooth` settings
+  // ---------------------------------------------------------------------------
+
+  /** Every device a site is connected to (Settings › Site settings). */
+  deviceGrants(): DeviceGrant[] {
+    return this.devices.map((grant) => ({ ...grant }))
+  }
+
+  /** The devices one site is connected to, of one kind or of every kind (the site-information rows). */
+  deviceGrantsFor(requestingOrigin: string, kind?: DeviceKind): DeviceGrant[] {
+    const origin = permissionSite(requestingOrigin)
+    if (!origin) return []
+    return this.devices
+      .filter((grant) => grant.origin === origin && (kind === undefined || grant.kind === kind))
+      .map((grant) => ({ ...grant }))
+  }
+
+  /**
+   * Whether the site is connected to this device: the engine's status question for a device it
+   * enumerated (`getDevices()`, `open()`), asked after `check()`. A site the setting refuses is
+   * connected to nothing. A grant from an earlier session names the device by identity; found
+   * again, it takes the device's id of this session so a later forget names the same thing.
+   * Asked from a private container, the store is read first and then the container's own grants
+   * (`resolve`'s order for a decision): a device connected in the regular profile stays connected
+   * in private, one picked in private is known to its private session alone.
+   */
+  hasDeviceGrant(
+    kind: DeviceKind,
+    requestingOrigin: string,
+    device: DeviceIdentity,
+    details?: DeviceGrantDetails
+  ): boolean {
+    if (this.resolve(kind, requestingOrigin, details) === 'deny') return false
+    const origin = permissionSite(requestingOrigin)
+    if (!origin) return false
+    const grant = this.devices.find(
+      (g) => g.origin === origin && g.kind === kind && sameDevice(g, device)
+    )
+    if (grant) {
+      if (grant.deviceId !== device.deviceId) {
+        grant.deviceId = device.deviceId
+        this.writeDevices({ permission: kind, origin })
+      }
+      return true
+    }
+    const agentGrant = [...this.agentDeviceGrants.values()]
+      .flat()
+      .find((g) => g.origin === origin && g.kind === kind && sameDevice(g, device))
+    if (agentGrant) {
+      agentGrant.deviceId = device.deviceId
+      return true
+    }
+    const container = details?.privateContainerId
+    if (!container) return false
+    const kept = this.privateDeviceGrants
+      .get(container)
+      ?.find((g) => g.origin === origin && g.kind === kind && sameDevice(g, device))
+    if (!kept) return false
+    kept.deviceId = device.deviceId
+    return true
+  }
+
+  /**
+   * The user picked the device in a chooser: the site is connected to it from now on. Picked in a
+   * private window or tab (`details.privateContainerId`), the connection lasts that private
+   * session and is never written to the store (Chrome's Incognito rule, as for an answer given
+   * in private).
+   */
+  grantDevice(
+    kind: DeviceKind,
+    requestingOrigin: string,
+    device: DeviceIdentity,
+    details?: DeviceGrantDetails
+  ): void {
+    const origin = permissionSite(requestingOrigin)
+    if (!origin) return
+    const grant: DeviceGrant = {
+      origin,
+      kind,
+      deviceId: device.deviceId,
+      name: device.name,
+      vendorId: device.vendorId ?? null,
+      productId: device.productId ?? null,
+      serialNumber: device.serialNumber ?? null,
+      grantedAt: this.now()
+    }
+    const agentTab = details?.agentTabId
+    if (agentTab) {
+      const kept = (this.agentDeviceGrants.get(agentTab) ?? []).filter(
+        (g) => g.origin !== origin || g.kind !== kind || !sameDevice(g, device)
+      )
+      this.agentDeviceGrants.set(agentTab, [...kept, grant])
+      return
+    }
+    const container = details?.privateContainerId
+    if (container) {
+      const kept = this.privateDeviceGrants.get(container) ?? []
+      const i = kept.findIndex(
+        (g) => g.origin === origin && g.kind === kind && sameDevice(g, device)
+      )
+      if (i >= 0) kept[i] = { ...grant, grantedAt: kept[i].grantedAt }
+      else kept.push(grant)
+      this.privateDeviceGrants.set(container, kept)
+      this.notify({ permission: kind, origin, container })
+      return
+    }
+    const i = this.devices.findIndex(
+      (g) => g.origin === origin && g.kind === kind && sameDevice(g, device)
+    )
+    if (i >= 0) this.devices[i] = { ...grant, grantedAt: this.devices[i].grantedAt }
+    else this.devices.push(grant)
+    this.writeDevices({ permission: kind, origin })
+  }
+
+  /**
+   * Take a site's connection to one device away (a page's `forget()`, the row's Revoke), or,
+   * without `device`, to every device of the kind. From a private container, only the session's
+   * own grants go: nothing done in private is written to the store.
+   */
+  forgetDevice(
+    kind: DeviceKind,
+    requestingOrigin: string,
+    device?: DeviceIdentity,
+    details?: DeviceGrantDetails
+  ): void {
+    const origin = permissionSite(requestingOrigin)
+    if (!origin) return
+    const keep = (g: DeviceGrant): boolean =>
+      g.origin !== origin || g.kind !== kind || (device !== undefined && !sameDevice(g, device))
+    for (const [tab, grants] of this.agentDeviceGrants) {
+      const left = grants.filter(keep)
+      if (left.length > 0) this.agentDeviceGrants.set(tab, left)
+      else this.agentDeviceGrants.delete(tab)
+    }
+    const container = details?.privateContainerId
+    if (container) {
+      const kept = this.privateDeviceGrants.get(container)
+      if (!kept) return
+      const left = kept.filter(keep)
+      if (left.length === kept.length) return
+      if (left.length > 0) this.privateDeviceGrants.set(container, left)
+      else this.privateDeviceGrants.delete(container)
+      this.notify({ permission: kind, origin, container })
+      return
+    }
+    const before = this.devices.length
+    this.devices = this.devices.filter(keep)
+    if (this.devices.length !== before) this.writeDevices({ permission: kind, origin })
+  }
+
+  private writeDevices(change: PermissionChange): void {
+    this.store.write(this.persisted())
+    this.notify(change)
+  }
+
+  /**
+   * The file's shape; a profile without device grants or notices keeps the shape it had before
+   * them.
+   */
+  private persisted(): Persisted {
+    const out: Persisted = { version: 1, decisions: this.decisions }
+    if (this.devices.length > 0) out.devices = this.devices
+    if (this.notices.length > 0) out.noticed = this.notices
+    if (Object.keys(this.meta).length > 0) out.meta = this.meta
+    if (this.revoked.length > 0) out.revokedUnused = this.revoked
+    return out
+  }
+
+  // ---------------------------------------------------------------------------
+  // First-use notices: a permission that acts without asking says so once per site
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Whether the site of `url` has been told about `permission` once – the desktop's first
+   * automatic picture-in-picture toast (MW-28) asks before it speaks. The memory is the
+   * answers' own (`permissions.json`, device-local, never synced) and goes with them: a site
+   * reset in Settings or the site card is told again, as it is asked again.
+   */
+  noticed(permission: string, url: string): boolean {
+    const origin = permissionSite(url)
+    return origin !== null && this.notices.includes(`${origin}|${permission}`)
+  }
+
+  /** The site of `url` has been told about `permission`: nothing is said again. */
+  markNoticed(permission: string, url: string): void {
+    const origin = permissionSite(url)
+    if (!origin) return
+    const key = `${origin}|${permission}`
+    if (this.notices.includes(key)) return
+    this.notices.push(key)
+    if (this.notices.length > MAX_NOTICES)
+      this.notices = this.notices.slice(this.notices.length - MAX_NOTICES)
+    this.store.write(this.persisted())
+  }
+
+  /** Forget the notices of `origin` (one permission, or all of them); true when any went. */
+  private forgetNotices(origin: string, permission?: string): boolean {
+    const left = this.notices.filter((key) => {
+      const split = key.lastIndexOf('|')
+      if (key.slice(0, split) !== origin) return true
+      return permission !== undefined && key.slice(split + 1) !== permission
+    })
+    if (left.length === this.notices.length) return false
+    this.notices = left
+    return true
+  }
+
+  /**
+   * File System Access under Electron: Chromium asks this check for a handle's status and only
+   * prompts when the answer is "ask", which a yes-or-no check cannot say, so the request prompt is
+   * never reached for a file. Hence: reading what the user picked or dropped is granted (Chrome
+   * grants it the same way), a folder's read answer comes from the picker's prompt, a file chosen
+   * in a save dialog is writable for the session, and any other write is refused while the user is
+   * asked, once the page has been interacted with; the answer is remembered for the site and the
+   * page's next attempt gets it.
+   */
+  private checkFileSystem(requestingOrigin: string, details: PermissionRequestDetails): boolean {
+    const stored = this.stored('fileSystem', requestingOrigin, details)
+    if (details.fileAccessType === 'readable') return details.isDirectory ? stored !== 'deny' : true
+    if (stored) return stored === 'allow'
+    const origin = permissionSite(requestingOrigin)
+    if (!origin) return false
+    const file = details.filePath ? `${origin}|${details.filePath}` : null
+    if (file && details.pickedForSaving) this.savedFiles.add(file)
+    if (file && this.savedFiles.has(file)) return true
+    if (details.pageActivated) void this.decide('fileSystem', requestingOrigin, details)
+    return false
+  }
+
+  /**
+   * What a request comes down to before anyone is asked: the site's own decision, an "Allow
+   * once" of the asking tab, the user's default for the permission, or the catalogue's built-in
+   * default (`ask` for the prompted ones). A page without a site gets only what needs no prompt.
+   */
+  resolve(
+    permission: string,
+    requestingUrl: string,
+    details?: PermissionRequestDetails
+  ): ContentDefault {
+    const origin = permissionSite(requestingUrl)
+    if (!origin) return this.siteless(permission, requestingUrl)
+    const overridden = this.overridden(permission, requestingUrl, details)
+    if (overridden) return overridden
+    const key = decisionKey(origin, permission, details)
+    const stored = this.decisions[key]
+    if (stored) return stored
+    if (details?.privateContainerId) {
+      const answered = this.privateDecisions.get(details.privateContainerId)?.get(key)
+      if (answered) return answered
+    }
+    if (details?.tabId && this.sessionAllows.get(details.tabId)?.has(key)) return 'allow'
+    return this.effectiveDefault(permission)
+  }
+
+  /**
+   * Extensions' content-setting rules rank above every answer of the user's (Chrome's order of
+   * providers); `setOverride` installs the provider, `overridesChanged` tells the listeners the
+   * affected permissions may resolve differently now (as a change of the defaults would).
+   */
+  setOverride(provider: PermissionOverride | null): void {
+    this.override = provider
+  }
+
+  overridesChanged(permissions: readonly string[]): void {
+    for (const permission of permissions) this.notify({ permission, origin: null })
+  }
+
+  private overridden(
+    permission: string,
+    requestingUrl: string,
+    details?: PermissionRequestDetails
+  ): ContentDefault | null {
+    if (!this.override) return null
+    return this.override(qualifiedPermission(permission, details), requestingUrl, details)
+  }
+
+  /**
+   * A page without a site (`zen://`, `chrome-error://`, `data:`, `about:blank`) cannot be asked
+   * about or remembered, so it gets what would be granted without a prompt anyway (fullscreen,
+   * pointer and keyboard lock, a clipboard write after a click) and is refused whatever a site
+   * would be asked about. Something that is not a URL at all gets nothing.
+   */
+  private siteless(permission: string, url: string): ContentDecision {
+    if (!safeUrl(url)) return 'deny'
+    return this.effectiveDefault(permission) === 'allow' ? 'allow' : 'deny'
+  }
+
+  /**
+   * The remembered answer for origin + permission (or the permission's default, see `defaultFor`),
+   * or null when the site would be asked.
+   */
+  stored(
+    permission: string,
+    requestingUrl: string,
+    details?: PermissionRequestDetails
+  ): PermissionDecision | null {
+    const origin = permissionSite(requestingUrl)
+    if (!origin) return null
+    const overridden = this.overridden(permission, requestingUrl, details)
+    if (overridden) return overridden === 'ask' ? null : overridden
+    return (
+      this.decisions[decisionKey(origin, permission, details)] ??
+      this.defaultFor(permission) ??
+      null
+    )
+  }
+
+  /** Remember an answer without prompting ("Always allow pop-ups on this site"). */
+  remember(
+    permission: string,
+    requestingUrl: string,
+    decision: PermissionDecision,
+    details?: PermissionRequestDetails
+  ): void {
+    const origin = permissionSite(requestingUrl)
+    if (!origin) return
+    this.keep(decisionKey(origin, permission, details), decision, details ?? {})
+  }
+
+  /** Forget one origin's answer for a permission: the site is asked (or blocked) again. */
+  forget(permission: string, requestingUrl: string, details?: PermissionRequestDetails): void {
+    const origin = permissionSite(requestingUrl)
+    if (!origin) return
+    const key = decisionKey(origin, permission, details)
+    this.update(key, null, changeFor(key))
+  }
+
+  /** Every remembered per-site answer (Settings lists and revokes them); defaults are not sites. */
+  rules(): PermissionRule[] {
+    const out: PermissionRule[] = []
+    for (const [key, decision] of Object.entries(this.decisions)) {
+      const split = key.lastIndexOf('|')
+      if (split < 0) continue
+      const origin = key.slice(0, split)
+      if (origin === DEFAULT_ORIGIN) continue
+      const rule: PermissionRule = { origin, permission: key.slice(split + 1), decision }
+      const meta = this.meta[key]
+      if (meta?.lastVisitedAt !== undefined) rule.lastVisitedAt = meta.lastVisitedAt
+      if (meta?.keepGranted) rule.keepGranted = true
+      out.push(rule)
+    }
+    return out.sort(
+      (a, b) => a.permission.localeCompare(b.permission) || a.origin.localeCompare(b.origin)
+    )
+  }
+
+  /** Forget one rule as Settings lists it (`permission` is the stored, qualified name). */
+  forgetRule(origin: string, permission: string): void {
+    const key = `${origin}|${permission}`
+    this.update(key, null, changeFor(key))
+  }
+
+  /**
+   * Decide a permission request: the resolved answer when there is one, else the prompt, shown
+   * once per origin + permission however many requests wait on it. Types the catalogue never
+   * asks about (pop-ups, unknown names) are refused without a question.
+   */
+  async decide(
+    permission: string,
+    requestingUrl: string,
+    details: PermissionRequestDetails = {}
+  ): Promise<boolean> {
+    const origin = permissionSite(requestingUrl)
+    if (!origin) return this.check(permission, requestingUrl, details)
+    if (permission === 'media') return this.decideMedia(origin, details)
+    // A frame of the embedding site itself already has its cookies (Chrome's
+    // `kAllowedBySameSite`): the Storage Access API resolves such a request on the spot, and no
+    // question is asked or remembered. Google's reCAPTCHA frames on google.com pages rely on it.
+    if (permission === 'storage-access' && sameSiteEmbedding(requestingUrl, details)) return true
+    const outcome = this.resolve(permission, requestingUrl, details)
+    const key = decisionKey(origin, permission, details)
+    if (outcome !== 'ask') {
+      if (outcome === 'allow') this.recordHit(key, details)
+      return outcome === 'allow'
+    }
+    if (promptLabelFor(permission) === null) return false
+    // The Storage Access API needs a gesture before it may ask (Chrome's
+    // `kDeniedByPrerequisites`): a request without one is refused at once, nothing shown.
+    if (isStorageAccessPermission(permission) && details.userGesture === false) return false
+    return this.askOnce(key, details, () => this.prompt(permission, origin, [key], details))
+  }
+
+  /**
+   * A `media` request asks for the camera and microphone rows it names: any row the site is
+   * refused refuses the request, and only the rows still open are asked about (one prompt,
+   * "camera and microphone" when both are).
+   */
+  private async decideMedia(origin: string, details: PermissionRequestDetails): Promise<boolean> {
+    const rows = mediaRows(details)
+    const outcomes = rows.map((row) => this.resolve(row, origin, details))
+    if (outcomes.some((outcome) => outcome === 'deny')) return false
+    const open = rows.filter((_row, i) => outcomes[i] === 'ask')
+    if (open.length === 0) {
+      for (const row of rows) this.recordHit(decisionKey(origin, row, details), details)
+      return true
+    }
+    const keys = open.map((row) => decisionKey(origin, row, details))
+    const permission = open.length === 1 ? open[0] : 'media'
+    return this.askOnce(keys.join('+'), details, () =>
+      this.prompt(permission, origin, keys, details)
+    )
+  }
+
+  /**
+   * Concurrent requests for the same question share one prompt and its answer – an agent's tab
+   * its own, so a user's tab never waits on an agent's question nor takes its answer.
+   */
+  private askOnce(
+    key: string,
+    details: PermissionRequestDetails,
+    ask: () => Promise<boolean>
+  ): Promise<boolean> {
+    const tabId = details.tabId
+    const pendingKey = tabId && this.agentPrompts?.takes(tabId) ? `${key}|${tabId}` : key
+    const inFlight = this.pending.get(pendingKey)
+    if (inFlight) return inFlight
+    const promise = ask().finally(() => this.pending.delete(pendingKey))
+    this.pending.set(pendingKey, promise)
+    return promise
+  }
+
+  private async prompt(
+    permission: string,
+    origin: string,
+    keys: string[],
+    details: PermissionRequestDetails
+  ): Promise<boolean> {
+    const copy = permissionPromptCopy(permission, origin, details)
+    const request: PermissionPrompt = {
+      id: newId('perm'),
+      tabId: details.tabId ?? null,
+      origin,
+      permission: contentSettingId(permission),
+      message: copy.message,
+      detail: copy.detail,
+      allowLabel: copy.okLabel,
+      blockLabel: copy.cancelLabel,
+      allowOnce: allowOnceFor(permission),
+      requestedAt: this.now()
+    }
+    const answer = await (this.agentPrompts?.ask(request, details) ?? this.prompts.show(request))
+    switch (answer) {
+      // Withdrawn (the page navigated away): refused this once, nothing counted or remembered.
+      case null:
+        return false
+      case 'allow':
+        for (const key of keys) {
+          this.dismissals.delete(key)
+          this.keep(key, 'allow', details)
+        }
+        return true
+      case 'allow-once':
+        for (const key of keys) this.dismissals.delete(key)
+        if (details.tabId) {
+          const grants = this.sessionAllows.get(details.tabId) ?? new Set<string>()
+          for (const key of keys) grants.add(key)
+          this.sessionAllows.set(details.tabId, grants)
+        }
+        return true
+      case 'block':
+        for (const key of keys) {
+          this.dismissals.delete(key)
+          if (!ONE_SHOT_DENY.has(permission)) this.keep(key, 'deny', details)
+        }
+        return false
+      case 'dismiss':
+        for (const key of keys) {
+          const count = (this.dismissals.get(key) ?? 0) + 1
+          if (count >= DISMISSALS_BEFORE_BLOCK && !ONE_SHOT_DENY.has(permission)) {
+            this.dismissals.delete(key)
+            this.keep(key, 'deny', details)
+          } else this.dismissals.set(key, count)
+        }
+        return false
+    }
+  }
+
+  /**
+   * An answer, kept where the request came from: the store for a regular window; the
+   * private container's own memory for a private one, which the store never sees (Chrome's
+   * Incognito rule – the regular profile's decisions are read in private, nothing is written
+   * back, and the memory ends with the session). The three-dismissals block takes the same path,
+   * so a site dismissed in private is not blocked for the regular profile.
+   */
+  private keep(key: string, decision: PermissionDecision, details: PermissionRequestDetails): void {
+    const container = details.privateContainerId
+    if (!container) {
+      this.update(key, decision, changeFor(key))
+      return
+    }
+    const answers = this.privateDecisions.get(container) ?? new Map<string, PermissionDecision>()
+    answers.set(key, decision)
+    this.privateDecisions.set(container, answers)
+    // The site-information sheet of a private tab reads `resolve`, so it hears of the change too
+    // – as the private container's, so a listener minding the regular profile's state can tell.
+    this.notify(changeFor(key, container))
+  }
+
+  /**
+   * The private session of `containerId` ended (no private window or tab is left): every answer
+   * given in it is forgotten, and every device picked in it, as Chrome forgets Incognito's on its
+   * last window closing. Every change says whose session ended (`PermissionChange.container`).
+   */
+  forgetContainer(containerId: string): void {
+    const answers = this.privateDecisions.get(containerId)
+    const grants = this.privateDeviceGrants.get(containerId)
+    this.privateDecisions.delete(containerId)
+    this.privateDeviceGrants.delete(containerId)
+    if (answers) for (const key of answers.keys()) this.notify(changeFor(key, containerId))
+    if (grants)
+      for (const grant of grants)
+        this.notify({ permission: grant.kind, origin: grant.origin, container: containerId })
+  }
+
+  /** The tab is no longer an AI agent's (released, closed, its session ended): its picks go. */
+  forgetAgentTab(tabId: string): void {
+    this.agentDeviceGrants.delete(tabId)
+  }
+
+  /** A stored allow answered a request. Private windows leave no trace in the activity either. */
+  private recordHit(key: string, details: PermissionRequestDetails): void {
+    if (details.privateContainerId) return
+    this.hits.set(key, (this.hits.get(key) ?? 0) + 1)
+  }
+
+  /**
+   * Sites whose stored allow for `permission` answered requests this session, busiest first:
+   * for notifications, how often a site showed one (each display is a request to the engine).
+   */
+  activity(permission: string): Array<{ origin: string; count: number }> {
+    const suffix = `|${permission}`
+    const out: Array<{ origin: string; count: number }> = []
+    for (const [key, count] of this.hits) {
+      if (!key.endsWith(suffix)) continue
+      const origin = key.slice(0, -suffix.length)
+      if (origin && origin !== DEFAULT_ORIGIN) out.push({ origin, count })
+    }
+    return out.sort((a, b) => b.count - a.count || a.origin.localeCompare(b.origin))
+  }
+
+  reset(): void {
+    const keys = Object.keys(this.decisions)
+    const goodbyes = [...this.devices.map((g) => grantChange(g)), ...this.privateGrantChanges()]
+    this.decisions = {}
+    this.devices = []
+    this.notices = []
+    this.meta = {}
+    this.revoked = []
+    this.regranted.clear()
+    this.savedFiles.clear()
+    this.sessionAllows.clear()
+    this.privateDecisions.clear()
+    this.privateDeviceGrants.clear()
+    this.agentDeviceGrants.clear()
+    this.dismissals.clear()
+    this.store.write(this.persisted())
+    for (const key of keys) this.notify(changeFor(key))
+    for (const change of goodbyes) this.notify(change)
+  }
+
+  /**
+   * The goodbye for every device picked in a private container still open, each as its
+   * container's change, for a reset to say alongside the store's.
+   */
+  private privateGrantChanges(): PermissionChange[] {
+    const out: PermissionChange[] = []
+    for (const [container, grants] of this.privateDeviceGrants)
+      for (const grant of grants) out.push(grantChange(grant, container))
+    return out
+  }
+
+  /**
+   * Clear browsing data's "Site settings": every per-site decision goes, and every device a
+   * site is connected to; the defaults the user chose in Settings stay (Chrome clears exceptions
+   * the same way).
+   */
+  resetSites(): void {
+    const removed = Object.keys(this.decisions).filter(
+      (key) => key.slice(0, key.lastIndexOf('|')) !== DEFAULT_ORIGIN
+    )
+    const goodbyes = [...this.devices.map((g) => grantChange(g)), ...this.privateGrantChanges()]
+    if (
+      removed.length === 0 &&
+      goodbyes.length === 0 &&
+      this.notices.length === 0 &&
+      this.revoked.length === 0 &&
+      this.savedFiles.size === 0 &&
+      this.sessionAllows.size === 0 &&
+      this.privateDecisions.size === 0
+    )
+      return
+    for (const key of removed) delete this.decisions[key]
+    this.devices = []
+    this.notices = []
+    this.meta = {}
+    this.revoked = []
+    this.regranted.clear()
+    this.savedFiles.clear()
+    this.sessionAllows.clear()
+    this.privateDecisions.clear()
+    this.privateDeviceGrants.clear()
+    this.agentDeviceGrants.clear()
+    this.dismissals.clear()
+    this.store.write(this.persisted())
+    for (const key of removed) this.notify(changeFor(key))
+    for (const change of goodbyes) this.notify(change)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Tab lifecycle: "Allow once" grants live with the tab and the site it is on
+  // ---------------------------------------------------------------------------
+
+  /** The tab committed a document of `url`: grants for other sites end. */
+  onTabNavigated(tabId: string, url: string): void {
+    const grants = this.sessionAllows.get(tabId)
+    if (!grants) return
+    const origin = permissionSite(url)
+    for (const key of grants) if (!origin || !key.startsWith(`${origin}|`)) grants.delete(key)
+    if (grants.size === 0) this.sessionAllows.delete(tabId)
+  }
+
+  onTabGone(tabId: string): void {
+    this.sessionAllows.delete(tabId)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Content settings: decisions made in Settings or the site-information sheet, no prompt
+  // ---------------------------------------------------------------------------
+
+  /** The decision stored for an origin and permission (no default, no prompt). */
+  get(permission: string, requestingOrigin: string): Decision | undefined {
+    const origin = permissionSite(requestingOrigin)
+    return origin ? this.decisions[`${origin}|${permission}`] : undefined
+  }
+
+  /** Remember a decision for an origin, or forget it with `null`. */
+  set(permission: string, requestingOrigin: string, decision: Decision | null): void {
+    const origin = permissionSite(requestingOrigin)
+    if (!origin) return
+    this.update(`${origin}|${permission}`, decision, { permission, origin })
+  }
+
+  /**
+   * A permission's default for origins without a decision of their own (`undefined`: none set).
+   * Defaults are kept per catalogue row: a qualified or aliased name reads its row's.
+   */
+  defaultFor(permission: string): Decision | undefined {
+    return this.decisions[`${DEFAULT_ORIGIN}|${contentSettingId(permission)}`]
+  }
+
+  setDefault(permission: string, decision: Decision | null): void {
+    const row = contentSettingId(permission)
+    this.update(`${DEFAULT_ORIGIN}|${row}`, decision, { permission: row, origin: null })
+  }
+
+  /** The default sites without a decision get: the user's, else the catalogue's. */
+  effectiveDefault(permission: string): ContentDefault {
+    return this.defaultFor(permission) ?? builtInDefault(permission)
+  }
+
+  /**
+   * Settings chose a default. `ask`, and the built-in default itself, clear the stored one so
+   * the catalogue answers again (and the blocking engine's master switch reads its row as before).
+   */
+  chooseDefault(permission: string, decision: ContentDefault): void {
+    const keep = decision !== 'ask' && decision !== builtInDefault(permission)
+    this.setDefault(permission, keep ? decision : null)
+  }
+
+  /** The effective default of every catalogue row (Settings › Site settings). */
+  defaults(rows: Iterable<string>): Record<string, ContentDefault> {
+    const out: Record<string, ContentDefault> = {}
+    for (const id of rows) out[id] = this.effectiveDefault(id)
+    return out
+  }
+
+  /** Every origin with its own decision for `permission` (the exception lists in Settings). */
+  listForPermission(permission: string): Array<{ origin: string; decision: Decision }> {
+    const suffix = `|${permission}`
+    const out: Array<{ origin: string; decision: Decision }> = []
+    for (const [key, decision] of Object.entries(this.decisions)) {
+      if (!key.endsWith(suffix)) continue
+      const origin = key.slice(0, -suffix.length)
+      if (origin && origin !== DEFAULT_ORIGIN && !origin.includes('|'))
+        out.push({ origin, decision })
+    }
+    return out.sort((a, b) => a.origin.localeCompare(b.origin))
+  }
+
+  /** Called after any decision changes (prompt, set, reset); returns the unsubscribe function. */
+  subscribe(listener: (change: PermissionChange) => void): () => void {
+    this.listeners.add(listener)
+    return () => {
+      this.listeners.delete(listener)
+    }
+  }
+
+  /** Write a pending change now (the quit path: a reset the on-exit clear made must land). */
+  flushSync(): void {
+    this.store.flushSync()
+  }
+
+  /**
+   * A decision the user made (a prompt's answer, a Settings row, a reset) lands here. An `allow`
+   * the sweep can reach starts its unused-sites clock now (a fresh grant is a fresh rule: no
+   * `keepGranted` survives it); a refusal or a forget carries none. And a change to any of a
+   * site's answers takes the site off the revoked list, as Chrome's `OnContentSettingChanged`
+   * does (`revoked_permissions_service.cc:263-268`): the user has looked at the site.
+   */
+  private update(key: string, decision: Decision | null, change: PermissionChange): void {
+    // A stored answer supersedes any "Allow once" for the same question.
+    for (const grants of this.sessionAllows.values()) grants.delete(key)
+    if ((this.decisions[key] ?? null) === decision) return
+    if (decision === null) delete this.decisions[key]
+    else this.decisions[key] = decision
+    if (decision === 'allow' && change.origin !== null && tracksLastVisit(change.permission))
+      this.meta[key] = { lastVisitedAt: coarseVisitTime(this.now()) }
+    else delete this.meta[key]
+    if (change.origin !== null) this.dropRevoked(change.origin)
+    this.store.write(this.persisted())
+    this.notify(change)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Unused sites (PS-41): the visit clock, the sweep, the revoked list and its review
+  // ---------------------------------------------------------------------------
+
+  /**
+   * A non-private tab committed a page of `url` (Chrome's `TabHelper::PrimaryPageChanged` →
+   * `UpdateLastVisitedTime`): every `allow` of the site the sweep can reach is stamped with this
+   * week. An allow from before the clock existed gets its first stamp here, so a site still
+   * visited eases into the sweep's reach and one never visited again stays out of it (Chrome
+   * 152 sweeps no unstamped rule either). Nothing is written when the week's stamp is already on;
+   * no change is announced – a stamp is not a decision, and the tab's commit pushes the state.
+   */
+  onPageVisited(url: string): void {
+    const origin = permissionSite(url)
+    if (!origin) return
+    const stamp = coarseVisitTime(this.now())
+    let changed = false
+    for (const [key, decision] of Object.entries(this.decisions)) {
+      if (decision !== 'allow' || !keyIsOf(key, origin)) continue
+      if (!tracksLastVisit(permissionOf(key))) continue
+      const meta = this.meta[key]
+      if (meta?.lastVisitedAt === stamp) continue
+      this.meta[key] = { ...meta, lastVisitedAt: stamp }
+      changed = true
+    }
+    if (changed) this.store.write(this.persisted())
+  }
+
+  /**
+   * The sweep (Chrome's `UnusedSitePermissionsManager`, daily): records past their 30 days go;
+   * then, when `revoke` (the "Automatically remove permissions from unused sites" setting), every
+   * `allow` the sweep can reach (`tracksLastVisit`) whose site's stamp is older than 60 days –
+   * never one the user allowed again (`keepGranted`), never one no visit has stamped, never a
+   * default, never a device grant, never anything answered in private (never stored) – is deleted,
+   * so the site asks again, and named in the site's record (`revokedAt` now, `expiresAt` 30 days
+   * on; an existing record grows and its clock restarts). One change per key, as a reset says it.
+   */
+  sweepUnused(revoke: boolean, now: number = this.now()): UnusedPermissionsSweepResult {
+    const kept = this.revoked.filter((record) => record.expiresAt > now)
+    const expired = this.revoked.length - kept.length
+    this.revoked = kept
+    const taken = new Map<string, string[]>()
+    if (revoke) {
+      const before = now - UNUSED_PERMISSION_MS
+      for (const [key, decision] of Object.entries(this.decisions)) {
+        if (decision !== 'allow') continue
+        const origin = originOf(key)
+        if (origin === null) continue
+        const meta = this.meta[key]
+        if (!meta || meta.keepGranted || meta.lastVisitedAt === undefined) continue
+        if (meta.lastVisitedAt >= before || !tracksLastVisit(permissionOf(key))) continue
+        const list = taken.get(origin) ?? []
+        list.push(permissionOf(key))
+        taken.set(origin, list)
+      }
+    }
+    const revoked: RevokedSitePermissions[] = []
+    for (const [origin, permissions] of taken) {
+      for (const permission of permissions) {
+        const key = `${origin}|${permission}`
+        delete this.decisions[key]
+        delete this.meta[key]
+      }
+      revoked.push(
+        this.putRevoked({
+          origin,
+          permissions,
+          revokedAt: now,
+          expiresAt: now + REVOKED_PERMISSIONS_KEPT_MS
+        })
+      )
+    }
+    if (expired > 0 || revoked.length > 0) this.store.write(this.persisted())
+    for (const record of revoked)
+      for (const permission of record.permissions)
+        this.notify({ permission, origin: record.origin })
+    return { revoked: revoked.map(copyRecord), expired }
+  }
+
+  /** The revoked list as the Safety check reviews it: the newest revocation first. */
+  revokedUnused(): RevokedSitePermissions[] {
+    return this.revoked
+      .map(copyRecord)
+      .sort((a, b) => b.revokedAt - a.revokedAt || a.origin.localeCompare(b.origin))
+  }
+
+  /**
+   * "Allow again" (Chrome's `RegrantPermissionsForOrigin`): every permission in the site's record
+   * is allowed once more, each marked `keepGranted` so no later sweep takes it, and the record
+   * goes – remembered for `undoRegrantRevoked`.
+   */
+  regrantRevoked(requestingOrigin: string): void {
+    const origin = permissionSite(requestingOrigin)
+    const record = origin ? this.takeRevoked(origin) : null
+    if (!origin || !record) return
+    const stamp = coarseVisitTime(this.now())
+    for (const permission of record.permissions) {
+      const key = `${origin}|${permission}`
+      for (const grants of this.sessionAllows.values()) grants.delete(key)
+      this.decisions[key] = 'allow'
+      this.meta[key] = { lastVisitedAt: stamp, keepGranted: true }
+    }
+    this.regranted.set(origin, record)
+    this.store.write(this.persisted())
+    for (const permission of record.permissions) this.notify({ permission, origin })
+  }
+
+  /**
+   * The Undo of "Allow again" (Chrome's `UndoRegrantPermissionsForOrigin`): the answers go back
+   * to the way the sweep left them (deleted, `keepGranted` cleared) and the record returns with
+   * its old times. Nothing happens when nothing was allowed again this session, or the user has
+   * since changed one of the site's answers (which forgets the undo, as it drops the record).
+   */
+  undoRegrantRevoked(requestingOrigin: string): void {
+    const origin = permissionSite(requestingOrigin)
+    const record = origin ? this.regranted.get(origin) : undefined
+    if (!origin || !record) return
+    this.regranted.delete(origin)
+    for (const permission of record.permissions) {
+      const key = `${origin}|${permission}`
+      delete this.decisions[key]
+      delete this.meta[key]
+    }
+    this.putRevoked(record)
+    this.store.write(this.persisted())
+    for (const permission of record.permissions) this.notify({ permission, origin })
+  }
+
+  /**
+   * "Got it" (Chrome's `ClearRevokedPermissionsList`): the whole list goes, the permissions stay
+   * revoked; the records are returned so the chrome's Undo can `restoreRevokedList` them.
+   */
+  acknowledgeRevoked(): RevokedSitePermissions[] {
+    if (this.revoked.length === 0) return []
+    const records = this.revokedUnused()
+    this.revoked = []
+    this.store.write(this.persisted())
+    return records
+  }
+
+  /**
+   * The Undo of "Got it" (Chrome's `RestoreDeletedRevokedPermissionsList`): the records go back
+   * as they were. A site the sweep has made a new record for meanwhile keeps that record's times
+   * and gains the restored permissions; a malformed record is dropped.
+   */
+  restoreRevokedList(records: RevokedSitePermissions[]): void {
+    const restored = sanitizeRevoked(records)
+    if (restored.length === 0) return
+    for (const record of restored) {
+      const current = this.revoked.find((r) => r.origin === record.origin)
+      if (current)
+        this.putRevoked({ ...record, revokedAt: current.revokedAt, expiresAt: current.expiresAt })
+      else this.putRevoked(record)
+    }
+    this.store.write(this.persisted())
+  }
+
+  /**
+   * Put a site's record in place: merged with the record the site has (its permissions joined,
+   * the incoming times taken), else appended. Returns the record as it stands.
+   */
+  private putRevoked(record: RevokedSitePermissions): RevokedSitePermissions {
+    const i = this.revoked.findIndex((r) => r.origin === record.origin)
+    const permissions =
+      i >= 0
+        ? [...new Set([...this.revoked[i].permissions, ...record.permissions])]
+        : [...record.permissions]
+    const merged: RevokedSitePermissions = {
+      origin: record.origin,
+      permissions,
+      revokedAt: record.revokedAt,
+      expiresAt: record.expiresAt
+    }
+    if (i >= 0) this.revoked[i] = merged
+    else this.revoked.push(merged)
+    return merged
+  }
+
+  /** Take a site's record off the list; null when it has none. */
+  private takeRevoked(origin: string): RevokedSitePermissions | null {
+    const i = this.revoked.findIndex((r) => r.origin === origin)
+    if (i < 0) return null
+    const [record] = this.revoked.splice(i, 1)
+    return record
+  }
+
+  /**
+   * The user changed one of the site's answers: its record goes (Chrome drops the origin from
+   * the list on any change of its settings), and so does the undo of an "Allow again" – the
+   * answers it would put back are no longer the sweep's. True when the list changed.
+   */
+  private dropRevoked(origin: string): boolean {
+    this.regranted.delete(origin)
+    return this.takeRevoked(origin) !== null
+  }
+
+  private notify(change: PermissionChange): void {
+    for (const listener of [...this.listeners]) listener(change)
+  }
+
+  /** Every remembered decision for an origin (the site-information sheet lists these). */
+  listForOrigin(
+    requestingOrigin: string
+  ): Array<{ permission: string; decision: PermissionDecision }> {
+    const origin = permissionSite(requestingOrigin)
+    if (!origin) return []
+    const out: Array<{ permission: string; decision: PermissionDecision }> = []
+    for (const [key, decision] of Object.entries(this.decisions)) {
+      const split = key.lastIndexOf('|')
+      if (split < 0 || key.slice(0, split) !== origin) continue
+      out.push({ permission: key.slice(split + 1), decision })
+    }
+    return out.sort((a, b) => a.permission.localeCompare(b.permission))
+  }
+
+  /**
+   * Forget the decisions of an origin (one permission, or all of them): the site asks again.
+   * The devices the site is connected to go with the decision of their kind.
+   */
+  resetOrigin(requestingOrigin: string, permission?: string): void {
+    const origin = permissionSite(requestingOrigin)
+    if (!origin) return
+    const removed: string[] = []
+    for (const key of Object.keys(this.decisions)) {
+      const split = key.lastIndexOf('|')
+      if (split < 0 || key.slice(0, split) !== origin) continue
+      if (permission !== undefined && key.slice(split + 1) !== permission) continue
+      delete this.decisions[key]
+      delete this.meta[key]
+      removed.push(key)
+    }
+    // A reset is the user's look at the site: its revoked record goes with the answers.
+    const unlisted = this.dropRevoked(origin)
+    if (permission === undefined || permission === 'fileSystem') {
+      for (const file of this.savedFiles)
+        if (file.startsWith(`${origin}|`)) this.savedFiles.delete(file)
+    }
+    for (const grants of this.sessionAllows.values()) {
+      for (const key of grants) {
+        if (!key.startsWith(`${origin}|`)) continue
+        if (permission === undefined || key.slice(origin.length + 1) === permission)
+          grants.delete(key)
+      }
+    }
+    const dropped = this.devices.filter(
+      (g) => g.origin === origin && (permission === undefined || g.kind === permission)
+    )
+    if (dropped.length > 0) this.devices = this.devices.filter((g) => !dropped.includes(g))
+    const forgotten = this.forgetNotices(origin, permission)
+    if (removed.length === 0 && dropped.length === 0 && !forgotten && !unlisted) return
+    this.store.write(this.persisted())
+    for (const key of removed) this.notify(changeFor(key))
+    for (const grant of dropped)
+      if (!removed.includes(`${origin}|${grant.kind}`))
+        this.notify({ permission: grant.kind, origin })
+  }
+}
+
+/** The same device: the id of this session, else the identity Chrome persists a grant by. */
+function sameDevice(grant: DeviceGrant, device: DeviceIdentity): boolean {
+  if (grant.deviceId === device.deviceId) return true
+  const vendorId = device.vendorId ?? null
+  const productId = device.productId ?? null
+  const serialNumber = device.serialNumber ?? null
+  return (
+    vendorId !== null &&
+    productId !== null &&
+    serialNumber !== null &&
+    serialNumber !== '' &&
+    grant.vendorId === vendorId &&
+    grant.productId === productId &&
+    grant.serialNumber === serialNumber
+  )
+}
+
+function isDeviceGrant(value: unknown): value is DeviceGrant {
+  if (typeof value !== 'object' || value === null) return false
+  const g = value as Record<string, unknown>
+  return (
+    typeof g.origin === 'string' &&
+    typeof g.kind === 'string' &&
+    isDeviceKind(g.kind) &&
+    typeof g.deviceId === 'string' &&
+    typeof g.name === 'string'
+  )
+}
+
+/** A stored grant with every optional field in its proper shape (an edited or older file). */
+function sanitizeGrant(g: DeviceGrant): DeviceGrant {
+  return {
+    origin: g.origin,
+    kind: g.kind,
+    deviceId: g.deviceId,
+    name: g.name,
+    vendorId: typeof g.vendorId === 'number' ? g.vendorId : null,
+    productId: typeof g.productId === 'number' ? g.productId : null,
+    serialNumber: typeof g.serialNumber === 'string' ? g.serialNumber : null,
+    grantedAt: typeof g.grantedAt === 'number' ? g.grantedAt : 0
+  }
+}
+
+/** The site of a decision key; null for a default's (`DEFAULT_ORIGIN`) or a key without a site. */
+function originOf(key: string): string | null {
+  const split = key.lastIndexOf('|')
+  if (split <= 0) return null
+  const origin = key.slice(0, split)
+  return origin === DEFAULT_ORIGIN ? null : origin
+}
+
+/** The stored, qualified permission name of a decision key. */
+function permissionOf(key: string): string {
+  return key.slice(key.lastIndexOf('|') + 1)
+}
+
+/** Whether a decision key is one of `origin`'s. */
+function keyIsOf(key: string, origin: string): boolean {
+  return key.slice(0, key.lastIndexOf('|')) === origin
+}
+
+function copyRecord(record: RevokedSitePermissions): RevokedSitePermissions {
+  return { ...record, permissions: [...record.permissions] }
+}
+
+/**
+ * The unused-sites clock as the file holds it (`meta`), kept where it belongs: an `allow` the
+ * sweep can reach, a finite stamp floored to the week, the keep mark as exactly `true`. An
+ * entry for a decision that is gone, or that the sweep never reads, is dropped.
+ */
+function sanitizeMeta(
+  value: unknown,
+  decisions: Record<string, PermissionDecision>
+): Record<string, RuleMeta> {
+  const out: Record<string, RuleMeta> = {}
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return out
+  for (const [key, raw] of Object.entries(value)) {
+    if (decisions[key] !== 'allow' || originOf(key) === null) continue
+    if (!tracksLastVisit(permissionOf(key))) continue
+    if (typeof raw !== 'object' || raw === null) continue
+    const m = raw as Record<string, unknown>
+    const meta: RuleMeta = {}
+    if (
+      typeof m.lastVisitedAt === 'number' &&
+      Number.isFinite(m.lastVisitedAt) &&
+      m.lastVisitedAt >= 0
+    )
+      meta.lastVisitedAt = coarseVisitTime(m.lastVisitedAt)
+    if (m.keepGranted === true) meta.keepGranted = true
+    if (meta.lastVisitedAt !== undefined || meta.keepGranted) out[key] = meta
+  }
+  return out
+}
+
+function isRevokedRecord(value: unknown): value is RevokedSitePermissions {
+  if (typeof value !== 'object' || value === null) return false
+  const r = value as Record<string, unknown>
+  return (
+    typeof r.origin === 'string' &&
+    r.origin !== '' &&
+    r.origin !== DEFAULT_ORIGIN &&
+    !r.origin.includes('|') &&
+    Array.isArray(r.permissions) &&
+    r.permissions.length > 0 &&
+    r.permissions.every((p) => typeof p === 'string' && p !== '') &&
+    typeof r.revokedAt === 'number' &&
+    Number.isFinite(r.revokedAt) &&
+    typeof r.expiresAt === 'number' &&
+    Number.isFinite(r.expiresAt)
+  )
+}
+
+/**
+ * Revoked records as the file (or a chrome's Undo) hands them: well-formed ones only, one per
+ * site – a site named twice keeps the union of the permissions and the newer record's times.
+ */
+function sanitizeRevoked(value: unknown): RevokedSitePermissions[] {
+  const out: RevokedSitePermissions[] = []
+  if (!Array.isArray(value)) return out
+  for (const raw of value) {
+    if (!isRevokedRecord(raw)) continue
+    const record: RevokedSitePermissions = {
+      origin: raw.origin,
+      permissions: [...new Set(raw.permissions)],
+      revokedAt: raw.revokedAt,
+      expiresAt: raw.expiresAt
+    }
+    const i = out.findIndex((r) => r.origin === record.origin)
+    if (i < 0) {
+      out.push(record)
+      continue
+    }
+    const newer = record.revokedAt >= out[i].revokedAt ? record : out[i]
+    out[i] = {
+      origin: record.origin,
+      permissions: [...new Set([...out[i].permissions, ...record.permissions])],
+      revokedAt: newer.revokedAt,
+      expiresAt: newer.expiresAt
+    }
+  }
+  return out
+}
+
+/** The camera / microphone rows a `media` request names (both when the host does not say). */
+function mediaRows(details?: PermissionRequestDetails): string[] {
+  const types = details?.mediaTypes
+  if (!types || types.length === 0) return [...MEDIA_ROWS]
+  const rows: string[] = []
+  if (types.includes('video')) rows.push('camera')
+  if (types.includes('audio')) rows.push('microphone')
+  return rows.length > 0 ? rows : [...MEDIA_ROWS]
+}
+
+/** The change a decision key names; `container` when the decision is a private container's. */
+function changeFor(key: string, container?: string): PermissionChange {
+  const split = key.lastIndexOf('|')
+  const origin = key.slice(0, split)
+  const change: PermissionChange = {
+    permission: key.slice(split + 1),
+    origin: origin === DEFAULT_ORIGIN ? null : origin
+  }
+  if (container !== undefined) change.container = container
+  return change
+}
+
+/** The change a device grant's coming or going is; `container` when it is a private container's. */
+function grantChange(grant: DeviceGrant, container?: string): PermissionChange {
+  const change: PermissionChange = { permission: grant.kind, origin: grant.origin }
+  if (container !== undefined) change.container = container
+  return change
+}
+
+/** The stored key for a request; qualifiers keep unrelated answers apart. */
+export function decisionKey(
+  origin: string,
+  permission: string,
+  details?: PermissionRequestDetails
+): string {
+  return `${origin}|${qualifiedPermission(permission, details)}`
+}
+
+export function qualifiedPermission(
+  permission: string,
+  details?: PermissionRequestDetails
+): string {
+  if (permission === 'openExternal') {
+    const scheme = schemeOf(details?.externalUrl ?? '')
+    return scheme ? `openExternal:${scheme}` : permission
+  }
+  if (permission === 'storage-access') {
+    const embedder = safeOrigin(details?.embedderUrl ?? '')
+    return embedder && embedder !== 'null' ? `storage-access:${embedder}` : permission
+  }
+  // Viewing the folders a site is handed and editing what it is handed are separate answers.
+  if (permission === 'fileSystem' && details?.fileAccessType === 'readable')
+    return 'fileSystem:read'
+  // Engine variants of a row (approximate location, periodic background sync) share its answer.
+  return permission.includes(':') ? permission : contentSettingId(permission)
+}
+
+/** The words of a permission prompt, shared by every host so the copy matches everywhere. */
+export function permissionPromptCopy(
+  permission: string,
+  origin: string,
+  details: PermissionRequestDetails = {}
+): PermissionPromptCopy {
+  const site = displayOrigin(origin)
+  const remembered = 'Your choice is remembered for this site.'
+  switch (permission) {
+    case 'openExternal': {
+      const scheme = schemeOf(details.externalUrl ?? '')
+      const what = scheme ? `${scheme}: links in another app` : 'another app'
+      const link = details.externalUrl ? `\n${shorten(details.externalUrl)}` : ''
+      const scope = scheme ? `${scheme}: links on this site` : 'this site'
+      return {
+        message: `Allow ${site} to open ${what}?`,
+        detail: `Ione hands the link to an application outside the browser.${link}\nChoosing Open is remembered for ${scope}.`,
+        okLabel: 'Open',
+        cancelLabel: 'Cancel'
+      }
+    }
+    case 'fileSystem': {
+      const target = details.filePath
+        ? `"${shorten(basename(details.filePath))}"`
+        : details.isDirectory
+          ? 'this folder'
+          : 'this file'
+      const message =
+        details.fileAccessType === 'readable'
+          ? `Allow ${site} to view ${details.isDirectory ? `the files in ${target}` : target}?`
+          : `Allow ${site} to save changes to ${target}?`
+      const scope =
+        details.fileAccessType === 'readable'
+          ? 'read everything in the folders you pick on it'
+          : 'edit the files and folders you pick on it'
+      return {
+        message,
+        detail: `The site can ${scope} until you take the permission away. ${remembered}`,
+        okLabel: details.fileAccessType === 'readable' ? 'View files' : 'Save changes',
+        cancelLabel: 'Block'
+      }
+    }
+    case 'storage-access': {
+      const embedder = safeOrigin(details.embedderUrl ?? '')
+      const where =
+        embedder && embedder !== 'null' ? ` while you are on ${displayOrigin(embedder)}` : ''
+      return {
+        message: `Allow ${site} to use cookies and site data it has stored${where}?`,
+        detail: `${site} is embedded in the page and wants to see you as signed in there. ${remembered}`,
+        okLabel: 'Allow',
+        cancelLabel: 'Block'
+      }
+    }
+    // Chrome's "This site is trying to download multiple files" (PS-71), asked when a page
+    // starts another download without a click of the user's behind it.
+    case 'automatic-downloads':
+      return {
+        message: `Allow ${site} to download multiple files?`,
+        detail: `The page started another download on its own. ${remembered}`,
+        okLabel: 'Allow',
+        cancelLabel: 'Block'
+      }
+    default: {
+      const label = promptLabelFor(permission) ?? `use "${permission}"`
+      return {
+        message: `Allow ${site} to ${label}?`,
+        detail: remembered,
+        okLabel: 'Allow',
+        cancelLabel: 'Block'
+      }
+    }
+  }
+}
+
+/**
+ * `https://example.com` → `example.com`; local files are `file:///`, as Chrome names their site;
+ * other schemes keep their prefix so they stay honest.
+ */
+export function displayOrigin(origin: string): string {
+  if (origin === FILE_SITE) return 'file:///'
+  return origin.replace(/^https:\/\//, '')
+}
+
+export function schemeOf(url: string): string {
+  const m = /^([a-z][a-z0-9+.-]*):/i.exec(url.trim())
+  return m ? m[1].toLowerCase() : ''
+}
+
+function basename(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, '')
+  const i = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  return i >= 0 ? trimmed.slice(i + 1) || trimmed : trimmed
+}
+
+function shorten(text: string): string {
+  return text.length > MAX_SHOWN ? `${text.slice(0, MAX_SHOWN - 1)}…` : text
+}
+
+export function safeOrigin(url: string): string {
+  try {
+    return new URL(url).origin
+  } catch {
+    return ''
+  }
+}
+
+/** The Storage Access API's two rows: `document.requestStorageAccess` and `requestStorageAccessFor`. */
+export function isStorageAccessPermission(permission: string): boolean {
+  return permission === 'storage-access' || permission === 'top-level-storage-access'
+}
+
+/**
+ * Whether a frame's storage-access request comes from the embedding page's own site: the same
+ * scheme and registrable domain (`www.google.com` in `google.com`, never `http:` in `https:`),
+ * which is what the web platform grants without a question. False when the host did not say
+ * which page embeds the frame.
+ */
+export function sameSiteEmbedding(
+  requestingUrl: string,
+  details?: PermissionRequestDetails
+): boolean {
+  const embedder = details?.embedderUrl
+  if (!embedder) return false
+  const scheme = schemeOf(requestingUrl)
+  if (!scheme || scheme !== schemeOf(embedder)) return false
+  return isSameSite(requestingUrl, embedder)
+}
+
+/**
+ * The site a page's permissions are decided for and remembered under: a web page's origin;
+ * `FILE_SITE` for every local file, whose origin is opaque (`new URL('file:///x').origin` is
+ * 'null') but which Chrome treats as one site; null for pages that have no site to remember
+ * anything for (`zen://`, `chrome-error://`, `data:`, `about:blank`) and for what is not a URL.
+ */
+export function permissionSite(url: string): string | null {
+  const parsed = safeUrl(url)
+  if (!parsed) return null
+  if (parsed.protocol === 'file:') return FILE_SITE
+  return parsed.origin && parsed.origin !== 'null' ? parsed.origin : null
+}
+
+function safeUrl(url: string): URL | null {
+  try {
+    return new URL(url)
+  } catch {
+    return null
+  }
+}

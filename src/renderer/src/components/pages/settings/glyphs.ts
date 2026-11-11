@@ -1,0 +1,71 @@
+import type { LucideIcon } from 'lucide-react'
+import {
+  Accessibility,
+  Activity,
+  AppWindow,
+  Bot,
+  CircleFadingArrowUp,
+  Container,
+  Download,
+  Eye,
+  Gauge,
+  Globe,
+  Import,
+  Info,
+  KeyRound,
+  Keyboard,
+  Languages,
+  Layers,
+  LayoutGrid,
+  Paintbrush,
+  PanelLeft,
+  Puzzle,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Settings,
+  Shield,
+  ShieldCheck,
+  UserRound,
+  Waypoints,
+  Zap
+} from 'lucide-react'
+
+/**
+ * The glyph of each Settings category on the phone landing (v2 §10.2: the desktop nav's icon
+ * set, 20 px at stroke 1.75, `--v2-text`). Looked up as `SECTION_GLYPHS[id] ?? SECTION_GLYPH`:
+ * a category registered without one gets the gear.
+ */
+export const SECTION_GLYPHS: Readonly<Record<string, LucideIcon>> = {
+  look: Eye,
+  accessibility: Accessibility,
+  compact: PanelLeft,
+  newtab: LayoutGrid,
+  tabs: Layers,
+  performance: Activity,
+  downloads: Download,
+  privacy: Shield,
+  resources: Gauge,
+  search: Search,
+  autofill: KeyRound,
+  languages: Languages,
+  spaces: Waypoints,
+  containers: Container,
+  boosts: Zap,
+  mods: Paintbrush,
+  extensions: Puzzle,
+  apps: AppWindow,
+  agents: Bot,
+  passwords: KeyRound,
+  security: ShieldCheck,
+  account: UserRound,
+  sync: RefreshCw,
+  import: Import,
+  shortcuts: Keyboard,
+  'default-browser': Globe,
+  updates: CircleFadingArrowUp,
+  reset: RotateCcw,
+  about: Info
+}
+
+export const SECTION_GLYPH: LucideIcon = Settings

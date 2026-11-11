@@ -1,0 +1,569 @@
+// @vitest-environment happy-dom
+import { act, useRef, type JSX, type ReactElement } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { DEFAULT_SETTINGS } from '@shared/defaults'
+import type { LayoutReport, Rect, Space, Tab, UIState } from '@shared/types'
+import { run } from '@renderer/lib/api'
+import { viewportStore, type FormFactor } from '@renderer/lib/formFactor'
+import { landingStore } from '@renderer/lib/fullscreenLanding'
+import { stageStore, type OverviewPhase } from '@renderer/lib/gestures/stage'
+import { registerRecedeLayer, recedeScale, type RecedeHandle } from '@renderer/lib/motion/recede'
+import { movePage, resetPageBand, seatBand } from '@renderer/lib/pageBand'
+import { contentAreaStore, uiStore } from '@renderer/lib/ui'
+import { useLayoutReporter } from '../useLayoutReporter'
+
+vi.mock('@renderer/lib/api', () => ({
+  cmd: vi.fn(async () => null),
+  run: vi.fn(),
+  onEvent: vi.fn(() => () => undefined)
+}))
+
+/*
+ * The layout reporter under the recede (v2 §11.1; PERF-4's audit, finding 2). A setting written
+ * while a sheet is up – the bar-position picker – has the reporter measure the viewport while
+ * the content frame stands at `scale(.97)`; `getBoundingClientRect()` read through that scale
+ * laid the page out 20 to 24 CSS px short until the next hide or return, and every bar-hide run's
+ * growth claims flaked on the stale `page 783 vs 805`. Two things put it right: the measure is
+ * the frame's LAYOUT box (the painted one run back through the frame's computed transform), and
+ * the frame is measured once more the moment the recede returns to 0.
+ */
+
+const tab = {
+  id: 't1',
+  spaceId: 'space',
+  containerId: 'default',
+  url: 'https://example.com/long',
+  title: 'Example',
+  loading: false
+} as unknown as Tab
+
+const space = {
+  id: 'space',
+  name: 'Work',
+  containerId: 'default',
+  tabIds: ['t1'],
+  activeTabId: 't1'
+} as unknown as Space
+
+function state(edge: 'top' | 'bottom'): UIState {
+  return {
+    platform: 'android',
+    tabs: { t1: tab },
+    spaces: [space],
+    activeSpaceId: 'space',
+    essentialTabIds: [],
+    folders: [],
+    splitGroups: {},
+    sidePanel: null,
+    glance: null,
+    settings: { ...DEFAULT_SETTINGS, phoneBarPosition: edge },
+    window: { kind: 'normal', fullscreen: false, htmlFullscreenTabId: null }
+  } as unknown as UIState
+}
+
+/** The phone's content frame with the bar at the bottom edge, and the viewport under a 3 px load bar. */
+const frameBox: Rect = { x: 8, y: 80, width: 396, height: 715 }
+const viewportBox: Rect = { x: 8, y: 83, width: 396, height: 712 }
+const centre = { x: frameBox.width / 2, y: frameBox.height / 2 }
+
+/** `rect` as the frame's scale `s` about its centre paints it. */
+function paint(rect: Rect, s: number): Rect {
+  const ox = frameBox.x + centre.x
+  const oy = frameBox.y + centre.y
+  return {
+    x: ox + (rect.x - ox) * s,
+    y: oy + (rect.y - oy) * s,
+    width: rect.width * s,
+    height: rect.height * s
+  }
+}
+
+/** What the DOM reports this frame: the painted boxes, and the frame's computed transform. */
+const painted = { frame: frameBox, viewport: viewportBox, transform: 'none' }
+
+/** Paint the frame at recede `p` – with, or (a transform the frame does not know of) without, saying so. */
+function recedeTo(p: number, declared = true): void {
+  const s = recedeScale(p)
+  painted.frame = paint(frameBox, s)
+  painted.viewport = paint(viewportBox, s)
+  painted.transform = declared && s !== 1 ? `matrix(${s}, 0, 0, ${s}, 0, 0)` : 'none'
+}
+
+function Probe({ state }: { state: UIState }): JSX.Element {
+  const viewportRef = useRef<HTMLDivElement>(null)
+  const frameRef = useRef<HTMLDivElement>(null)
+  const sidePanelRef = useRef<HTMLDivElement>(null)
+  useLayoutReporter(viewportRef, frameRef, sidePanelRef, state, uiStore.get(), false)
+  return (
+    <div ref={frameRef} data-frame>
+      <div>
+        <div ref={viewportRef} data-viewport />
+      </div>
+    </div>
+  )
+}
+
+const area = (): Rect | null => contentAreaStore.get().area
+
+let root: Root | null = null
+let mount: HTMLElement | null = null
+
+function render(el: ReactElement): { rerender: (next: ReactElement) => void; unmount: () => void } {
+  mount = document.createElement('div')
+  document.body.appendChild(mount)
+  root = createRoot(mount)
+  act(() => root!.render(el))
+  return {
+    rerender: (next) => act(() => root!.render(next)),
+    unmount: () => cleanup()
+  }
+}
+
+function cleanup(): void {
+  if (root) act(() => root!.unmount())
+  root = null
+  mount?.remove()
+  mount = null
+}
+
+function close(actual: Rect | null, expected: Rect): void {
+  expect(actual).not.toBeNull()
+  expect(actual!.x).toBeCloseTo(expected.x, 6)
+  expect(actual!.y).toBeCloseTo(expected.y, 6)
+  expect(actual!.width).toBeCloseTo(expected.width, 6)
+  expect(actual!.height).toBeCloseTo(expected.height, 6)
+}
+
+describe('useLayoutReporter under the recede', () => {
+  const handles: RecedeHandle[] = []
+  let frames: Array<() => void>
+
+  beforeEach(() => {
+    frames = []
+    vi.stubGlobal('requestAnimationFrame', (cb: () => void) => {
+      frames.push(cb)
+      return frames.length
+    })
+    vi.stubGlobal('cancelAnimationFrame', () => undefined)
+    // happy-dom has no ResizeObserver; the transform is not a resize, so none is needed here.
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        observe = vi.fn()
+        disconnect = vi.fn()
+        unobserve = vi.fn()
+      }
+    )
+    recedeTo(0)
+    const rect = (r: Rect): DOMRect =>
+      ({
+        left: r.x,
+        top: r.y,
+        width: r.width,
+        height: r.height,
+        right: r.x + r.width,
+        bottom: r.y + r.height,
+        x: r.x,
+        y: r.y
+      }) as DOMRect
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (
+      this: Element
+    ) {
+      if (this.hasAttribute('data-frame')) return rect(painted.frame)
+      if (this.hasAttribute('data-viewport')) return rect(painted.viewport)
+      return rect({ x: 0, y: 0, width: 0, height: 0 })
+    })
+    const computed = window.getComputedStyle.bind(window)
+    vi.spyOn(window, 'getComputedStyle').mockImplementation((el: Element) =>
+      el.hasAttribute('data-frame')
+        ? ({
+            transform: painted.transform,
+            transformOrigin: `${centre.x}px ${centre.y}px`
+          } as unknown as CSSStyleDeclaration)
+        : computed(el)
+    )
+    contentAreaStore.set({ area: null })
+  })
+
+  afterEach(() => {
+    for (const h of handles.splice(0)) h.release()
+    cleanup()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+    contentAreaStore.set({ area: null })
+  })
+
+  const sheetUp = (): RecedeHandle => {
+    const h = registerRecedeLayer()
+    handles.push(h)
+    act(() => {
+      h.progress(1)
+      recedeTo(1)
+    })
+    return h
+  }
+
+  it('measures the layout box at rest', () => {
+    render(<Probe state={state('bottom')} />)
+    close(area(), viewportBox)
+    act(() => frames.splice(0).forEach((f) => f()))
+    act(() => frames.splice(0).forEach((f) => f()))
+    close(area(), viewportBox)
+  })
+
+  it('a setting written with a sheet up (the bar-position picker) measures through the receded frame and still reports the layout box', () => {
+    const { rerender } = render(<Probe state={state('bottom')} />)
+    close(area(), viewportBox)
+    const h = sheetUp()
+    // What the DOM paints: 3 percent short, the frame's 21 px – PERF-4's `page 783 vs 805`.
+    expect(viewportBox.height - painted.viewport.height).toBeGreaterThan(20)
+    // The picker writes the bar to the top edge: the reporter measures again, the sheet still up.
+    rerender(<Probe state={state('top')} />)
+    close(area(), viewportBox)
+    act(() => frames.splice(0).forEach((f) => f()))
+    close(area(), viewportBox)
+    // To the bit, not within ε: the run-back answers on the layout grid, so the re-measure at
+    // the recede's rest finds the same rect and reports nothing more – the store keeps the very
+    // object (an ε-different answer would cost one more `layout.report`, and the host a 1 px
+    // relayout, at the rest).
+    const under = area()
+    expect(under).toEqual(viewportBox)
+    act(() => {
+      recedeTo(0)
+      h.progress(0)
+    })
+    expect(area()).toBe(under)
+  })
+
+  it('measures once more the moment the recede returns to 0: a measure that missed a transform is put right at the rest', () => {
+    const { rerender } = render(<Probe state={state('bottom')} />)
+    const h = registerRecedeLayer()
+    handles.push(h)
+    // A scale the frame does not declare (the case the transform read cannot see): the painted
+    // box is all the measure has while the sheet is up.
+    act(() => {
+      h.progress(1)
+      recedeTo(1, false)
+    })
+    rerender(<Probe state={state('top')} />)
+    close(area(), paint(viewportBox, recedeScale(1)))
+    // The sheet on its way down: nothing measures at .5.
+    act(() => {
+      recedeTo(0.5, false)
+      h.progress(0.5)
+    })
+    close(area(), paint(viewportBox, recedeScale(1)))
+    // Landed: the frame is measured again at its rest, and the page has its whole height back.
+    act(() => {
+      recedeTo(0)
+      h.progress(0)
+    })
+    close(area(), viewportBox)
+  })
+
+  it('the rest re-measure stops with the hook', () => {
+    const { unmount } = render(<Probe state={state('bottom')} />)
+    unmount()
+    contentAreaStore.set({ area: null })
+    const h = registerRecedeLayer()
+    handles.push(h)
+    act(() => {
+      h.progress(1)
+      h.progress(0)
+    })
+    expect(area()).toBeNull()
+  })
+
+  /*
+   * A page's element in fullscreen (MOT-32): the chrome stays mounted under the host's
+   * fullscreen layer, so the reporter is mounted too – and reports nothing meanwhile: the core
+   * lays the fullscreen view over the window itself and keeps the layout from before the
+   * fullscreen to put the page back by. The first layout after the exit is reported whatever
+   * the last one said: the return fade waits on that report's placement (lib/fullscreenLanding.ts).
+   */
+  const fullscreen = (s: UIState, tabId: string | null): UIState =>
+    ({ ...s, window: { ...s.window, htmlFullscreenTabId: tabId } }) as UIState
+  const reports = (): number =>
+    vi.mocked(run).mock.calls.filter(([c]) => c === 'layout.report').length
+
+  it('reports no layout while a page is fullscreen, and the first one after it even when nothing changed', () => {
+    vi.mocked(run).mockClear()
+    landingStore.set({ settling: undefined, placed: new Map(), sized: new Map(), reports: 0 })
+    const { rerender } = render(<Probe state={state('bottom')} />)
+    expect(reports()).toBe(1)
+    const noted = landingStore.get().reports
+    expect(noted).toBeGreaterThan(0)
+    // The fullscreen: whatever the chrome lays out under the layer is no placement.
+    rerender(<Probe state={fullscreen(state('bottom'), 't1')} />)
+    act(() => frames.splice(0).forEach((f) => f()))
+    expect(reports()).toBe(1)
+    expect(landingStore.get().reports).toBe(noted)
+    // The exit: the layout is the one from before, and it is reported – and noted for the
+    // landing – all the same.
+    rerender(<Probe state={fullscreen(state('bottom'), null)} />)
+    expect(reports()).toBe(2)
+    expect(landingStore.get().reports).toBe(noted + 1)
+    const [, first] = vi.mocked(run).mock.calls.filter(([c]) => c === 'layout.report')[0]!
+    const [, after] = vi.mocked(run).mock.calls.filter(([c]) => c === 'layout.report')[1]!
+    expect(after).toEqual(first)
+    // Out of fullscreen an unchanged layout is not reported twice.
+    rerender(<Probe state={fullscreen(state('bottom'), null)} />)
+    expect(reports()).toBe(2)
+  })
+
+  /*
+   * "Hold ⌘Q to quit" over a hung page (session-08; the design lead's C4 on #486): the view
+   * gives way to its picture for the hold (`lib/quitHoldCover.ts` sets `quitHoldCover`), so the
+   * chrome's twin of the notice is seen over a frame the hung renderer keeps painted – the host
+   * hears it as `contentHidden`, the same word the "Page unresponsive" prompt hides the view by.
+   */
+  const lastReport = (): LayoutReport =>
+    vi
+      .mocked(run)
+      .mock.calls.filter(([c]) => c === 'layout.report')
+      .at(-1)![1] as LayoutReport
+
+  it('the hold’s cover over a hung page reports the views hidden, and their return with its close', () => {
+    vi.mocked(run).mockClear()
+    const desktop = { ...state('bottom'), platform: 'linux' } as UIState
+    const { rerender } = render(<Probe state={desktop} />)
+    expect(lastReport().contentHidden).toBe(false)
+    // A hold begins over the hung page: the cover stands (no picture to wait for here, so the
+    // hide is at once).
+    uiStore.set({ quitHoldCover: true })
+    rerender(<Probe state={{ ...desktop }} />)
+    expect(lastReport().contentHidden).toBe(true)
+    // The key is released: the cover goes and the live view comes back.
+    uiStore.set({ quitHoldCover: false })
+    rerender(<Probe state={{ ...desktop }} />)
+    expect(lastReport().contentHidden).toBe(false)
+  })
+
+  /*
+   * The first-run tour stands opaque over the whole window, and the page views composite above
+   * the chrome: the New Tab's view the window has from creation (#490) stood over the tour's
+   * panel once the bar stopped opening under the tour (#347) and its cover no longer hid the
+   * page. The tour reports the views hidden for as long as it stands (`firstRunCovers`; nothing
+   * to wait for – no picture is taken), and its end brings them back with the layout that follows.
+   */
+  const firstRun = (done: boolean, kind = 'synced'): UIState =>
+    ({
+      ...state('bottom'),
+      platform: 'linux',
+      settings: { ...DEFAULT_SETTINGS, onboardingDone: done },
+      window: { kind, chrome: 'full', fullscreen: false, htmlFullscreenTabId: null }
+    }) as unknown as UIState
+
+  it('the tour reports the views hidden until it ends, and their return with its end', () => {
+    vi.mocked(run).mockClear()
+    const { rerender } = render(<Probe state={firstRun(false)} />)
+    expect(lastReport().contentHidden).toBe(true)
+    // The tour's last click: the views come back with the layout that follows.
+    rerender(<Probe state={firstRun(true)} />)
+    expect(lastReport().contentHidden).toBe(false)
+  })
+
+  it('a window that never shows the tour (a blank or private one) reports its views as before', () => {
+    vi.mocked(run).mockClear()
+    render(<Probe state={firstRun(false, 'normal')} />)
+    expect(lastReport().contentHidden).toBe(false)
+  })
+
+  /*
+   * The EEA's search-engine choice screen (W6-2) stands where the tour stood: opaque over the
+   * whole window, so it reports the views hidden the same way (`firstRunCovers` counts
+   * `searchChoiceCovers`), until the choice is made or skipped.
+   */
+  const eeaFirstRun = (done: boolean, required: boolean): UIState =>
+    ({
+      ...firstRun(done),
+      searchChoice: { region: required ? 'DE' : 'US', eea: required, required, seed: 7 }
+    }) as unknown as UIState
+
+  it('the choice screen owed after the tour keeps the views hidden until the choice', () => {
+    vi.mocked(run).mockClear()
+    // In the EEA the tour's end leaves the choice screen standing: the views stay hidden until
+    // the choice is made or skipped, and return then.
+    const { rerender } = render(<Probe state={eeaFirstRun(false, true)} />)
+    expect(lastReport().contentHidden).toBe(true)
+    rerender(<Probe state={eeaFirstRun(true, true)} />)
+    expect(lastReport().contentHidden).toBe(true)
+    rerender(<Probe state={eeaFirstRun(true, false)} />)
+    expect(lastReport().contentHidden).toBe(false)
+  })
+
+  /*
+   * The phone's first-run tour (W6-HF2, hole 2), which `firstRunCovers` leaves out: the tour is
+   * the whole window, drawn in the chrome, and the pages lie above the chrome on Android – a page
+   * placed while it stands covers it (a fresh profile's first launch from a link: the VIEW
+   * intent's tab is active and loaded). The reporter reads the shell's own term for the tour
+   * (`phoneOnboardingCovers`, the phone's one window whatever its kind) and reports the content
+   * hidden from the FIRST report – the core applies none of a hidden report's placements
+   * (`Window.applyLayout`) – and the first layout after the tour's end places the page by the
+   * ordinary path. The tablet's tour is the desktop's: `firstRunCovers` hides the page under it
+   * (#528), and the phone's term stays out of it.
+   */
+  const fresh = (s: UIState): UIState =>
+    ({ ...s, settings: { ...s.settings, onboardingDone: false } }) as UIState
+  const done = (s: UIState): UIState =>
+    ({ ...s, settings: { ...s.settings, onboardingDone: true } }) as UIState
+  const layoutAs = (formFactor: FormFactor): void =>
+    viewportStore.set({ ...viewportStore.get(), formFactor })
+
+  it("reports the content hidden under the phone's tour from the first report, and places the page once the tour has ended", () => {
+    vi.mocked(run).mockClear()
+    const before = viewportStore.get()
+    layoutAs('phone')
+    try {
+      const { rerender } = render(<Probe state={fresh(state('bottom'))} />)
+      expect(reports()).toBe(1)
+      expect(lastReport().contentHidden).toBe(true)
+      // The tour's end (`onboarding.complete` puts the flag up): the next report shows the page.
+      rerender(<Probe state={done(state('bottom'))} />)
+      expect(reports()).toBe(2)
+      expect(lastReport().contentHidden).toBe(false)
+      expect(lastReport().placements.map((p) => p.tabId)).toEqual(['t1'])
+    } finally {
+      viewportStore.set(before)
+    }
+  })
+
+  it('a phone past its first run places the page as before', () => {
+    vi.mocked(run).mockClear()
+    const before = viewportStore.get()
+    layoutAs('phone')
+    try {
+      render(<Probe state={done(state('bottom'))} />)
+      expect(reports()).toBe(1)
+      expect(lastReport().contentHidden).toBe(false)
+      expect(lastReport().placements.map((p) => p.tabId)).toEqual(['t1'])
+    } finally {
+      viewportStore.set(before)
+    }
+  })
+
+  it("the tablet's tour is the desktop's: firstRunCovers hides the page under it (#528), the phone's term out of it", () => {
+    vi.mocked(run).mockClear()
+    const before = viewportStore.get()
+    layoutAs('tablet')
+    try {
+      // The synced window's tour (`onboardingCovers`, the term TabletShell mounts it on).
+      const { rerender } = render(<Probe state={firstRun(false)} />)
+      expect(reports()).toBe(1)
+      expect(lastReport().contentHidden).toBe(true)
+      // A window that never shows the tour: the page is placed, the phone's term not in play.
+      rerender(<Probe state={firstRun(false, 'normal')} />)
+      expect(lastReport().contentHidden).toBe(false)
+      expect(lastReport().placements.map((p) => p.tabId)).toEqual(['t1'])
+    } finally {
+      viewportStore.set(before)
+    }
+  })
+
+  /*
+   * Page visibility under the tab overview (OS-39, the lead's ruling on #728): a report that
+   * hides the pages under the overview – open or on its way open (`overviewInteractive`), the
+   * phone's and the tablet's one stage – carries `switchedAway`, and the host tells the pages
+   * under it they are hidden (`view.setVisible { switched: true }`). A report hidden under any
+   * other cover carries no flag, nor does one that shows the pages; the desktop, where the
+   * overview never opens, never carries one.
+   */
+  const overviewAt = (phase: OverviewPhase, target: 0 | 1 = 1): void =>
+    stageStore.set({ overview: { phase, progress: target, heroTabId: 't1', target } })
+  const overviewClosed = (): void =>
+    stageStore.set({ overview: { phase: 'closed', progress: 0, heroTabId: null, target: 0 } })
+
+  it('the pages hidden under the open overview report switchedAway; under a sheet, and shown again, no flag', () => {
+    vi.mocked(run).mockClear()
+    try {
+      const { rerender } = render(<Probe state={state('bottom')} />)
+      expect(lastReport().contentHidden).toBe(false)
+      expect('switchedAway' in lastReport()).toBe(false)
+      // The stage hides the page as the overview begins to open (its drag): a cover, no word yet.
+      uiStore.set({ stageActive: true })
+      overviewAt('dragging')
+      rerender(<Probe state={state('bottom')} />)
+      expect(lastReport().contentHidden).toBe(true)
+      expect('switchedAway' in lastReport()).toBe(false)
+      // On its way open (the tabs button's spring), then open: the hide is a switch.
+      overviewAt('settling')
+      rerender(<Probe state={state('bottom')} />)
+      expect(lastReport()).toMatchObject({ contentHidden: true, switchedAway: true })
+      overviewAt('open')
+      rerender(<Probe state={state('bottom')} />)
+      expect(lastReport()).toMatchObject({ contentHidden: true, switchedAway: true })
+      // Closed on the page's own card: the page is shown again, and nothing is switched.
+      overviewClosed()
+      uiStore.set({ stageActive: false })
+      rerender(<Probe state={state('bottom')} />)
+      expect(lastReport().contentHidden).toBe(false)
+      expect('switchedAway' in lastReport()).toBe(false)
+      // A sheet over the page (a hold's cover here): hidden, and no flag – not a switch.
+      uiStore.set({ quitHoldCover: true })
+      rerender(<Probe state={state('bottom')} />)
+      expect(lastReport().contentHidden).toBe(true)
+      expect('switchedAway' in lastReport()).toBe(false)
+    } finally {
+      uiStore.set({ stageActive: false, quitHoldCover: false })
+      overviewClosed()
+    }
+  })
+
+  it('a desktop report never carries the flag: no overview opens there, and a cover is a cover', () => {
+    vi.mocked(run).mockClear()
+    const desktop = { ...state('bottom'), platform: 'linux' } as UIState
+    const { rerender } = render(<Probe state={desktop} />)
+    expect('switchedAway' in lastReport()).toBe(false)
+    uiStore.set({ quitHoldCover: true })
+    rerender(<Probe state={{ ...desktop }} />)
+    expect(lastReport().contentHidden).toBe(true)
+    expect('switchedAway' in lastReport()).toBe(false)
+    uiStore.set({ quitHoldCover: false })
+  })
+
+  /*
+   * The page-edge band's seat (motion spec §3.4, lib/pageBand.ts): the desktop's band host
+   * seats the band's height once per travel, and the reporter lays the page out under it in the
+   * same flush – the page's rect less the seat at its top – naming the seat and the page's
+   * present offset in the report, so the core places the views by their difference. Nothing is
+   * said while nothing is seated and the page is home (Android's reports, every one).
+   */
+  it('lays the page out under the band’s seat in the flush that seats it, and names the seat and the offset', () => {
+    vi.mocked(run).mockClear()
+    resetPageBand()
+    try {
+      const desktop = { ...state('bottom'), platform: 'linux' } as UIState
+      render(<Probe state={desktop} />)
+      expect(reports()).toBe(1)
+      const home = lastReport()
+      expect(home.band).toBeUndefined()
+      const [full] = home.placements
+      // The band's rest: the page goes 56 down and 56 shorter, in one report, with the word.
+      act(() => {
+        movePage(56)
+        seatBand(56)
+      })
+      expect(reports()).toBe(2)
+      const seated = lastReport()
+      expect(seated.band).toEqual({ seat: 56, offset: 56 })
+      expect(seated.placements[0].rect).toEqual({
+        ...full.rect,
+        y: full.rect.y + 56,
+        height: full.rect.height - 56
+      })
+      // A band seats the page; it is no switch away from it (OS-39's flag stays the overview's).
+      expect('switchedAway' in seated).toBe(false)
+      // The leave's departure: home again at once, the page still 56 down by the word.
+      act(() => seatBand(0))
+      expect(reports()).toBe(3)
+      expect(lastReport().band).toEqual({ seat: 0, offset: 56 })
+      expect(lastReport().placements[0].rect).toEqual(full.rect)
+      // The frames are the host's, not the reporter's: a frame reports no layout.
+      act(() => movePage(30))
+      expect(reports()).toBe(3)
+    } finally {
+      resetPageBand()
+    }
+  })
+})

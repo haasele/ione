@@ -1,0 +1,1519 @@
+// @vitest-environment happy-dom
+import { act, createElement } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type {
+  ClosedEntrySummary,
+  HistoryDayGroup,
+  SyncDeviceTabs,
+  SyncStatus,
+  Tab,
+  UIState
+} from '@shared/types'
+import { dayKeyOf } from '@shared/dayKey'
+
+/*
+ * The History page tab (design language v2 §10.1; Chrome's chrome://history): the title block
+ * with "Delete browsing data…", the search field that filters through `history.grouped` and
+ * moves the tab's URL to `zen://history?q=` without a history entry, the day groups as §9.27
+ * headings (their ⋮ on approach) over §9.21 two-line rows with no slot held at rest, selection
+ * as a mode (§9.6, §10.1: entered by Ctrl/Shift-click, the row menu's Select or Ctrl+A, the
+ * checkbox column on every row while it lasts, the count, Delete and Cancel in the title block's
+ * slot), Recently closed as the page's first group, the other devices' tabs after it (ID-28:
+ * each device its own group, folding for the session; the one "Tabs from other devices" group
+ * with its §9.17 line and the row to Settings › Sync when there is nothing to list), and the
+ * §9.17 empty state.
+ */
+
+;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+
+const DAY = 86_400_000
+// A pinned local noon (the clock is faked to it in `beforeEach`): the fixtures' "today" and
+// "yesterday" are the page's whatever the hour the run happens at – a run straddling midnight
+// used to relabel the day groups under the assertions.
+const NOW = new Date(2026, 8, 16, 12, 0, 0).getTime()
+const TODAY = dayKeyOf(NOW)
+const YESTERDAY = dayKeyOf(NOW - DAY)
+const WEEKDAY = dayKeyOf(NOW - 3 * DAY)
+const DATED = dayKeyOf(NOW - 10 * DAY)
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+
+const GROUPS: HistoryDayGroup[] = [
+  {
+    dayKey: TODAY,
+    visits: [
+      {
+        id: 'v1',
+        url: 'https://example.com/docs',
+        title: 'Example docs',
+        favicon: null,
+        visitTime: NOW - 60_000,
+        transition: 'link'
+      },
+      {
+        id: 'v2',
+        url: 'https://news.example.org/story',
+        title: 'A story',
+        favicon: null,
+        visitTime: NOW - 120_000,
+        transition: 'typed'
+      }
+    ]
+  },
+  {
+    dayKey: YESTERDAY,
+    visits: [
+      {
+        id: 'v3',
+        url: 'https://zen-browser.app/',
+        title: 'Zen',
+        favicon: null,
+        visitTime: NOW - DAY,
+        transition: 'link'
+      }
+    ]
+  },
+  {
+    dayKey: WEEKDAY,
+    visits: [
+      {
+        id: 'v4',
+        url: 'https://react.dev/',
+        title: 'React',
+        favicon: null,
+        visitTime: NOW - 3 * DAY,
+        transition: 'link'
+      }
+    ]
+  },
+  {
+    dayKey: DATED,
+    visits: [
+      {
+        id: 'v5',
+        url: 'https://developer.mozilla.org/',
+        title: 'MDN',
+        favicon: null,
+        visitTime: NOW - 10 * DAY,
+        transition: 'link'
+      }
+    ]
+  }
+]
+
+const CLOSED: ClosedEntrySummary[] = [
+  {
+    id: 'c1',
+    kind: 'tab',
+    title: 'Settings',
+    url: 'zen://settings',
+    favicon: null,
+    closedAt: NOW - 30_000,
+    tabCount: 1
+  },
+  {
+    id: 'c2',
+    kind: 'tab',
+    title: 'Example Domain',
+    url: 'https://www.example.com/about',
+    favicon: null,
+    closedAt: NOW - 60_000,
+    tabCount: 1
+  }
+]
+
+/**
+ * Two other devices' open tabs, the phone's list the newer (`sync.tabsFromDevices` answers newest
+ * first). The phone announced its kind; the laptop's build announced none (services pass 4).
+ */
+const DEVICES: SyncDeviceTabs[] = [
+  {
+    deviceId: 'phone',
+    deviceName: 'Pixel 9',
+    deviceKind: 'phone',
+    updatedAt: NOW - 5 * 60_000,
+    tabs: [
+      {
+        tabId: 'p1',
+        url: 'https://www.wikipedia.org/wiki/Zen',
+        title: 'Zen – Wikipedia',
+        favicon: null,
+        lastActive: NOW - 5 * 60_000,
+        windowId: null
+      },
+      {
+        tabId: 'p2',
+        url: 'https://recipes.example.net/ragu',
+        title: 'Slow-cooked ragù',
+        favicon: 'data:image/png;base64,iVBORw0KGgo=',
+        lastActive: NOW - 9 * 60_000,
+        windowId: null
+      }
+    ]
+  },
+  {
+    deviceId: 'work',
+    deviceName: 'Work laptop',
+    updatedAt: NOW - 3 * 3_600_000,
+    tabs: [
+      {
+        tabId: 'held-1',
+        url: 'https://github.com/haasele/ione/pulls',
+        title: 'Pull requests · Ione',
+        favicon: null,
+        lastActive: NOW - 3 * 3_600_000,
+        windowId: null
+      }
+    ]
+  }
+]
+
+let groups: HistoryDayGroup[] = GROUPS
+let closed: ClosedEntrySummary[] = CLOSED
+let devices: SyncDeviceTabs[] = []
+/** The core's folded devices (`history.foldedDevices`), as the session holds them. */
+let folded: string[] = []
+/** The core's hidden devices (`history.hiddenDevices`), as the session holds them. */
+let hidden: string[] = []
+const invoke = vi.fn<(name: string, args?: unknown) => Promise<unknown>>(async (name) => {
+  if (name === 'history.grouped') return groups
+  if (name === 'session.recentlyClosed') return closed
+  if (name === 'sync.tabsFromDevices') return devices
+  if (name === 'history.foldedDevices') return folded
+  if (name === 'history.hiddenDevices') return hidden
+  return null
+})
+/** The core's events the page listens for, fired by name. */
+const listeners = new Map<string, Set<(payload: unknown) => void>>()
+Object.assign(window, {
+  zen: {
+    invoke,
+    on: (name: string, fn: (payload: unknown) => void) => {
+      const set = listeners.get(name) ?? new Set()
+      set.add(fn)
+      listeners.set(name, set)
+      return () => set.delete(fn)
+    }
+  }
+})
+function emit(name: string, payload: unknown): void {
+  for (const fn of listeners.get(name) ?? []) fn(payload)
+}
+
+const { HistoryPage, DELETE_SELECTED_PROMPT } = await import('../HistoryPage')
+const { FrameDialogHost } = await import('@renderer/lib/portals')
+const { syncScopeRowId } = await import('@renderer/lib/syncSetup')
+
+/** Each status a test hands in carries a version of its own: the reader asks the core once per version. */
+let version = 0
+
+/** The sync status: off, or on with Open tabs among what it syncs (`openTabs` says whether). */
+function sync(enabled: boolean, openTabs = true): SyncStatus {
+  return {
+    enabled,
+    folder: enabled ? '/home/me/Sync' : null,
+    folderName: enabled ? 'Sync' : null,
+    folderLost: false,
+    deviceId: 'this',
+    deviceName: 'This laptop',
+    scope: {
+      spaces: true,
+      folders: true,
+      pinnedTabs: true,
+      essentials: true,
+      openTabs,
+      containers: true,
+      bookmarks: true,
+      passwords: true,
+      addresses: true,
+      paymentMethods: true,
+      settings: true,
+      shortcuts: true,
+      boosts: true,
+      history: true,
+      readingList: true,
+      mods: true,
+      extensions: true
+    },
+    lastSyncAt: enabled ? NOW - 60_000 : null,
+    lastError: null,
+    lastErrorKind: null,
+    syncing: false,
+    devices: enabled ? [{ id: 'phone', name: 'Pixel 9', lastSeen: NOW - 5 * 60_000 }] : [],
+    pendingMerge: false,
+    remoteTabsVersion: ++version,
+    transport: 'folder',
+    webdav: null,
+    webdavAvailable: false,
+    authRefused: false,
+    accountAvailable: false,
+    account: null,
+    accountLink: null,
+    accountLinkFailure: null,
+    accountSignedOut: false
+  }
+}
+
+/** What the page reads of the state: the sync capability and status, and this device's tabs. */
+function state(status: SyncStatus = sync(false), held: string[] = []): UIState {
+  return {
+    capabilities: { sync: true },
+    sync: status,
+    tabs: Object.fromEntries(held.map((id) => [id, { id, url: 'https://held.example/' }]))
+  } as unknown as UIState
+}
+
+function tab(url = 'zen://history'): Tab {
+  return {
+    id: 'history',
+    spaceId: 'space',
+    containerId: 'default',
+    url,
+    title: 'History',
+    favicon: null,
+    pinned: false,
+    essential: false,
+    pinnedUrl: null,
+    customTitle: null,
+    customIcon: null,
+    windowId: null,
+    folderId: null,
+    loading: false,
+    canGoBack: false,
+    canGoForward: false,
+    audible: false,
+    muted: false,
+    discarded: false,
+    frozen: false,
+    cpuThrottle: 1,
+    zoom: 1,
+    splitGroupId: null,
+    createdAt: 0,
+    lastActiveAt: 0,
+    errorCode: null,
+    bookmarked: false,
+    readerable: false,
+    blockedCount: 0,
+    openerTabId: null
+  } as Tab
+}
+
+let root: Root | null = null
+let mount: HTMLElement | null = null
+
+/** The page inside the frame's dialog host, where its bulk delete's prompt renders. */
+function page(t: Tab, s: UIState): ReturnType<typeof createElement> {
+  return createElement(FrameDialogHost, null, createElement(HistoryPage, { state: s, tab: t }))
+}
+
+async function mountPage(t: Tab = tab(), s: UIState = state()): Promise<HTMLElement> {
+  mount = document.createElement('div')
+  document.body.appendChild(mount)
+  root = createRoot(mount)
+  await act(async () => root!.render(page(t, s)))
+  await flush()
+  return mount
+}
+
+async function rerender(t: Tab, s: UIState = state()): Promise<void> {
+  await act(async () => root!.render(page(t, s)))
+  await flush()
+}
+
+/** The page mounted again in the same session (a second History tab, or the tab reopened). */
+async function remount(t: Tab, s: UIState): Promise<HTMLElement> {
+  act(() => root!.unmount())
+  mount?.remove()
+  return mountPage(t, s)
+}
+
+/** Let the fetches resolve and their state land. */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 3; i++) {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0))
+    })
+  }
+}
+
+/** Every `invoke` of `name`, in order. */
+function calls(name: string): unknown[] {
+  return invoke.mock.calls.filter((c) => c[0] === name).map((c) => c[1])
+}
+
+function text(el: Element | null | undefined): string {
+  return (el?.textContent ?? '').replace(/\s+/g, ' ').trim()
+}
+
+/** A click on a visit row's target (its text), with the modifiers a pointer would carry. */
+function rowClick(el: HTMLElement, id: string, init: MouseEventInit = {}): void {
+  el.querySelector<HTMLButtonElement>(
+    `[data-visit-id="${id}"] button[data-row-focus]`
+  )!.dispatchEvent(new MouseEvent('click', { bubbles: true, ...init }))
+}
+
+/** A key pressed on a visit row's target. */
+async function rowKey(el: HTMLElement, id: string, init: KeyboardEventInit): Promise<void> {
+  const target = el.querySelector<HTMLButtonElement>(
+    `[data-visit-id="${id}"] button[data-row-focus]`
+  )!
+  target.focus()
+  await act(async () =>
+    target.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init }))
+  )
+}
+
+/** The bulk delete's prompt while it is up – a panel on its way out (`data-leaving`) is not one. */
+function prompt(): HTMLElement | null {
+  return document.querySelector<HTMLElement>(
+    `[data-confirm="${DELETE_SELECTED_PROMPT}"]:not([data-leaving])`
+  )
+}
+
+/** The picked rows' ids, in the list's order. */
+function picked(el: HTMLElement): string[] {
+  return [...el.querySelectorAll('[data-selected]')].map((r) => r.getAttribute('data-visit-id')!)
+}
+
+/** The kept panels' exit animations end (happy-dom runs none): the host lets the chrome go. */
+async function endExit(): Promise<void> {
+  await act(async () => {
+    for (const panel of document.querySelectorAll('.zen-frame-dialogs-slot > [data-leaving]'))
+      panel.dispatchEvent(new Event('animationend'))
+  })
+}
+
+/** The page's session stores of folded and hidden devices, one per chrome document: fresh ones per test. */
+function freshDeviceStores(): void {
+  const stores = (globalThis as { __zenStores?: Record<string, { set: (p: object) => void }> })
+    .__zenStores
+  stores?.historyCollapsedDevices?.set({ ids: new Set(), asked: false })
+  stores?.historyHiddenDevices?.set({ ids: new Set(), asked: false })
+}
+
+beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  vi.setSystemTime(NOW)
+  invoke.mockClear()
+  groups = GROUPS
+  closed = CLOSED
+  devices = []
+  folded = []
+  hidden = []
+  freshDeviceStores()
+})
+
+afterEach(() => {
+  if (root) act(() => root!.unmount())
+  root = null
+  mount?.remove()
+  mount = null
+  vi.useRealTimers()
+})
+
+describe('the History page tab (§10.1)', () => {
+  it('draws the title block with Delete browsing data… and the search field, no overlay chrome', async () => {
+    const el = await mountPage()
+    const page = el.querySelector('[data-testid="history-page"]')!
+    expect(page.classList.contains('zen-page')).toBe(true)
+    const title = page.querySelector('h1.zen-page-title')
+    expect(text(title)).toBe('History')
+    // Chrome's History page link `IDS_CLEAR_BROWSING_DATA_TITLE` "Delete browsing data" (M124+),
+    // the opener's ellipsis added (W8-7).
+    const clear = page.querySelector('[data-testid="history-clear-browsing-data"]')!
+    expect(text(clear)).toBe('Delete browsing data…')
+    expect(clear.classList.contains('zen-v2-button')).toBe(true)
+    const field = page.querySelector<HTMLInputElement>('[data-testid="history-search"]')!
+    expect(field.classList.contains('zen-v2-field')).toBe(true)
+    expect(field.getAttribute('placeholder')).toBe('Search history')
+    // Nothing of the overlay shell: no close button, no panel.
+    expect(page.querySelector('[aria-label="Close"]')).toBeNull()
+    expect(page.querySelector('.zen-overlay-shell, .zen-history')).toBeNull()
+    // The header is the sticky part of the scroll column.
+    expect(page.querySelector('.zen-page-scroll > header.zen-page-header')).not.toBeNull()
+  })
+
+  it('groups the visits by day under §9.27 headings, each a §9.21 two-line row', async () => {
+    const el = await mountPage()
+    expect(calls('history.grouped')).toEqual([{ query: { text: undefined, limit: 300 } }])
+    const headings = [...el.querySelectorAll('.zen-page-group h2')].map(text)
+    // The phone list's vocabulary (`historyGroups.ts`): a day within the week is its weekday,
+    // an older one the date – "Friday", then "Friday, September 11".
+    const weekday = WEEKDAY_NAMES[new Date(NOW - 3 * DAY).getDay()]!
+    // Sync is off in the default state: the one "Tabs from other devices" group stands after
+    // Recently closed with its §9.17 line (the devices' own groups take its place when it is on).
+    expect(headings).toEqual([
+      'Recently closed',
+      'Tabs from other devices',
+      'Today',
+      'Yesterday',
+      weekday,
+      new Intl.DateTimeFormat(undefined, {
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long',
+        year: DATED.slice(0, 4) === TODAY.slice(0, 4) ? undefined : 'numeric',
+        timeZone: 'UTC'
+      }).format(new Date(`${DATED}T12:00:00Z`))
+    ])
+    const today = el.querySelector(`[data-day="${TODAY}"]`)!
+    expect(text(today.querySelector('.zen-page-heading-aside'))).toBe('2')
+    // The day's ⋮ follows the rows' rule – on approach – so at rest the heading is its text and
+    // count; Recently closed's clear the same. Both stay buttons in the tab order.
+    const dayMenu = today.querySelector('.zen-page-heading > button[aria-haspopup="menu"]')!
+    expect(dayMenu.classList.contains('zen-page-heading-reveal')).toBe(true)
+    expect(dayMenu.getAttribute('aria-label')).toBe('Options for Today')
+    expect(
+      el
+        .querySelector('[data-testid="history-recently-closed"] .zen-page-heading > button')!
+        .classList.contains('zen-page-heading-reveal')
+    ).toBe(true)
+    const rows = [...today.querySelectorAll('li.zen-v2-row.zen-page-row')]
+    expect(rows).toHaveLength(2)
+    const first = rows[0]!
+    expect(first.getAttribute('data-visit-id')).toBe('v1')
+    // The favicon leads the row: no checkbox and no slot held for one at rest, on any row.
+    expect(first.firstElementChild!.classList.contains('zen-page-row-lead')).toBe(true)
+    expect(el.querySelectorAll('.zen-page-row-check, input.zen-v2-checkbox')).toHaveLength(0)
+    expect(text(first.querySelector('.zen-page-row-label'))).toBe('Example docs')
+    expect(text(first.querySelector('.zen-page-row-desc'))).toBe('example.com')
+    expect(first.querySelector('time.zen-page-row-time')).not.toBeNull()
+    expect(first.querySelector('button[aria-haspopup="menu"]')).not.toBeNull()
+  })
+
+  it('opens a row in the tab, behind it on a middle or Ctrl click (§10.1: one meaning, no pick), and anchors the ⋮ on the row menu', async () => {
+    const el = await mountPage()
+    const row = el.querySelector('[data-visit-id="v1"]')!
+    const target = row.querySelector<HTMLButtonElement>('button[data-row-focus]')!
+    await act(async () => target.click())
+    expect(calls('urlbar.submit').at(-1)).toEqual({
+      input: 'https://example.com/docs',
+      newTab: false,
+      tabId: 'history',
+      background: false
+    })
+    await act(async () =>
+      target.dispatchEvent(new MouseEvent('auxclick', { bubbles: true, button: 1 }))
+    )
+    expect(calls('urlbar.submit').at(-1)).toEqual({
+      input: 'https://example.com/docs',
+      newTab: true,
+      tabId: 'history',
+      background: true
+    })
+    // Ctrl-click is the same tab behind – on this page as on every page row – and picks nothing.
+    await act(async () =>
+      target.dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: true }))
+    )
+    expect(calls('urlbar.submit').at(-1)).toMatchObject({ newTab: true, background: true })
+    await act(async () =>
+      target.dispatchEvent(new MouseEvent('click', { bubbles: true, metaKey: true }))
+    )
+    expect(calls('urlbar.submit').at(-1)).toMatchObject({ newTab: true, background: true })
+    expect(calls('urlbar.submit')).toHaveLength(4)
+    expect(row.hasAttribute('data-selected')).toBe(false)
+    expect(el.querySelector('[data-selecting]')).toBeNull()
+    expect(el.querySelectorAll('.zen-page-row-check')).toHaveLength(0)
+    const more = row.querySelector<HTMLButtonElement>(
+      'button[aria-label="Actions for Example docs"]'
+    )!
+    await act(async () => more.click())
+    expect(calls('history.contextMenu').at(-1)).toMatchObject({
+      visitId: 'v1',
+      url: 'https://example.com/docs'
+    })
+  })
+
+  it('selection is a mode (§9.6, §10.1): Shift-click enters it, the checkbox column shows on every row, the slot shows the count, Delete asks and then removes the picked as one and leaves it', async () => {
+    const el = await mountPage()
+    const row = el.querySelector('[data-visit-id="v1"]')!
+    // Shift-click with nothing picked yet picks this row alone and so enters the mode.
+    await act(async () => rowClick(el, 'v1', { shiftKey: true }))
+    // Picked, not opened.
+    expect(calls('urlbar.submit')).toEqual([])
+    expect(row.hasAttribute('data-selected')).toBe(true)
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('1 selected')
+    expect(el.querySelector('[data-testid="history-clear-browsing-data"]')).toBeNull()
+    expect(el.querySelector('[data-selecting]')).not.toBeNull()
+    // The column: a checkbox on each of the five visit rows, the two closed rows holding its
+    // width so every favicon on the page moved as one.
+    expect(
+      el.querySelectorAll('[data-visit-id] input.zen-v2-checkbox.zen-page-row-check')
+    ).toHaveLength(5)
+    expect(el.querySelectorAll('[data-closed-id] .zen-page-row-check')).toHaveLength(2)
+    // The checkbox leads the row, in its cell (the row's boxes are the list's: `display: contents`).
+    const lead = row.firstElementChild!
+    expect(lead.getAttribute('role')).toBe('gridcell')
+    expect(lead.classList.contains('zen-page-row-cell')).toBe(true)
+    expect(lead.firstElementChild!.classList.contains('zen-page-row-check')).toBe(true)
+    // In the mode a row's checkbox and a plain click on the row both pick or drop it.
+    const second = el.querySelector<HTMLInputElement>('[data-visit-id="v2"] input.zen-v2-checkbox')!
+    await act(async () => second.click())
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('2 selected')
+    await act(async () => rowClick(el, 'v3'))
+    expect(calls('urlbar.submit')).toEqual([])
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('3 selected')
+    await act(async () => rowClick(el, 'v3'))
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('2 selected')
+    // Inside the mode too, Ctrl-click keeps its one meaning: the page behind, the pick unchanged.
+    await act(async () => rowClick(el, 'v3', { ctrlKey: true }))
+    expect(calls('urlbar.submit')).toEqual([
+      { input: 'https://zen-browser.app/', newTab: true, tabId: 'history', background: true }
+    ])
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('2 selected')
+    expect(el.querySelector('[data-visit-id="v3"]')!.hasAttribute('data-selected')).toBe(false)
+    // The bar's Delete asks first (HB-68, §9.23): nothing is removed until the prompt's verb.
+    const remove = el.querySelector<HTMLButtonElement>('[data-testid="history-delete-selected"]')!
+    expect(remove.getAttribute('aria-haspopup')).toBe('dialog')
+    await act(async () => remove.click())
+    await flush()
+    expect(calls('history.deleteVisits')).toEqual([])
+    const dialog = prompt()!
+    expect(dialog.getAttribute('role')).toBe('alertdialog')
+    expect(text(dialog.querySelector('[id$="title"]'))).toBe('Delete 2 items from history?')
+    expect(dialog.getAttribute('data-count')).toBe('2')
+    // The verb is the danger-ink secondary with no primary (§6): no default key on a destructive prompt.
+    const verb = dialog.querySelector<HTMLButtonElement>('[data-action="confirm"]')!
+    expect(text(verb)).toBe('Delete')
+    expect(verb.hasAttribute('data-danger')).toBe(true)
+    expect(verb.hasAttribute('data-primary')).toBe(false)
+    expect(text(dialog.querySelector('[data-action="cancel"]'))).toBe('Cancel')
+    await act(async () => verb.click())
+    await flush()
+    await endExit()
+    // ONE deleteVisits for the whole set, in the list's order; the prompt is gone.
+    expect(calls('history.deleteVisits')).toEqual([{ ids: ['v1', 'v2'] }])
+    expect(prompt()).toBeNull()
+    // Deleting the selection leaves the mode: the column goes, the slot is Clear browsing
+    // data… again, a plain click opens.
+    expect(el.querySelector('.zen-page-title-count')).toBeNull()
+    expect(el.querySelector('[data-selecting]')).toBeNull()
+    expect(el.querySelectorAll('.zen-page-row-check')).toHaveLength(0)
+    expect(el.querySelector('[data-testid="history-clear-browsing-data"]')).not.toBeNull()
+    await act(async () => rowClick(el, 'v3'))
+    expect(calls('urlbar.submit').at(-1)).toEqual({
+      input: 'https://zen-browser.app/',
+      newTab: false,
+      tabId: 'history',
+      background: false
+    })
+  })
+
+  it('the prompt names the count (one item, n items); Cancel and Escape keep the selection', async () => {
+    const el = await mountPage()
+    await act(async () => rowClick(el, 'v4', { shiftKey: true }))
+    const remove = (): HTMLButtonElement =>
+      el.querySelector<HTMLButtonElement>('[data-testid="history-delete-selected"]')!
+    await act(async () => remove().click())
+    await flush()
+    expect(text(prompt()!.querySelector('[id$="title"]'))).toBe('Delete 1 item from history?')
+    // A confirmation of the user's own command carries no glyph on its title (§9.23; #496's nit).
+    expect(prompt()!.querySelector('[id$="title"] svg')).toBeNull()
+    expect(text(prompt())).toContain('The visit is removed from your history.')
+    // Cancel: the prompt goes, the pick stands, nothing was removed.
+    await act(async () =>
+      prompt()!.querySelector<HTMLButtonElement>('[data-action="cancel"]')!.click()
+    )
+    await flush()
+    await endExit()
+    expect(prompt()).toBeNull()
+    expect(picked(el)).toEqual(['v4'])
+    expect(calls('history.deleteVisits')).toEqual([])
+    // Escape on the prompt is Cancel too – the prompt's, not the page's: the mode stays.
+    await act(async () => remove().click())
+    await flush()
+    expect(prompt()).not.toBeNull()
+    await act(async () =>
+      prompt()!.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+      )
+    )
+    await flush()
+    await endExit()
+    expect(prompt()).toBeNull()
+    expect(picked(el)).toEqual(['v4'])
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('1 selected')
+    expect(calls('history.deleteVisits')).toEqual([])
+  })
+
+  it('the Delete key asks about the selection when there is one, and removes a focused row at once when there is none (§10.5: a single record asks nothing)', async () => {
+    const el = await mountPage()
+    // Nothing picked: Delete on the focused row is that row's remove, as the ⋮ menu's – no prompt.
+    await rowKey(el, 'v3', { key: 'Delete' })
+    expect(calls('history.deleteVisits')).toEqual([{ ids: ['v3'] }])
+    expect(prompt()).toBeNull()
+    invoke.mockClear()
+    // With a selection the key is the bar's Delete: the prompt, the ids untouched until the verb.
+    await act(async () => rowClick(el, 'v1', { shiftKey: true }))
+    await act(async () => rowClick(el, 'v2'))
+    await rowKey(el, 'v5', { key: 'Delete' })
+    await flush()
+    expect(calls('history.deleteVisits')).toEqual([])
+    expect(text(prompt()!.querySelector('[id$="title"]'))).toBe('Delete 2 items from history?')
+    await act(async () =>
+      prompt()!.querySelector<HTMLButtonElement>('[data-action="confirm"]')!.click()
+    )
+    await flush()
+    await endExit()
+    expect(calls('history.deleteVisits')).toEqual([{ ids: ['v1', 'v2'] }])
+    expect(el.querySelector('[data-selecting]')).toBeNull()
+  })
+
+  it('a row a live change takes from the list falls out of the selection; a prompt over a set so changed is withdrawn, one over an untouched set stands', async () => {
+    const el = await mountPage()
+    const without = (...ids: string[]): void => {
+      groups = GROUPS.map((g) => ({
+        ...g,
+        visits: g.visits.filter((v) => !ids.includes(v.id))
+      })).filter((g) => g.visits.length > 0)
+    }
+    const remove = (): HTMLButtonElement =>
+      el.querySelector<HTMLButtonElement>('[data-testid="history-delete-selected"]')!
+    await act(async () => rowClick(el, 'v1', { shiftKey: true }))
+    await act(async () => rowClick(el, 'v5'))
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('2 selected')
+    await act(async () => remove().click())
+    await flush()
+    expect(text(prompt()!.querySelector('[id$="title"]'))).toBe('Delete 2 items from history?')
+    // Another window removes v2 and v3, neither picked: the list reloads, the question stands.
+    without('v2', 'v3')
+    await act(async () => emit('history.changed', undefined))
+    await flush()
+    expect(el.querySelectorAll('[data-visit-id]')).toHaveLength(3)
+    expect(picked(el)).toEqual(['v1', 'v5'])
+    expect(prompt()).not.toBeNull()
+    // Then v5, a picked row: it falls out of the set, the count follows, and the question –
+    // asked about a set that is no longer the selection – is withdrawn; the mode stays.
+    without('v2', 'v3', 'v5')
+    await act(async () => emit('history.changed', undefined))
+    await flush()
+    await endExit()
+    expect(prompt()).toBeNull()
+    expect(picked(el)).toEqual(['v1'])
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('1 selected')
+    expect(el.querySelector('[data-selecting]')).not.toBeNull()
+    expect(calls('history.deleteVisits')).toEqual([])
+    // Asked again, the prompt counts what is left; a change that takes the last picked row
+    // leaves nothing to ask about, and the mode with it.
+    await act(async () => remove().click())
+    await flush()
+    expect(text(prompt()!.querySelector('[id$="title"]'))).toBe('Delete 1 item from history?')
+    groups = []
+    await act(async () => emit('history.changed', undefined))
+    await flush()
+    await endExit()
+    expect(prompt()).toBeNull()
+    expect(el.querySelector('[data-selecting]')).toBeNull()
+    expect(calls('history.deleteVisits')).toEqual([])
+  })
+
+  it('Space on a focused row picks or drops it; the rows are a multiselectable grid whose rows say aria-selected (§9.22)', async () => {
+    const el = await mountPage()
+    const grids = [...el.querySelectorAll('[data-day] ul.zen-page-rows')]
+    expect(grids).toHaveLength(4)
+    for (const grid of grids) {
+      expect(grid.getAttribute('role')).toBe('grid')
+      expect(grid.getAttribute('aria-multiselectable')).toBe('true')
+      // Labelled by its day's heading.
+      const heading = document.getElementById(grid.getAttribute('aria-labelledby')!)
+      expect(heading?.tagName).toBe('H2')
+    }
+    const row = el.querySelector('[data-visit-id="v2"]')!
+    expect(row.getAttribute('role')).toBe('row')
+    expect(row.getAttribute('aria-selected')).toBe('false')
+    // Every part of the row is a cell: the text, the time, the ⋮ – and the checkbox once the mode is on.
+    expect(row.querySelectorAll(':scope > [role="gridcell"]')).toHaveLength(3)
+    await rowKey(el, 'v2', { key: ' ' })
+    expect(row.getAttribute('aria-selected')).toBe('true')
+    expect(row.hasAttribute('data-selected')).toBe(true)
+    expect(row.querySelectorAll(':scope > [role="gridcell"]')).toHaveLength(4)
+    const check = row.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+    expect(check.checked).toBe(true)
+    expect(check.getAttribute('aria-label')).toBe('Select A story')
+    // The count is the page's one live region for the selection: no row announces its own.
+    expect(
+      el.querySelectorAll('[data-visit-id] [role="status"], [data-visit-id] [aria-live]')
+    ).toHaveLength(0)
+    expect(el.querySelector('.zen-page-title-count')!.getAttribute('role')).toBe('status')
+    await rowKey(el, 'v2', { key: ' ' })
+    expect(row.getAttribute('aria-selected')).toBe('false')
+    expect(el.querySelector('[data-selecting]')).toBeNull()
+  })
+
+  it('Shift-click picks the run from the last picked row; Ctrl+A picks every visit shown; Escape leaves the mode', async () => {
+    const el = await mountPage()
+    await act(async () => rowClick(el, 'v2', { shiftKey: true }))
+    await act(async () => rowClick(el, 'v4', { shiftKey: true }))
+    expect(
+      [...el.querySelectorAll('[data-selected]')].map((r) => r.getAttribute('data-visit-id'))
+    ).toEqual(['v2', 'v3', 'v4'])
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('3 selected')
+    const target = el.querySelector<HTMLButtonElement>(
+      '[data-visit-id="v1"] button[data-row-focus]'
+    )!
+    target.focus()
+    await act(async () =>
+      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }))
+    )
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('5 selected')
+    await act(async () =>
+      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    )
+    expect(el.querySelector('[data-selected]')).toBeNull()
+    expect(el.querySelectorAll('.zen-page-row-check')).toHaveLength(0)
+    // Ctrl+A with nothing picked enters the mode by itself.
+    await act(async () =>
+      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }))
+    )
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('5 selected')
+    expect(el.querySelectorAll('[data-visit-id] input.zen-v2-checkbox')).toHaveLength(5)
+  })
+
+  it('"Select" in the row’s ⋮ menu (the core’s history.select) picks the row and enters the mode; dropping the last picked leaves it', async () => {
+    const el = await mountPage()
+    await act(async () => emit('history.select', { visitId: 'v3' }))
+    expect(el.querySelector('[data-visit-id="v3"]')!.hasAttribute('data-selected')).toBe(true)
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('1 selected')
+    expect(el.querySelectorAll('[data-visit-id] input.zen-v2-checkbox')).toHaveLength(5)
+    await act(async () =>
+      el.querySelector<HTMLInputElement>('[data-visit-id="v3"] input.zen-v2-checkbox')!.click()
+    )
+    expect(el.querySelector('[data-selecting]')).toBeNull()
+    expect(el.querySelectorAll('.zen-page-row-check')).toHaveLength(0)
+  })
+
+  it('Cancel leaves the mode; Delete on a focused row removes just that visit', async () => {
+    const el = await mountPage()
+    await act(async () => rowClick(el, 'v1', { shiftKey: true }))
+    await act(async () =>
+      [...el.querySelectorAll<HTMLButtonElement>('.zen-page-title-actions button')]
+        .find((b) => text(b) === 'Cancel')!
+        .click()
+    )
+    expect(el.querySelector('[data-selected]')).toBeNull()
+    expect(el.querySelectorAll('.zen-page-row-check')).toHaveLength(0)
+    const target = el.querySelector<HTMLButtonElement>(
+      '[data-visit-id="v3"] button[data-row-focus]'
+    )!
+    target.focus()
+    await act(async () =>
+      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }))
+    )
+    expect(calls('history.deleteVisits')).toEqual([{ ids: ['v3'] }])
+  })
+
+  it('the arrows walk the rows across the groups, Home and End jump (§9.22)', async () => {
+    const el = await mountPage()
+    const targets = [...el.querySelectorAll<HTMLButtonElement>('button[data-row-focus]')]
+    // The two closed tabs, the "Turn on sync" row (sync is off), then the five visits over four days.
+    expect(targets.length).toBe(8)
+    expect(targets[2]!.getAttribute('data-testid')).toBe('history-remote-tabs-settings')
+    targets[1]!.focus()
+    const key = (k: string): void => {
+      document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true }))
+    }
+    await act(async () => key('ArrowDown'))
+    expect(document.activeElement).toBe(targets[2])
+    await act(async () => key('ArrowUp'))
+    expect(document.activeElement).toBe(targets[1])
+    await act(async () => key('End'))
+    expect(document.activeElement).toBe(targets[7])
+    await act(async () => key('Home'))
+    expect(document.activeElement).toBe(targets[0])
+  })
+
+  it('a typed search filters through history.grouped and moves the URL to ?q= with replace', async () => {
+    const el = await mountPage()
+    groups = [GROUPS[0]!]
+    const field = el.querySelector<HTMLInputElement>('[data-testid="history-search"]')!
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+      setter.call(field, 'example')
+      field.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(calls('history.grouped')).toHaveLength(1)
+    await act(async () => {
+      vi.advanceTimersByTime(200)
+    })
+    await flush()
+    expect(calls('history.grouped').at(-1)).toEqual({ query: { text: 'example', limit: 300 } })
+    expect(calls('page.navigate')).toEqual([
+      { tabId: 'history', section: null, replace: true, query: { q: 'example' } }
+    ])
+    // Recently closed steps aside while searching; matches are marked.
+    expect(el.querySelector('[data-testid="history-recently-closed"]')).toBeNull()
+    expect(el.querySelectorAll('mark').length).toBeGreaterThan(0)
+    // Clearing the field goes back to the plain URL.
+    await act(async () =>
+      el.querySelector<HTMLButtonElement>('button[aria-label="Clear search"]')!.click()
+    )
+    await act(async () => {
+      vi.advanceTimersByTime(200)
+    })
+    await flush()
+    expect(calls('page.navigate').at(-1)).toEqual({
+      tabId: 'history',
+      section: null,
+      replace: true,
+      query: undefined
+    })
+  })
+
+  it('a query the URL brings fills the field and filters; its echo is not adopted twice', async () => {
+    const el = await mountPage(tab('zen://history?q=zen'))
+    const field = el.querySelector<HTMLInputElement>('[data-testid="history-search"]')!
+    expect(field.value).toBe('zen')
+    expect(calls('history.grouped')).toEqual([{ query: { text: 'zen', limit: 300 } }])
+    // The page did not push what it was given.
+    expect(calls('page.navigate')).toEqual([])
+    // "More from this site" (the omnibox, back, forward) moves the tab's URL: the field follows.
+    await rerender(tab('zen://history?q=example.com'))
+    expect(field.value).toBe('example.com')
+    expect(calls('history.grouped').at(-1)).toEqual({ query: { text: 'example.com', limit: 300 } })
+    expect(calls('page.navigate')).toEqual([])
+  })
+
+  it('while searching, the matches are one flat list under “Results for …”, newest first, the day on every row before its time (history-03)', async () => {
+    const el = await mountPage(tab('zen://history?q=example'))
+    // Chrome's search view drops its date headers: no day groups while a query is active.
+    expect(el.querySelectorAll('[data-day]')).toHaveLength(0)
+    const results = el.querySelector('[data-testid="history-results"]')!
+    expect(text(results.querySelector('h2'))).toBe('Results for “example”')
+    expect(results.getAttribute('aria-labelledby')).toBe(results.querySelector('h2')!.id)
+    expect(text(results.querySelector('.zen-page-heading-aside'))).toBe('5')
+    const rows = [...results.querySelectorAll('li.zen-v2-row.zen-page-row')]
+    expect(rows.map((r) => r.getAttribute('data-visit-id'))).toEqual(['v1', 'v2', 'v3', 'v4', 'v5'])
+    // The rows keep the day groups' shape – favicon, two lines, the trailing time, the ⋮ – and
+    // the time slot gains the day in the headings' words, cut to the slot: "Today", "Yesterday",
+    // the weekday, then the short date (the year once it is not this year's).
+    const clock = (ms: number): string =>
+      new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(ms)
+    const weekday = WEEKDAY_NAMES[new Date(NOW - 3 * DAY).getDay()]!
+    const dated = new Intl.DateTimeFormat(undefined, {
+      day: 'numeric',
+      month: 'short',
+      year: DATED.slice(0, 4) === TODAY.slice(0, 4) ? undefined : 'numeric'
+    }).format(NOW - 10 * DAY)
+    expect(rows.map((r) => text(r.querySelector('time.zen-page-row-time')))).toEqual([
+      `Today · ${clock(NOW - 60_000)}`,
+      `Today · ${clock(NOW - 120_000)}`,
+      `Yesterday · ${clock(NOW - DAY)}`,
+      `${weekday} · ${clock(NOW - 3 * DAY)}`,
+      `${dated} · ${clock(NOW - 10 * DAY)}`
+    ])
+    expect(rows[2]!.querySelector('time')!.getAttribute('aria-label')).toBe(
+      `Visited Yesterday, ${clock(NOW - DAY)}`
+    )
+    expect(text(rows[0]!.querySelector('.zen-page-row-label'))).toBe('Example docs')
+    expect(rows[0]!.querySelectorAll('mark').length).toBeGreaterThan(0)
+    expect(rows[0]!.querySelector('button[aria-haspopup="menu"]')).not.toBeNull()
+    // A result row is a visit row: it opens, and Shift-click enters the mode across the list.
+    rowClick(el, 'v3')
+    expect(calls('urlbar.submit').at(-1)).toEqual({
+      input: 'https://zen-browser.app/',
+      newTab: false,
+      tabId: 'history',
+      background: false
+    })
+    await act(async () => rowClick(el, 'v2', { shiftKey: true }))
+    await act(async () => rowClick(el, 'v4', { shiftKey: true }))
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('3 selected')
+    expect(results.querySelectorAll('input.zen-page-row-check')).toHaveLength(5)
+    // The search's end (the URL back to the plain page) brings the day groups back.
+    await rerender(tab('zen://history'))
+    expect(el.querySelector('[data-testid="history-results"]')).toBeNull()
+    expect(el.querySelectorAll('[data-day]')).toHaveLength(4)
+    expect(text(el.querySelector('[data-visit-id="v3"] time'))).toBe(clock(NOW - DAY))
+  })
+
+  it('a full page of results counts “300+” and offers Show more', async () => {
+    groups = [
+      {
+        dayKey: TODAY,
+        visits: Array.from({ length: 300 }, (_, i) => ({
+          id: `m${i}`,
+          url: `https://example.com/${i}`,
+          title: `Example ${i}`,
+          favicon: null,
+          visitTime: NOW - i * 1000,
+          transition: 'link' as const
+        }))
+      }
+    ]
+    const el = await mountPage(tab('zen://history?q=example'))
+    const results = el.querySelector('[data-testid="history-results"]')!
+    expect(text(results.querySelector('.zen-page-heading-aside'))).toBe('300+')
+    expect(results.querySelectorAll('[data-visit-id]')).toHaveLength(300)
+    const more = [...el.querySelectorAll<HTMLButtonElement>('.zen-page-more button')].find(
+      (b) => text(b) === 'Show more'
+    )!
+    await act(async () => more.click())
+    await flush()
+    expect(calls('history.grouped').at(-1)).toEqual({ query: { text: 'example', limit: 600 } })
+  })
+
+  it('marks a term where it starts a word – in the title and the host – never inside one', async () => {
+    groups = [
+      {
+        dayKey: TODAY,
+        visits: [
+          GROUPS[0]!.visits[0]!,
+          {
+            // Found through its path ("/example-page"); the title holds the term inside a word.
+            id: 'v6',
+            url: 'https://docs.ione.app/example-page',
+            title: 'Counterexample',
+            favicon: null,
+            visitTime: NOW - 90_000,
+            transition: 'link'
+          },
+          {
+            // The host's "example" after the dot, and an upper-case one in the title.
+            id: 'v7',
+            url: 'https://news.example.org/',
+            title: 'EXAMPLE news · an example',
+            favicon: null,
+            visitTime: NOW - 100_000,
+            transition: 'link'
+          }
+        ]
+      }
+    ]
+    const el = await mountPage(tab('zen://history?q=example'))
+    const marks = (id: string, part: string): string[] =>
+      [...el.querySelectorAll(`[data-visit-id="${id}"] ${part} mark`)].map((m) => text(m))
+    expect(marks('v1', '.zen-page-row-label')).toEqual(['Example'])
+    expect(marks('v1', '.zen-page-row-desc')).toEqual(['example'])
+    expect(marks('v6', '.zen-page-row-label')).toEqual([])
+    expect(marks('v6', '.zen-page-row-desc')).toEqual([])
+    expect(marks('v7', '.zen-page-row-label')).toEqual(['EXAMPLE', 'example'])
+    expect(marks('v7', '.zen-page-row-desc')).toEqual(['example'])
+  })
+
+  it('says so when there is nothing, and when nothing matches', async () => {
+    groups = []
+    closed = []
+    const el = await mountPage()
+    const empty = el.querySelector('[data-testid="history-empty"]')!
+    expect(empty.getAttribute('role')).toBe('status')
+    expect(text(empty)).toBe('Pages you visit will show up here')
+    await rerender(tab('zen://history?q=nothing'))
+    expect(text(el.querySelector('[data-testid="history-empty"]'))).toBe(
+      'No history matches “nothing”'
+    )
+  })
+
+  it('Recently closed is the first group: a row restores (behind on a middle or Ctrl click), the heading clears', async () => {
+    const el = await mountPage()
+    const group = el.querySelector('[data-testid="history-recently-closed"]')!
+    expect(text(group.querySelector('h2'))).toBe('Recently closed')
+    const row = group.querySelector('[data-closed-id="c1"]')!
+    expect(text(row.querySelector('.zen-page-row-label'))).toBe('Settings')
+    // A closed page tab carries its registered glyph in the favicon slot (§10.1), not the globe,
+    // and its ione:// address on the second line, where a site's row reads its host.
+    const glyph = row.querySelector('.zen-page-row-lead svg')!
+    expect(glyph.classList.contains('lucide-settings')).toBe(true)
+    expect(glyph.classList.contains('zen-page-row-glyph')).toBe(true)
+    expect(row.querySelector('.zen-page-row-favicon-fallback')).toBeNull()
+    expect(text(row.querySelector('.zen-page-row-desc'))).toBe('ione://settings')
+    expect(row.querySelector('button[data-row-focus]')!.getAttribute('title')).toBe(
+      'ione://settings'
+    )
+    const site = group.querySelector('[data-closed-id="c2"]')!
+    expect(text(site.querySelector('.zen-page-row-label'))).toBe('Example Domain')
+    expect(text(site.querySelector('.zen-page-row-desc'))).toBe('example.com')
+    await act(async () => row.querySelector<HTMLButtonElement>('button[data-row-focus]')!.click())
+    expect(calls('session.restoreClosed')).toEqual([{ id: 'c1', background: false }])
+    // §10.1's one meaning on every page row: a middle or Ctrl click restores the tab behind this
+    // one; the row's own Restore control brings it to the front as a plain click does.
+    const siteTarget = site.querySelector<HTMLButtonElement>('button[data-row-focus]')!
+    await act(async () =>
+      siteTarget.dispatchEvent(new MouseEvent('auxclick', { bubbles: true, button: 1 }))
+    )
+    expect(calls('session.restoreClosed').at(-1)).toEqual({ id: 'c2', background: true })
+    await act(async () =>
+      siteTarget.dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: true }))
+    )
+    expect(calls('session.restoreClosed').at(-1)).toEqual({ id: 'c2', background: true })
+    expect(el.querySelector('[data-selecting]')).toBeNull()
+    await act(async () =>
+      site.querySelector<HTMLButtonElement>('button[aria-label="Restore tab"]')!.click()
+    )
+    expect(calls('session.restoreClosed').at(-1)).toEqual({ id: 'c2', background: false })
+    expect(calls('session.restoreClosed')).toHaveLength(4)
+    await act(async () =>
+      group
+        .querySelector<HTMLButtonElement>('button[aria-label="Clear the recently closed list"]')!
+        .click()
+    )
+    expect(calls('session.clearRecentlyClosed')).toHaveLength(1)
+  })
+})
+
+describe('Tabs from other devices (ID-28, §10.1)', () => {
+  /** The groups' headings in page order. */
+  const headings = (el: HTMLElement): string[] =>
+    [...el.querySelectorAll('.zen-page-group h2')].map(text)
+
+  it('with sync off, the one group after Recently closed says to turn on sync, its row opening Settings › Sync', async () => {
+    const el = await mountPage(tab(), state(sync(false)))
+    expect(headings(el).slice(0, 3)).toEqual([
+      'Recently closed',
+      'Tabs from other devices',
+      'Today'
+    ])
+    const group = el.querySelector('[data-testid="history-remote-tabs"]')!
+    expect(group.getAttribute('data-state')).toBe('sync-off')
+    const line = group.querySelector('[data-testid="history-remote-tabs-empty"]')!
+    expect(line.getAttribute('role')).toBe('status')
+    expect(text(line)).toBe('Turn on sync to see tabs from your other devices')
+    const row = group.querySelector<HTMLButtonElement>(
+      '[data-testid="history-remote-tabs-settings"]'
+    )!
+    expect(text(row)).toBe('Turn on sync')
+    expect(row.closest('li')!.querySelector('.zen-page-row-chevron')).not.toBeNull()
+    await act(async () => row.click())
+    // The section from its top: no row asked for (the way in is the section's own setup).
+    expect(calls('page.open')).toEqual([{ id: 'settings', section: 'sync' }])
+    expect(calls('page.open')[0]).not.toHaveProperty('query')
+    // Nothing was asked of the core while sync is off.
+    expect(calls('sync.tabsFromDevices')).toEqual([])
+    // No device group anywhere.
+    expect(el.querySelector('[data-testid="history-remote-device"]')).toBeNull()
+  })
+
+  it("with sync on but Open tabs off in What you sync, the line names the scope and the row chooses it, landing on Settings › Sync's Open tabs switch (?row=)", async () => {
+    const el = await mountPage(tab(), state(sync(true, false)))
+    const group = el.querySelector('[data-testid="history-remote-tabs"]')!
+    expect(group.getAttribute('data-state')).toBe('scope-off')
+    expect(text(group.querySelector('[data-testid="history-remote-tabs-empty"]'))).toBe(
+      'Turn on Open tabs in What you sync to see them'
+    )
+    const row = group.querySelector<HTMLButtonElement>(
+      '[data-testid="history-remote-tabs-settings"]'
+    )!
+    expect(text(row)).toBe('Choose what to sync')
+    expect(row.closest('li')!.querySelector('.zen-page-row-chevron')).not.toBeNull()
+    await act(async () => row.click())
+    // The phone's door (#316): the Sync section asked for the Open tabs switch's row, whose
+    // group `SettingsPage` scrolls to the top – `zen://settings/sync?row=sync-scope%3AopenTabs`.
+    expect(calls('page.open')).toEqual([
+      { id: 'settings', section: 'sync', query: { row: 'sync-scope:openTabs' } }
+    ])
+    // The id is the minter's, so the string lives in one place (`syncSetup.ts`).
+    expect(calls('page.open')[0]).toMatchObject({ query: { row: syncScopeRowId('openTabs') } })
+    expect(calls('sync.tabsFromDevices')).toEqual([])
+  })
+
+  it('with sync on and nothing published the group steps aside, as Recently closed does when empty (§10.1 as amended)', async () => {
+    devices = []
+    const el = await mountPage(tab(), state(sync(true)))
+    // The core was asked and answered with nothing: no heading, no sentence, no row.
+    expect(calls('sync.tabsFromDevices')).toHaveLength(1)
+    expect(el.querySelector('[data-testid="history-remote-tabs"]')).toBeNull()
+    expect(el.querySelector('[data-testid="history-remote-tabs-empty"]')).toBeNull()
+    expect(el.querySelector('[data-testid="history-remote-device"]')).toBeNull()
+    expect(el.textContent).not.toContain('No tabs from other devices')
+    expect(el.textContent).not.toContain('Tabs from other devices')
+    expect(headings(el).slice(0, 2)).toEqual(['Recently closed', 'Today'])
+    // The way out stands only while a setting is the way: the scope turned off brings the group.
+    await rerender(tab(), state(sync(true, false)))
+    expect(
+      el.querySelector('[data-testid="history-remote-tabs"]')!.getAttribute('data-state')
+    ).toBe('scope-off')
+    await rerender(tab(), state(sync(true)))
+    expect(el.querySelector('[data-testid="history-remote-tabs"]')).toBeNull()
+  })
+
+  it('each device is its own group after Recently closed, newest first, its name the heading and "Last active …" the aside, its tabs §9.21 rows', async () => {
+    devices = DEVICES
+    const el = await mountPage(tab(), state(sync(true)))
+    expect(headings(el).slice(0, 4)).toEqual(['Recently closed', 'Pixel 9', 'Work laptop', 'Today'])
+    // No umbrella heading while devices are listed.
+    expect(el.querySelector('[data-testid="history-remote-tabs"]')).toBeNull()
+    const cards = [...el.querySelectorAll('[data-testid="history-remote-device"]')]
+    expect(cards.map((c) => c.getAttribute('data-device-id'))).toEqual(['phone', 'work'])
+    const phone = cards[0]!
+    expect(phone.getAttribute('aria-labelledby')).toBe('zen-history-device-phone')
+    expect(text(phone.querySelector('.zen-page-heading-aside'))).toBe('Last active 5 min ago')
+    expect(text(cards[1]!.querySelector('.zen-page-heading-aside'))).toBe('Last active 3 h ago')
+    // The heading leads with the device's kind glyph on the rows' favicon column (services pass
+    // 4): the phone's glyph at the full ink; the laptop, whose build announced no kind, the
+    // stand-in at 69 %. Decorative – the heading's text is still the name alone.
+    const glyph = (card: Element): { kind: string | null; standin: boolean } => {
+      const svg = card.querySelector<SVGElement>(
+        '.zen-page-heading > .zen-page-heading-lead[aria-hidden] > svg[data-testid="device-glyph"]'
+      )!
+      return {
+        kind: svg.getAttribute('data-kind'),
+        standin: svg.classList.contains('zen-list-standin')
+      }
+    }
+    expect(glyph(phone)).toEqual({ kind: 'phone', standin: false })
+    expect(glyph(cards[1]!)).toEqual({ kind: 'none', standin: true })
+    expect(text(phone.querySelector('h2'))).toBe('Pixel 9')
+    const rows = [...phone.querySelectorAll('li.zen-v2-row.zen-page-row')]
+    expect(rows).toHaveLength(2)
+    const first = rows[0]!
+    expect(first.getAttribute('data-remote-tab')).toBe('phone:p1')
+    // The favicon leads (the globe for a tab with none), then the title over the host.
+    expect(first.firstElementChild!.classList.contains('zen-page-row-lead')).toBe(true)
+    expect(
+      first.querySelector('.zen-page-row-lead svg.zen-page-row-favicon-fallback')
+    ).not.toBeNull()
+    expect(text(first.querySelector('.zen-page-row-label'))).toBe('Zen – Wikipedia')
+    expect(text(first.querySelector('.zen-page-row-desc'))).toBe('wikipedia.org')
+    const second = rows[1]!
+    expect(second.querySelector('img.zen-page-row-favicon')!.getAttribute('src')).toBe(
+      'data:image/png;base64,iVBORw0KGgo='
+    )
+    // No visit time, no checkbox: the row names a page another device holds, not a visit.
+    expect(first.querySelector('time')).toBeNull()
+    expect(first.querySelector('input')).toBeNull()
+    expect(first.querySelector('button[aria-haspopup="menu"]')).not.toBeNull()
+    // The rows join the arrow walk between the closed tabs and the visits.
+    const targets = [...el.querySelectorAll<HTMLButtonElement>('button[data-row-focus]')]
+    expect(targets.length).toBe(2 + 3 + 5)
+  })
+
+  it('a list in which no device announced a kind – every peer an older build – leads no heading with a glyph: the names on the rows’ text edge, no stand-in column (§10.4’s condition, anyDeviceKind)', async () => {
+    devices = DEVICES.map((device) => ({ ...device, deviceKind: undefined }))
+    const el = await mountPage(tab(), state(sync(true)))
+    const cards = [...el.querySelectorAll('[data-testid="history-remote-device"]')]
+    expect(cards.map((c) => c.getAttribute('data-device-id'))).toEqual(['phone', 'work'])
+    for (const card of cards) {
+      expect(card.querySelector('.zen-page-heading-lead')).toBeNull()
+      expect(card.querySelector('[data-testid="device-glyph"]')).toBeNull()
+      expect(card.querySelector('.zen-page-heading')!.firstElementChild!.tagName).toBe('H2')
+    }
+    expect(headings(el).slice(0, 4)).toEqual(['Recently closed', 'Pixel 9', 'Work laptop', 'Today'])
+  })
+
+  it('a click opens the page in a new tab in front; a middle or Ctrl click one behind; a tab this device holds comes to the front', async () => {
+    devices = DEVICES
+    const el = await mountPage(tab(), state(sync(true), ['held-1']))
+    const target = el.querySelector<HTMLButtonElement>(
+      '[data-remote-tab="phone:p1"] button[data-row-focus]'
+    )!
+    await act(async () => target.click())
+    expect(calls('urlbar.submit').at(-1)).toEqual({
+      input: 'https://www.wikipedia.org/wiki/Zen',
+      newTab: true,
+      tabId: 'history',
+      background: false
+    })
+    await act(async () =>
+      target.dispatchEvent(new MouseEvent('auxclick', { bubbles: true, button: 1 }))
+    )
+    expect(calls('urlbar.submit').at(-1)).toMatchObject({ newTab: true, background: true })
+    await act(async () =>
+      target.dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: true }))
+    )
+    expect(calls('urlbar.submit').at(-1)).toMatchObject({ newTab: true, background: true })
+    expect(calls('urlbar.submit')).toHaveLength(3)
+    // Ctrl-click picked nothing: on every page row it is the tab behind (§10.1), and these rows
+    // are not the mode's besides.
+    expect(el.querySelector('[data-selecting]')).toBeNull()
+    // The work laptop's tab is open here too (the Open tabs scope carries the tab records): a
+    // click brings it to the front instead of opening it twice; a middle click still opens one behind.
+    const held = el.querySelector<HTMLButtonElement>(
+      '[data-remote-tab="work:held-1"] button[data-row-focus]'
+    )!
+    await act(async () => held.click())
+    expect(calls('tab.activate')).toEqual([{ tabId: 'held-1' }])
+    expect(calls('urlbar.submit')).toHaveLength(3)
+    await act(async () =>
+      held.dispatchEvent(new MouseEvent('auxclick', { bubbles: true, button: 1 }))
+    )
+    expect(calls('urlbar.submit').at(-1)).toEqual({
+      input: 'https://github.com/haasele/ione/pulls',
+      newTab: true,
+      tabId: 'history',
+      background: true
+    })
+  })
+
+  it('the row’s ⋮ and right click hang the history menu for the page, with no visit named', async () => {
+    devices = DEVICES
+    const el = await mountPage(tab(), state(sync(true)))
+    const row = el.querySelector<HTMLElement>('[data-remote-tab="phone:p2"]')!
+    const more = row.querySelector<HTMLButtonElement>(
+      'button[aria-label="Actions for Slow-cooked ragù"]'
+    )!
+    await act(async () => more.click())
+    expect(calls('history.contextMenu').at(-1)).toMatchObject({
+      visitId: null,
+      url: 'https://recipes.example.net/ragu'
+    })
+    await act(async () =>
+      row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 50 }))
+    )
+    expect(calls('history.contextMenu')).toHaveLength(2)
+    expect(calls('history.contextMenu').at(-1)).toMatchObject({
+      visitId: null,
+      url: 'https://recipes.example.net/ragu'
+    })
+  })
+
+  it('a device group folds on its heading’s chevron and stays folded for the session; the mode holds the column on its rows', async () => {
+    devices = DEVICES
+    let el = await mountPage(tab(), state(sync(true)))
+    const card = (): HTMLElement =>
+      el.querySelector<HTMLElement>(
+        '[data-testid="history-remote-device"][data-device-id="phone"]'
+      )!
+    const twisty = (): HTMLButtonElement =>
+      card().querySelector<HTMLButtonElement>('.zen-page-heading-twisty')!
+    expect(twisty().getAttribute('aria-expanded')).toBe('true')
+    expect(twisty().getAttribute('aria-label')).toBe('Hide tabs from Pixel 9')
+    expect(twisty().querySelector('svg')!.hasAttribute('data-open')).toBe(true)
+    await act(async () => twisty().click())
+    expect(card().hasAttribute('data-collapsed')).toBe(true)
+    // The fold is the session's: the core is told, and holds it for every window's chrome.
+    expect(calls('history.foldDevice')).toEqual([{ deviceId: 'phone', folded: true }])
+    expect(twisty().getAttribute('aria-expanded')).toBe('false')
+    expect(twisty().getAttribute('aria-label')).toBe('Show tabs from Pixel 9')
+    expect(twisty().querySelector('svg')!.hasAttribute('data-open')).toBe(false)
+    // The rows left the DOM: the arrows walk what is shown; the heading and its aside stay.
+    expect(card().querySelectorAll('li')).toHaveLength(0)
+    expect(text(card().querySelector('h2'))).toBe('Pixel 9')
+    expect(text(card().querySelector('.zen-page-heading-aside'))).toBe('Last active 5 min ago')
+    // The other device is untouched.
+    expect(el.querySelectorAll('[data-device-id="work"] li')).toHaveLength(1)
+    // The page mounted again (the tab closed and reopened) finds the fold where it was left.
+    el = await remount(tab(), state(sync(true)))
+    expect(card().hasAttribute('data-collapsed')).toBe(true)
+    expect(card().querySelectorAll('li')).toHaveLength(0)
+    await act(async () => twisty().click())
+    expect(card().hasAttribute('data-collapsed')).toBe(false)
+    expect(card().querySelectorAll('li')).toHaveLength(2)
+    expect(calls('history.foldDevice').at(-1)).toEqual({ deviceId: 'phone', folded: false })
+    // Another window folded the laptop: the core's word reaches this one and it folds here too.
+    await act(async () => emit('history.foldedDevicesChanged', ['work']))
+    expect(el.querySelector('[data-device-id="work"]')!.hasAttribute('data-collapsed')).toBe(true)
+    expect(el.querySelectorAll('[data-device-id="work"] li')).toHaveLength(0)
+    expect(card().hasAttribute('data-collapsed')).toBe(false)
+    await act(async () => emit('history.foldedDevicesChanged', []))
+    expect(el.querySelectorAll('[data-device-id="work"] li')).toHaveLength(1)
+    // Entering the mode: the remote rows hold the checkbox column's width, picked by nothing.
+    await act(async () => rowClick(el, 'v1', { shiftKey: true }))
+    expect(el.querySelectorAll('[data-remote-tab] span.zen-page-row-check')).toHaveLength(3)
+    expect(el.querySelectorAll('[data-remote-tab] input')).toHaveLength(0)
+    // Ctrl+A picks the visits alone.
+    const target = el.querySelector<HTMLButtonElement>(
+      '[data-visit-id="v1"] button[data-row-focus]'
+    )!
+    target.focus()
+    await act(async () =>
+      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }))
+    )
+    expect(text(el.querySelector('.zen-page-title-count'))).toBe('5 selected')
+  })
+
+  it('a fresh chrome (a second window) starts from the folds the core holds', async () => {
+    devices = DEVICES
+    folded = ['work']
+    // A window's chrome is a document of its own: its store has not asked the core yet.
+    const el = await mountPage(tab(), state(sync(true)))
+    expect(calls('history.foldedDevices')).toHaveLength(1)
+    expect(el.querySelector('[data-device-id="work"]')!.hasAttribute('data-collapsed')).toBe(true)
+    expect(el.querySelectorAll('[data-device-id="work"] li')).toHaveLength(0)
+    expect(el.querySelector('[data-device-id="phone"]')!.hasAttribute('data-collapsed')).toBe(false)
+    // Mounted again in the same chrome, it does not ask twice.
+    await remount(tab(), state(sync(true)))
+    expect(calls('history.foldedDevices')).toHaveLength(1)
+  })
+
+  it('a device heading’s right-click and menu key hang the device menu at the anchor; the rows keep the page’s menu (history-21)', async () => {
+    devices = DEVICES
+    const el = await mountPage(tab(), state(sync(true)))
+    const card = el.querySelector<HTMLElement>('[data-device-id="phone"]')!
+    const heading = card.querySelector<HTMLElement>('.zen-page-heading')!
+    // A right-click on the heading's line – its name here – opens at the pointer.
+    await act(async () =>
+      heading
+        .querySelector('h2')!
+        .dispatchEvent(
+          new MouseEvent('contextmenu', { bubbles: true, button: 2, clientX: 140, clientY: 90 })
+        )
+    )
+    expect(calls('history.deviceMenu').at(-1)).toEqual({ deviceId: 'phone', x: 140, y: 90 })
+    // The menu key while the focus is in the line (Chromium raises the event at the focused
+    // element, the twisty, with no button): keyboard mode, the first item selected.
+    const twisty = card.querySelector<HTMLButtonElement>('.zen-page-heading-twisty')!
+    twisty.focus()
+    await act(async () =>
+      twisty.dispatchEvent(
+        new MouseEvent('contextmenu', { bubbles: true, button: 0, clientX: 700, clientY: 96 })
+      )
+    )
+    expect(calls('history.deviceMenu').at(-1)).toEqual({
+      deviceId: 'phone',
+      x: 700,
+      y: 96,
+      keyboard: true
+    })
+    // The twisty is the disclosure still: no popup of its own is declared, so no pressed fill.
+    expect(twisty.hasAttribute('aria-haspopup')).toBe(false)
+    expect(twisty.getAttribute('aria-expanded')).toBe('true')
+    // A row's right-click is the row's menu, not the device's.
+    await act(async () =>
+      card
+        .querySelector('[data-remote-tab="phone:p1"]')!
+        .dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, button: 2 }))
+    )
+    expect(calls('history.deviceMenu')).toHaveLength(2)
+    expect(calls('history.contextMenu').at(-1)).toMatchObject({ visitId: null })
+  })
+
+  it('a hidden device leaves the list for the session; "Show hidden devices" follows the last device and brings it back', async () => {
+    devices = DEVICES
+    let el = await mountPage(tab(), state(sync(true)))
+    const ids = (): Array<string | null> =>
+      [...el.querySelectorAll('[data-testid="history-remote-device"]')].map((c) =>
+        c.getAttribute('data-device-id')
+      )
+    expect(ids()).toEqual(['phone', 'work'])
+    expect(el.querySelector('[data-testid="history-hidden-devices"]')).toBeNull()
+    // The menu's Hide Device ran in the core: its word reaches the page.
+    await act(async () => emit('history.hiddenDevicesChanged', ['phone']))
+    expect(ids()).toEqual(['work'])
+    // The way back is the row after the last device's group – no umbrella heading over it, the
+    // group beat's 20 above it in the heading's stead (`.zen-page-rows-loose`, §10.3).
+    const rows = el.querySelector<HTMLElement>('[data-testid="history-hidden-devices"]')!
+    expect(rows.previousElementSibling!.getAttribute('data-device-id')).toBe('work')
+    expect(rows.closest('.zen-page-group')).toBeNull()
+    expect(rows.classList.contains('zen-page-rows-loose')).toBe(true)
+    const show = rows.querySelector<HTMLButtonElement>(
+      '[data-testid="history-devices-show-hidden"]'
+    )!
+    expect(text(show)).toBe('Show hidden devices')
+    expect(show.hasAttribute('data-row-focus')).toBe(true)
+    // A search does not reach a hidden device: the phone's ragù is not found.
+    await rerender(tab('zen://history?q=cooked'), state(sync(true)))
+    await flush()
+    expect(el.querySelector('[data-remote-tab]')).toBeNull()
+    expect(el.querySelector('[data-testid="history-hidden-devices"]')).toBeNull()
+    await rerender(tab('zen://history'), state(sync(true)))
+    await flush()
+    // Mounted again (the tab closed and reopened), the device is hidden still.
+    el = await remount(tab(), state(sync(true)))
+    expect(ids()).toEqual(['work'])
+    // The row: shown here at once, and the core told.
+    await act(async () =>
+      el.querySelector<HTMLButtonElement>('[data-testid="history-devices-show-hidden"]')!.click()
+    )
+    expect(ids()).toEqual(['phone', 'work'])
+    expect(calls('history.showHiddenDevices')).toHaveLength(1)
+    expect(el.querySelector('[data-testid="history-hidden-devices"]')).toBeNull()
+  })
+
+  it('with every device hidden the umbrella group keeps the page’s place with its sentence and the row (§10.1 as amended for #316)', async () => {
+    devices = DEVICES
+    hidden = ['phone', 'work']
+    const el = await mountPage(tab(), state(sync(true)))
+    expect(calls('history.hiddenDevices')).toHaveLength(1)
+    expect(el.querySelector('[data-testid="history-remote-device"]')).toBeNull()
+    const group = el.querySelector<HTMLElement>('[data-testid="history-remote-tabs"]')!
+    expect(group.getAttribute('data-state')).toBe('hidden')
+    expect(text(group.querySelector('h2'))).toBe('Tabs from other devices')
+    expect(text(group.querySelector('[data-testid="history-remote-tabs-empty"]'))).toBe(
+      "You've hidden every device"
+    )
+    const show = group.querySelector<HTMLButtonElement>(
+      '[data-testid="history-devices-show-hidden"]'
+    )!
+    expect(text(show)).toBe('Show hidden devices')
+    // The row stays on the page: no chevron. Under the umbrella heading it is a group's row, at
+    // the heading's 4 – the loose row's beat is for the row with no heading over it.
+    expect(show.parentElement!.querySelector('.zen-page-row-chevron')).toBeNull()
+    expect(show.closest('ul')!.classList.contains('zen-page-rows-loose')).toBe(false)
+    expect(headings(el).slice(0, 3)).toEqual([
+      'Recently closed',
+      'Tabs from other devices',
+      'Today'
+    ])
+    // A search shows matches, not the state: the group steps aside with the rest.
+    await rerender(tab('zen://history?q=example'), state(sync(true)))
+    await flush()
+    expect(el.querySelector('[data-testid="history-remote-tabs"]')).toBeNull()
+    await rerender(tab('zen://history'), state(sync(true)))
+    await flush()
+    // The group came back with the search's end; its row shows every device again.
+    await act(async () =>
+      el.querySelector<HTMLButtonElement>('[data-testid="history-devices-show-hidden"]')!.click()
+    )
+    expect(el.querySelector('[data-testid="history-remote-tabs"]')).toBeNull()
+    expect(el.querySelectorAll('[data-testid="history-remote-device"]')).toHaveLength(2)
+    // A hidden id no device lists any more counts for nothing: sync on with nothing published
+    // steps aside as before.
+    devices = []
+    await act(async () => emit('history.hiddenDevicesChanged', ['old-phone']))
+    await rerender(tab(), state(sync(true)))
+    expect(el.querySelector('[data-testid="history-remote-tabs"]')).toBeNull()
+  })
+
+  it('the search filters the devices’ rows too – a device left with nothing steps aside – and a match answers the search when history has none', async () => {
+    devices = DEVICES
+    // History finds nothing for any of these; the phone's tab answers "cooked", so no "No history matches".
+    groups = []
+    const el = await mountPage(tab('zen://history?q=cooked'), state(sync(true)))
+    expect(calls('history.grouped').at(-1)).toEqual({ query: { text: 'cooked', limit: 300 } })
+    expect(el.querySelector('[data-testid="history-empty"]')).toBeNull()
+    const cards = [...el.querySelectorAll('[data-testid="history-remote-device"]')]
+    expect(cards.map((c) => c.getAttribute('data-device-id'))).toEqual(['phone'])
+    const rows = [...cards[0]!.querySelectorAll('[data-remote-tab]')]
+    expect(rows.map((r) => r.getAttribute('data-remote-tab'))).toEqual(['phone:p2'])
+    expect(rows[0]!.querySelectorAll('mark').length).toBeGreaterThan(0)
+    // The host matches as the URL does.
+    await rerender(tab('zen://history?q=github.com'), state(sync(true)))
+    await flush()
+    expect(
+      [...el.querySelectorAll('[data-remote-tab]')].map((r) => r.getAttribute('data-remote-tab'))
+    ).toEqual(['work:held-1'])
+    // The devices' rows read by the visits' rule (history-03): a term at the start of a word
+    // ("cooked" after the hyphen), never inside one ("ooked"); case-folded ("RAGÙ" finds "ragù");
+    // every term must land on the one page – title or address.
+    await rerender(tab('zen://history?q=ooked'), state(sync(true)))
+    await flush()
+    expect(el.querySelector('[data-remote-tab]')).toBeNull()
+    expect(text(el.querySelector('[data-testid="history-empty"]'))).toBe(
+      'No history matches “ooked”'
+    )
+    await rerender(tab('zen://history?q=RAGÙ ione'), state(sync(true)))
+    await flush()
+    expect(
+      [...el.querySelectorAll('[data-remote-tab]')].map((r) => r.getAttribute('data-remote-tab'))
+    ).toEqual([])
+    await rerender(tab('zen://history?q=RAGÙ recipes'), state(sync(true)))
+    await flush()
+    expect(
+      [...el.querySelectorAll('[data-remote-tab]')].map((r) => r.getAttribute('data-remote-tab'))
+    ).toEqual(['phone:p2'])
+    // Nothing anywhere: History's own line, and no empty device group beside it.
+    await rerender(tab('zen://history?q=nowhere'), state(sync(true)))
+    await flush()
+    expect(text(el.querySelector('[data-testid="history-empty"]'))).toBe(
+      'No history matches “nowhere”'
+    )
+    expect(el.querySelector('[data-testid="history-remote-device"]')).toBeNull()
+    expect(el.querySelector('[data-testid="history-remote-tabs"]')).toBeNull()
+  })
+
+  it('while searching, the empty group steps aside with Recently closed', async () => {
+    const el = await mountPage(tab('zen://history?q=example'), state(sync(false)))
+    expect(el.querySelector('[data-testid="history-remote-tabs"]')).toBeNull()
+    expect(el.querySelector('[data-testid="history-recently-closed"]')).toBeNull()
+    await rerender(tab('zen://history'), state(sync(false)))
+    expect(el.querySelector('[data-testid="history-remote-tabs"]')).not.toBeNull()
+  })
+
+  it('is not drawn on a host without sync', async () => {
+    devices = DEVICES
+    const s = state(sync(true))
+    ;(s.capabilities as { sync: boolean }).sync = false
+    const el = await mountPage(tab(), s)
+    expect(el.querySelector('[data-testid="history-remote-tabs"]')).toBeNull()
+    expect(el.querySelector('[data-testid="history-remote-device"]')).toBeNull()
+  })
+})

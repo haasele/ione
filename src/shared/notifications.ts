@@ -1,0 +1,118 @@
+/**
+ * Web notifications: what the page preload and the host agree on.
+ *
+ * Chromium asks the host a yes-or-no question for `Notification.permission`, so an undecided
+ * site would read `denied` and never ask. The page preload therefore answers the page itself,
+ * from the browser's three-state resolution of the site's permission, over these channels.
+ */
+
+/** Web `Notification.permission`. */
+export type NotificationPermissionStatus = 'granted' | 'denied' | 'default'
+
+export function isNotificationPermissionStatus(
+  value: unknown
+): value is NotificationPermissionStatus {
+  return value === 'granted' || value === 'denied' || value === 'default'
+}
+
+/**
+ * Renderer → main (synchronous, answered with the status of the sender's document) and
+ * main → renderer (the status changed while the document is open).
+ */
+export const NOTIFICATION_PERMISSION_CHANNEL = 'zen:notification-permission'
+
+/**
+ * Renderer → main, once per `Notification.requestPermission()` call, sent before the engine's
+ * own permission request leaves the page: whether the document holds a user activation at that
+ * moment (`navigator.userActivation.isActive`, read by the preload's isolated world), or
+ * undefined where the engine cannot say. The host's permission request handler hears no gesture
+ * from the engine (Electron's request details carry the frame and its URL alone), so this is
+ * how the core's quiet rule (NOT-03, `webNotifications.asksQuietly`) learns of the gesture on a
+ * host whose engine raises the request itself; the page script's polyfill carries it inside
+ * its `request` message instead.
+ */
+export const NOTIFICATION_REQUEST_CHANNEL = 'zen:notification-request'
+
+/**
+ * DOM events joining the page's main world (where the shim redefines `Notification`) with the
+ * preload's isolated world (which has the browser's ear). Both worlds share the document, and a
+ * `CustomEvent.detail` string crosses worlds as a copy.
+ */
+export interface NotificationShimEvents {
+  /** Main world asks; the isolated world answers with `update` before the dispatch returns. */
+  query: string
+  /** Isolated world → main world: `detail` is the status. */
+  update: string
+  /** Main world → isolated world: the page called `window.focus()` while it had a gesture. */
+  focus: string
+  /**
+   * Main world → isolated world: the page is calling `Notification.requestPermission()`; the
+   * isolated world reads the frame's activation itself and tells the browser
+   * (`NOTIFICATION_REQUEST_CHANNEL`) before the engine's request leaves.
+   */
+  request: string
+}
+
+export const NOTIFICATION_SHIM_EVENTS: NotificationShimEvents = {
+  query: 'ione:notification-permission-query',
+  update: 'ione:notification-permission',
+  focus: 'ione:focus',
+  request: 'ione:notification-request'
+}
+
+// ---------------------------------------------------------------------------
+// The polyfill (hosts whose engine has no `Notification`: the Android WebView)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the page script's `Notification` posts to the browser. `query` asks for the document's
+ * status (the answer is pushed as `status`), `request` is `Notification.requestPermission()`,
+ * `show` a constructed notification, `close` its `close()`.
+ */
+export interface NotificationPageRequest {
+  notification: 'query' | 'request' | 'show' | 'close'
+  /** `request` / `show` / `close`: the page's id for the notification or the request. */
+  id?: string
+  /**
+   * `request`: whether `requestPermission()` ran inside a user activation (`navigator.userActivation`).
+   * A request without one asks quietly (Chrome's rule, NOT-03); left out where the engine cannot say.
+   */
+  gesture?: boolean
+  title?: string
+  body?: string
+  /** Absolute URL of the icon, '' for none. */
+  icon?: string
+  tag?: string
+  silent?: boolean
+  requireInteraction?: boolean
+  renotify?: boolean
+  /** `NotificationOptions.timestamp` (ms since the epoch), when the page set one. */
+  timestamp?: number
+}
+
+/** Browser → page: answers and the notification's life events. */
+export interface NotificationHostMessage {
+  type: 'notification'
+  action: 'status' | 'result' | 'shown' | 'click' | 'close' | 'error'
+  /** `status` / `result`: the document's `Notification.permission`. */
+  status?: NotificationPermissionStatus
+  /** `result` and the life events: the id the page gave. */
+  id?: string
+}
+
+/** Longest title and body a notification carries to the host (Chrome truncates similarly). */
+export const MAX_NOTIFICATION_TEXT = 1024
+
+/** Resolve `Notification.permission` from the site's content decision. */
+export function notificationStatusOf(
+  decision: 'allow' | 'deny' | 'ask'
+): NotificationPermissionStatus {
+  switch (decision) {
+    case 'allow':
+      return 'granted'
+    case 'deny':
+      return 'denied'
+    default:
+      return 'default'
+  }
+}

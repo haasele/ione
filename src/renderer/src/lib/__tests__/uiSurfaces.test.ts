@@ -1,0 +1,464 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+vi.mock('../api', () => ({
+  cmd: vi.fn(async () => null),
+  run: vi.fn(),
+  onEvent: vi.fn(() => () => undefined)
+}))
+
+import type { UIState, WebAppInstallPrompt } from '@shared/types'
+import type { WebAppInfo } from '@shared/webApp'
+import { cmd, run } from '../api'
+import {
+  browserStore,
+  chromeNeedsKeyboard,
+  closeClearBrowsingData,
+  closeDeleteSearchHistoryConfirm,
+  closeImportDialog,
+  closeMediaSheet,
+  closeNameWindow,
+  newTabRevealOpensUrlbar,
+  onboardingUp,
+  openClearBrowsingData,
+  openDeleteSearchHistoryConfirm,
+  openImportDialog,
+  installPopoverUp,
+  openInstallSheet,
+  openMediaSheet,
+  openNameWindow,
+  openNewTabPageUrlbar,
+  openNewTabShortcutDialog,
+  overlayCoversContent,
+  pageHidden,
+  panelAloneOverContent,
+  uiStore,
+  type UiState
+} from '../ui'
+import { viewportStore } from '../formFactor'
+import { openImportSurface } from '../pages'
+
+const idle = (): UiState => uiStore.get()
+
+afterEach(() => {
+  uiStore.set({
+    overlay: 'none',
+    siteInfoOpen: false,
+    permissionPromptOpen: false,
+    clearBrowsingDataOpen: false,
+    nameWindowOpen: false,
+    deleteSearchHistoryOpen: false,
+    barMenuOpen: false,
+    starDialog: null,
+    snapshot: null,
+    snapshotTabId: null,
+    install: null,
+    installOffer: null,
+    mediaSheet: null,
+    importDialog: null,
+    overlaySection: null
+  })
+  uiStore.set((s) => ({ urlbar: { ...s.urlbar, open: false } }))
+  vi.mocked(run).mockClear()
+  vi.mocked(cmd).mockClear()
+})
+
+const INSTALL_PROMPT: WebAppInstallPrompt = {
+  tabId: 't1',
+  title: 'Sketch',
+  url: 'https://sketch.example/',
+  origin: 'sketch.example',
+  icon: null,
+  info: null,
+  tint: null,
+  surface: 'homeScreen'
+}
+
+describe('the install sheet', () => {
+  it('opens for a Home-screen prompt and for a desktop one alike, over the page with the chrome focused', async () => {
+    // One store entry serves both chromes: the phone's `InstallLayer` shows a sheet for it, the
+    // desktop's `InstallPopoverLayer` the pill's popover – each on its own host only.
+    await openInstallSheet({ ...INSTALL_PROMPT, surface: 'desktop' })
+    expect(idle().install?.surface).toBe('desktop')
+    expect(run).toHaveBeenCalledWith('focus.chrome', undefined)
+    uiStore.set({ install: null })
+    vi.mocked(run).mockClear()
+    await openInstallSheet(INSTALL_PROMPT)
+    expect(idle().install?.tabId).toBe('t1')
+    expect(run).toHaveBeenCalledWith('focus.chrome', undefined)
+  })
+
+  it('the desktop’s "Install <app>?" popover is a panel over the page’s picture, no dim of its own (§9.5, §9.20); the "Create shortcut" dialog and the phone’s sheet are not', () => {
+    const info: WebAppInfo = {
+      manifestUrl: 'https://sketch.example/manifest.webmanifest',
+      id: 'https://sketch.example/',
+      name: 'Sketch',
+      shortName: null,
+      description: null,
+      startUrl: 'https://sketch.example/',
+      scope: 'https://sketch.example/',
+      display: 'standalone',
+      themeColor: null,
+      backgroundColor: null,
+      icons: [
+        {
+          src: 'https://sketch.example/icon.png',
+          sizes: '192x192',
+          type: 'image/png',
+          purpose: ['any']
+        }
+      ],
+      screenshots: [],
+      shareTarget: null
+    }
+    // An installable manifest on a host with windows: Chrome's form, the popover under the chip.
+    uiStore.set({ install: { ...INSTALL_PROMPT, surface: 'desktop', info } })
+    expect(installPopoverUp(idle())).toBe(true)
+    expect(overlayCoversContent(idle())).toBe(true)
+    expect(panelAloneOverContent(idle())).toBe(true)
+    // Over Settings it is not alone: the overlay dims.
+    uiStore.set({ overlay: 'settings' })
+    expect(panelAloneOverContent(idle())).toBe(false)
+    uiStore.set({ overlay: 'none' })
+    // No installable manifest: the "Create shortcut" frame dialog, whose dim is the host's scrim.
+    uiStore.set({ install: { ...INSTALL_PROMPT, surface: 'desktop', info: null } })
+    expect(installPopoverUp(idle())).toBe(false)
+    expect(panelAloneOverContent(idle())).toBe(false)
+    // The phone's sheet carries a scrim of its own: not the popover either.
+    uiStore.set({ install: { ...INSTALL_PROMPT, info } })
+    expect(installPopoverUp(idle())).toBe(false)
+    expect(panelAloneOverContent(idle())).toBe(false)
+  })
+
+  it('the core’s offer is the same popover (lib/installOffer.ts): over the page’s picture, undimmed, holding the keys; the prompt takes its place', async () => {
+    const banner = { tabId: 't1', name: 'Sketch', origin: 'sketch.example', icon: null, tint: null }
+    uiStore.set({ installOffer: { banner, retired: false } })
+    expect(installPopoverUp(idle())).toBe(true)
+    expect(overlayCoversContent(idle())).toBe(true)
+    expect(panelAloneOverContent(idle())).toBe(true)
+    expect(chromeNeedsKeyboard()).toBe(true)
+    // Retired by the core, it is still up while it leaves: the page stays under its picture.
+    uiStore.set({ installOffer: { banner, retired: true } })
+    expect(overlayCoversContent(idle())).toBe(true)
+    expect(panelAloneOverContent(idle())).toBe(true)
+    // The user's prompt for the tab – the chip, the app menu – stands alone: the offer goes.
+    await openInstallSheet({ ...INSTALL_PROMPT, surface: 'desktop', info: null })
+    expect(idle().installOffer).toBeNull()
+    expect(idle().install?.surface).toBe('desktop')
+  })
+})
+
+describe('the media sheet', () => {
+  it('holds a picture of the tab on screen, not of the media’s tab, and shows the media’s tab', async () => {
+    vi.mocked(cmd).mockResolvedValueOnce('data:image/jpeg;base64,AAAA' as never)
+    // The media plays in t1 while t2 is on screen: the recede starts on t2's page, and the
+    // capture is named for it, so the host hides that view and no other.
+    await openMediaSheet('t1', 't2')
+    expect(cmd).toHaveBeenCalledWith('overlay.snapshot', { tabId: 't2' })
+    expect(cmd).not.toHaveBeenCalledWith('overlay.snapshot', { tabId: 't1' })
+    expect(idle().snapshotTabId).toBe('t2')
+    expect(idle().mediaSheet).toBe('t1')
+    expect(overlayCoversContent(idle())).toBe(true)
+    expect(run).toHaveBeenCalledWith('focus.chrome', undefined)
+    closeMediaSheet()
+    expect(idle().mediaSheet).toBeNull()
+  })
+})
+
+describe('chrome surfaces over the content', () => {
+  it('counts the Delete browsing data dialog as a surface that covers the page and holds the keyboard', () => {
+    expect(overlayCoversContent(idle())).toBe(false)
+    expect(chromeNeedsKeyboard()).toBe(false)
+    uiStore.set({ clearBrowsingDataOpen: true })
+    expect(overlayCoversContent(idle())).toBe(true)
+    expect(chromeNeedsKeyboard()).toBe(true)
+    // A dialog dims the page: it is not a lone panel.
+    expect(panelAloneOverContent(idle())).toBe(false)
+  })
+
+  it('treats site information and the permission prompt as panels that draw no dim of their own', () => {
+    // A popover on a mouse (no scrim, §9.5), a chassis sheet on a phone whose own scrim is the
+    // one dim over the page (§11.5): either way the capture behind them shows undimmed.
+    uiStore.set({ siteInfoOpen: true })
+    expect(panelAloneOverContent(idle())).toBe(true)
+    uiStore.set({ siteInfoOpen: false, permissionPromptOpen: true })
+    expect(panelAloneOverContent(idle())).toBe(true)
+    // Over Settings the popover is not alone: the overlay dims.
+    uiStore.set({ overlay: 'settings' })
+    expect(panelAloneOverContent(idle())).toBe(false)
+  })
+
+  it('the collapsed rail’s flyout leaves the page’s picture under it undimmed: the sidebar beside the page, not a dialog over it (§9.20)', () => {
+    uiStore.set({ railFlyout: true })
+    try {
+      expect(pageHidden(idle())).toBe(true)
+      expect(overlayCoversContent(idle())).toBe(false)
+      expect(panelAloneOverContent(idle())).toBe(true)
+      // The hover card off one of its rows is a panel too: still no dim.
+      uiStore.set({ hoverCard: { ...idle().hoverCard, tabId: 't1' } })
+      expect(panelAloneOverContent(idle())).toBe(true)
+      uiStore.set({ hoverCard: { ...idle().hoverCard, tabId: null } })
+      // Out over Settings or a dialog it is not alone: their dim stays.
+      uiStore.set({ overlay: 'settings' })
+      expect(panelAloneOverContent(idle())).toBe(false)
+      uiStore.set({ overlay: 'none', clearBrowsingDataOpen: true })
+      expect(panelAloneOverContent(idle())).toBe(false)
+    } finally {
+      uiStore.set({ railFlyout: false, clearBrowsingDataOpen: false })
+    }
+  })
+
+  it.each([
+    ['the compact sidebar’s edge reveal', 'compactHover'],
+    ['the hidden toolbar’s reveal', 'toolbarHover']
+  ] as const)(
+    '%s leaves the page’s picture under it undimmed, like the rail’s flyout: a hover reveal of chrome is not a dialog (#411 ruling 4, §9.20)',
+    (_name, flag) => {
+      uiStore.set({ [flag]: true })
+      try {
+        // The reveal stands over the page's picture (the flag is `pageHidden`'s), covers no
+        // content of its own and, alone, draws no dim.
+        expect(pageHidden(idle())).toBe(true)
+        expect(overlayCoversContent(idle())).toBe(false)
+        expect(panelAloneOverContent(idle())).toBe(true)
+        // A panel opened from the revealed chrome – the hover card off a tab row, site
+        // information from the revealed toolbar's pill – keeps the page undimmed.
+        uiStore.set({ hoverCard: { ...idle().hoverCard, tabId: 't1' } })
+        expect(panelAloneOverContent(idle())).toBe(true)
+        uiStore.set({ hoverCard: { ...idle().hoverCard, tabId: null }, siteInfoOpen: true })
+        expect(panelAloneOverContent(idle())).toBe(true)
+        uiStore.set({ siteInfoOpen: false })
+        // Both reveals out at once (the sidebar's edge and the toolbar's): still no dim.
+        uiStore.set({ compactHover: true, toolbarHover: true })
+        expect(panelAloneOverContent(idle())).toBe(true)
+        // Out over Settings or a dialog it is not alone: their dim stays.
+        uiStore.set({ overlay: 'settings' })
+        expect(panelAloneOverContent(idle())).toBe(false)
+        uiStore.set({ overlay: 'none', clearBrowsingDataOpen: true })
+        expect(panelAloneOverContent(idle())).toBe(false)
+      } finally {
+        uiStore.set({ compactHover: false, toolbarHover: false, clearBrowsingDataOpen: false })
+      }
+    }
+  )
+
+  it('a menu the renderer draws – the desktop app menu under ⋯ – leaves the page under it undimmed (§6 "Menus", §9.20)', () => {
+    const menu = { id: 'm1', source: 'app' as const, items: [], x: null, y: null }
+    uiStore.set({ menu })
+    try {
+      expect(overlayCoversContent(idle())).toBe(true)
+      expect(chromeNeedsKeyboard()).toBe(true)
+      expect(panelAloneOverContent(idle())).toBe(true)
+      // Over a dialog it is not alone: the dialog's dim stays.
+      uiStore.set({ clearBrowsingDataOpen: true })
+      expect(panelAloneOverContent(idle())).toBe(false)
+    } finally {
+      uiStore.set({ menu: null, clearBrowsingDataOpen: false })
+    }
+  })
+
+  it('opens Delete browsing data once, taking the keyboard, and gives it back on close', async () => {
+    await openClearBrowsingData(null)
+    expect(idle().clearBrowsingDataOpen).toBe(true)
+    expect(run).toHaveBeenCalledWith('focus.chrome', undefined)
+    vi.mocked(run).mockClear()
+    await openClearBrowsingData(null)
+    expect(run).not.toHaveBeenCalled()
+    closeClearBrowsingData()
+    expect(idle().clearBrowsingDataOpen).toBe(false)
+    expect(run).toHaveBeenCalledWith('focus.content', undefined)
+    vi.mocked(run).mockClear()
+    closeClearBrowsingData()
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('the Name window prompt is a dialog over the page in the same way: opened once with the keyboard, covering and dimming, the keyboard back on close (shortcuts-menus-121)', async () => {
+    expect(overlayCoversContent(idle())).toBe(false)
+    await openNameWindow(null)
+    expect(idle().nameWindowOpen).toBe(true)
+    expect(run).toHaveBeenCalledWith('focus.chrome', undefined)
+    expect(overlayCoversContent(idle())).toBe(true)
+    expect(chromeNeedsKeyboard()).toBe(true)
+    expect(panelAloneOverContent(idle())).toBe(false)
+    vi.mocked(run).mockClear()
+    await openNameWindow(null)
+    expect(run).not.toHaveBeenCalled()
+    closeNameWindow()
+    expect(idle().nameWindowOpen).toBe(false)
+    expect(run).toHaveBeenCalledWith('focus.content', undefined)
+    vi.mocked(run).mockClear()
+    closeNameWindow()
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('the "Delete search history?" prompt is a dialog over the page in the same way (pr-434 ruling 3): covering, dimming, holding the keyboard; under the open bar its close leaves the keyboard with the chrome', async () => {
+    expect(overlayCoversContent(idle())).toBe(false)
+    await openDeleteSearchHistoryConfirm(null)
+    expect(idle().deleteSearchHistoryOpen).toBe(true)
+    expect(run).toHaveBeenCalledWith('focus.chrome', undefined)
+    expect(overlayCoversContent(idle())).toBe(true)
+    expect(chromeNeedsKeyboard()).toBe(true)
+    expect(panelAloneOverContent(idle())).toBe(false)
+    vi.mocked(run).mockClear()
+    // Cancel: nothing forgotten; with no bar up the page takes the keyboard back.
+    closeDeleteSearchHistoryConfirm()
+    expect(idle().deleteSearchHistoryOpen).toBe(false)
+    expect(run).not.toHaveBeenCalledWith('urlbar.clearSearchHistory', undefined)
+    expect(run).toHaveBeenCalledWith('focus.content', undefined)
+    vi.mocked(run).mockClear()
+    closeDeleteSearchHistoryConfirm()
+    expect(run).not.toHaveBeenCalled()
+    // Under the open bar the chrome keeps the keyboard as the prompt goes: the bar's field takes
+    // it (the prompt's own return, desktopOmnibox.test.tsx), never the page.
+    uiStore.set((s) => ({ urlbar: { ...s.urlbar, open: true } }))
+    await openDeleteSearchHistoryConfirm(null)
+    vi.mocked(run).mockClear()
+    closeDeleteSearchHistoryConfirm()
+    expect(idle().deleteSearchHistoryOpen).toBe(false)
+    expect(run).not.toHaveBeenCalledWith('focus.content', undefined)
+    expect(overlayCoversContent(idle())).toBe(true)
+  })
+
+  it('the import dialog is a dialog over the page in the same way, opened once with its preselected source (ID-23)', async () => {
+    expect(overlayCoversContent(idle())).toBe(false)
+    await openImportDialog(null, 'chrome:Default')
+    expect(idle().importDialog).toEqual({ source: 'chrome:Default' })
+    expect(overlayCoversContent(idle())).toBe(true)
+    expect(chromeNeedsKeyboard()).toBe(true)
+    expect(panelAloneOverContent(idle())).toBe(false)
+    expect(run).toHaveBeenCalledWith('focus.chrome', undefined)
+    vi.mocked(run).mockClear()
+    // A second ask while it is up changes nothing (the menu pressed twice).
+    await openImportDialog(null, null)
+    expect(idle().importDialog).toEqual({ source: 'chrome:Default' })
+    expect(run).not.toHaveBeenCalled()
+    closeImportDialog()
+    expect(idle().importDialog).toBeNull()
+    expect(run).toHaveBeenCalledWith('focus.content', undefined)
+  })
+
+  it('the import surface is Settings on Import with the dialog over it on a mouse – the tab where the host has page tabs, the overlay where not – and the category alone on a phone', async () => {
+    // A host without page tabs: the overlay on the section asked for, the dialog over it.
+    browserStore.set({
+      state: { capabilities: { pageTabs: false } } as unknown as UIState
+    })
+    await openImportSurface('t1', 'firefox:abcd', 'sync')
+    expect(idle().overlay).toBe('settings')
+    expect(idle().overlaySection).toBe('sync')
+    expect(idle().importDialog).toEqual({ source: 'firefox:abcd' })
+    expect(run).not.toHaveBeenCalledWith('page.open', expect.anything())
+    uiStore.set({ overlay: 'none', overlaySection: null, importDialog: null })
+    vi.mocked(run).mockClear()
+
+    // The desktop, Settings a tab (#193): the tab on the section, the dialog over it. The first
+    // run ends over the new tab page with the URL bar up in its new-tab mode: it closes first,
+    // or it would float over the tab and the dialog.
+    browserStore.set({
+      state: { capabilities: { pageTabs: true } } as unknown as UIState
+    })
+    uiStore.set((s) => ({ urlbar: { ...s.urlbar, open: true } }))
+    await openImportSurface('t1', 'chrome:Default')
+    expect(idle().overlay).toBe('none')
+    expect(idle().urlbar.open).toBe(false)
+    expect(run).toHaveBeenCalledWith('page.open', { id: 'settings', section: 'import' })
+    expect(idle().importDialog).toEqual({ source: 'chrome:Default' })
+    uiStore.set({ importDialog: null })
+    vi.mocked(run).mockClear()
+
+    // A phone: the category alone, and on Import whatever section was asked for – its rows
+    // import from files, there being no other browser's profile to read.
+    viewportStore.set({ formFactor: 'phone' })
+    await openImportSurface('t1', 'chrome:Default', 'sync')
+    expect(run).toHaveBeenCalledWith('page.open', { id: 'settings', section: 'import' })
+    expect(idle().importDialog).toBeNull()
+    expect(idle().overlay).toBe('none')
+    viewportStore.set({ formFactor: 'desktop' })
+    browserStore.set({ state: null })
+  })
+})
+
+describe('the URL bar and the first-run tour', () => {
+  const profileWindow = (onboardingDone: boolean): UIState =>
+    ({
+      settings: { onboardingDone },
+      window: { kind: 'synced', chrome: 'full' },
+      tabs: {}
+    }) as unknown as UIState
+
+  afterEach(() => {
+    uiStore.set((s) => ({ urlbar: { ...s.urlbar, open: false }, newTabShortcutDialog: null }))
+    viewportStore.set({ formFactor: 'desktop' })
+    browserStore.set({ state: null })
+  })
+
+  const settled = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
+
+  it('reads the tour from the state the shells mount it on; nothing until the state is here', () => {
+    expect(onboardingUp()).toBe(false)
+    browserStore.set({ state: profileWindow(false) })
+    expect(onboardingUp()).toBe(true)
+    browserStore.set({ state: profileWindow(true) })
+    expect(onboardingUp()).toBe(false)
+  })
+
+  it("does not open the new tab's bar or the shortcut dialog under the tour; the newtab.opened after the tour opens it", async () => {
+    browserStore.set({ state: profileWindow(false) })
+    // The boot path's `newtab.opened` (a fresh tab's bar 150 ms after the chrome is ready) and
+    // Ctrl+T during the tour: no bar under the tour, whose buttons would take the keyboard
+    // from a field the user cannot see.
+    openNewTabPageUrlbar('t1', undefined, false)
+    await settled()
+    expect(uiStore.get().urlbar.open).toBe(false)
+    expect(run).not.toHaveBeenCalledWith('focus.chrome', undefined)
+    await openNewTabShortcutDialog({
+      tabId: 't1',
+      id: null,
+      title: '',
+      url: 'https://example.org/'
+    })
+    expect(uiStore.get().newTabShortcutDialog).toBeNull()
+    // The tour's last click: the core broadcasts the state that puts the tour away, then the
+    // new tab it opened (`newtab.opened` follows the broadcast). The bar opens over that tab.
+    browserStore.set({ state: profileWindow(true) })
+    openNewTabPageUrlbar('t2', undefined, false)
+    await settled()
+    expect(uiStore.get().urlbar).toMatchObject({ open: true, mode: 'new-tab', tabId: 't2' })
+    expect(run).toHaveBeenCalledWith('focus.chrome', undefined)
+  })
+
+  it("leaves the phone's flow alone: its bar is the phone shell's own", async () => {
+    viewportStore.set({ formFactor: 'phone' })
+    browserStore.set({ state: profileWindow(false) })
+    expect(onboardingUp()).toBe(false)
+    openNewTabPageUrlbar('t1', undefined, true)
+    await settled()
+    expect(uiStore.get().urlbar).toMatchObject({ open: true, mode: 'new-tab', tabId: 't1' })
+  })
+})
+
+describe("the served new tab page's reveal (NTP-35): `newtab.opened` and the bar", () => {
+  afterEach(() => {
+    viewportStore.set({ formFactor: 'desktop' })
+  })
+
+  it("the desktop's reveal is unchanged: the announcement of a new tab opens the bar over the page", () => {
+    viewportStore.set({ formFactor: 'desktop' })
+    // `Browser.revealFreshTab` / `NewTabService.open` announce without `text`.
+    expect(newTabRevealOpensUrlbar(undefined)).toBe(true)
+    // The page's `search` action: a click ('') or the first character typed into its field.
+    expect(newTabRevealOpensUrlbar('')).toBe(true)
+    expect(newTabRevealOpensUrlbar('z')).toBe(true)
+  })
+
+  it('the tablet skips it: the page comes up bare, and only the tap on its field opens the bar', () => {
+    viewportStore.set({ formFactor: 'tablet' })
+    expect(newTabRevealOpensUrlbar(undefined)).toBe(false)
+    expect(newTabRevealOpensUrlbar('')).toBe(true)
+    expect(newTabRevealOpensUrlbar('z')).toBe(true)
+  })
+
+  it('the phone never reaches it (its chrome draws its own page – `bootFirstTab.test.ts`); were it announced, the page would come up bare too', () => {
+    viewportStore.set({ formFactor: 'phone' })
+    expect(newTabRevealOpensUrlbar(undefined)).toBe(false)
+    expect(newTabRevealOpensUrlbar('')).toBe(true)
+  })
+})

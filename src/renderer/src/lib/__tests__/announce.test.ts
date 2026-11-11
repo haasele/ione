@@ -1,0 +1,376 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { DownloadItem, Tab, UIState } from '@shared/types'
+import { downloadItem } from '@shared/__tests__/downloadFixtures'
+
+vi.mock('../api', () => ({
+  cmd: vi.fn(() => Promise.resolve(null)),
+  run: vi.fn(),
+  onEvent: vi.fn(() => () => undefined)
+}))
+
+import {
+  ANNOUNCE_CLEAR_MS,
+  ANNOUNCE_REPEAT_MS,
+  announce,
+  announcementVoice,
+  announcerStore,
+  downloadAnnouncement,
+  findAnnouncement,
+  loadCompleteAnnouncement,
+  muteAnnouncements,
+  resetAnnouncer,
+  startAnnouncer,
+  stateAnnouncements,
+  tabMoveAnnouncement,
+  tabSwitchAnnouncement,
+  zoomAnnouncement
+} from '../announce'
+import { browserStore } from '../ui'
+
+function tab(id: string, over: Partial<Tab> = {}): Tab {
+  return {
+    id,
+    title: `Page ${id}`,
+    url: `https://${id}.example/`,
+    pinned: false,
+    muted: false,
+    ...over
+  } as Tab
+}
+
+/**
+ * A snapshot with one space whose strip holds Essentials `e`, pinned `p`, folder `f`'s `f1`,
+ * and the loose rows `a`, `b`, `c` – the order the strip (and `tabOrderOf`) reads them in.
+ */
+function state(over: {
+  active?: string | null
+  focused?: boolean
+  tabs?: Record<string, Tab>
+}): UIState {
+  const tabs = over.tabs ?? {
+    e: tab('e', { title: 'Mail' }),
+    p: tab('p', { pinned: true }),
+    f1: tab('f1', { folderId: 'f' }),
+    a: tab('a', { title: 'Example Domain' }),
+    b: tab('b', { title: '', customTitle: undefined, url: 'https://b.example/path' }),
+    c: tab('c', { title: 'Third', customTitle: 'My notes' })
+  }
+  return {
+    tabs,
+    essentialTabIds: ['e'],
+    folders: { f: { id: 'f', spaceId: 's', name: 'Work' } },
+    spaces: [
+      {
+        id: 's',
+        containerId: null,
+        activeTabId: over.active === undefined ? 'a' : over.active,
+        tabIds: ['p', 'f1', 'a', 'b', 'c']
+      }
+    ],
+    activeSpaceId: 's',
+    settings: { containerSpecificEssentials: false },
+    window: { focused: over.focused ?? true }
+  } as unknown as UIState
+}
+
+describe('announcement text', () => {
+  it('names the front tab by its place in the strip order and its title', () => {
+    const s = state({})
+    expect(tabSwitchAnnouncement(s, 'e')).toBe('Tab 1 of 6, Mail')
+    expect(tabSwitchAnnouncement(s, 'p')).toBe('Tab 2 of 6, Page p')
+    expect(tabSwitchAnnouncement(s, 'f1')).toBe('Tab 3 of 6, Page f1')
+    expect(tabSwitchAnnouncement(s, 'a')).toBe('Tab 4 of 6, Example Domain')
+  })
+
+  it("falls back to the address for an untitled tab and prefers the user's own title", () => {
+    const s = state({})
+    expect(tabSwitchAnnouncement(s, 'b')).toBe('Tab 5 of 6, https://b.example/path')
+    expect(tabSwitchAnnouncement(s, 'c')).toBe('Tab 6 of 6, My notes')
+  })
+
+  it('names a tab the strip does not list without a place, and nothing for an unknown id', () => {
+    const s = state({ tabs: { x: tab('x', { title: 'Popup' }) } })
+    expect(tabSwitchAnnouncement(s, 'x')).toBe('Tab, Popup')
+    expect(tabSwitchAnnouncement(s, 'nope')).toBeNull()
+  })
+
+  it('says a download starting and how it ended, by file name; progress and removal say nothing', () => {
+    const named = (over: Partial<DownloadItem>): DownloadItem =>
+      downloadItem({ id: 'd', filename: 'report.txt', ...over })
+    expect(downloadAnnouncement(named({ state: 'progressing' }), 'started')).toBe(
+      'Download started: report.txt'
+    )
+    expect(downloadAnnouncement(named({ state: 'progressing' }), 'progress')).toBeNull()
+    expect(downloadAnnouncement(named({ state: 'completed' }), 'done')).toBe(
+      'Download finished: report.txt'
+    )
+    expect(downloadAnnouncement(named({ state: 'interrupted' }), 'done')).toBe(
+      'Download failed: report.txt'
+    )
+    expect(downloadAnnouncement(named({ state: 'cancelled' }), 'done')).toBe(
+      'Download cancelled: report.txt'
+    )
+    expect(downloadAnnouncement(named({ state: 'completed' }), 'removed')).toBeNull()
+    // The name on disk wins once the engine settled it (a "(1)" suffix).
+    expect(
+      downloadAnnouncement(named({ state: 'completed', finalName: 'report (1).txt' }), 'done')
+    ).toBe('Download finished: report (1).txt')
+  })
+
+  it('reads the find count as words, and nothing before the page answers', () => {
+    expect(findAnnouncement('lorem', { tabId: 't', activeMatchOrdinal: 3, matches: 12 })).toBe(
+      '3 of 12 matches'
+    )
+    expect(findAnnouncement('lorem', { tabId: 't', activeMatchOrdinal: 1, matches: 1 })).toBe(
+      '1 of 1 match'
+    )
+    expect(findAnnouncement('zzz', { tabId: 't', activeMatchOrdinal: 0, matches: 0 })).toBe(
+      'No matches'
+    )
+    expect(findAnnouncement('lorem', null)).toBeNull()
+    expect(findAnnouncement('', { tabId: 't', activeMatchOrdinal: 0, matches: 0 })).toBeNull()
+  })
+
+  it('reads the zoom as a percentage', () => {
+    expect(zoomAnnouncement(1.25)).toBe('Zoom 125%')
+    expect(zoomAnnouncement(1)).toBe('Zoom 100%')
+    expect(zoomAnnouncement(0.5)).toBe('Zoom 50%')
+  })
+
+  it('names one muted or unmuted tab, counts several, and says a mixed change as two', () => {
+    const before = state({})
+    const oneMuted = state({
+      tabs: { ...before.tabs, a: tab('a', { title: 'Example Domain', muted: true }) }
+    })
+    expect(muteAnnouncements(before, oneMuted)).toEqual(['Tab muted, Example Domain'])
+    expect(muteAnnouncements(oneMuted, before)).toEqual(['Tab unmuted, Example Domain'])
+    const site = state({
+      tabs: {
+        ...before.tabs,
+        a: tab('a', { muted: true }),
+        b: tab('b', { muted: true }),
+        c: tab('c', { muted: true })
+      }
+    })
+    expect(muteAnnouncements(before, site)).toEqual(['3 tabs muted'])
+    const mixed = state({
+      tabs: { ...oneMuted.tabs, b: tab('b', { muted: true }), c: tab('c', { muted: true }) }
+    })
+    const flipped = state({
+      tabs: { ...mixed.tabs, a: tab('a', { title: 'Example Domain', muted: false }) }
+    })
+    expect(muteAnnouncements(mixed, flipped)).toEqual(['Tab unmuted, Example Domain'])
+    expect(muteAnnouncements(before, flipped)).toEqual(['2 tabs muted'])
+    expect(
+      muteAnnouncements(state({ tabs: { ...before.tabs, b: tab('b', { muted: true }) } }), oneMuted)
+    ).toEqual(['Tab muted, Example Domain', 'Tab unmuted, https://b.example/path'])
+    // A tab that appeared muted (opened from a muted site) is not a change.
+    expect(
+      muteAnnouncements(before, state({ tabs: { ...before.tabs, n: tab('n', { muted: true }) } }))
+    ).toEqual([])
+    expect(muteAnnouncements(before, before)).toEqual([])
+  })
+
+  it('says where the keyboard put a tab, with the group it entered or left (tabs-34)', () => {
+    const moved = { tabId: 'a', position: 2, count: 5, focused: true }
+    expect(tabMoveAnnouncement({ ...moved, from: null, to: null })).toBe('Moved to position 2 of 5')
+    const research = { folderId: 'g', name: 'Research' }
+    // Inside a group: the place alone, as the row's aria-posinset has it.
+    expect(tabMoveAnnouncement({ ...moved, from: research, to: research })).toBe(
+      'Moved to position 2 of 5'
+    )
+    expect(tabMoveAnnouncement({ ...moved, from: null, to: research })).toBe(
+      'Moved to position 2 of 5 in Research'
+    )
+    expect(tabMoveAnnouncement({ ...moved, from: research, to: null })).toBe(
+      'Moved out of Research to position 2 of 5'
+    )
+    const trip = { folderId: 'k', name: 'Trip' }
+    expect(tabMoveAnnouncement({ ...moved, position: 1, count: 3, from: research, to: trip })).toBe(
+      'Moved to position 1 of 3 in Trip'
+    )
+    // A folder without a name is "the folder" – the desktop's noun (#398 F10), never "group".
+    expect(tabMoveAnnouncement({ ...moved, from: null, to: { folderId: 'k', name: '  ' } })).toBe(
+      'Moved to position 2 of 5 in the folder'
+    )
+    expect(tabMoveAnnouncement({ ...moved, from: { folderId: 'k', name: '' }, to: null })).toBe(
+      'Moved out of the folder to position 2 of 5'
+    )
+  })
+
+  it('reads a switch of the front tab and mute changes from two states, in the focused window only', () => {
+    const before = state({ active: 'a' })
+    expect(stateAnnouncements(before, state({ active: 'c' }))).toEqual(['Tab 6 of 6, My notes'])
+    expect(stateAnnouncements(before, state({ active: 'a' }))).toEqual([])
+    expect(stateAnnouncements(before, state({ active: null }))).toEqual([])
+    expect(stateAnnouncements(before, state({ active: 'c', focused: false }))).toEqual([])
+    const muted = state({
+      active: 'c',
+      tabs: { ...before.tabs, a: tab('a', { title: 'Example Domain', muted: true }) }
+    })
+    expect(stateAnnouncements(before, muted)).toEqual([
+      'Tab 6 of 6, My notes',
+      'Tab muted, Example Domain'
+    ])
+  })
+})
+
+describe('the phone’s voice (A11Y-02)', () => {
+  it('is the phone’s alone: the tablet’s strip and the desktop read as the desktop', () => {
+    expect(announcementVoice('phone')).toBe('phone')
+    expect(announcementVoice('tablet')).toBe('desktop')
+    expect(announcementVoice('desktop')).toBe('desktop')
+  })
+
+  it('names the front tab first, then its place, as the overview’s cards read (Chrome’s grid switcher)', () => {
+    const s = state({})
+    expect(tabSwitchAnnouncement(s, 'e', 'phone')).toBe('Mail, tab 1 of 6')
+    expect(tabSwitchAnnouncement(s, 'a', 'phone')).toBe('Example Domain, tab 4 of 6')
+    expect(tabSwitchAnnouncement(s, 'b', 'phone')).toBe('https://b.example/path, tab 5 of 6')
+    expect(tabSwitchAnnouncement(s, 'c', 'phone')).toBe('My notes, tab 6 of 6')
+    const popup = state({ tabs: { x: tab('x', { title: 'Popup' }) } })
+    expect(tabSwitchAnnouncement(popup, 'x', 'phone')).toBe('Popup, tab')
+    expect(tabSwitchAnnouncement(popup, 'nope', 'phone')).toBeNull()
+    // The desktop's words are untouched.
+    expect(tabSwitchAnnouncement(s, 'a')).toBe('Tab 4 of 6, Example Domain')
+  })
+
+  it('says the front tab’s load finishing by its title on the core’s `tab.loaded` – in the phone’s voice, for the tab in front, in the focused window', () => {
+    const s = state({ active: 'a' })
+    expect(loadCompleteAnnouncement(s, 'a', 'phone')).toBe('Example Domain loaded')
+    // A tab behind finishing is not the reader's news (the switch's, once it comes to the front).
+    expect(loadCompleteAnnouncement(s, 'c', 'phone')).toBeNull()
+    // A page still without a title reads by its address; a user's title wins.
+    expect(loadCompleteAnnouncement(state({ active: 'b' }), 'b', 'phone')).toBe(
+      'https://b.example/path loaded'
+    )
+    expect(loadCompleteAnnouncement(state({ active: 'c' }), 'c', 'phone')).toBe('My notes loaded')
+    // The desktop's voice hears no load; a background window's reader is not listening.
+    expect(loadCompleteAnnouncement(s, 'a')).toBeNull()
+    expect(loadCompleteAnnouncement(s, 'a', 'desktop')).toBeNull()
+    expect(
+      loadCompleteAnnouncement(state({ active: 'a', focused: false }), 'a', 'phone')
+    ).toBeNull()
+    // An id the state does not know says nothing.
+    expect(loadCompleteAnnouncement(s, 'nope', 'phone')).toBeNull()
+  })
+
+  it('reads a switch as the switch alone – a tab that arrives loading or loaded says nothing of its load – and reads no load off two snapshots (a fast load’s start and stop reach the chrome as one)', () => {
+    const before = state({
+      active: 'a',
+      tabs: {
+        ...state({}).tabs,
+        c: tab('c', { title: 'Third', customTitle: 'My notes', loading: true })
+      }
+    })
+    const switched = state({
+      active: 'c',
+      tabs: {
+        ...state({}).tabs,
+        c: tab('c', { title: 'Third', customTitle: 'My notes', loading: false })
+      }
+    })
+    expect(stateAnnouncements(before, switched, 'phone')).toEqual(['My notes, tab 6 of 6'])
+    const loaded = state({
+      active: 'a',
+      tabs: {
+        ...state({}).tabs,
+        c: tab('c', { title: 'Third', customTitle: 'My notes', loading: false })
+      }
+    })
+    const frontLoading = state({
+      active: 'a',
+      tabs: { ...state({}).tabs, a: tab('a', { title: 'Example Domain', loading: true }) }
+    })
+    const frontLoaded = state({
+      active: 'a',
+      tabs: { ...state({}).tabs, a: tab('a', { title: 'Example Domain', loading: false }) }
+    })
+    expect(stateAnnouncements(before, loaded, 'phone')).toEqual([])
+    // The front tab's `loading` going off is the `tab.loaded` event's to say, in either voice.
+    expect(stateAnnouncements(frontLoading, frontLoaded, 'phone')).toEqual([])
+    expect(stateAnnouncements(frontLoading, frontLoaded)).toEqual([])
+    expect(stateAnnouncements(frontLoading, frontLoaded, 'desktop')).toEqual([])
+    // A background window's snapshot says nothing in either voice.
+    expect(
+      stateAnnouncements(before, { ...switched, window: { focused: false } } as UIState, 'phone')
+    ).toEqual([])
+  })
+})
+
+describe('the status region', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    resetAnnouncer()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('takes a message, says the same words once within the repeat window, and empties itself', () => {
+    expect(announce('Zoom 110%', 1000)).toBe(true)
+    expect(announcerStore.get()).toEqual({ text: 'Zoom 110%', seq: 1 })
+    // The same words again, at once: quiet (a key held down); the window slides with each press.
+    expect(announce('Zoom 110%', 1000 + ANNOUNCE_REPEAT_MS - 1)).toBe(false)
+    expect(announce('Zoom 110%', 1000 + 2 * ANNOUNCE_REPEAT_MS - 2)).toBe(false)
+    expect(announcerStore.get().seq).toBe(1)
+    // Other words go through, and the earlier ones may then follow again.
+    expect(announce('Zoom 125%', 1100)).toBe(true)
+    expect(announce('Zoom 110%', 1200)).toBe(true)
+    expect(announcerStore.get()).toEqual({ text: 'Zoom 110%', seq: 3 })
+    // After the repeat window the same words are said again, as a new message.
+    expect(announce('Zoom 110%', 1200 + ANNOUNCE_REPEAT_MS)).toBe(true)
+    expect(announcerStore.get().seq).toBe(4)
+    // Empty text says nothing.
+    expect(announce('   ')).toBe(false)
+    expect(announcerStore.get().seq).toBe(4)
+    // The region empties a while after the last message; the count stays so a repeat is a new node.
+    vi.advanceTimersByTime(ANNOUNCE_CLEAR_MS - 1)
+    expect(announcerStore.get().text).toBe('Zoom 110%')
+    vi.advanceTimersByTime(1)
+    expect(announcerStore.get()).toEqual({ text: '', seq: 4 })
+  })
+
+  it('follows the browser state for the front tab and mute changes', () => {
+    browserStore.set({ state: state({ active: 'a' }) })
+    const stop = startAnnouncer()
+    browserStore.set({ state: state({ active: 'b' }) })
+    expect(announcerStore.get().text).toBe('Tab 5 of 6, https://b.example/path')
+    // A snapshot with the same front tab says nothing.
+    browserStore.set({ state: state({ active: 'b' }) })
+    expect(announcerStore.get().seq).toBe(1)
+    // A background window's snapshot says nothing either.
+    browserStore.set({ state: state({ active: 'c', focused: false }) })
+    expect(announcerStore.get().seq).toBe(1)
+    stop()
+    browserStore.set({ state: state({ active: 'a' }) })
+    expect(announcerStore.get().seq).toBe(1)
+  })
+
+  it('speaks in the voice it is given per change: the phone’s words for a switch; the load finishing on the tab in front waits for the core’s event', () => {
+    let voice: 'desktop' | 'phone' = 'phone'
+    const loading = state({
+      active: 'b',
+      tabs: { ...state({}).tabs, b: tab('b', { title: 'Second', loading: true }) }
+    })
+    browserStore.set({ state: state({ active: 'a' }) })
+    const stop = startAnnouncer(() => voice)
+    browserStore.set({ state: loading })
+    expect(announcerStore.get().text).toBe('Second, tab 5 of 6')
+    const settled = state({
+      active: 'b',
+      tabs: { ...state({}).tabs, b: tab('b', { title: 'Second', loading: false }) }
+    })
+    browserStore.set({ state: settled })
+    // `loading` going off in a snapshot says nothing of itself: the `tab.loaded` event does
+    // (`useMainEvents`), with these words off the settled state.
+    expect(announcerStore.get()).toEqual({ text: 'Second, tab 5 of 6', seq: 1 })
+    expect(announce(loadCompleteAnnouncement(settled, 'b', voice) ?? '')).toBe(true)
+    expect(announcerStore.get()).toEqual({ text: 'Second loaded', seq: 2 })
+    // The layout moved (the phone docked): the desktop's words from the next change on.
+    voice = 'desktop'
+    browserStore.set({ state: state({ active: 'a' }) })
+    expect(announcerStore.get().text).toBe('Tab 4 of 6, Example Domain')
+    stop()
+  })
+})

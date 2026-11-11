@@ -1,0 +1,4061 @@
+package app.zen.chromium
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.content.res.Resources
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Outline
+import android.graphics.Rect
+import android.net.Uri
+import android.net.http.SslError
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.Message
+import android.os.SystemClock
+import android.util.Base64
+import android.util.Log
+import android.view.ActionMode
+import android.view.InputDevice
+import android.view.KeyCharacterMap
+import android.view.KeyEvent
+import android.view.Menu
+import android.view.MenuItem
+import android.view.MotionEvent
+import android.view.PixelCopy
+import android.view.View
+import android.view.ViewOutlineProvider
+import android.webkit.ClientCertRequest
+import android.webkit.ConsoleMessage
+import android.webkit.GeolocationPermissions
+import android.webkit.HttpAuthHandler
+import android.webkit.JavascriptInterface
+import android.webkit.JsPromptResult
+import android.webkit.JsResult
+import android.webkit.PermissionRequest
+import android.webkit.SslErrorHandler
+import android.webkit.ValueCallback
+import android.webkit.WebBackForwardList
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.core.content.FileProvider
+import androidx.webkit.JavaScriptReplyProxy
+import androidx.webkit.ScriptHandler
+import androidx.webkit.WebMessageCompat
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import app.zen.chromium.blocking.Blocking
+import app.zen.chromium.blocking.BlockingTab
+import app.zen.chromium.blocking.Decision
+import app.zen.chromium.blocking.SafeBrowsingHit
+import app.zen.chromium.ext.ExtensionUrls
+import app.zen.chromium.ext.NavigationReports
+import app.zen.chromium.privacy.PreloadRules
+import app.zen.chromium.privacy.PrivacyFlags
+import app.zen.chromium.privacy.SaverModes
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.net.URLDecoder
+import java.security.SecureRandom
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.roundToInt
+
+/**
+ * One tab's page. Mirrors what Electron's `WebContentsView` gives the core: navigation events,
+ * title/favicon, load failures mapped to Chromium net error codes, HTML fullscreen, find-in-page,
+ * downloads, permission prompts, popups, the injected Zen page script and the request engine's
+ * verdicts (`shouldInterceptRequest`, on WebView's IO threads).
+ */
+@SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
+class TabWebView(
+    context: Context,
+    override var tabId: String,
+    override val containerId: String,
+    host: PageHost
+) : WebView(context), BlockingTab {
+    /** Reassigned once, when a custom tab's page moves into the browser window (`TabHost.adopt`). */
+    var host: PageHost = host
+        internal set
+    private var loading = false
+    /** The document the page's requests belong to; written on the main thread, read on IO threads. */
+    @Volatile
+    private var currentDocument: String? = null
+    /**
+     * The document generation the request engine stamps its decisions with (see
+     * [BlockingTab.documentGeneration]): advanced on the IO thread by every main-frame request
+     * the engine decides, and at commit for a document whose request it never saw (a non-http
+     * page, an extension page). [committedGeneration] is the one the last commit reported.
+     */
+    private val documentGeneration = AtomicLong(0)
+    private var committedGeneration = 0L
+    private val blockedPending = AtomicInteger(0)
+    private val blockedFlushScheduled = AtomicBoolean(false)
+    /** The beat's blocked requests by host, for the chrome's tracker report; guarded by itself. */
+    private val blockedHosts = LinkedHashMap<String, BlockedHostTally>()
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+    var radiusPx = 0f
+        private set
+    /** How far the page sits below the top of its frame during a pull-to-refresh (device px). */
+    private var pullOffsetPx = 0f
+    /**
+     * How much of [pullOffsetPx] the layout carries under a standing page-edge band – the view
+     * placed that much lower and shorter (`TabHost.place`) – rather than the translation ([PageSeat]).
+     */
+    private var seatPx = 0
+    /** The bar that hides on scroll: what of the touches and the scroll it hears (see `BarHideGesture`). */
+    val barHide = BarHideGesture(this) { phase, payload -> host.barScroll(tabId, phase, payload) }
+    /**
+     * With the bar hiding off the top edge, the page is laid out tall and slid up by the bar's
+     * offset, and the part of it that then pokes past the frame's bottom edge is clipped; the
+     * strip a bottom-docked bar has not yet left is clipped the same way (see `TabHost.place`).
+     */
+    private var barShiftPx = 0f
+    private var barClipPx = 0
+    private val pull = PullToRefreshGesture(this, { event -> barHide.forward(event) { super.onTouchEvent(it) } }) { event -> onPull(event) }
+    /**
+     * The edge drag that goes back or forward in 3-button navigation mode (GN-04), ahead of the
+     * pull in the touch chain: what it does not take flows on to the pull and the WebView.
+     */
+    private val historyNav = HistoryNavGesture(this, { event -> pull.onTouchEvent(event) }) { event -> onHistoryNav(event) }
+    /** Strips at the top and bottom edges that chrome messages cover (see `ContentCover`). */
+    val cover = ContentCover({ resources.displayMetrics.density }) { invalidateOutline() }
+    /** The in-page predictive back in flight on this view, if any (see `PredictiveBack.kt`). */
+    var backTransition: PageBackTransition? = null
+    /** The history entry the page on screen belongs to (updated as navigations commit), and how long the list was. */
+    private var committedIndex = -1
+    private var committedUrl = ""
+    private var committedSize = 0
+    private var lastRememberedAt = 0L
+    /** The copies of the window in flight for this page, shared between their askers (see [captureBitmap]). */
+    private val captureShare = CaptureShare<Bitmap>()
+    /**
+     * The internal pages in this view's list, by position, to the `zen://` URL each was shown
+     * as. Their items all carry one and the same URL (the `data:` header WebView loads a
+     * `loadDataWithBaseURL` document under, [NavigationState.isDocumentPlaceholder]), so a name
+     * is its position's: set as the entry commits ([onHistoryCommitted], off the URL the commit
+     * reports, which for such a document is the base URL the page was loaded with – its own),
+     * seeded from the snapshot when a restore rebuilds the list ([restoreFromHostState]), and
+     * kept while the position holds a `data:` item ([NavigationState.keptNames]).
+     */
+    private val internalNames = HashMap<Int, String>()
+    /** A restore just rebuilt the list: the commit that follows reports it as built (see [onHistoryCommitted]). */
+    private var restoredList = false
+    /** The last `historyChanged` payload sent, as text: the same list again is not sent twice. */
+    private var lastHistoryText: String? = null
+    private var replyProxy: JavaScriptReplyProxy? = null
+    /**
+     * The image search's frame-owner protocol for this tab ([ImageOwner]): made at the first
+     * sub-frame `hello` or the first `view.imageThumbnail`, never at construction.
+     */
+    private var imageOwner: ImageOwner<JavaScriptReplyProxy>? = null
+    /** Whether the bridge object the page script posts through is registered on this view. */
+    private var bridgeInstalled = false
+    /**
+     * The document-start registration of the current host's script, page-controls rules ahead of
+     * it (null without the feature).
+     */
+    private var documentScript: ScriptHandler? = null
+    /**
+     * The core's content-settings answers this tab holds, by site ([ContentRules.Resolved]): what
+     * came with the core's own loads (`view.load`, `view.reload`) and what it answered the view's
+     * `resolveRules` questions with. Dropped whole on every push of the document
+     * ([onContentRulesChanged]), the core's signal that the answers may resolve differently now.
+     */
+    private val resolvedRules = HashMap<String, ContentRules.Resolved>()
+    /** The `window.__zenResolvedRules` literal the document-start script was last registered with. */
+    private var registeredResolved = "null"
+    /**
+     * A main-frame navigation the page started that waits for the core's answer (see
+     * `interceptNavigation`): the WebView was told to stop it, and the answer – or the watchdog –
+     * re-issues it as a load of this view's ([resumeHeld]). A newer load or document supersedes it.
+     */
+    private var heldNavigation: HeldNavigation? = null
+    private var rulesTokenSeq = 0
+
+    /**
+     * A held navigation: its token, its address, the referrer its re-issued load carries, and
+     * whether the page objected to it and the user chose to leave already (`letGo`: the
+     * re-issued load's second objection is answered with that, see [LeaveCarry]).
+     */
+    private class HeldNavigation(val token: Int, val url: String, val referer: String?, val letGo: Boolean)
+    /** The user's Leave at a `beforeunload` objection, carried to the held navigation's re-issued load. */
+    private val leaveCarry = LeaveCarry()
+    /** The page's own referrer policy, told by its script ahead of the navigation the view holds (`referrerPolicy.ts`). */
+    private val referrerPolicyWord = ReferrerPolicyWord()
+    /** The privacy signals' document-start script (`navigator.globalPrivacyControl`, `doNotTrack`) and its registration. */
+    private var signalScript: String? = null
+    private var signalScriptHandler: ScriptHandler? = null
+    /** The third-party cookie switch as last set on this view (`applyCookiePolicy`); null before the first policy. */
+    private var acceptsThirdPartyCookies: Boolean? = null
+    /** The speculative-loading status last set on this view (PS-43), null before the first `applyPrivacy`. */
+    private var speculativeLoadingStatus: Int? = null
+    private var currentFlags: JSONObject = json("glanceEnabled" to true, "glanceTrigger" to "alt", "thirdParty" to null)
+    private var pendingFlags = false
+    private var zoomFactor = 1.0
+    /** The WebView's own user agent, the truth both the mobile and the desktop shape derive from. */
+    private val defaultUserAgent: String = settings.userAgentString
+    /** Desktop site: the user agent and client hints this tab currently presents. */
+    var desktopMode = false
+        private set
+    /** The user agent changed after the current page was requested (see `reload`). */
+    private var userAgentStale = false
+    private var darkening = false
+    private var lastDeviceWidth = 0
+    var muted = false
+        private set
+    /**
+     * The main-frame URL as last reported by the WebViewClient; readable from any thread
+     * (`shouldInterceptRequest` runs on a network thread where `getUrl()` must not be called).
+     */
+    val currentUrl: String? get() = currentDocument
+
+    /** The last console warnings and errors of the page (extension diagnostics). */
+    val console = ArrayDeque<String>()
+    /** The `domReady` view event, once per document (see `DomReadyGate`). */
+    private val domReady = DomReadyGate()
+    /** `onPageStarted` fired for a document whose commit `doUpdateVisitedHistory` has not reported yet. */
+    private var awaitingCommit = false
+    /**
+     * The document whose pixels the view shows: the one `onPageCommitVisible` (WebView's word that
+     * nothing of the page before is drawn any more) or `onPageFinished` last reported, carried
+     * across the in-page commits of that same document. Null until the view has drawn any
+     * document at all – a tab restored at boot whose page has not answered yet shows a blank
+     * window, and WebView says nothing of a load before the response comes (`onPageStarted`
+     * waits for it), so this is the only word that there is a page to picture: the card picture
+     * is taken of this document alone ([captureThumbnail], [snapshot]).
+     */
+    private var paintedDocument: String? = null
+    /** Whether the view has drawn any document at all (see [paintedDocument]). */
+    val hasPaintedDocument: Boolean get() = paintedDocument != null
+    /**
+     * Told once, as the first document after it was set paints ([paintedDocument] is written):
+     * the restored tab's picture comes down on it (`RestoredPictures`). Nulled as it is told.
+     */
+    var onDocumentPainted: (() -> Unit)? = null
+
+    private fun documentPainted(url: String) {
+        paintedDocument = url
+        onDocumentPainted?.let { told ->
+            onDocumentPainted = null
+            told()
+        }
+    }
+    /**
+     * The main-frame URL whose load failed last. WebView has already committed its own error page
+     * under that URL (or is about to, and reports the commit through `doUpdateVisitedHistory` and
+     * the page's title, "Webpage not available", through `onReceivedTitle`) by the time the core
+     * hears of the failure and replaces it with `zen://error`. Neither is the page the user asked
+     * for: the commit is not reported as a navigation and the title is dropped, so nothing of the
+     * interstitial reaches history. The core is quick to answer, and its `zen://error` page can
+     * start before WebView's own has committed (it still commits first: Chromium does not cancel
+     * a commit already under way for a later load), so the start of the core's error page keeps
+     * this; the next commit of any page, or the start of any other load, clears it.
+     */
+    private var failedUrl: String? = null
+    /**
+     * The committed document is one the core's `zen://error` page stands in for, until another
+     * commit replaces it: WebView's built-in error page, or a page the core turned into a
+     * question after its commit (a lookalike reached by a link, [loadHtml]).
+     */
+    private var interstitial = false
+    /**
+     * The URL of the entry the core's `zen://error` page stands in for: the one WebView's built-in
+     * error page last committed under, or the committed page the core replaced with its question
+     * ([loadHtml]). The entry stays in the back-forward list behind the core's page, and going
+     * back onto it would run the failed load, or ask the question, again: [goBack] steps over it.
+     */
+    private var interstitialUrl: String? = null
+    /** A certificate `onReceivedSslError` refused; the request's own failure follows and is the same news. */
+    private var refusedCertificateUrl: String? = null
+    /**
+     * The extension page the runtime answered with an empty document because it does not serve
+     * the extension ([refuseExtensionPage], set from the request's thread before the document
+     * can start): its `onPageStarted` reports the load as failed, `ERR_BLOCKED_BY_CLIENT`.
+     */
+    @Volatile private var refusedExtensionPage: String? = null
+    /** The URL of the last document `onPageStarted` announced (main thread). */
+    private var startedDocument: String? = null
+    /**
+     * Certificates refused for resources that did not read as the page itself (another site's:
+     * most likely a subresource, which Chrome blocks quietly), by URL, with the failure the
+     * interstitial would show should the request turn out to be the main frame's after all
+     * (`onReceivedError` knows the frame; `onReceivedSslError` does not).
+     */
+    private val refusedCertificates = HashMap<String, RefusedCertificate>()
+
+    private class RefusedCertificate(val code: Int, val certificate: JSONObject?)
+    /**
+     * The page's dialog up right now (PUI-27, PUI-28): Ione's sheet and the `JsResult` of the
+     * `alert` / `confirm` / `prompt` the page is blocked in, or of the `beforeunload` objection the
+     * WebView holds a navigation for, until the sheet's answer settles it ([showDialog]; [destroy]
+     * cancels one left up). One at a time: the renderer waits in the call.
+     */
+    private var dialog: PageDialogUp? = null
+    /** What the page has done with dialogs this visit: Chrome's count and its silencing ([PageDialogVisit]). */
+    private val dialogVisit = PageDialogVisit()
+    /** The `beforeunload` check in flight, if any (see [confirmUnload]). */
+    private var unloadCheck: UnloadCheck? = null
+    /** When the core last asked for a reload: a `beforeunload` objection right after it is "Reload site?". */
+    private var reloadAskedAt = 0L
+    /**
+     * An agent works this page while the layout hides it (the core's `TabView.setAgentDriven`,
+     * said before each of the agent's actions and taken back when it lets the tab go; OS-40).
+     * The page's `beforeunload` objection is then the agent's question, not the user's
+     * ([UnloadObjection]): the agent's input is trusted input, so a page it drives may raise
+     * one. Hidden, the view runs as any hidden one does (nothing pauses a GONE WebView;
+     * [TabHost.setVisible]). A show clears it: a tab brought in front is the user's again, sheet
+     * and all, until the agent's next action says otherwise (§9.23). Cleared too when the view
+     * is bound to another tab ([TabHost.bind], [TabHost.adopt]).
+     *
+     * The page's `alert` / `confirm` / `prompt` and its "Leave site?" on such a page are the
+     * agent's dialog policy's ([dialogPolicy], [DialogPolicyAnswer]): they cannot be
+     * round-tripped to the core while the page waits in the call – the chrome WebView's
+     * JavaScript shares the one renderer with the pages and is frozen for as long as the call
+     * lasts (`PageDialogsDemo` scenario 9) – so they are answered here at once from the policy
+     * the agent set ahead of the call, and reported to it after.
+     */
+    var agentDriven = false
+    /**
+     * The agent's dialog policy for this tab as the core resolved it (`view.setDialogPolicy`,
+     * said beside [agentDriven] at each of the agent's actions and whenever the policy changes;
+     * null when no rule covers the tab). A dialog of the page while an agent drives it hidden
+     * is answered from it at once, the default for a kind it leaves out, and reported to the
+     * core (`pageDialogAnswered`; [DialogPolicyAnswer.decide]); the tab in front of the user
+     * keeps its sheet. Never spent here: the core spends a `once` rule on the report and sends
+     * what is left. Cleared when the view is bound to another tab ([TabHost.bind],
+     * [TabHost.adopt]): the policy is the core's word on that tab, and comes with it.
+     */
+    var dialogPolicy: DialogPolicyAnswer.Policy? = null
+    /** What [NavigationReports.attach] registered, to unregister at [destroy]. */
+    private var navigationListener: androidx.webkit.NavigationListener? = null
+    private var lastProgressAt = 0L
+    /**
+     * An agent works this page (`view.interceptAgentPrompts`): the page's file choosers and the
+     * view's client-certificate requests are held for the core instead of opening system UI over
+     * the page (`AgentPrompts.kt`); the core says per request whose each one is, and a tab that
+     * is not an agent's (any more) gets the system's UI as every other tab does.
+     */
+    var interceptsAgentPrompts = false
+        private set
+    /** The file choosers held for the core's answer, by the request id the event carried. */
+    private val heldFileChoosers = HashMap<String, HeldFileChooser>()
+    private var fileChooserSeq = 0
+    /** Where the agent's chooser answers were written ([AgentUploads]), deleted when the agent lets the page go. */
+    private val agentUploadFolders = ArrayList<File>()
+
+    private class HeldFileChooser(val callback: ValueCallback<Array<Uri>>, val params: WebChromeClient.FileChooserParams)
+
+    init {
+        Profiles.apply(this, containerId)
+        // The container's profile carries the GPC / DNT request headers (a new container's profile
+        // was just created; the default one has them from the last policy push).
+        Profiles.profile(containerId)?.let(host.privacy::applySignalHeaders)
+        settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            allowFileAccess = false
+            allowContentAccess = false
+            loadWithOverviewMode = true
+            useWideViewPort = true
+            setSupportZoom(true)
+            builtInZoomControls = true
+            displayZoomControls = false
+            setSupportMultipleWindows(true)
+            // The pop-up blocker: window.open needs a gesture unless the core allowed the site
+            // (setPopupsAllowed); a blocked call is reported by the page script and listed.
+            javaScriptCanOpenWindowsAutomatically = false
+            mediaPlaybackRequiresUserGesture = true
+        }
+        // The page fonts (Settings › Appearance › Customize fonts), and under a profile that never
+        // touched them Chrome's typographic defaults rather than WebView's: text a page leaves
+        // unstyled is serif (Android maps Chrome's "Times New Roman" to it), and small text is not
+        // pushed up to 8 px – Chrome has no floor for absolute sizes and 6 px for relative ones.
+        applyFonts()
+        // Present as the browser it is, not as an app's embedded view (see UserAgent).
+        UserAgent.apply(settings, desktop = desktopMode, default = defaultUserAgent)
+        applyTextZoom()
+        // Dark theme for sites: only ever while the app itself is dark (WebView ties algorithmic
+        // darkening to the theme), and never for pages that bring a dark scheme of their own.
+        setDarkening(host.pageRules.darkenDefault)
+        applyWebAuthn()
+        applyAutofillProvider()
+        setBackgroundColor(Color.WHITE)
+        clipToOutline = true
+        outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                // Chrome messages along the edges show through the strips they cover, and pulled
+                // down, the page is clipped at the frame's bottom edge, not its own: the chrome
+                // below the frame stays uncovered.
+                outline.setRoundRect(0, visibleTop(), view.width, visibleBottom(), radiusPx)
+            }
+        }
+        applyPullToRefreshMode()
+        isFocusableInTouchMode = true
+        webViewClient = Client()
+        webChromeClient = Chrome()
+        setDownloadListener { url, userAgent, contentDisposition, mimetype, contentLength ->
+            // A response the engine cannot show ends the navigation here; the core decides whether
+            // it is a PDF for the viewer or a file for Downloads (`navigation`).
+            host.downloads.start(url, userAgent, contentDisposition, mimetype, contentLength, tabId, navigation = true)
+        }
+        setFindListener { activeMatchOrdinal, numberOfMatches, isDoneCounting ->
+            host.viewEvent(
+                tabId, "found",
+                json(
+                    "activeMatchOrdinal" to (if (numberOfMatches == 0) 0 else activeMatchOrdinal + 1),
+                    "matches" to numberOfMatches,
+                    "finalUpdate" to isDoneCounting
+                )
+            )
+        }
+        setOnLongClickListener { onLongPress() }
+        // Mouse right-click / stylus button (DeX, tablets) opens the same menu as a long-press.
+        setOnContextClickListener { onLongPress() }
+        installPageScript()
+        host.extensions?.attach(this)
+        // The navigation listener's reports carry `chrome.webNavigation` on a WebView that has
+        // it; the extension runtime infers the family from the client callbacks otherwise.
+        if (host.extensions != null) {
+            // The unload check's own navigation (see [confirmUnload]) is not the page's news.
+            navigationListener = NavigationReports.attach(this) {
+                // Neither the unload check's blank document nor the unload probe's address is a navigation of the tab's.
+                if (unloadCheck == null && !UnloadProbeRules.isProbeUrl(it.optString("url"))) host.viewEvent(tabId, "navigation", it)
+            }
+        }
+        applyPrivacy()
+        // The renderer stopping to answer an input to this page (the unresponsive-page prompt).
+        host.watchRenderer(this)
+    }
+
+    override fun destroy() {
+        // A local document still being read lands nowhere.
+        localDocumentSeq++
+        // A page gone in one of its dialogs: its sheet goes, the renderer is released from the
+        // call (it goes anyway), and a check still waiting on it hears that the page went.
+        dialog?.let { up ->
+            dialog = null
+            up.sheet.dismiss()
+            up.result.cancel()
+        }
+        unloadCheck?.settle(leave = true, destroyView = false)
+        // A load still waiting on its probe lands nowhere: the view goes.
+        cancelUnloadProbe()
+        cancelHeldFileChoosers()
+        clearAgentUploads()
+        // An image search still waiting on a frame hears that the page went ([ImageOwner]).
+        imageOwner?.destroy()
+        NavigationReports.detach(this, navigationListener)
+        navigationListener = null
+        host.extensions?.detach(this)
+        super.destroy()
+    }
+
+    // --- page fonts (the document the core pushes; see PageFonts.kt) -------------------------------
+
+    /**
+     * Bring this page's `WebSettings` in line with the host's page fonts: at creation, on every
+     * `fonts.apply` (the core's start, a Settings row, a sync merge), and when a page made
+     * elsewhere is adopted (`TabHost.adopt`). Nothing reloads: WebView restyles the open
+     * document as a size changes, and a family changing alone – which Blink's own invalidation
+     * does not carry to the text – has the document asked to (`PageFonts.RESTYLE_SCRIPT`): one
+     * line of script after the settings, reaching the renderer in that order (both travel the
+     * frame's channel). A page with no document yet has nothing to restyle.
+     */
+    fun applyFonts() {
+        // The user's document, with `chrome.fontSettings`' layer over it where an extension holds a value.
+        val fonts = host.extensions?.fontLayer?.over(host.pageFonts) ?: host.pageFonts
+        val restyle = fonts.applyTo(settings)
+        if (restyle && currentDocument != null) evaluateJavascript(PageFonts.RESTYLE_SCRIPT, null)
+    }
+
+    // --- privacy (the policy the core pushes; see privacy/Privacy.kt) -----------------------------
+
+    /**
+     * Bring this page in line with the privacy policy: at creation, whenever the core pushes a
+     * new policy (`privacy.apply`), and – for the cookie switch, which depends on the top site –
+     * as the document changes. WebView's own Safe Browsing (Google's lists, its interstitial)
+     * follows the same switch as Ione's feeds; `always` mode, whose subresource upgrades
+     * WebView cannot perform, blocks plaintext subresources of secure pages instead.
+     */
+    fun applyPrivacy() {
+        val flags = host.privacy.flags
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) settings.safeBrowsingEnabled = flags.safeBrowsing
+        applySpeculativeLoading(flags)
+        applyMixedContentPolicy(flags, currentDocument)
+        applyCookiePolicy(flags, currentDocument)
+        val script = flags.navigatorScript()
+        if (script != signalScript) {
+            signalScriptHandler?.remove()
+            signalScriptHandler = null
+            signalScript = script
+            if (script != null && WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                signalScriptHandler = WebViewCompat.addDocumentStartJavaScript(this, script, setOf("*"))
+            }
+        }
+    }
+
+    /**
+     * Preload pages (PS-43) for this view: `none` → `SPECULATIVE_LOADING_DISABLED`, the other
+     * levels → `SPECULATIVE_LOADING_PRERENDER_ENABLED` (`PrivacyFlags.speculativeLoading`), through
+     * androidx.webkit's `setSpeculativeLoadingStatus` where the WebView on the device offers it
+     * (`WebViewFeature.SPECULATIVE_LOADING`; an older WebView keeps its own default, which runs no
+     * prerender). Set only when the answer changes: the core pushes the policy to every open tab.
+     * WebView's own default is disabled, so `standard` is what first lets a page's speculation
+     * rules prerender on the phone at all (Chrome Android's Standard does): the view answers each
+     * prerender's navigation in `Client.shouldOverrideUrlLoading`, and refuses the ones it could
+     * not run. The prerenders are this setting's whole reach: under `none` the prefetches – Blink
+     * resource fetches outside `IsPrerender2Allowed` – are refused at the request engine instead
+     * ([Client.refusePreload]).
+     */
+    @OptIn(WebSettingsCompat.ExperimentalSpeculativeLoading::class)
+    private fun applySpeculativeLoading(flags: PrivacyFlags) {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.SPECULATIVE_LOADING)) return
+        val status = when (flags.speculativeLoading()) {
+            PrivacyFlags.SpeculativeLoading.DISABLED -> WebSettingsCompat.SPECULATIVE_LOADING_DISABLED
+            PrivacyFlags.SpeculativeLoading.PRERENDER_ENABLED -> WebSettingsCompat.SPECULATIVE_LOADING_PRERENDER_ENABLED
+        }
+        if (status == speculativeLoadingStatus) return
+        speculativeLoadingStatus = status
+        WebSettingsCompat.setSpeculativeLoadingStatus(settings, status)
+    }
+
+    /**
+     * Third-party cookies for the document at `documentUrl` (the exception list names top
+     * sites), and "block all cookies" for the jar: WebView has no per-site cookie switch, so the
+     * profile's jar refuses every cookie under the policy's `blockAll` (the header stage's relay
+     * still carries a listed site's document cookies, read and written through the jar's Java
+     * API, which the switch does not govern) and the never list is emulated by the relay and the
+     * core's deletion of a never-site's data.
+     */
+    private fun applyCookiePolicy(flags: PrivacyFlags, documentUrl: String?) {
+        // The jar of this tab's container: a WebView on another profile is not the default jar's.
+        val jar = Profiles.cookieManager(containerId)
+        jar.setAcceptCookie(!flags.siteData.blockAll)
+        // The switch is this view's own, and set only when its answer changes: a policy the core
+        // pushes to every open tab that leaves this container's answer as it was – the private
+        // new tab page's third-party cookies choice, which is the private container's alone
+        // (INC-03) – asks nothing of a regular tab's WebView.
+        val accepts = flags.acceptsThirdPartyCookies(containerId, documentUrl)
+        if (accepts != acceptsThirdPartyCookies) {
+            acceptsThirdPartyCookies = accepts
+            jar.setAcceptThirdPartyCookies(this, accepts)
+        }
+    }
+
+    /**
+     * An extension's own page in this tab (served on `https://<id>.ext.ione.invalid/`) fetches
+     * plaintext URLs freely: in Chrome a `chrome-extension:` document is not a mixed-content
+     * restricting origin, only `https:` is, and Stylus's install page reads a usercss off the
+     * `http:` site it came from. A site whose Insecure content row says Allow (PS-59, the
+     * site-settings exception to the built-in Block) gets the same, as Chrome's exception lets
+     * the page load and run its plaintext parts. Every other document follows the HTTPS-only
+     * setting.
+     */
+    private fun applyMixedContentPolicy(flags: PrivacyFlags, documentUrl: String?) {
+        val mode = host.contentRules.mixedContentMode(documentUrl, flags.httpsOnly, documentUrl?.let(::resolvedFor))
+        if (settings.mixedContentMode != mode) settings.mixedContentMode = mode
+    }
+
+    /**
+     * The per-site content settings this WebView enforces through its `WebSettings`, for the
+     * document about to load at `url` (Chrome keys them by the top site): set as the load is
+     * asked for ([loadUrl]), as a link takes the page elsewhere (`shouldOverrideUrlLoading`, each
+     * redirect hop included) and as the document starts – before its first request leaves, since
+     * a `WebSettings` change reaches the renderer with the navigation. Pages that are not web
+     * pages (the chrome's `zen://` documents, the error page, a local file) and an extension's own
+     * pages get everything back: the settings are the view's, so a blocked site's answer must not
+     * outlive its document.
+     *
+     * The decision is the core's ([resolvedFor]: `PermissionService.resolve` – an extension's
+     * rule over the user's answer in the tab's container over the default), which came with the
+     * core's own load or answered the view's question for a navigation the page started; the
+     * pushed document ([PageHost.contentRules]) decides only a navigation the core could not be
+     * asked about. The same answer is prefixed to the document-start script
+     * (`window.__zenResolvedRules`, re-registered when it differs from the last one) so the
+     * page-world guards of the document about to load read the core's word too.
+     *
+     * - Images (PS-63): `loadsImagesAutomatically` holds every image of the document – `data:`
+     *   URIs included, as Chrome's setting does; `blockNetworkImage` would leave inline images
+     *   through. Turning it back on loads the current document's images at once.
+     * - JavaScript (PS-64): `javaScriptEnabled` – the document's own scripts and, as in Chrome
+     *   for a blocked site, the page script's document-start half too: forms, page controls and
+     *   the page guards go quiet on such a page (the host's native callbacks still report).
+     */
+    private fun applyContentRules(url: String) {
+        val rules = host.contentRules
+        val governed = governedByContentRules(url)
+        val resolved = if (governed) resolvedFor(url) else null
+        val images = !governed || rules.allows(ContentRules.IMAGES, url, resolved)
+        if (settings.loadsImagesAutomatically != images) settings.loadsImagesAutomatically = images
+        val javascript = !governed || rules.allows(ContentRules.JAVASCRIPT, url, resolved)
+        if (settings.javaScriptEnabled != javascript) settings.javaScriptEnabled = javascript
+        val literal = resolved?.toJson()?.toString() ?: "null"
+        if (literal != registeredResolved) {
+            registeredResolved = literal
+            if (documentScript != null) registerStartScript()
+        }
+    }
+
+    /** The rows a document at `url` is governed by at all: a web page that is not an extension's own. */
+    private fun governedByContentRules(url: String): Boolean = PageRules.isWebPage(url) && !ExtensionUrls.isExtensionUrl(url)
+
+    /** The core's answer this tab holds for `url`'s site, if any. */
+    private fun resolvedFor(url: String): ContentRules.Resolved? = ContentRules.siteOf(url)?.let { resolvedRules[it] }
+
+    /**
+     * The core's answer for a load of its own (`view.load`, `view.reload`: `rules` is every row's
+     * word for the destination's site, null when its rules service has not started), kept for
+     * the load and the site's later documents in this tab.
+     */
+    fun presetResolvedRules(url: String, rules: JSONObject?) {
+        if (rules == null) return
+        val site = ContentRules.siteOf(url) ?: return
+        resolvedRules[site] = ContentRules.Resolved.fromJson(site, rules)
+    }
+
+    /** Ask the core which content settings govern a navigation to `url`; `token` 0 asks without holding one. */
+    private fun askRules(url: String, token: Int = 0) {
+        host.viewEvent(tabId, "resolveRules", json("token" to token, "url" to url))
+    }
+
+    /**
+     * The core's answer (`view.rulesResolved`) to [askRules]: remembered for the site; the
+     * navigation held under `token` goes on with it (or with the pushed document, when the core
+     * could not tell); an answer asked for the document on screen without a hold – at its start,
+     * when the core could not be asked ahead of it, or after the rules changed – has the live
+     * document re-read its own, as a rules change always did.
+     */
+    fun onRulesResolved(token: Int, url: String, rules: JSONObject?) {
+        val site = ContentRules.siteOf(url)
+        if (site != null && rules != null) resolvedRules[site] = ContentRules.Resolved.fromJson(site, rules)
+        val held = heldNavigation
+        if (held != null && token != 0 && held.token == token) {
+            heldNavigation = null
+            resumeHeld(held)
+            return
+        }
+        if (token != 0 || site == null || rules == null) return
+        val document = currentDocument ?: return
+        if (ContentRules.siteOf(document) != site) return
+        applyContentRules(document)
+        applyMixedContentPolicy(host.privacy.flags, document)
+    }
+
+    /**
+     * A main-frame navigation the page started (a link, a script, a redirect hop) whose site the
+     * core has not answered for yet: held – `shouldOverrideUrlLoading` says true and the WebView
+     * drops it – while the core is asked, then re-issued as a load of this view's with the answer
+     * in hand ([resumeHeld]; the desktop-site switch re-issues a link the same way, since the
+     * core's word arrives a round trip too late for the request about to leave). Nothing is held
+     * when the core cannot be asked (a host without one, or its rules service not started: the
+     * pushed document decides) or the site is already answered for. Returns whether it held. The
+     * re-issued load carries the page's referrer under `policy`, the page's own referrer policy
+     * as its script read it for this navigation ([ReferrerPolicyWord]: the tapped anchor's
+     * `rel=noreferrer` / `referrerpolicy`, else the document's `<meta name=referrer>`; the empty
+     * word is Chrome's default) – a policy set by the `Referrer-Policy` response header alone
+     * is not readable from the page and is not followed here. The WebView lifts the load's
+     * `Referer` into the navigation's referrer under its default policy (`AwContents.loadUrl`),
+     * so a page policy stricter than the default is followed to the wire and a looser one
+     * (`unsafe-url`, `no-referrer-when-downgrade`, the downgrade cases of `origin` /
+     * `origin-when-cross-origin`) is clamped there to the default's: the re-issued hop never
+     * carries more than the default would, nor more than the page asked. A redirect hop's
+     * referrer is the original request's, which the view does not know, so it is resumed
+     * without one. A Leave
+     * the user gave the page's `beforeunload` objection for this navigation goes with it
+     * ([LeaveCarry]: the re-issued load has the browser ask the page once more).
+     */
+    private fun holdForContentRules(target: String, redirect: Boolean, policy: String): Boolean {
+        if (!host.contentRulesResolvable || !governedByContentRules(target) || resolvedFor(target) != null) return false
+        val referer = if (redirect) null else ContentRules.resumeReferer(currentDocument, target, policy)
+        val held = HeldNavigation(++rulesTokenSeq, target, referer, leaveCarry.holds(SystemClock.uptimeMillis()))
+        heldNavigation = held
+        askRules(target, held.token)
+        // The chrome's thread may be busy (the renderer is one for every page): the pushed document
+        // decides a navigation the core has not answered for by then.
+        postDelayed({
+            if (heldNavigation === held) {
+                Log.w("ZenTab", "content rules for ${held.url} not resolved within ${RESOLVE_RULES_WATCHDOG_MS} ms; the pushed document decides")
+                heldNavigation = null
+                resumeHeld(held)
+            }
+        }, RESOLVE_RULES_WATCHDOG_MS)
+        return true
+    }
+
+    /**
+     * The held navigation goes on as this view's own load, its referrer restored (under the
+     * page's own policy, see [holdForContentRules]). The load is browser-initiated, so the browser has the page run its
+     * `beforeunload` again; when the user already chose to leave for this navigation, its second
+     * objection is answered with that word rather than a second sheet (`onJsBeforeUnload`).
+     */
+    private fun resumeHeld(held: HeldNavigation) {
+        val headers = HashMap<String, String>()
+        held.referer?.let { headers["Referer"] = it }
+        loadRequested(held.url, headers)
+        // After the load is asked for: loadRequested drops what any load leaves behind.
+        leaveCarry.resumed(SystemClock.uptimeMillis(), held.letGo)
+    }
+
+    /**
+     * The core's per-site content settings changed (or an extension's rules did, the document
+     * unchanged): the answers this tab remembered are dropped, the document-start script is
+     * re-registered so the next document's page-world guards (motion sensors and the other rows
+     * no engine switch covers, `contentGuards.ts`) read the new rules, and the current document
+     * re-reads its own – from the core's answer when it can be asked (it re-reads on the reply,
+     * [onRulesResolved]), else from the pushed document at once. The live document keeps the
+     * guards it was born with, as Chrome's renderer does.
+     */
+    fun onContentRulesChanged() {
+        resolvedRules.clear()
+        registeredResolved = "null"
+        if (host.pageScript.isNotEmpty() && WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            registerStartScript()
+        }
+        val document = currentDocument ?: url ?: return
+        if (host.contentRulesResolvable && governedByContentRules(document)) {
+            askRules(document)
+            return
+        }
+        applyContentRules(document)
+        applyMixedContentPolicy(host.privacy.flags, document)
+    }
+
+    // --- placement ------------------------------------------------------------------------------
+
+    fun setRadius(px: Float) {
+        radiusPx = px
+        invalidateOutline()
+    }
+
+    // --- pull-to-refresh --------------------------------------------------------------------------
+
+    /**
+     * The chrome's pull machine (`lib/pull.ts`) worked out how far down the page sits: move it
+     * there. The page slides as one piece below the frame's top edge, where the chrome – under
+     * this view – draws the indicator in the band that opens up.
+     */
+    fun setPullOffset(offsetCss: Double) {
+        val px = (offsetCss * resources.displayMetrics.density).toFloat().coerceAtLeast(0f)
+        pull.offsetApplied(px / resources.displayMetrics.density)
+        if (px == pullOffsetPx) return
+        pullOffsetPx = px
+        applyTranslation()
+        invalidateOutline()
+    }
+
+    /**
+     * The page-edge band's seat (device px; `TabHost.place` has laid the view out a seat lower
+     * and shorter for it): that much of the pull channel's offset leaves the translation, so the
+     * page stays where it is on screen and sits in its frame at rest ([PageSeat]).
+     */
+    fun setBandSeat(px: Int) {
+        val seat = px.coerceAtLeast(0)
+        if (seat == seatPx) return
+        seatPx = seat
+        applyTranslation()
+        invalidateOutline()
+    }
+
+    /** The band's seat the view is laid out under right now, device px (diagnostics, the band demo). */
+    val bandSeatPx: Int get() = seatPx
+
+    // --- the bar that hides on scroll ---------------------------------------------------------------
+
+    /**
+     * Slide the page by `shiftPx` (a top-docked bar in motion takes the page's top edge with it)
+     * and clip `clipPx` off its bottom edge (the frame's edge where the tall layout runs past it,
+     * or the strip a bottom-docked bar has not yet left). Both 0 with the bar at rest.
+     */
+    fun setBarHideShift(shiftPx: Float, clipPx: Int) {
+        if (shiftPx == barShiftPx && clipPx == barClipPx) return
+        barShiftPx = shiftPx
+        barClipPx = clipPx.coerceAtLeast(0)
+        applyTranslation()
+        invalidateOutline()
+    }
+
+    /**
+     * The page sits below its frame's top during a pull and above it behind a hiding top bar;
+     * the part of a band's offset the layout carries ([seatPx]) is not translated ([PageSeat]).
+     */
+    private fun applyTranslation() {
+        translationY = PageSeat.translation(pullOffsetPx, seatPx, barShiftPx)
+    }
+
+    /**
+     * How much further down the page can scroll in its current layout, device px (0 at its end):
+     * what the bar that hides on scroll reads before it starts a hide – the page laid out a band
+     * taller must still have that band to scroll, or Chromium clamps the scroll back – and by
+     * which it tells that clamp from a finger's scroll up (see [BarHideScrollFilter]).
+     */
+    fun scrollRemaining(): Int =
+        (computeVerticalScrollRange() - computeVerticalScrollExtent() - scrollY).coerceAtLeast(0)
+
+    /** Whether a drag down from the top of this page may become a pull-to-refresh right now. */
+    fun pullToRefreshEligible(): Boolean =
+        host.pullToRefresh && backTransition == null && PullGestureClassifier.refreshable(url)
+
+    /**
+     * With the pull on, the top edge's effect is the pull itself, so the WebView's own glow – which
+     * would flash before the pull takes the finger – stays off; off, the stock edge glow returns.
+     * A `touchpad` two-finger swipe is never a pull (see `PullToRefreshGesture`), so for the
+     * gesture that begins with it the glow is the top edge's effect, as in Chrome, whose passive
+     * glow follows a touchpad overscroll there (`overscroll_controller_android.cc`,
+     * `OnOverscrolled`); the next finger's down puts the pull's mode back before the WebView
+     * sees that finger. Set only when it changes: the WebView builds its glow afresh per set.
+     */
+    fun applyPullToRefreshMode(touchpad: Boolean = false) {
+        val mode = if (host.pullToRefresh && !touchpad) View.OVER_SCROLL_NEVER else View.OVER_SCROLL_IF_CONTENT_SCROLLS
+        if (overScrollMode != mode) overScrollMode = mode
+    }
+
+    private fun onPull(event: PullGestureClassifier.Pull) {
+        val (phase, payload) = when (event) {
+            PullGestureClassifier.Pull.Start -> "start" to null
+            is PullGestureClassifier.Pull.Move -> "move" to json("travel" to event.travel.toDouble(), "time" to event.time)
+            is PullGestureClassifier.Pull.Release -> "release" to json("time" to event.time)
+            is PullGestureClassifier.Pull.Cancel -> "cancel" to json("time" to event.time)
+        }
+        if (event !is PullGestureClassifier.Pull.Move) Log.d(PULL_TAG, "$phase on $tabId (${url ?: "no url"})")
+        host.pullEvent(tabId, phase, payload)
+    }
+
+    // --- overscroll history navigation (GN-04) ------------------------------------------------------
+
+    /**
+     * Whether a drag in from `edge` may become a history navigation right now: with no other
+     * transition moving the page, and, for a finger on the screen, only with the system's three
+     * navigation buttons (in gesture mode the edges are the system's); a `touchpad` two-finger
+     * swipe (GN-23) meets no system gesture and arms in either mode, but only while Settings →
+     * Accessibility's "Swipe between pages using a touchpad" is on (Chrome's
+     * `touchpad_swipe_to_navigate` gate in `OnOverscrolled`; the finger's drag is not its). A drag
+     * from the right needs an entry ahead. A drag from the left is always one, as Chrome's
+     * `NavigationHandler.canNavigate` has it ("navigating back is considered always possible –
+     * actual navigation, closing tab, or exiting app"): with no entry behind (the one [goBack]
+     * lands on, [backIndex]) the chrome's machine performs its back at the tab's root on the
+     * release – the tab closed to its opener or the previous tab, the page starting over, the
+     * window minimized – and captions the bubble 'Close tab' / 'Close Ione' while the drag is
+     * armed (`lib/historyNav.ts`, `lib/back.ts`).
+     */
+    fun historyNavEligible(edge: HistoryNavClassifier.Edge, touchpad: Boolean = false): Boolean {
+        if (touchpad && !host.touchpadSwipeToNavigate) return false
+        if ((!touchpad && !host.threeButtonNavigation) || backTransition != null) return false
+        return when (edge) {
+            HistoryNavClassifier.Edge.LEFT -> true
+            HistoryNavClassifier.Edge.RIGHT -> canGoForward()
+        }
+    }
+
+    private fun onHistoryNav(event: HistoryNavClassifier.Nav) {
+        val (phase, payload) = when (event) {
+            is HistoryNavClassifier.Nav.Start -> "start" to json("edge" to if (event.edge == HistoryNavClassifier.Edge.LEFT) "left" else "right")
+            is HistoryNavClassifier.Nav.Move -> "move" to json("travel" to event.travel.toDouble(), "time" to event.time)
+            // `force`: a touchpad swipe let go faster than Chrome's fling threshold navigates whatever its travel;
+            // `disallow`: one flung back out of the page at Chrome's -500 px/s or faster navigates never.
+            is HistoryNavClassifier.Nav.Release -> "release" to json("time" to event.time, "force" to event.force, "disallow" to event.disallow)
+            is HistoryNavClassifier.Nav.Cancel -> "cancel" to json("time" to event.time)
+        }
+        if (event !is HistoryNavClassifier.Nav.Move) {
+            val fling = when {
+                event is HistoryNavClassifier.Nav.Release && event.force -> " (forced by the fling)"
+                event is HistoryNavClassifier.Nav.Release && event.disallow -> " (disallowed by the fling)"
+                else -> ""
+            }
+            Log.d(PULL_TAG, "history $phase on $tabId (${url ?: "no url"})$fling")
+        }
+        host.historyNavEvent(tabId, phase, payload)
+    }
+
+    override fun onOverScrolled(scrollX: Int, scrollY: Int, clampedX: Boolean, clampedY: Boolean) {
+        super.onOverScrolled(scrollX, scrollY, clampedX, clampedY)
+        barHide.onOverScrolled(scrollY, clampedY)
+        pull.onOverScrolled(scrollY, clampedY)
+        historyNav.onOverScrolled(scrollX, clampedX, (computeHorizontalScrollRange() - computeHorizontalScrollExtent()).coerceAtLeast(0))
+    }
+
+    override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
+        super.onScrollChanged(l, t, oldl, oldt)
+        barHide.onScrollChanged(t, oldt)
+    }
+
+    // --- the covered strips (chrome messages) ---------------------------------------------------
+
+    /**
+     * Where the page's visible part starts and ends (device px): inside the covered strips,
+     * above the frame's bottom edge while the page hangs lower during a pull (or under a band's
+     * travel – a band seated at rest hangs nothing, [PageSeat.hangPx]), and above the strip the
+     * bar that hides on scroll still holds (see [setBarHideShift]).
+     */
+    private fun visibleTop(): Int = cover.topPx.coerceAtMost(height)
+    private fun visibleBottom(): Int =
+        (height - maxOf(cover.bottomPx.toFloat(), PageSeat.hangPx(pullOffsetPx, seatPx), barClipPx.toFloat())).roundToInt().coerceIn(visibleTop(), height)
+
+    /**
+     * A touch landing on a covered strip is the chrome's: the message card drawn there wants it.
+     * The card's whole gesture (down, moves, up) is handed to the view under the page (the chrome
+     * WebView, [PageHost.underlay]) in its own coordinates; the page never sees it. A host with
+     * nothing under the page (a custom tab) covers nothing, so its pages keep every touch. The
+     * strip the page's own displacement opens is the chrome's too: held down by a pull or a
+     * band's travel ([setPullOffset]) the page hangs over a bottom-docked bar – the parent
+     * hit-tests it by its translated rect – and the clipped strip there is the bar's row, not the
+     * page's; the copy carries the translation so the chrome sees the touch where the bar is
+     * ([StripTouchRule]). A band seated at rest ([setBandSeat]) hangs nothing: the view ends at
+     * its frame's bottom edge and the bar's row is never its to receive.
+     */
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        val chrome = host.underlay
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            coverTouch = StripTouchRule.chromesTouch(chrome != null, cover.active, PageSeat.hangPx(pullOffsetPx, seatPx) > 0f, event.y, visibleTop(), visibleBottom())
+        }
+        if (!coverTouch || chrome == null) return super.dispatchTouchEvent(event)
+        val copy = MotionEvent.obtain(event)
+        val (dx, dy) = StripTouchRule.offsetToChrome(left, top, translationX, translationY, chrome.left, chrome.top)
+        copy.offsetLocation(dx, dy)
+        val handled = chrome.dispatchTouchEvent(copy)
+        copy.recycle()
+        if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            coverTouch = false
+        }
+        return handled
+    }
+
+    /** The gesture in progress began on a covered strip and belongs to the chrome. */
+    private var coverTouch = false
+
+    // --- page script (Glance, third-party links, media tracking) -------------------------------
+
+    /**
+     * Install the current host's page script and the bridge it talks through. Runs at creation
+     * and again when the view changes hosts (`TabHost.adopt`): whatever an earlier host installed
+     * comes down first – its script carries that host's token – and evaluations still waiting on
+     * that bridge are failed rather than left to time out. A document already loaded gets the new
+     * script on its next navigation.
+     */
+    internal fun installPageScript() {
+        if (bridgeInstalled || documentScript != null) uninstallPageScript()
+        // A host without the core (a custom tab) has nothing to talk to the page about.
+        if (host.pageScript.isEmpty()) return
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+            WebViewCompat.addWebMessageListener(this, PAGE_BRIDGE, setOf("*")) { _, message, _, isMainFrame, proxy ->
+                onPageMessage(message, proxy, isMainFrame)
+            }
+        } else {
+            addJavascriptInterface(LegacyPageBridge(), PAGE_BRIDGE)
+        }
+        bridgeInstalled = true
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            registerStartScript()
+        } else {
+            pendingFlags = true // inject on page finished instead (see Client)
+        }
+    }
+
+    private fun uninstallPageScript() {
+        documentScript?.remove()
+        documentScript = null
+        if (bridgeInstalled) {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                WebViewCompat.removeWebMessageListener(this, PAGE_BRIDGE)
+            } else {
+                removeJavascriptInterface(PAGE_BRIDGE)
+            }
+            bridgeInstalled = false
+        }
+        replyProxy = null
+        failPendingEvals("the page changed hosts")
+    }
+
+    /**
+     * The document-start script: the page-controls rules this tab lays pages out by (viewport
+     * rewriting for zoom, desktop layout and force-zoom happens in the page, from the same rules
+     * the core and this host share) and the host's word on rotate-to-fullscreen – a phone's
+     * window's alone ([PageHost.rotateToFullscreen], MED-02) – followed by the page script itself.
+     * Re-registered whenever the rules or the view's width change (a screen crossing the tablet
+     * line – a fold, a floating window; never a split, whose class stays the display's – resizes
+     * the view, so the next document hears the new class; the live one keeps the word it was born
+     * with, as Chrome's gate never changes with the window); the live page is told the rules over
+     * the message channel too. The per-site content rules ride along: the core's answer for the
+     * document about to load (`window.__zenResolvedRules`, [ContentRules.Resolved] – the
+     * extension-over-user decision, re-registered per navigation whose answer differs,
+     * [applyContentRules]) and the pushed document (`window.__zenContentRules`, the same JSON the
+     * core pushes for [ContentRules]) behind it: the page script installs the page-world guards of
+     * a blocked site's document from them (motion sensors, PS-58/69's rows) before any of the
+     * page's own script runs, so they are re-registered on a rules change as well
+     * (`onContentRulesChanged`).
+     */
+    private fun startScriptSource(): String =
+        "window.__zenPageRules=" + host.pageRulesJson.toString() + ";window.__zenDeviceWidth=" + deviceWidth() +
+            ";window.__zenRotateToFullscreen=" + host.rotateToFullscreen +
+            ";window.__zenContentRules=" + host.contentRulesJson.toString() +
+            ";window.__zenResolvedRules=" + registeredResolved + ";" + host.pageScript
+
+    private fun registerStartScript() {
+        documentScript?.remove()
+        documentScript = WebViewCompat.addDocumentStartJavaScript(this, startScriptSource(), setOf("*"))
+    }
+
+    /** The view's width in CSS px at scale 1 – what `width=device-width` means to a page in it. */
+    private fun deviceWidth(): Int {
+        val d = resources.displayMetrics.density
+        return if (width > 0) (width / d).roundToInt() else 0
+    }
+
+    /** The core's page-controls policy changed (or the view was resized): pages follow at once. */
+    fun onPageRulesChanged() {
+        // A host without a page script (a custom tab) has no rules to lay pages out by either.
+        if (host.pageScript.isEmpty()) return
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) registerStartScript()
+        postToPage(json("type" to "pageRules", "rules" to host.pageRulesJson, "deviceWidth" to deviceWidth()).toString())
+        setDarkening(host.pageRules.darken(url ?: ""))
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        val css = deviceWidth()
+        if (css != lastDeviceWidth) {
+            lastDeviceWidth = css
+            onPageRulesChanged()
+        }
+        host.viewSized(this, w, h)
+    }
+
+    // --- background video (MED-08 / EDGE-32) and background tabs (OS-39) -------------------------
+
+    private val backgroundVideo = BackgroundVideoHold()
+
+    /**
+     * Whether this tab's video keeps playing while the app is in the background: the OS controls'
+     * session is this tab's, playing, a `<video>`, and its site's `background-video` setting is
+     * allow – [MediaSessions] keeps the word current. While it is yes and the window leaves the
+     * screen (Home, the lock screen), the hide the system dispatches is held from the WebView
+     * ([onWindowVisibilityChanged]), so the engine and the page both keep the page visible and
+     * nothing pauses; the moment it turns no with the window still away, the held hide goes
+     * through ([BackgroundVideoRule]).
+     */
+    var keepsVideoInBackground: Boolean
+        get() = backgroundVideo.keep
+        set(value) {
+            backgroundVideo.onKeep(value)?.let { visible -> forwardWindowVisibility(visible) }
+        }
+
+    /**
+     * The tab is behind another tab on screen, by the tab host's pass over what is on screen
+     * ([TabHost], [BackgroundTabRule]): the engine hears GONE – the page is hidden, as Chrome's
+     * switched-away tab is – and VISIBLE once the tab is back on screen; the hide is held like the
+     * window's while the tab's video keeps playing (OS-39).
+     */
+    var backgroundTab: Boolean
+        get() = backgroundVideo.background
+        set(value) {
+            backgroundVideo.onBackground(value)?.let { visible -> forwardWindowVisibility(visible) }
+        }
+
+    /** A hide – the window's, or a tab switch's – is being held from the engine for this tab's video (diagnostics, the demo). */
+    val holdingWindowHide: Boolean get() = backgroundVideo.holding
+
+    /**
+     * The window's visibility, as `ViewRootImpl` dispatches it to the tree: GONE when the
+     * activity's window leaves the screen, VISIBLE when it is back. `WebView` hands it to
+     * `AwContents`, whose WebContents is shown or hidden by it – the hide that pauses a video and
+     * tells the page `visibilitychange` – so a hide is held here while the tab's video may keep
+     * playing, the return goes through as it always does, and the VISIBLE the system dispatches
+     * to a view attached while its tab is behind another is not the tab's: the engine keeps the
+     * GONE the tab is owed ([backgroundTab]).
+     */
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        backgroundVideo.onWindow(visibility == View.VISIBLE)?.let { visible -> forwardWindowVisibility(visible) }
+    }
+
+    /** The word the engine gets: a show, a hide going through (held or not), or a switch's. */
+    private fun forwardWindowVisibility(visible: Boolean) {
+        super.onWindowVisibilityChanged(if (visible) View.VISIBLE else View.GONE)
+    }
+
+    /**
+     * While this page's element is fullscreen the engine draws the page in the view it handed
+     * the fullscreen layer, and here – the view the core lays over the whole window meanwhile –
+     * nothing but the page's background colour (WebView's `NullAwViewMethods`). That flat colour
+     * would cover the chrome the layer's reveal uncovers as the chrome's bar slides off (MOT-32,
+     * [FullscreenReveal]), so nothing is drawn instead; the host invalidates the view at the
+     * fullscreen's two ends, and the page's picture is back with the exit.
+     */
+    override fun onDraw(canvas: Canvas) {
+        if (host.fullscreenTab === this) return
+        super.onDraw(canvas)
+    }
+
+    /**
+     * A message from the page script in one of the tab's frames. The script runs in every frame,
+     * but the main document alone speaks for the tab, save for a frame's own fullscreen
+     * ([PageMessageRoute.heardFrom]): an embed's video goes fullscreen from its frame's document,
+     * the one that knows the video's size. The host weighs a frame's report against the main
+     * frame's ([PageHost.fullscreenVideo]). The legacy bridge (no frame on its messages) is
+     * taken as the main frame's, as it always was.
+     */
+    private fun onPageMessage(message: WebMessageCompat, proxy: JavaScriptReplyProxy?, isMainFrame: Boolean = true) {
+        val route = routePageMessage(message.data, host.pageToken)
+        // A sub-frame's hello, before it is dropped below: its reply proxy joins the frames the
+        // image search's frame-owner protocol asks ([ImageOwner.registerFrame]), stamped with its
+        // document's navigation start. The tab's replyProxy stays the main document's: the flags
+        // and the core's messages are its alone.
+        if (!isMainFrame && proxy != null && route is PageMessageRoute.Hello) imageOwner().registerFrame(proxy, route.documentStart)
+        if (!route.heardFrom(isMainFrame)) return
+        when (route) {
+            PageMessageRoute.Ignore -> return
+            is PageMessageRoute.Hello -> {
+                replyProxy = proxy
+                // The main frame's hello is the tab's document boundary for the protocol's frames:
+                // the ones stamped before this document's navigation start were the old
+                // document's ([ImageOwner.documentStarted]). Not onPageStarted, which WebView 113
+                // posts at commit as a Java message the frames' hellos can run ahead of.
+                imageOwner?.documentStarted(route.documentStart)
+                sendFlags()
+            }
+            // The settled value of a Promise an evaluate() script returned (see evaluate()).
+            is PageMessageRoute.EvalResult -> pendingEvals.remove(route.id)?.invoke(route.value)
+            PageMessageRoute.DomReady -> if (domReady.scriptReady()) host.viewEvent(tabId, "domReady", null)
+            is PageMessageRoute.Fullscreen ->
+                host.fullscreenVideo(this, route.active, route.video, route.videoWidth, route.videoHeight, mainFrame = isMainFrame)
+            // The page's own referrer policy, for the navigation the view may hold next.
+            is PageMessageRoute.ReferrerPolicy -> {
+                route.next?.let { referrerPolicyWord.nextNavigation(it, SystemClock.uptimeMillis()) }
+                val origin = route.origin
+                if (route.document != null && origin != null) referrerPolicyWord.document(route.document, origin)
+            }
+            is PageMessageRoute.Forward -> when (route.message.optString("type")) {
+                // The frame-owner protocol's answers (a frame's hash claim, the owner's bytes) are
+                // the orchestrator's alone: never a `pageMessage` to the core, which hears the
+                // verb's reply. With no orchestrator there is no live request to answer.
+                PageMessageRoute.IMAGE_OWNER, PageMessageRoute.IMAGE_THUMBNAIL ->
+                    imageOwner?.onMessage(route.message, proxy, isMainFrame)
+                "share" -> host.preparePageMessage(route.message) { host.viewEvent(tabId, "pageMessage", it) }
+                else -> host.viewEvent(tabId, "pageMessage", route.message)
+            }
+        }
+    }
+
+    /**
+     * The frame-owner protocol's orchestrator, made on first use (this file is on the boot path:
+     * nothing of it is built with the view). Its timers run on the main looper – the view's own
+     * `postDelayed` waits for an attach a hidden tab may not get – and its nonces come from a
+     * `SecureRandom` made at the first request, not at a frame's hello; a proxy that is gone
+     * drops the message on its own (`JsReplyProxy`), the `runCatching` is for the boundary.
+     */
+    private fun imageOwner(): ImageOwner<JavaScriptReplyProxy> = imageOwner ?: run {
+        val handler = Handler(Looper.getMainLooper())
+        val random = lazy(LazyThreadSafetyMode.NONE) { SecureRandom() }
+        ImageOwner<JavaScriptReplyProxy>(
+            schedule = { delayMs, block ->
+                val run = Runnable { block() }
+                handler.postDelayed(run, delayMs)
+                ({ handler.removeCallbacks(run) })
+            },
+            randomBytes = { count -> ByteArray(count).also(random.value::nextBytes) },
+            post = { proxy, payload -> runCatching { proxy.postMessage(payload) } }
+        ).also { imageOwner = it }
+    }
+
+    /**
+     * `view.imageThumbnail`: the image search's thumbnail from the frame that holds the image
+     * ([ImageOwner], the frame-owner protocol). [reply] gets the `ImageFetchResult` JSON text
+     * once. On the legacy bridge – no reply proxies to tell frames apart by, or no
+     * document-start script to put the answerer in every frame – it is
+     * `{ ok:false, reason:'unsupported' }` at once, and the core keeps today's path there.
+     */
+    fun imageThumbnail(src: String, bounds: JSONObject, quality: Double, maxBytes: Long, reply: (String) -> Unit) {
+        val legacy = !WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER) ||
+            !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+        imageOwner().start(src, bounds, quality, maxBytes, replyProxy, legacy, reply)
+    }
+
+    // --- script evaluation for the core (async-aware) --------------------------------------------
+
+    private val pendingEvals = HashMap<Int, (String?) -> Unit>()
+    private var evalSeq = 0
+
+    /**
+     * Run `code` in the page and answer with the JSON text of its value, like Electron's
+     * `executeJavaScript`: a returned Promise is awaited (WebView's `evaluateJavascript` would
+     * hand back `{}` for it at once), and a thrown or rejected error comes back as
+     * `{"__zenError": message}` so the bridge can reject the call. The async path reports through
+     * the page bridge, so the token the page script already carries is embedded in the wrapper.
+     */
+    fun evaluate(code: String, callback: (String?) -> Unit) {
+        val id = ++evalSeq
+        pendingEvals[id] = callback
+        val post = "window.__zenPageBridge&&__zenPageBridge.postMessage(JSON.stringify({token:${JSONObject.quote(host.pageToken)},type:'evalResult',id:$id,value:__s}))"
+        val wrapped = "(function(){var __e=function(e){return {__zenError:String((e&&e.message)||e)}};try{var __r=(" + code + "\n);" +
+            "if(__r&&typeof __r.then==='function'){__r.then(function(v){var __s;try{__s=JSON.stringify(v===undefined?null:v)}catch(x){__s=JSON.stringify(String(v))}$post}," +
+            "function(e){var __s=JSON.stringify(__e(e));$post});return '__zen_pending__'}return __r}catch(e){return __e(e)}})()"
+        evaluateJavascript(wrapped) { result ->
+            if (result == "\"__zen_pending__\"") {
+                // Settled later through onPageMessage; never leave the core hanging past its own budget.
+                Handler(Looper.getMainLooper()).postDelayed({
+                    pendingEvals.remove(id)?.invoke("{\"__zenError\":\"the script's promise did not settle in time\"}")
+                }, EVAL_TIMEOUT_MS)
+                return@evaluateJavascript
+            }
+            pendingEvals.remove(id)?.invoke(result)
+        }
+    }
+
+    /** A new document unloads whatever scripts were still pending. */
+    private fun failPendingEvals(reason: String) {
+        if (pendingEvals.isEmpty()) return
+        val waiting = pendingEvals.values.toList()
+        pendingEvals.clear()
+        for (cb in waiting) cb("{\"__zenError\":${JSONObject.quote(reason)}}")
+    }
+
+    private inner class LegacyPageBridge {
+        @JavascriptInterface
+        fun postMessage(data: String) {
+            Handler(Looper.getMainLooper()).post {
+                onPageMessage(WebMessageCompat(data), null)
+            }
+        }
+    }
+
+    fun setFlags(flags: JSONObject) {
+        currentFlags = flags
+        sendFlags()
+    }
+
+    /** Boost "zap element" picker on/off (handled by the injected page script). */
+    fun setZap(on: Boolean) {
+        postToPage(json("type" to "zap", "on" to on).toString())
+    }
+
+    private fun sendFlags() {
+        postToPage(json("type" to "flags", "flags" to currentFlags).toString())
+        postToPage(formsConfig())
+        // The extension runtime's word on the response stage (contract 7.10): a new document
+        // learns it at hello; a flip while the document lives comes through [setExtObserve].
+        if (host.blocking.observeResponses) setExtObserve(true)
+    }
+
+    /**
+     * Whether the page script observes the page's `fetch` / XHR responses for the extension
+     * runtime's `webRequest` emulation (`requestObserver.ts`): on while a response-stage
+     * listener exists somewhere (`Extensions.kt`, `ext.observeResponses`), off otherwise.
+     */
+    fun setExtObserve(on: Boolean) {
+        postToPage(json("type" to "extObserve", "on" to on).toString())
+    }
+
+    /**
+     * A hardware keyboard's Tab entering this page from the chrome ([FocusHandoff], A11Y-09): the
+     * view takes the keyboard, and out of touch mode WebView's own `requestFocus` has Blink land
+     * the document's initial focus on its first tabbable as a keyboard focus – the landing that
+     * matches `:focus-visible`, which a script's `focus()` after a touch would not (see
+     * [Host.onFocusLanding]) – then the page script confirms the first tabbable or moves to the
+     * last for a Shift+Tab (`focus` in `pageScript.ts`, `@shared/focusEdge`); in touch mode, where
+     * Blink places nothing, the script's landing is the whole of it. `edge` is `first` or `last`.
+     */
+    fun focusEdge(edge: String) {
+        requestFocus()
+        postToPage(json("type" to "focus", "edge" to edge).toString())
+    }
+
+    /** Deliver a browser → page message (JSON text) over the reply proxy (or the legacy bridge). */
+    fun postToPage(payload: String) {
+        val proxy = replyProxy
+        if (proxy != null) {
+            runCatching { proxy.postMessage(payload) }
+        } else if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+            evaluateJavascript(
+                "window.__zenPageBridge&&__zenPageBridge.onmessage&&__zenPageBridge.onmessage({data:${JSONObject.quote(payload)}})",
+                null
+            )
+        }
+    }
+
+    /** The core's "always allow pop-ups on this site": window.open may open windows on its own. */
+    fun setPopupsAllowed(allowed: Boolean) {
+        settings.javaScriptCanOpenWindowsAutomatically = allowed
+    }
+
+    // --- an AI agent's native prompts (AgentPrompts.kt) ----------------------------------------------
+
+    /**
+     * `view.interceptAgentPrompts`: an agent took this page (on), or let it go (off). A chooser
+     * held when the agent lets go keeps waiting for the core's answer, which then says `user`;
+     * the files its answers wrote go with it ([AgentUploads]), the page having read them at
+     * submit while the agent worked it.
+     */
+    fun setInterceptAgentPrompts(on: Boolean) {
+        interceptsAgentPrompts = on
+        if (!on) clearAgentUploads()
+    }
+
+    /**
+     * The page opened a file chooser while an agent works it: nothing opens; the core hears of
+     * it (`fileChooser`) and answers with [answerFileChooser]. The callback waits meanwhile – the
+     * core's two-minute default cancels it, and [destroy] cancels one left waiting.
+     */
+    private fun holdFileChooser(callback: ValueCallback<Array<Uri>>, params: WebChromeClient.FileChooserParams) {
+        val requestId = "fc_${++fileChooserSeq}"
+        heldFileChoosers[requestId] = HeldFileChooser(callback, params)
+        host.viewEvent(
+            tabId, "fileChooser",
+            AgentPrompts.fileChooserEvent(
+                requestId,
+                params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE,
+                params.acceptTypes?.toList() ?: emptyList()
+            )
+        )
+    }
+
+    /**
+     * The core's answer to a held chooser (`view.fileChooserAnswer`): the agent's files – bytes
+     * written to a private folder first ([AgentUploads]) and handed to the page as this app's
+     * `content://` URIs; never a path, which [AgentPrompts.fileChooserAnswer] turns into a cancel
+     * – a cancel, or `user`: the tab is not an agent's, the system's chooser opens as it would
+     * have. An answer to a chooser no longer held (the page went) is nothing.
+     */
+    fun answerFileChooser(requestId: String, args: JSONObject) {
+        val held = heldFileChoosers.remove(requestId) ?: return
+        when (val answer = AgentPrompts.fileChooserAnswer(args)) {
+            AgentPrompts.FileChooserAnswer.User ->
+                if (!host.activity.showFileChooser(host, held.callback, held.params)) held.callback.onReceiveValue(null)
+            AgentPrompts.FileChooserAnswer.Cancel -> held.callback.onReceiveValue(null)
+            is AgentPrompts.FileChooserAnswer.Files -> {
+                val activity = host.activity
+                Thread {
+                    val dir = File(activity.cacheDir, AgentUploads.DIR)
+                    val now = System.currentTimeMillis()
+                    // What an earlier run left behind goes before this answer is written.
+                    AgentUploads.sweep(dir, now)
+                    val written = runCatching {
+                        val w = AgentUploads.write(dir, answer.files, now)
+                        w to w.files.map { file -> FileProvider.getUriForFile(activity, "${activity.packageName}.files", file) }
+                    }.getOrElse { e ->
+                        Log.w("ZenTab", "an agent's upload could not be written: $e")
+                        null
+                    }
+                    post {
+                        if (written == null || written.second.isEmpty()) {
+                            held.callback.onReceiveValue(null)
+                            return@post
+                        }
+                        agentUploadFolders.add(written.first.folder)
+                        held.callback.onReceiveValue(written.second.toTypedArray())
+                    }
+                }.start()
+            }
+        }
+    }
+
+    /** The folders this tab's agent answers were written to go, off the main thread. */
+    private fun clearAgentUploads() {
+        if (agentUploadFolders.isEmpty()) return
+        val folders = agentUploadFolders.toList()
+        agentUploadFolders.clear()
+        Thread { for (f in folders) f.deleteRecursively() }.start()
+    }
+
+    /** The page went with choosers held: each hears it was cancelled, so no callback is left waiting. */
+    private fun cancelHeldFileChoosers() {
+        val held = heldFileChoosers.values.toList()
+        heldFileChoosers.clear()
+        for (h in held) h.callback.onReceiveValue(null)
+    }
+
+    // --- autofill and passkeys -----------------------------------------------------------------------
+
+    /**
+     * A fill for the page's forms script, or its configuration (`{type:'config', enabled}`); the
+     * host keeps the configuration and [sendFlags] repeats it to every new document.
+     */
+    fun sendForms(command: JSONObject) {
+        postToPage(json("type" to "forms", "command" to command).toString())
+    }
+
+    private fun formsConfig(): String =
+        json("type" to "forms", "command" to json("type" to "config", "enabled" to host.formsEnabled)).toString()
+
+    /**
+     * Whose autofill the page gets (see [SystemAutofill]): under the system provider the WebView
+     * stays a client of the framework, under Ione's it and every field in it step out of it.
+     */
+    fun applyAutofillProvider() {
+        importantForAutofill = SystemAutofill.importance(host.autofillProvider)
+    }
+
+    /**
+     * Passkeys (WebAuthn) through Android's Credential Manager, at the level a non-privileged app
+     * gets: `navigator.credentials` works for origins whose Digital Asset Links statement lists
+     * this app (Ione's own sites). Any origin at all needs `WEB_AUTHENTICATION_SUPPORT_FOR_BROWSER`,
+     * which Android grants only to the browsers on Google's privileged-browser allowlist; those
+     * requests are refused by the platform, not by Ione. Without the WebView feature (an old
+     * WebView) the calls fail as they always did.
+     */
+    private fun applyWebAuthn() {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_AUTHENTICATION)) return
+        runCatching {
+            WebSettingsCompat.setWebAuthenticationSupport(settings, WebSettingsCompat.WEB_AUTHENTICATION_SUPPORT_FOR_APP)
+        }.onFailure { Log.w("ZenTab", "WebAuthn support could not be enabled: ${it.message}") }
+    }
+
+    // --- input ---------------------------------------------------------------------------------
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        lastTouchX = event.x
+        lastTouchY = event.y
+        if (event.actionMasked == MotionEvent.ACTION_UP) reportActivation()
+        // The bar that hides on scroll hears every touch; the edge drag that navigates history
+        // (see HistoryNavGesture) and then the pull decide what of it the WebView sees (see
+        // PullToRefreshGesture), and the bar shifts that by what it has taken.
+        barHide.onTouch(event)
+        return historyNav.onTouchEvent(event)
+    }
+
+    /**
+     * Ctrl + the mouse wheel over the page zooms it (OS-12; see [WheelZoom]): the step goes to the
+     * core as the `zoomChanged` view event – `ViewEvents.onZoomChanged`, the same `adjustZoom` the
+     * keyboard's Ctrl+= and Ctrl+- run – and the event ends here, so the WebView neither scrolls
+     * under the zoom nor zooms on its own. Every other motion (a plain wheel, a mouse hover, a
+     * stylus) is the WebView's as ever.
+     */
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        val step = wheelZoom.step(
+            event.actionMasked == MotionEvent.ACTION_SCROLL,
+            event.metaState and KeyEvent.META_CTRL_ON != 0,
+            event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+        )
+        step.direction?.let { host.viewEvent(tabId, "zoomChanged", json("direction" to it)) }
+        return step.consumed || super.onGenericMotionEvent(event)
+    }
+
+    private val wheelZoom = WheelZoom()
+
+    /**
+     * A trusted tap or key reached the page: the core's user-activation model (pop-ups, app
+     * launches) runs on it. Rate-limited so scrolling does not flood the bridge.
+     */
+    private fun reportActivation() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastActivationAt < ACTIVATION_REPORT_INTERVAL_MS) return
+        lastActivationAt = now
+        host.viewEvent(tabId, "activation", null)
+    }
+
+    private var lastActivationAt = 0L
+
+    /** Long-press on links/images opens Zen's page menu; text selection stays native. */
+    private fun onLongPress(): Boolean {
+        // The served new tab page's tiles hold their own menu (NTP-35): the renderer gets the gesture.
+        if (LinkHits.holdIsThePages(currentDocument)) return false
+        val result = hitTestResult
+        val density = resources.displayMetrics.density
+        val anchorX = (left + lastTouchX) / density
+        val anchorY = (top + lastTouchY) / density
+        when {
+            // A page link, an image in one, a `tel:` or a `mailto:` link (LinkHits): the WebView
+            // types the last two apart and hands their number or address bare.
+            LinkHits.opensLinkMenu(result.type) -> {
+                val msg = Message.obtain(Handler(Looper.getMainLooper()) { m ->
+                    val href = LinkHits.href(result.type, m.data.getString("url"), result.extra)
+                    val src = m.data.getString("src") ?: ""
+                    // The anchor's text (`title` in the WebView's bundle): the link menu's
+                    // header title (PUI-18) and its Copy Link Text item.
+                    val text = m.data.getString("title")?.trim() ?: ""
+                    host.viewEvent(
+                        tabId, "contextMenu",
+                        json(
+                            "linkURL" to href,
+                            "linkText" to text,
+                            "srcURL" to src,
+                            "mediaType" to if (src.isNotEmpty()) "image" else "none",
+                            "x" to anchorX, "y" to anchorY
+                        )
+                    )
+                    true
+                })
+                requestFocusNodeHref(msg)
+                return true
+            }
+            result.type == HitTestResult.IMAGE_TYPE -> {
+                host.viewEvent(
+                    tabId, "contextMenu",
+                    json("linkURL" to "", "srcURL" to (result.extra ?: ""), "mediaType" to "image", "x" to anchorX, "y" to anchorY)
+                )
+                return true
+            }
+        }
+        return false
+    }
+
+    // --- the text-selection toolbar (see SelectionToolbar.kt) ------------------------------------
+
+    /**
+     * The WebView starts the system's floating action mode over selected text with its own
+     * callback (Copy, Share, Select all, Web search); wrapped, so Ione's items from the core
+     * join them after Copy. The mode itself – floating type, handles, position – is the system's.
+     * Anything else (a primary action mode, another caller's callback) passes through untouched.
+     */
+    override fun startActionMode(callback: ActionMode.Callback, type: Int): ActionMode? {
+        if (type != ActionMode.TYPE_FLOATING || callback !is ActionMode.Callback2) return super.startActionMode(callback, type)
+        return super.startActionMode(SelectionActionMode(callback), type)
+    }
+
+    /**
+     * The WebView's selection callback with Ione's items added (`SelectionToolbar.plan`). The
+     * items come from the core for the text selected, and again on every prepare of a selection
+     * menu (`SelectionToolbar.Listing`): the WebView keeps one mode across selection changes – a
+     * handle drag, Select all – and invalidates it, so the list is re-read then and the mode
+     * invalidated once more when the items change (the system's items show at once; Ione's
+     * join within the toolbar's own entrance). A touch on one reads the selection again, sends
+     * `selection.action` to the core and finishes the mode, which clears the selection as the
+     * system's items do.
+     */
+    private inner class SelectionActionMode(private val system: ActionMode.Callback2) : ActionMode.Callback2() {
+        private var mode: ActionMode? = null
+        private var finished = false
+        /** The core's items, kept current with the selection across the mode's life. */
+        private val listing = SelectionToolbar.Listing(
+            readSelection = { onText -> evaluateJavascript(SelectionToolbar.SELECTION_SCRIPT) { raw -> onText(SelectionToolbar.selectionText(raw)) } },
+            listItems = { text, onJson -> host.selectionMenu(tabId, text, onJson) },
+            invalidate = { mode?.invalidate() }
+        )
+        /** Where the selection sits on this view (`onGetContentRect`), for a glance's origin. */
+        private val selectionRect = Rect()
+        private val strings by lazy { frameworkStrings() }
+
+        override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
+            this.mode = mode
+            Log.d(SELECTION_TAG, "selection mode of $tabId created")
+            return system.onCreateActionMode(mode, menu)
+        }
+
+        override fun onPrepareActionMode(mode: ActionMode, menu: Menu): Boolean {
+            val prepared = system.onPrepareActionMode(mode, menu)
+            menu.removeGroup(SelectionToolbar.GROUP)
+            val systemItems = (0 until menu.size()).map(menu::getItem)
+            val plan = SelectionToolbar.plan(
+                systemItems.map { SelectionToolbar.SystemItem(it.groupId, it.order, it.title?.toString() ?: "", it.itemId) },
+                listing.items,
+                strings
+            )
+            Log.d(SELECTION_TAG, "selection mode of $tabId prepared: anchored ${plan.anchored}, items ${plan.items.map { it.id }}")
+            // A menu with Copy is a text selection: ask for the items for the selection as it is
+            // now (a Paste toolbar or a password field gets nothing); the menu shows the last
+            // answer meanwhile, and a different one invalidates the mode again.
+            if (plan.anchored) listing.onPrepare()
+            for (index in plan.hidden) systemItems[index].isVisible = false
+            plan.items.forEachIndexed { index, item ->
+                menu.add(SelectionToolbar.GROUP, SelectionToolbar.FIRST_ITEM_ID + index, plan.order, item.title).apply {
+                    setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS or MenuItem.SHOW_AS_ACTION_WITH_TEXT)
+                    contentDescription = item.title
+                }
+            }
+            // Copy link to highlight (PUI-40), the last of Ione's rows, for a text selection in
+            // a web page: the link the page script makes for the passage (`TextFragmentLink`). It
+            // is placed as the core's rows are – in the bar while there is room, else where the
+            // toolbar puts the rows that did not fit, at the head of its overflow – and not as an
+            // overflow-only item, which the toolbar sorts under the system's own rows, under the
+            // fold of a phone's overflow list (the sixth row on a Pixel 6). Not for a `zen://`
+            // page or a file, where the link means nothing to whoever gets it; not for a Paste
+            // toolbar or a password field; not in a custom tab, which runs no page script to make
+            // the link; not in the PDF viewer, whose text layer sits under the document's http URL
+            // but whose link would highlight nothing.
+            val copyLink = TextFragmentLink.offered(plan.anchored, host.pageScript, this@TabWebView.url, pdfPage != null)
+            if (copyLink) {
+                menu.add(SelectionToolbar.GROUP, R.id.zen_selection_copy_link, plan.order, TextFragmentLink.TITLE).apply {
+                    setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS or MenuItem.SHOW_AS_ACTION_WITH_TEXT)
+                    contentDescription = TextFragmentLink.TITLE
+                }
+            }
+            return prepared || !plan.isEmpty || copyLink
+        }
+
+        override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
+            if (item.groupId != SelectionToolbar.GROUP) return system.onActionItemClicked(mode, item)
+            if (item.itemId == R.id.zen_selection_copy_link) {
+                copyLinkToHighlight(mode)
+                return true
+            }
+            val action = SelectionToolbar.itemAt(listing.items, item.itemId) ?: return true
+            val originX = SelectionToolbar.fraction(selectionRect.exactCenterX(), width)
+            val originY = SelectionToolbar.fraction(selectionRect.exactCenterY(), height)
+            evaluateJavascript(SelectionToolbar.SELECTION_SCRIPT) { raw ->
+                val selected = SelectionToolbar.selectionText(raw).ifEmpty { listing.text }
+                if (selected.isNotBlank()) host.hostEvent("selection.action", SelectionToolbar.action(tabId, action.id, selected, originX, originY))
+                if (!finished) mode.finish()
+            }
+            return true
+        }
+
+        /**
+         * Copy link to highlight: the page's directive for its selection – asked through the DOM
+         * (`TextFragmentLink.GENERATE_SCRIPT`), where the selection the mode just collapsed stands
+         * in for the page script (`selectionMemory.withCleared`) – and the page's URL with it onto
+         * the clipboard. The page must still be the one the item was offered for when the answer
+         * lands. Android 13 shows its own chip for a copy; below it the chrome's toast says so,
+         * and a selection that cannot be linked to gets the desktop's word for it.
+         */
+        private fun copyLinkToHighlight(mode: ActionMode) {
+            val pageUrl = this@TabWebView.url
+            evaluateJavascript(TextFragmentLink.GENERATE_SCRIPT) { raw ->
+                val link = TextFragmentLink.linkTo(pageUrl, TextFragmentLink.directiveOf(raw))?.takeIf { this@TabWebView.url == pageUrl }
+                if (link != null) {
+                    SecretClipboard.write(context, link, sensitive = false)
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) toast("Link copied")
+                } else {
+                    toast(TextFragmentLink.NO_LINK_TOAST)
+                }
+                Log.d(SELECTION_TAG, "copy link to highlight in $tabId: ${if (link != null) "copied" else "no link"}")
+                if (!finished) mode.finish()
+            }
+        }
+
+        /** A word to the user through the chrome's toast (the one toast the app has). */
+        private fun toast(message: String) {
+            host.hostEvent("toast", json("message" to message, "kind" to "info", "action" to null))
+        }
+
+        override fun onDestroyActionMode(mode: ActionMode) {
+            finished = true
+            listing.finish()
+            this.mode = null
+            Log.d(SELECTION_TAG, "selection mode of $tabId destroyed after ${listing.asks} ask(s)")
+            system.onDestroyActionMode(mode)
+        }
+
+        override fun onGetContentRect(mode: ActionMode, view: View, outRect: Rect) {
+            system.onGetContentRect(mode, view, outRect)
+            selectionRect.set(outRect)
+        }
+    }
+
+    /**
+     * What the system's selection items are told by (see `SelectionToolbar.plan`): Copy and Paste
+     * are the public `android.R.string.copy` and `android.R.string.paste`; the WebView's Share is
+     * its own `select_action_menu_share` id, resolved in the WebView package's resources (loaded
+     * into this process as a shared library, so the id is the one its items carry; 0 when the
+     * lookup fails); the framework's own Share string (its text fields' item) is not public, so it
+     * is looked up by name and may be missing – the title fallback for the id.
+     */
+    private fun frameworkStrings(): SelectionToolbar.Strings {
+        val share = Resources.getSystem().let { system ->
+            system.getIdentifier("share", "string", "android").takeIf { it != 0 }?.let { id -> runCatching { system.getString(id) }.getOrNull() }
+        }
+        val shareItemId = runCatching {
+            val webViewPackage = WebView.getCurrentWebViewPackage()?.packageName ?: return@runCatching 0
+            resources.getIdentifier(SelectionToolbar.SHARE_ITEM_ID_NAME, "id", webViewPackage)
+        }.getOrDefault(0)
+        return SelectionToolbar.Strings(
+            copy = context.getString(android.R.string.copy),
+            share = share,
+            paste = context.getString(android.R.string.paste),
+            shareItemId = shareItemId
+        )
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            reportActivation()
+            val isEscape = event.keyCode == KeyEvent.KEYCODE_ESCAPE
+            if (host.keys.matches(event) || isEscape) {
+                host.keys.toInput(event)?.let { host.onKey(tabId, it) }
+                if (!isEscape) return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    // --- AI agent input (trusted MotionEvent / KeyEvent synthesis) -------------------------------
+
+    /**
+     * Deliver a synthetic-but-trusted input event from an AI agent. Coordinates arrive in CSS
+     * pixels relative to the layout viewport (what `getBoundingClientRect` reports); on screen
+     * they are offset by the visual viewport (pinch pan) and scaled by the page scale × density –
+     * a desktop-layout page shown zoomed out has far fewer device pixels per CSS pixel than the
+     * density alone would suggest. `done` runs once the event has been dispatched.
+     */
+    fun sendAgentInput(event: JSONObject, done: () -> Unit) {
+        when (event.str("type")) {
+            "click" -> pageToView(event.num("x"), event.num("y")) { x, y ->
+                agentTap(x, y, event.num("clickCount", 1.0).toInt())
+                done()
+            }
+            "mouseMove" -> pageToView(event.num("x"), event.num("y")) { x, y ->
+                agentHover(x, y)
+                done()
+            }
+            "key" -> {
+                agentKey(event.str("key"))
+                done()
+            }
+            else -> done()
+        }
+    }
+
+    /** CSS px in the layout viewport → device px on this view. */
+    private fun pageToView(cssX: Double, cssY: Double, then: (Float, Float) -> Unit) {
+        @Suppress("DEPRECATION")
+        val scale = scale.toDouble() // device px per CSS px: density × current page scale
+        evaluateJavascript(VISUAL_OFFSET_SCRIPT) { result ->
+            val offset = runCatching { JSONArray(result ?: "") }.getOrNull()
+            val ox = offset?.optDouble(0, 0.0) ?: 0.0
+            val oy = offset?.optDouble(1, 0.0) ?: 0.0
+            then(((cssX - ox) * scale).toFloat(), ((cssY - oy) * scale).toFloat())
+        }
+    }
+
+    private fun agentTap(x: Float, y: Float, count: Int) {
+        repeat(count.coerceAtLeast(1)) {
+            val down = SystemClock.uptimeMillis()
+            dispatchTouchEvent(pointerEvent(down, down, MotionEvent.ACTION_DOWN, x, y, MotionEvent.TOOL_TYPE_FINGER, InputDevice.SOURCE_TOUCHSCREEN))
+            dispatchTouchEvent(pointerEvent(down, down + 20, MotionEvent.ACTION_UP, x, y, MotionEvent.TOOL_TYPE_FINGER, InputDevice.SOURCE_TOUCHSCREEN))
+        }
+    }
+
+    /** A mouse hover: only pointer events from a mouse source reach the page as mouse moves. */
+    private fun agentHover(x: Float, y: Float) {
+        val now = SystemClock.uptimeMillis()
+        dispatchGenericMotionEvent(pointerEvent(now, now, MotionEvent.ACTION_HOVER_ENTER, x, y, MotionEvent.TOOL_TYPE_MOUSE, InputDevice.SOURCE_MOUSE))
+        dispatchGenericMotionEvent(pointerEvent(now, now + 1, MotionEvent.ACTION_HOVER_MOVE, x, y, MotionEvent.TOOL_TYPE_MOUSE, InputDevice.SOURCE_MOUSE))
+    }
+
+    private fun pointerEvent(down: Long, time: Long, action: Int, x: Float, y: Float, toolType: Int, source: Int): MotionEvent {
+        val properties = MotionEvent.PointerProperties().apply {
+            id = 0
+            this.toolType = toolType
+        }
+        val coords = MotionEvent.PointerCoords().apply {
+            this.x = x
+            this.y = y
+            pressure = if (toolType == MotionEvent.TOOL_TYPE_MOUSE) 0f else 1f
+            size = if (toolType == MotionEvent.TOOL_TYPE_MOUSE) 0f else 1f
+        }
+        return MotionEvent.obtain(down, time, action, 1, arrayOf(properties), arrayOf(coords), 0, 0, 1f, 1f, 0, 0, source, 0)
+    }
+
+    private fun agentKey(key: String) {
+        val code = when (key) {
+            "Enter" -> KeyEvent.KEYCODE_ENTER
+            "Tab" -> KeyEvent.KEYCODE_TAB
+            "Escape" -> KeyEvent.KEYCODE_ESCAPE
+            "Backspace" -> KeyEvent.KEYCODE_DEL
+            "Delete" -> KeyEvent.KEYCODE_FORWARD_DEL
+            "ArrowUp" -> KeyEvent.KEYCODE_DPAD_UP
+            "ArrowDown" -> KeyEvent.KEYCODE_DPAD_DOWN
+            "ArrowLeft" -> KeyEvent.KEYCODE_DPAD_LEFT
+            "ArrowRight" -> KeyEvent.KEYCODE_DPAD_RIGHT
+            " " -> KeyEvent.KEYCODE_SPACE
+            else -> null
+        }
+        if (code != null) {
+            dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+            dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+        } else if (key.length == 1) {
+            val chars = key.toCharArray()
+            val events = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD).getEvents(chars)
+            events?.forEach { dispatchKeyEvent(it) }
+        }
+    }
+
+    // --- history snapshots (the previews behind predictive back) ----------------------------------
+
+    /**
+     * Remember what the page on screen looks like, keyed to the history entry it belongs to, for
+     * the back preview that will one day slide it in again. Called on the way out of a page –
+     * before a link click, a URL bar load or a history traversal moves the view on – while the
+     * page is still the one painted. Cheap to call liberally: it copies the window at most every
+     * few hundred milliseconds and never while the view is hidden or mid back-gesture (the copy
+     * would be of the preview, not of the page).
+     */
+    fun rememberCurrentPage(force: Boolean = false) {
+        if (backTransition != null) return
+        val now = SystemClock.uptimeMillis()
+        if (!force && now - lastRememberedAt < REMEMBER_THROTTLE_MS) return
+        if (width <= 0 || height <= 0 || !isShown) return
+        val index = committedIndex
+        val url = committedUrl
+        if (index < 0 || url.isEmpty() || url == "about:blank") return
+        // The entry must still be the one on screen: a commit that already replaced it is the
+        // new page, and a copy of the window now would be of the old one under the new name.
+        val history = copyBackForwardList()
+        if (history.currentIndex != index || history.getItemAtIndex(index)?.url != url) return
+        lastRememberedAt = now
+        captureBitmap(minOf(1f, HistorySnapshots.MAX_WIDTH.toFloat() / width)) { bitmap ->
+            if (bitmap != null) remember(index, url, bitmap)
+        }
+    }
+
+    private fun remember(index: Int, url: String, bitmap: Bitmap) {
+        val pageTitle = title ?: ""
+        host.snapshots.remember(HistorySnapshots.Entry(tabId, index, url, pageTitle, favicon, bitmap))
+    }
+
+    /**
+     * The navigation has committed: which entry is on screen now, which snapshots still hold, and
+     * which internal pages' names still stand ([internalNames]). `shown` is the URL the commit
+     * was reported under (`doUpdateVisitedHistory`'s; for an internal page the `zen://` URL it
+     * was loaded with, where its list item is a `data:` placeholder), null when the commit is not
+     * a callback's (a restore: the snapshot named the entries, and the commit that follows confirms
+     * the current one). `reload` is the callback's word too.
+     */
+    private fun onHistoryCommitted(shown: String?, reload: Boolean = false) {
+        val history = copyBackForwardList()
+        val items = (0 until history.size).map { history.getItemAtIndex(it)?.url }
+        // The commit of a restored list's current entry reports the list the restore built,
+        // unchanged: not a drop, whatever its size.
+        val afterRestore = restoredList
+        restoredList = false
+        if (!afterRestore && NavigationState.listDroppedAnEntry(committedIndex, committedSize, history.currentIndex, history.size, reload)) {
+            // The oldest entry went for this one: every position before it moved, and no name is
+            // its position's any more (the current one is named again below).
+            internalNames.clear()
+        }
+        committedIndex = history.currentIndex
+        committedSize = history.size
+        committedUrl = history.currentItem?.url ?: url ?: ""
+        val kept = NavigationState.keptNames(internalNames, items)
+        if (kept.size != internalNames.size) {
+            internalNames.clear()
+            internalNames.putAll(kept)
+        }
+        // The commit decides its own position's name: an internal page (the list holds its
+        // document under a `data:` URL, the commit reports the page's URL) is named by it; any
+        // other page committing there (a web page; a `data:` page opened as one, whose commit
+        // reports the URL itself) takes the name a previous internal page left at the position.
+        if (committedIndex >= 0 && shown != null) {
+            if (committedUrl.isNotEmpty() && NavigationState.standsInFor(committedUrl, shown)) {
+                internalNames[committedIndex] = shown
+            } else {
+                internalNames.remove(committedIndex)
+            }
+        }
+        host.snapshots.validate(tabId, history)
+    }
+
+    // --- the back/forward stack for the core (NavigationSnapshot; see NavigationState.kt) ---------
+
+    /**
+     * The list as the core's snapshot: `{ entries: [{ url, title, originalUrl? }], index }`, the
+     * internal pages under the URLs they were shown as. Main thread; the `historyChanged` push
+     * ([pushHistory]) hands the same object to the chrome, and `Host` keeps the last one for the
+     * synchronous `view.navigationEntries`.
+     */
+    fun navigationEntries(): JSONObject {
+        val history = copyBackForwardList()
+        val items = (0 until history.size).map { i ->
+            val item = history.getItemAtIndex(i)
+            NavigationState.Item(item?.url ?: "", item?.title, item?.originalUrl)
+        }
+        return NavigationState.snapshotJson(items, history.currentIndex, internalNames)
+    }
+
+    /**
+     * Tell the core the list changed (`historyChanged { entries, index }`): at every commit, when
+     * a page finishes and when a title arrives, and only when it reads differently from the last
+     * time. `force` sends it anyway (the view was bound to a new tab id). The state behind the
+     * list goes to the host's mirror first, every time ([hostState]; the core asks for it as it
+     * records the list this push announces, from a thread that cannot ask the WebView).
+     */
+    fun pushHistory(force: Boolean = false) {
+        val snapshot = navigationEntries()
+        host.navigationStateChanged(tabId, hostState())
+        val text = snapshot.toString()
+        if (!force && text == lastHistoryText) return
+        lastHistoryText = text
+        host.viewEvent(tabId, "historyChanged", snapshot)
+    }
+
+    /**
+     * The opaque state a fresh view rebuilds this list from (`view.navigationHostState`), or null:
+     * for a private tab, an empty list, or a state over the core's bound. Main thread.
+     */
+    fun hostState(): String? = NavigationState.hostStateOf(this, Profiles.isPrivate(containerId))
+
+    /**
+     * The host's mirror takes this view's state as it is now, without a list push: on the page's
+     * way off the screen ([Host.setTabVisible]'s hide). The list was last pushed at its commit,
+     * before the user scrolled; the engine writes the scroll into the current entry within a
+     * second of it, so the state a sleep of the hidden page records (`view.navigationHostState`,
+     * read from the mirror) is the one its return restores the scroll from (OS-37). Main thread.
+     */
+    fun refreshHostState() {
+        host.navigationStateChanged(tabId, hostState())
+    }
+
+    /** Jump to entry `index` of the list (the back list's row): nothing for an index outside it. */
+    fun goToIndex(index: Int) {
+        val history = copyBackForwardList()
+        val steps = NavigationState.stepsTo(index, history.currentIndex, history.size) ?: return
+        if (steps == 0) return
+        cancelUnloadProbe()
+        rememberCurrentPage()
+        goBackOrForward(steps)
+    }
+
+    /**
+     * `view.restoreNavigation`: the whole list from `hostState`, when there is one and it is
+     * ours ([NavigationState.decodeHostState]), this view is still empty, `restoreState` accepts
+     * it and the list it gives back is the one `entries` describes, position for position, the
+     * current one at `index` ([NavigationState.restoredMatches]; an internal page's item is a
+     * `data:` placeholder where the entry names the `zen://` page) (true). Anything else is false
+     * and loads nothing: the core loads the current entry itself then (`loadURL`, which is also
+     * what gives an internal page its document), so a load here would be a second one. Main thread.
+     */
+    fun restoreNavigation(entries: JSONArray, index: Int, hostState: String?): Boolean {
+        val restored = restoreFromHostState(entries, index, hostState)
+        lastRestore = restored
+        return restored
+    }
+
+    /** What the last [restoreNavigation] answered, null before one: the demo driver reads it in-process. */
+    var lastRestore: Boolean? = null
+        private set
+
+    private fun restoreFromHostState(entries: JSONArray, index: Int, hostState: String?): Boolean {
+        val wanted = NavigationState.currentUrl(entries, index) ?: return false
+        val bytes = NavigationState.decodeHostState(hostState) ?: return false
+        // Only into a view with nothing in it: over a list already built, restoreState has
+        // "undesirable side-effects" (the platform's words), and the core never asks for that.
+        if (copyBackForwardList().size > 0) return false
+        val bundle = NavigationState.bundleOf(bytes) ?: return false
+        // What a load of the current entry sets up before its first request goes out (see loadUrl).
+        if (PageRules.isWebPage(wanted)) {
+            currentDocument = wanted
+            switchDesktopModeFor(wanted)
+            applyCookiePolicy(host.privacy.flags, wanted)
+        }
+        val restored = try {
+            restoreState(bundle)
+        } catch (e: Exception) {
+            Log.i("ZenTab", "restoreState refused the state of $tabId: ${e.javaClass.simpleName}")
+            null
+        } ?: return false
+        val items = (0 until restored.size).map { restored.getItemAtIndex(it)?.url }
+        val names = NavigationState.entryUrls(entries)
+        if (!NavigationState.restoredMatches(items, restored.currentIndex, names, index)) {
+            Log.i("ZenTab", "the restored list of $tabId is not the one described (${restored.size} entries, current ${restored.currentIndex}; ${names.size} expected, current $index); the core loads the entry")
+            return false
+        }
+        // The internal pages' names, from the snapshot: their items are `data:` placeholders,
+        // and the view that saved the list is not this one (see internalNames).
+        internalNames.clear()
+        internalNames.putAll(NavigationState.internalNamesOf(items, names))
+        onHistoryCommitted(shown = null)
+        restoredList = true
+        pushHistory(force = true)
+        Log.i("ZenTab", "restored the list of $tabId: ${restored.size} entries, current ${restored.currentIndex}")
+        return true
+    }
+
+    /**
+     * Downscaled RGB_565 copy of this view's pixels as they are on screen (null when it cannot be
+     * copied: hidden, unsized). Shared by the overlay snapshot, the card thumbnail and the
+     * history previews – and shared in flight: a request while a copy with at least its pixels
+     * is under way gets that copy's bitmap rather than a second PixelCopy of the same frame
+     * ([CaptureShare]). The bitmap belongs to everyone who hears it; nobody recycles it.
+     */
+    private fun captureBitmap(scale: Float, callback: (Bitmap?) -> Unit) {
+        if (width <= 0 || height <= 0 || !isShown) {
+            callback(null)
+            return
+        }
+        val ticket = captureShare.request(scale, callback) ?: return
+        val bitmap = Bitmap.createBitmap((width * scale).toInt().coerceAtLeast(1), (height * scale).toInt().coerceAtLeast(1), Bitmap.Config.RGB_565)
+        val location = IntArray(2)
+        getLocationInWindow(location)
+        val rect = Rect(location[0], location[1], location[0] + width, location[1] + height)
+        try {
+            PixelCopy.request(host.activity.window, rect, bitmap, { result ->
+                captureShare.complete(ticket, if (result == PixelCopy.SUCCESS) bitmap else null)
+            }, Handler(Looper.getMainLooper()))
+        } catch (e: Exception) {
+            // Software fallback (e.g. before the window is attached).
+            val drawn = runCatching {
+                val canvas = Canvas(bitmap)
+                canvas.scale(scale, scale)
+                draw(canvas)
+            }.isSuccess
+            captureShare.complete(ticket, if (drawn) bitmap else null)
+        }
+    }
+
+    /** The scale the cover and the card picture copy the page at: at most 1400 px wide, else half. */
+    private fun coverScale(): Float = if (width > 1400) 1400f / width else 0.5f
+
+    // --- the page's dialogs and its beforeunload (PUI-27, PUI-28) ---------------------------------
+
+    /** A dialog up: the sheet, the WebView's result it answers, and what to do with the answer. */
+    private class PageDialogUp(val sheet: PageDialogSheet, val result: JsResult)
+
+    /**
+     * Show `spec` as Ione's sheet over the page ([PageDialogSheet]) and hold `result` for its
+     * answer: the page's `alert` dismissed, its `confirm` / `prompt` answered (the prompt's text
+     * with an accepted one), its `beforeunload` objection overruled (the navigation goes on) or
+     * upheld (the page stays). `then` hears the answer after the result has been settled. Main
+     * thread (the `WebChromeClient`'s). A dialog already up – it cannot be, the renderer waits in
+     * the call – would be cancelled for this one.
+     */
+    private fun showDialog(spec: PageDialogSpec, result: JsResult, then: (accepted: Boolean, suppress: Boolean) -> Unit) {
+        dialog?.let { up ->
+            dialog = null
+            up.sheet.dismiss()
+            up.result.cancel()
+        }
+        lateinit var up: PageDialogUp
+        val sheet = PageDialogSheet(host, spec) { accepted, value, suppress ->
+            if (dialog !== up) return@PageDialogSheet
+            dialog = null
+            when {
+                !accepted -> result.cancel()
+                result is JsPromptResult -> result.confirm(value ?: "")
+                else -> result.confirm()
+            }
+            then(accepted, suppress)
+        }
+        up = PageDialogUp(sheet, result)
+        dialog = up
+        sheet.show()
+    }
+
+    /**
+     * The page called `alert`, `confirm` or `prompt` from the frame at `frameUrl` and waits in
+     * the call (PUI-27). A page the user is not looking at – a hidden tab's, or the shown tab's
+     * under the overview – has its dialog answered as a dismissal at once: the WebView's one
+     * renderer waits in the call for every page and for the chrome, so nothing could bring the
+     * tab forward for the dialog to wait on, as Chrome's would (`PageDialogSpec`). So is a
+     * dialog of a page told to open no more this visit ([PageDialogVisit]); the checkbox that
+     * tells it so is offered from its second dialog on.
+     *
+     * A page an agent drives hidden is the agent's dialog policy's first ([dialogPolicy],
+     * [DialogPolicyAnswer]): its dialog is answered from the policy at once – the default,
+     * Cancel, for a kind the policy leaves out, OK for an alert – and reported to the core for
+     * the agent's next result; the visit's count is not the agent's. The tab in front of the
+     * user is not the policy's, and takes the path above.
+     */
+    private fun pageDialog(kind: PageDialogKind, frameUrl: String, message: String?, defaultValue: String?, result: JsResult) {
+        val policyAnswer = DialogPolicyAnswer.decide(
+            kind = kind,
+            policy = dialogPolicy,
+            agentDriven = agentDriven,
+            shown = isShown,
+            userUnload = unloadCheck != null,
+            url = frameUrl,
+            message = message,
+            defaultValue = defaultValue
+        )
+        if (policyAnswer is DialogPolicyAnswer.Decision.Answer) {
+            when {
+                !policyAnswer.accepted -> result.cancel()
+                result is JsPromptResult -> result.confirm(policyAnswer.text ?: "")
+                else -> result.confirm()
+            }
+            host.viewEvent(tabId, "pageDialogAnswered", policyAnswer.report.toJson())
+            return
+        }
+        if (!isShown) {
+            result.cancel()
+            return
+        }
+        val offer = dialogVisit.request()
+        if (offer == null) {
+            result.cancel()
+            return
+        }
+        val spec = PageDialogSpec.page(kind, frameUrl, currentDocument ?: url ?: "", message ?: "", defaultValue ?: "", offer)
+        showDialog(spec, result) { _, suppress -> dialogVisit.answered(suppress) }
+    }
+
+    /**
+     * The user stayed on the page that objected to the core's own navigation: `document`, the
+     * page that is still there – the WebView's word (the committed page's URL) for a reload or
+     * a history step, the probe's remembered document for a load the probe stood for
+     * ([UnloadProbe.settle]). [loadRequested] wrote the destination into the document mirror
+     * as the load was asked for (the requests of the page that is coming are its own from the
+     * first); with the navigation refused, the mirror and the settings go back to the page. The
+     * core hears `stayed`: it wrote the destination into the tab as it asked (the pill shows
+     * where the tab is going, as Chrome's omnibox does), and takes the tab back to the page
+     * (`tabs.stayedOnPage`), the omnibox reading the page's address again.
+     */
+    private fun stayedOnPage(document: String? = url) {
+        // The user stays: no Leave of theirs carries to any load.
+        leaveCarry.reset()
+        host.viewEvent(tabId, "stayed", null)
+        val stayed = document?.takeIf(PageRules::isWebPage) ?: return
+        currentDocument = stayed
+        switchDesktopModeFor(stayed)
+        val flags = host.privacy.flags
+        applyMixedContentPolicy(flags, stayed)
+        applyCookiePolicy(flags, stayed)
+    }
+
+    /**
+     * The page's objection to a navigation outside a check was answered with a stay – at the
+     * sheet, by the hidden tab's rule, by an agent's policy: written on the probe in flight,
+     * whose settling runs [stayedOnPage] ([UnloadProbe.settle]), or run here for a reload or a
+     * history step, which no probe stands for.
+     */
+    private fun stayChosen() {
+        val probe = unloadProbe
+        if (probe != null) probe.answered(leave = false) else stayedOnPage()
+    }
+
+    /**
+     * Whether the page may be unloaded (the core's `TabView.confirmUnload`, ahead of a tab close,
+     * the app's exit): its `beforeunload` handlers run. `reply` hears true once the page may go
+     * – no objection, an objection overruled, the page gone or silent for
+     * [UNLOAD_CHECK_TIMEOUT_MS] (a hung renderer holds no close up, as in Chrome). On a touch
+     * host it never hears false: a close path never asks "Leave site?" (§9.23,
+     * [UnloadObjection.SettleCheck]). The chrome's close paths run with Undo on the toast
+     * (`lib/closeUndo.ts`: the overview's cards, the strip's rows and tiles, the tab search's
+     * rows, the tablet menu's close rows, Back), and that Undo is the protection; the app's
+     * exit keeps the tab with its stack. A close that comes to the core past the chrome – a
+     * hardware keyboard's shortcut – has neither (named for the Lead in #759's gate addendum).
+     *
+     * The WebView runs the handlers for a navigation only, so the check is one: a load of
+     * `about:blank` the page may object to, started past this view's own [loadUrl] (nothing of
+     * it is the page's news: the callbacks it raises are dropped while the check is up, its
+     * navigation report too). An objection comes as `onJsBeforeUnload` with the navigation held,
+     * and is let go on, the check settled as leave. A page that does
+     * not object commits the blank document, and the view is destroyed at once (Electron's
+     * `close({ waitForBeforeUnload })` does the same): the core hears `destroyed` and closes
+     * the tab, or keeps it unloaded with its stack when the check was the app's exit. Its card
+     * picture is taken before any of it, so an undo shows the page as it was left.
+     *
+     * A page with no handlers to run has nothing to check: an internal page (`zen://`, the PDF
+     * viewer), the blank document, an error page, a view with no document yet.
+     */
+    fun confirmUnload(reply: (Boolean) -> Unit) {
+        unloadCheck?.let { running ->
+            // A second check joins the first (a Close Others sweeping a tab a Close asked already).
+            running.replies.add(reply)
+            return
+        }
+        val document = currentDocument
+        if (document == null || document == "about:blank" || !PageRules.isWebPage(document) || failedUrl != null || interstitial || pdfPage != null) {
+            reply(true)
+            return
+        }
+        captureThumbnail()
+        val check = UnloadCheck(reply)
+        unloadCheck = check
+        postDelayed(check.timeout, UNLOAD_CHECK_TIMEOUT_MS)
+        super.loadUrl("about:blank")
+    }
+
+    /**
+     * A `beforeunload` check in flight (see [confirmUnload]): what it answers to, and whether
+     * its blank document started. A page that objects under it is not asked on a touch host
+     * ([UnloadObjection.SettleCheck]): the objection is overruled and the check settles as leave.
+     */
+    private inner class UnloadCheck(reply: (Boolean) -> Unit) {
+        val replies = arrayListOf(reply)
+        /** The check's blank document has started: the page did not object, and is on its way out. */
+        var navigated = false
+        val timeout = Runnable { settle(leave = true, destroyView = false) }
+
+        /**
+         * The check is over: every asker hears `leave`, and with `destroyView` the view goes
+         * (posted: never from inside the WebView's own callback), the core hearing `destroyed`.
+         */
+        fun settle(leave: Boolean, destroyView: Boolean) {
+            if (unloadCheck !== this) return
+            removeCallbacks(timeout)
+            val askers = replies.toList()
+            replies.clear()
+            if (destroyView) {
+                navigated = true
+                post {
+                    // The view goes with the check still up: the picture TabHost.destroy takes
+                    // of a shown view would be of the blank document (captureThumbnail leaves
+                    // it, the page's own picture taken as the check began), and destroy() ends
+                    // the check. The askers hear once the core has heard `destroyed`.
+                    if (host.tabs.get(tabId) === this@TabWebView) host.tabs.destroy(tabId)
+                    unloadCheck = null
+                    for (asker in askers) asker(true)
+                }
+                return
+            }
+            unloadCheck = null
+            for (asker in askers) asker(leave)
+        }
+    }
+
+    /**
+     * Whether a `WebViewClient` / `WebChromeClient` word about `url` is the unload check's blank
+     * document ([confirmUnload]) rather than the page's: dropped by the callbacks.
+     */
+    private fun isUnloadCheckDocument(url: String): Boolean {
+        val check = unloadCheck ?: return false
+        return url == "about:blank" || check.navigated
+    }
+
+    // --- card thumbnails (the pictures of the tab overview's cards, `Thumbnails.kt`) --------------
+
+    /**
+     * Take the card picture of this page now, if there is anything to take: the page is on
+     * screen, not mid navigation (a copy would be of the page it is leaving, under the URL it is
+     * going to) or mid back gesture, and its last picture is not fresh ([Thumbnails.FRESH_MS]:
+     * the cover a sheet just captured, the copy a hide a frame ago made). Called on the page's
+     * way off the screen ([Host.setTabVisible]'s hide), as the app leaves the foreground
+     * ([Host.onPause]) and before a shown tab's view goes ([TabHost.destroy], for an undo).
+     */
+    fun captureThumbnail() {
+        val thumbnails = host.thumbnails ?: return
+        if (backTransition != null || awaitingCommit) return
+        // Under an unload check the view may be on the check's blank document already
+        // ([confirmUnload] took the page's picture before it began).
+        if (unloadCheck != null) return
+        if (width <= 0 || height <= 0 || !isShown) return
+        if (thumbnails.fresh(tabId, SystemClock.uptimeMillis())) return
+        // A view with no document yet shows nothing worth a picture; its card has its placeholder.
+        val document = currentDocument ?: return
+        if (document == "about:blank") return
+        // Nor is a document the view has not drawn yet: a tab restored at boot whose page is still
+        // on its way shows a blank window, and a copy of it would take the place of the picture
+        // on disk – the very one the card is to show until the page paints (BH-33).
+        if (document != paintedDocument) return
+        val asked = SystemClock.uptimeMillis()
+        captureBitmap(coverScale()) { bitmap ->
+            if (bitmap != null) publishThumbnail(bitmap, document, SystemClock.uptimeMillis() - asked)
+        }
+    }
+
+    /**
+     * The card picture from a copy of the page: scaled to the card's width and encoded on the
+     * pictures' own thread ([Thumbnails.disk] – never the cover's `zen-encode`, whose work the
+     * chrome waits for), written to disk ([Thumbnails.save]) and handed to the chrome
+     * (`thumbnail.captured`). `document` is the one the copy shows (the caller's word: it was
+     * [paintedDocument] when the copy was asked for). Not of a page that navigated since – checked
+     * on the main thread before anything is written, and again before the chrome hears of it, so
+     * a picture of the page before is never on disk under the new page's tab (BH-14, across a
+     * kill too) – and not twice for one frame: a cover and a hide that shared the copy publish
+     * once between them. A private tab's picture goes to the chrome alone: nothing of it is
+     * written (the private profile leaves no file to wipe). `copyMs` is what the copy took when
+     * this call asked for it (-1: the copy was the cover's); the debug log line carries it with
+     * the encode and save times, for the cost of a picture per switch.
+     */
+    private fun publishThumbnail(bitmap: Bitmap, document: String, copyMs: Long = -1L) {
+        val thumbnails = host.thumbnails ?: return
+        val now = SystemClock.uptimeMillis()
+        if (document != currentDocument || thumbnails.fresh(tabId, now)) return
+        thumbnails.taken(tabId, now)
+        val id = tabId
+        val cardWidth = thumbnails.width
+        val persisted = containerId != Profiles.PRIVATE_CONTAINER
+        val target = host
+        val main = Handler(Looper.getMainLooper())
+        fun captured(picture: Thumbnails.Picture) =
+            target.hostEvent("thumbnail.captured", json("tabId" to id, "data" to picture.dataUrl, "width" to picture.width, "height" to picture.height))
+        thumbnails.disk.execute {
+            val started = SystemClock.uptimeMillis()
+            val picture = Thumbnails.encode(bitmap, cardWidth)
+            val encodeMs = SystemClock.uptimeMillis() - started
+            main.post {
+                // The page navigated while the picture was encoded: it is of the page before, and
+                // the card must not show it – nothing is written. Nor does a picture that could
+                // not be encoded count as taken.
+                if (picture == null || document != currentDocument) {
+                    thumbnails.stale(id)
+                    return@post
+                }
+                if (!persisted) {
+                    captured(picture)
+                    return@post
+                }
+                thumbnails.disk.execute {
+                    val writing = SystemClock.uptimeMillis()
+                    val saved = thumbnails.save(id, picture.jpeg, document)
+                    if (BuildConfig.DEBUG) {
+                        Log.d(
+                            "ZenTab",
+                            "thumbnail of $id: ${picture.width}x${picture.height} ${picture.jpeg.size} bytes, " +
+                                "copy ${if (copyMs < 0) "shared" else "$copyMs ms"}, encode $encodeMs ms, save ${SystemClock.uptimeMillis() - writing} ms"
+                        )
+                    }
+                    main.post {
+                        // Navigated during the write: the file names the page before
+                        // ([Thumbnails.stamp]), so no read shows it, and the chrome's own drop
+                        // for the navigation is behind the write on the same thread.
+                        if (!saved || document != currentDocument) {
+                            thumbnails.stale(id)
+                            return@post
+                        }
+                        captured(picture)
+                    }
+                }
+            }
+        }
+    }
+
+    // --- operations used by the core -------------------------------------------------------------
+
+    /**
+     * A `zen://` page of the core's, rendered straight into the view under its own address. The
+     * PDF viewer page comes with a base URL of its own and the file it shows (`PdfViewer`): the
+     * document runs under that URL – the PDF's own, as Chrome's viewer presents its tab, so an
+     * extension's content script matching it runs there; the viewer's origin for a PDF with no
+     * address – and fetches pdf.js and the bytes from the viewer's origin, while the history
+     * entry – what [getUrl] and the navigation events show – stays `url`.
+     *
+     * A `zen://error` page for the very document that is committed – the core's question over a
+     * lookalike a link or a redirect reached, which the engine could not hold before the request
+     * and the core turned into the question on `navigated` – stands in for that entry the way
+     * WebView's own error page stands in for a failed load's: back steps over it
+     * ([interstitialUrl]), else the phone's Back would land on the lookalike and ask again. A
+     * page still on its way (`awaitingCommit`) is the failed load's case, marked at its commit;
+     * a `zen://error` page for another address (a typed lookalike the core held before any
+     * request) leaves the committed page the way back.
+     */
+    fun loadHtml(url: String, html: String, baseUrl: String? = null, document: PdfViewer.Document? = null) {
+        rememberCurrentPage()
+        interstitialOver(url, currentDocument, awaitingCommit)?.let { replaced ->
+            interstitial = true
+            interstitialUrl = replaced
+        }
+        pdfPage = if (baseUrl != null && document != null) PdfViewer.Page(url, baseUrl, document) else null
+        servesNewTabPage = NewTabPage.isDocument(url)
+        loadDataWithBaseURL(baseUrl ?: url, html, "text/html", "utf-8", url)
+    }
+
+    /** The viewer page this view shows, while it does (see [loadHtml]); read on the network thread too. */
+    @Volatile private var pdfPage: PdfViewer.Page? = null
+
+    /**
+     * Whether this view shows the served new tab page (`zen://newtab`, NTP-35): set when the view
+     * loads it ([loadHtml], a history step back onto it – [onPageStarted]), cleared by any other
+     * load. Read first on the network thread by [shouldInterceptRequest]: the page's tile icons
+     * (`zen://favicon/<hash>`) are answered from the favicon store only while it is set, so every
+     * other view – the phone's first load among them – pays one boolean read per request and
+     * nothing else.
+     */
+    @Volatile private var servesNewTabPage = false
+
+    /**
+     * The address a navigation callback's URL stands for: the viewer page's `zen://pdf` address
+     * for its document's URL (WebView may report either the base or the history URL of a
+     * `loadDataWithBaseURL` document; the base is the PDF's own address or the viewer's origin),
+     * the URL itself otherwise.
+     */
+    private fun pageUrlFor(url: String): String {
+        val page = pdfPage ?: return url
+        return if (PdfViewer.isDocumentUrl(url, page)) page.url else url
+    }
+
+    /**
+     * The URL the viewer page's document reports as its own (`location.href`: the base URL it
+     * runs under), when the view shows one; null otherwise. The extension layer keeps the
+     * endpoints of a document that said hello under it (`Extensions.onDocumentGone`).
+     */
+    private fun pdfDocumentUrl(): String? = pdfPage?.baseUrl
+
+    // A load the core asked for: the page is asked first ([probeThenLoad]), then the user agent
+    // follows the rules for the URL before it leaves ([loadRequested]).
+    override fun loadUrl(requested: String) = probeThenLoad(requested)
+
+    // --- the unload probe (seed A7: Cancel on "Leave site?" keeps the page) ---------------------
+
+    /**
+     * A load the core asked for – a typed address, a bookmark, a history row, a tile – over a web
+     * document: the page's `beforeunload` is asked FIRST, by a probe navigation, and the load
+     * itself is issued only once the page, or the user at the sheet, has let it go.
+     *
+     * Why: WebView's `loadUrl` is a browser-initiated navigation, for which Chromium sends the
+     * page's frame `BeforeUnload` and waits 500 ms (`RenderViewHostImpl::kUnloadTimeoutMS`); a
+     * renderer busy past that – the one renderer serves every page and the chrome, and the
+     * omnibox closing over a typed address is work of its own – is taken to have let the
+     * navigation go, and the request leaves. The page's objection then reaches the sheet late,
+     * and the user's Cancel answers a question Chromium stopped waiting for: the second page
+     * commits under it (debug run 36898943391; pre-existing on main). Nothing of that timing
+     * is the host's to change; what the host can change is WHICH navigation Chromium hurries.
+     *
+     * The probe: the WebView's own `loadUrl` of [UnloadProbeRules.probeUrl] – an `.invalid`
+     * host: no site, no service worker, nothing to resolve – answered first in
+     * `shouldInterceptRequest` ([Client.interceptUnloadProbe]) with an empty 204, which Chromium
+     * drops without committing (the request engine's answer for a blocked document) and which
+     * never leaves the device. The page's `beforeunload` runs for it exactly as it would for
+     * the load, and `onJsBeforeUnload`'s table answers it as it always has – the sheet for the
+     * tab in front, the carry, the agent's policy, the hidden tab's stay – the answer written
+     * on the probe ([UnloadProbe.answered]). Right behind the probe goes `evaluateJavascript`
+     * of a constant: the same `LocalFrame` pipe as `BeforeUnload`, in order, so its result
+     * comes back only once the renderer has run the dispatch – and, where the page objected,
+     * only once the sync dialog was answered, the renderer waiting inside it. At that ack the
+     * probe settles ([UnloadProbe.settle]): a Stay, and the load is never issued – the page as
+     * it was ([stayedOnPage]), the core told to take the tab's address back; otherwise the load
+     * goes out ([loadRequested]), a Leave carried to its own asking ([LeaveCarry.probeLeft]:
+     * Chrome asks once). A probe Chromium hurried (the renderer busy past the budget) costs
+     * nothing: its request is the 204, its late objection still reaches the sheet, and the
+     * sheet's answer – not the timer – decides whether the load is ever issued. A renderer
+     * that never answers has the load issued at [UNLOAD_PROBE_TIMEOUT_MS] (Chrome navigates a
+     * hung page), the watchdog held while the sheet is up.
+     *
+     * No probe for a view with no document, the blank document, an internal or error page, the
+     * viewer page (nothing of theirs objects) or under an unload check ([UnloadProbeRules.needsProbe],
+     * [confirmUnload]'s list); a second load asked while a probe is up retargets it (the later
+     * word is the load's), and a reload, a history step, Stop or the view going cancels it.
+     * [resumeHeld]'s re-issued load never comes here: the renderer asked its page before the
+     * hold, and its second asking is the carry's. Nothing of the probe is the page's news: the
+     * WebView's words about its address are dropped ([UnloadProbeRules.isProbeUrl]), as the
+     * check's blank document's are.
+     */
+    private fun probeThenLoad(requested: String) {
+        unloadProbe?.let { probe ->
+            probe.retarget(requested)
+            return
+        }
+        val document = currentDocument
+        if (!UnloadProbeRules.needsProbe(document, failed = failedUrl != null, interstitial = interstitial, viewer = pdfPage != null, checkInFlight = unloadCheck != null)) {
+            loadRequested(requested, emptyMap())
+            return
+        }
+        // Superseded ahead of the question, as loadRequested has them: a navigation held for the
+        // core's answer, a reload asked just before (an objection now is to leaving, not
+        // reloading), a Leave given for a navigation still on its way.
+        heldNavigation = null
+        reloadAskedAt = 0L
+        leaveCarry.reset()
+        UnloadProbe(requested, checkNotNull(document)).start()
+    }
+
+    /** The probe in flight for a load the core asked for ([probeThenLoad]), or null. */
+    private var unloadProbe: UnloadProbe? = null
+    private var unloadProbeSeq = 0
+
+    /** The probe's own navigation: the WebView's `loadUrl`, past this view's. */
+    private fun navigateToProbe(url: String) = super.loadUrl(url)
+
+    /**
+     * One probe ([probeThenLoad]): the load it stands for, the page it asks, what the page
+     * answered, and the watchdog. Settled once, by the renderer's ack or the watchdog.
+     */
+    private inner class UnloadProbe(private var requested: String, val document: String) {
+        val url = UnloadProbeRules.probeUrl(++unloadProbeSeq)
+        private var stayed = false
+        private var letGo = false
+        private var done = false
+        private val watchdog = Runnable { settle() }
+
+        fun start() {
+            unloadProbe = this
+            postDelayed(watchdog, UNLOAD_PROBE_TIMEOUT_MS)
+            navigateToProbe(url)
+            evaluateJavascript("0") { settle() }
+        }
+
+        /** The page objected and the sheet is up: the user's answer takes as long as it takes. */
+        fun asking() {
+            removeCallbacks(watchdog)
+        }
+
+        /** The page's objection was answered – at the sheet, by the table, by a carry: written on the probe. */
+        fun answered(leave: Boolean) {
+            if (done) return
+            if (leave) letGo = true else stayed = true
+            // The ack follows the answer closely; a renderer that still never answers is given the window once more.
+            removeCallbacks(watchdog)
+            postDelayed(watchdog, UNLOAD_PROBE_TIMEOUT_MS)
+        }
+
+        /** A second load asked while the probe is up: the later word is the load's. */
+        fun retarget(url: String) {
+            requested = url
+        }
+
+        /** Another word superseded the load (a reload, a history step, Stop, the view going). */
+        fun cancel() {
+            if (done) return
+            done = true
+            removeCallbacks(watchdog)
+            if (unloadProbe === this) unloadProbe = null
+        }
+
+        private fun settle() {
+            if (done) return
+            cancel()
+            if (stayed) {
+                // The remembered document, not getUrl(): that is the probe's address until
+                // Chromium has dropped the navigation, and the watchdog may come before it has.
+                stayedOnPage(document)
+                return
+            }
+            loadRequested(requested, emptyMap())
+            if (letGo) leaveCarry.probeLeft()
+        }
+    }
+
+    /** The probe in flight, if any, is superseded: a reload, a history step, Stop, the view going. */
+    private fun cancelUnloadProbe() {
+        unloadProbe?.cancel()
+    }
+
+    /**
+     * [loadUrl]'s body, for a load the core asked for (past its probe, [probeThenLoad]) and for
+     * a navigation the page started that was held for the core's content-settings answer and
+     * now goes on ([resumeHeld], `extra` its referrer): the user agent, the content settings and
+     * the policies follow the rules for the URL before its request leaves.
+     */
+    private fun loadRequested(requested: String, extra: Map<String, String>) {
+        // A local document still being read for this view lands nowhere: the tab has moved on
+        // (the read's own guard reads the sequence; a second local load bumps it itself).
+        localDocumentSeq++
+        // A navigation held for the core's answer is superseded by any load (its late answer is kept).
+        heldNavigation = null
+        // The core spells an extension page's URL as Chrome does; the WebView loads the served origin.
+        val url = ExtensionUrls.toServed(requested)
+        rememberCurrentPage()
+        // A load supersedes a reload asked just before: an objection now is to leaving. And a
+        // Leave given for a navigation still on its way carries to no other load (resumeHeld
+        // marks its own load right after this).
+        reloadAskedAt = 0L
+        leaveCarry.reset()
+        // Any other load puts the served new tab page away (its icons are answered no longer).
+        servesNewTabPage = false
+        if (LocalDocuments.isLocal(url)) {
+            loadLocalDocument(url)
+            return
+        }
+        if (url.startsWith("http", ignoreCase = true)) currentDocument = url
+        switchDesktopModeFor(url)
+        applyContentRules(url)
+        val headers = HashMap(extra)
+        if (url.startsWith("http", ignoreCase = true)) {
+            val flags = host.privacy.flags
+            applyMixedContentPolicy(flags, url)
+            applyCookiePolicy(flags, url)
+            if (retriesFailedEntry(url)) {
+                // The address the core's error page stands in for, asked for again (Proceed past
+                // the certificate interstitial, or a retry): from WebView's own entry for the
+                // failed load, right behind, which a history navigation runs afresh. The page
+                // then takes the failed load's place rather than stacking behind the warning, as
+                // on the desktop, where the interstitial lives in the failed entry itself.
+                super.goBack()
+                return
+            }
+            // A WebView that cannot attach the GPC / DNT headers to every request gets them on
+            // the navigations the browser starts, at least.
+            if (!host.privacy.headersSupported) headers.putAll(flags.signalHeaders())
+        }
+        if (headers.isEmpty()) super.loadUrl(url) else super.loadUrl(url, headers)
+    }
+
+    override fun loadUrl(requested: String, additionalHttpHeaders: MutableMap<String, String>) {
+        localDocumentSeq++
+        heldNavigation = null
+        val url = ExtensionUrls.toServed(requested)
+        rememberCurrentPage()
+        reloadAskedAt = 0L
+        leaveCarry.reset()
+        switchDesktopModeFor(url)
+        applyContentRules(url)
+        if (url.startsWith("http", ignoreCase = true)) applyMixedContentPolicy(host.privacy.flags, url)
+        super.loadUrl(url, additionalHttpHeaders)
+    }
+
+    /**
+     * The image-search upload's POST into this tab (CT-32; `view.post`, [ImagePostNavigation]):
+     * the same preparation as a load the core asked for – the user agent, the content settings
+     * and the policies follow the rules for the engine's URL before the request leaves – then
+     * the WebView's `postUrl` for an urlencoded body, or the core's self-submitting form
+     * document for a multipart one, loaded under an opaque origin with the engine's address as
+     * its history entry. An empty wire loads the address.
+     */
+    fun postForImageSearch(url: String, body: String?, html: String?) {
+        when (val plan = ImagePostNavigation.plan(url, body, html)) {
+            is ImagePostNavigation.Plan.PostUrl -> {
+                prepareRequestedLoad(url)
+                super.postUrl(url, plan.body)
+            }
+            is ImagePostNavigation.Plan.FormDocument -> {
+                prepareRequestedLoad(url)
+                loadDataWithBaseURL(
+                    ImagePostNavigation.FORM_DOCUMENT_BASE,
+                    plan.html,
+                    ImagePostNavigation.FORM_DOCUMENT_MIME,
+                    ImagePostNavigation.FORM_DOCUMENT_ENCODING,
+                    url
+                )
+            }
+            is ImagePostNavigation.Plan.Load -> loadUrl(plan.url)
+        }
+    }
+
+    /** [loadUrl]'s preparation for a request that leaves by another WebView call ([postForImageSearch]). */
+    private fun prepareRequestedLoad(url: String) {
+        localDocumentSeq++
+        heldNavigation = null
+        rememberCurrentPage()
+        reloadAskedAt = 0L
+        leaveCarry.reset()
+        if (url.startsWith("http", ignoreCase = true)) currentDocument = url
+        switchDesktopModeFor(url)
+        applyContentRules(url)
+        if (url.startsWith("http", ignoreCase = true)) applyMixedContentPolicy(host.privacy.flags, url)
+    }
+
+    /** Local documents read for this view: a read that ends after the tab moved on lands nowhere. */
+    private var localDocumentSeq = 0
+
+    /**
+     * A `content:` or `file:` document another app handed the browser (LocalDocuments; the
+     * WebView loads neither scheme itself, see the settings above). A PDF goes the way of one
+     * the tab navigates to: a download the core's viewer opens in this tab once complete (the
+     * DownloadListener's `navigation`). A page or an SVG is read off the main thread and put in
+     * the view under its own address, its entry and [getUrl] the address itself. A document that
+     * is not one of the kinds, is refused (the app's own files) or cannot be read fails the load
+     * as WebView fails a missing file, and the core's error page stands in.
+     */
+    private fun loadLocalDocument(url: String) {
+        val seq = ++localDocumentSeq
+        val resolver = context.contentResolver
+        val uri = Uri.parse(url)
+        val refused = LocalDocuments.refused(url, LocalDocuments.privateDirs(context))
+        val userAgent = settings.userAgentString
+        Thread({
+            val name = if (refused) "" else LocalDocuments.nameOf(resolver, uri)
+            val kind = if (refused) null else LocalDocuments.kindOf(runCatching { resolver.getType(uri) }.getOrNull(), name)
+            val outcome: () -> Unit = when (kind) {
+                null -> ({ failLocalDocument(url) })
+                LocalDocuments.Kind.PDF -> {
+                    val size = LocalDocuments.sizeOf(resolver, uri)
+                    val disposition = "inline; filename=\"${name.replace('"', '\'')}\""
+                    ({ host.downloads.start(url, userAgent, disposition, kind.mimeType, size, tabId, navigation = true) })
+                }
+                else -> {
+                    val bytes = runCatching {
+                        resolver.openInputStream(uri)?.use { readUpTo(it, LocalDocuments.MAX_TEXT_BYTES) }
+                    }.getOrNull()
+                    if (bytes == null) ({ failLocalDocument(url) })
+                    else ({ loadDataWithBaseURL(url, LocalDocuments.decode(bytes), kind.mimeType, "utf-8", url) })
+                }
+            }
+            post { if (seq == localDocumentSeq) outcome() }
+        }, "zen-local-document").start()
+    }
+
+    /** The load of a local document failed before the view saw a byte: the core hears as of a missing file. */
+    private fun failLocalDocument(url: String) {
+        loading = false
+        val code = NetErrors.FILE_NOT_FOUND
+        host.viewEvent(tabId, "failLoad", json("code" to code, "description" to (NetErrors.name(code) ?: "ERR_FILE_NOT_FOUND"), "url" to url))
+    }
+
+    /** The stream's bytes, or null past `max` (a document too large to show from memory). */
+    private fun readUpTo(input: java.io.InputStream, max: Long): ByteArray? {
+        val out = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(64 * 1024)
+        while (true) {
+            val n = input.read(buffer)
+            if (n < 0) return out.toByteArray()
+            if (out.size() + n > max) return null
+            out.write(buffer, 0, n)
+        }
+    }
+
+    /**
+     * The runtime answered the main-frame request for `url`, an extension page it does not serve
+     * (the extension is not enabled, not installed, or not allowed in this private tab), with an
+     * empty document (`Extensions.intercept`, any thread): the page fails as Chrome fails such a
+     * page, `ERR_BLOCKED_BY_CLIENT`, as its document starts, the way a load WebView fails is
+     * reported right after its `onPageStarted`. The empty document then stands under the URL
+     * like WebView's own error page under a failed load's (see [failedUrl]).
+     */
+    fun refuseExtensionPage(url: String) {
+        refusedExtensionPage = url
+    }
+
+    /**
+     * The extension page on `url`, held on an empty document while its extension was about to
+     * be configured (`Extensions.releaseHeld` reloads the ones that came up), belongs to an
+     * extension that is not coming: it fails now, as [refuseExtensionPage] fails a page. Main
+     * thread; nothing when the tab has moved on since the request.
+     */
+    fun failExtensionPage(url: String) {
+        if (currentDocument != url) return
+        if (startedDocument != url) {
+            // The empty document has not started yet: it fails as it starts.
+            refusedExtensionPage = url
+            return
+        }
+        failStartedExtensionPage(url)
+    }
+
+    /**
+     * The empty document under `url` has started ([onPageStarted]): the failure goes to the core,
+     * whose `zen://error` page replaces the document, and the document's entry is stepped over on
+     * the way back ([interstitialUrl]) whether its commit is still to come (then through
+     * [failedUrl], as for a load WebView failed) or has happened.
+     */
+    private fun failStartedExtensionPage(url: String) {
+        if (awaitingCommit) failedUrl = url
+        else {
+            interstitial = true
+            interstitialUrl = url
+        }
+        loading = false
+        host.viewEvent(
+            tabId,
+            "failLoad",
+            json("code" to NetErrors.BLOCKED_BY_CLIENT, "description" to "ERR_BLOCKED_BY_CLIENT", "url" to ExtensionUrls.present(url))
+        )
+        host.backChanged()
+    }
+
+    /** Stop (the core's `view.stop`): a load still waiting on its probe is given up with the rest. */
+    override fun stopLoading() {
+        cancelUnloadProbe()
+        super.stopLoading()
+    }
+
+    override fun reload() {
+        cancelUnloadProbe()
+        rememberCurrentPage()
+        reloadAskedAt = SystemClock.uptimeMillis()
+        leaveCarry.reset()
+        url?.let(::switchDesktopModeFor)
+        if (userAgentStale) {
+            // Like Chrome, a reload under a changed user agent asks again from the URL the entry
+            // was requested with rather than the one it ended on: a site that sent the mobile
+            // browser to its m. domain gets to answer the desktop one from the top (and back).
+            val original: String? = copyBackForwardList().currentItem?.originalUrl
+            if (original != null && original != url && PageRules.isWebPage(original)) {
+                super.loadUrl(original)
+                return
+            }
+        }
+        super.reload()
+    }
+
+    /**
+     * The entry [goBack] lands on, or -1 when there is none: the one behind, except from the
+     * core's error page when that is WebView's own error page for the load the core's page stands
+     * in for (see [interstitialUrl]) – then the one before it, as on the desktop, where the failed
+     * load never made an entry. The core's page is told by the view's URL: the entry's own is the
+     * `data:` URL `loadHtml` gave it, the history URL is what [getUrl] shows.
+     */
+    fun backIndex(history: WebBackForwardList = copyBackForwardList()): Int = backIndexOf(
+        history.currentIndex,
+        { history.getItemAtIndex(it)?.url },
+        onErrorPage = url?.startsWith(ERROR_PAGE_PREFIX) == true,
+        skipped = interstitialUrl
+    )
+
+    /**
+     * Whether [goBack] has an entry to land on – what [navState] tells the core and the chrome's
+     * Back key and predictive back read (`Host`, `PredictiveBack`). WebView's own answer counts
+     * the entry the core's error page stands in for: a lookalike question as a tab's first page
+     * has that entry alone behind it, and the chrome's Back then does what it does with no
+     * history (a tab a link opened closes) rather than nothing.
+     */
+    override fun canGoBack(): Boolean = backIndex() >= 0
+
+    override fun goBack() {
+        cancelUnloadProbe()
+        rememberCurrentPage()
+        reloadAskedAt = 0L
+        leaveCarry.reset()
+        val history = copyBackForwardList()
+        val steps = backIndex(history) - history.currentIndex
+        if (steps == -1) super.goBack() else if (steps < 0) super.goBackOrForward(steps)
+    }
+
+    /** Whether a load of `target` from the core's error page is best run from the entry right behind (see [loadUrl]). */
+    private fun retriesFailedEntry(target: String): Boolean {
+        val history = copyBackForwardList()
+        val behind = history.currentIndex - 1
+        return retriesFailedEntryOf(
+            onErrorPage = url?.startsWith(ERROR_PAGE_PREFIX) == true,
+            target = target,
+            behindUrl = if (behind >= 0) history.getItemAtIndex(behind)?.url else null,
+            skipped = interstitialUrl
+        )
+    }
+
+    override fun goForward() {
+        cancelUnloadProbe()
+        rememberCurrentPage()
+        reloadAskedAt = 0L
+        leaveCarry.reset()
+        super.goForward()
+    }
+
+    fun setMuted(muted: Boolean) {
+        this.muted = muted
+        // WebView has no audio mute; mute the page's media elements (kept in sync by the page).
+        evaluateJavascript(
+            "(function(m){window.__zenMuted=m;document.querySelectorAll('audio,video').forEach(function(e){e.muted=m});})($muted)",
+            null
+        )
+    }
+
+    /**
+     * The core's effective zoom for this tab's page. The page script lays the page out by the same
+     * rules (see `startScriptSource`), so this is only remembered; nothing here scales text.
+     */
+    fun setZoom(factor: Double) {
+        zoomFactor = factor
+    }
+
+    /**
+     * Text at the size the page asked for. WebView would start every tab at the system font scale
+     * (a phone set to large text got every page 130% larger), which Chrome does not do: its pages
+     * ignore the system font size and offer page zoom instead. Ione's page zoom reflows the
+     * layout from the page script; when the user wants the system font size in it, the core
+     * multiplies it into the default zoom ("Include the system font size" in Accessibility).
+     */
+    private fun applyTextZoom() {
+        settings.textZoom = 100
+    }
+
+    /**
+     * Desktop site: Chrome-on-Linux user agent and client hints from the next load on; the page
+     * script lays the page out at the desktop width. The core reloads the tab when the user asks.
+     */
+    fun setDesktopMode(on: Boolean) {
+        if (desktopMode == on) return
+        desktopMode = on
+        userAgentStale = true
+        UserAgent.apply(settings, desktop = on, default = defaultUserAgent)
+    }
+
+    /** Switch the user agent to what the rules say for `url`; true when it changed. */
+    private fun switchDesktopModeFor(url: String): Boolean {
+        if (!PageRules.isWebPage(url)) return false
+        val wanted = host.pageRules.desktop(url)
+        if (wanted == desktopMode) return false
+        setDesktopMode(wanted)
+        return true
+    }
+
+    /**
+     * Dark theme for sites: WebView's algorithmic darkening, which only acts while the app's
+     * theme is dark (Ione's own colour scheme sets the night mode, see `Host.applyTheme`) and
+     * leaves pages that declare `color-scheme: dark` to their own dark style. Before the feature
+     * existed (older WebViews) there is nothing safe to do; force-dark is a no-op at this target.
+     */
+    fun setDarkening(on: Boolean) {
+        darkening = on
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) return
+        runCatching { WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, on) }
+    }
+
+    fun find(text: String, forward: Boolean, newSession: Boolean) {
+        if (newSession) findAllAsync(text) else findNext(forward)
+    }
+
+    fun stopFind() {
+        clearMatches()
+    }
+
+    /**
+     * Downscaled JPEG of what is on screen right now, for the dimmed preview behind overlays.
+     * The tab's card picture comes out of the same copy ([publishThumbnail]): the page under a
+     * sheet or the overview is never copied a second time for its card. The cover's own encode
+     * is queued first and runs on its own thread; the card's work never stands in front of it.
+     */
+    fun snapshot(callback: (String?) -> Unit) {
+        if (backTransition != null) {
+            callback(null)
+            return
+        }
+        // The chrome asks just before it hides the page (menu, URL bar, overview): the copy is the
+        // last chance to remember this history entry before a load from within that UI replaces it.
+        val index = committedIndex
+        val url = committedUrl
+        // The card picture comes out of this copy only when the pixels are the document's own
+        // ([paintedDocument]): the cover of a window whose page has not painted is a cover of
+        // white, which is what the sheet is to stand over – not what the card is to keep.
+        val painted = currentDocument?.takeIf { it == paintedDocument }
+        captureBitmap(coverScale()) { bitmap ->
+            if (bitmap == null) {
+                callback(null)
+                return@captureBitmap
+            }
+            if (index >= 0 && url.isNotEmpty() && url == (copyBackForwardList().currentItem?.url ?: "")) remember(index, url, bitmap)
+            // The cover first: the chrome mounts its sheet on this data URL (#168).
+            encoder.execute {
+                val out = ByteArrayOutputStream()
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 62, out)
+                val data = "data:image/jpeg;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                Handler(Looper.getMainLooper()).post { callback(data) }
+            }
+            if (painted != null && !awaitingCommit) publishThumbnail(bitmap, painted)
+        }
+    }
+
+    /**
+     * Full-resolution PNG bytes of the page, or null: the visible area, or with `fullPage` the
+     * whole document – the page scrolled in viewport-sized steps and the strips stitched
+     * (`PageCapture`, the agents' full-page path; a WebView never paints what is off screen), cut
+     * at the capture's height limit. A document the stitcher cannot read (no page script yet)
+     * comes back as the visible area, as it does for the agents.
+     */
+    fun screenshot(fullPage: Boolean = false, callback: (ByteArray?) -> Unit) {
+        if (width <= 0 || height <= 0 || !isShown) {
+            callback(null)
+            return
+        }
+        if (fullPage) {
+            capture(CapturePlan.MODE_FULL_PAGE, null, "png", 100) { result ->
+                val data = result?.optString("data")
+                val bytes = if (data.isNullOrEmpty()) null else runCatching { Base64.decode(data, Base64.DEFAULT) }.getOrNull()
+                if (bytes != null) callback(bytes) else screenshot(false, callback)
+            }
+            return
+        }
+        copyViewport { bitmap ->
+            if (bitmap == null) {
+                callback(null)
+                return@copyViewport
+            }
+            encoder.execute {
+                val out = ByteArrayOutputStream()
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                bitmap.recycle()
+                Handler(Looper.getMainLooper()).post { callback(out.toByteArray()) }
+            }
+        }
+    }
+
+    /**
+     * The visible area's pixels at full resolution (the caller's to recycle), or null when the
+     * window refuses: Take Screenshot's picture (SH-07), before the flash so it is not in it.
+     */
+    fun copyViewport(callback: (Bitmap?) -> Unit) {
+        if (width <= 0 || height <= 0 || !isShown) {
+            callback(null)
+            return
+        }
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val location = IntArray(2)
+        getLocationInWindow(location)
+        val rect = Rect(location[0], location[1], location[0] + width, location[1] + height)
+        try {
+            PixelCopy.request(host.activity.window, rect, bitmap, { result ->
+                if (result == PixelCopy.SUCCESS) callback(bitmap) else {
+                    bitmap.recycle()
+                    callback(null)
+                }
+            }, Handler(Looper.getMainLooper()))
+        } catch (e: Exception) {
+            bitmap.recycle()
+            callback(null)
+        }
+    }
+
+    /**
+     * The long screenshot's capture (SH-08): the page from the viewport's top down to Chrome's
+     * ~10 screens, stitched by [PageCapture] as a bitmap the caller crops and writes. The strips
+     * are copies of the window where the page is, so the page must be on screen and alone in its
+     * frame throughout: the chrome mounts the editor only once the picture is in its hands (the
+     * chrome lies under the pages; a sheet over the page would hide it), and the card whose
+     * Capture more asked is on its way out as this is called – its strip along the frame's
+     * bottom edge is the chrome's, not the page's ([cover]), and the copies wait for the strip
+     * to close over the page again. A strip that stays – a banner at rest above the page
+     * (default browser, add to home screen) – is not waited on: past the deadline the cover is
+     * held at 0 for the capture, so the page draws over the banner and every copy of the frame
+     * is the page alone, and released with the result ([ContentCover.hold]).
+     */
+    fun captureLong(callback: (PageCapture.Capture?) -> Unit) {
+        val radius = radiusPx
+        val square = { on: Boolean ->
+            radiusPx = if (on) 0f else radius
+            invalidateOutline()
+        }
+        val capture = PageCapture(this, host.activity.window, encoder, square, ::evaluate)
+        val deadline = SystemClock.uptimeMillis() + COVER_CLEAR_WAIT_MS
+        fun whenUncovered() {
+            if (!cover.active) {
+                capture.runBitmap(CapturePlan.MODE_LONG, null, callback)
+            } else if (SystemClock.uptimeMillis() >= deadline) {
+                cover.hold()
+                capture.runBitmap(CapturePlan.MODE_LONG, null) { result ->
+                    cover.release()
+                    callback(result)
+                }
+            } else {
+                postOnAnimation { whenUncovered() }
+            }
+        }
+        whenUncovered()
+    }
+
+    /**
+     * Agent screenshot (and `chrome.tabs.captureVisibleTab`): `mode` is `viewport`, `fullPage` or
+     * `region` (with `region` in CSS page px), `format` `jpeg` or `png`, `quality` the JPEG quality
+     * 0..100 (anything else: the default). Answers `{ data, mimeType, width, height }` or null.
+     */
+    fun capture(mode: String, region: JSONObject?, format: String, quality: Int, callback: (JSONObject?) -> Unit) {
+        val radius = radiusPx
+        val square = { on: Boolean ->
+            radiusPx = if (on) 0f else radius
+            invalidateOutline()
+        }
+        PageCapture(this, host.activity.window, encoder, square, ::evaluate).run(mode, PageCapture.parseRegion(region), format, quality, callback)
+    }
+
+    /**
+     * The page's geometry for the chrome's capture overlay (`page.viewport`): the metrics the
+     * stitcher plans with, in the chrome's terms ([CapturePlan.viewportJson]). Null when the page
+     * cannot answer (no document yet, a crashed renderer).
+     */
+    fun viewport(callback: (JSONObject?) -> Unit) {
+        evaluateJavascript(PageCapture.METRICS_SCRIPT) { result ->
+            val metrics = runCatching { JSONObject(result ?: "") }.getOrNull()?.let { PageCapture.parseMetrics(it) }
+            callback(metrics?.let { CapturePlan.viewportJson(it, width, resources.displayMetrics.density.toDouble()) })
+        }
+    }
+
+    /**
+     * What the core hears as the tab's URL. An extension page loaded from its served origin is
+     * reported as Chrome spells it (`chrome-extension://<id>/...`, [ExtensionUrls.present]): that
+     * is the tab's canonical URL for the core's model, the URL bar and the extension APIs, and
+     * [loadUrl] takes it back to the served origin. The PDF viewer page, loaded on its own origin
+     * the same way, is reported under its `zen://pdf` address ([pageUrlFor]).
+     */
+    fun navState(): JSONObject = json(
+        "url" to ExtensionUrls.present(pageUrlFor(url ?: "")),
+        "title" to reportableTitle(),
+        "canGoBack" to canGoBack(),
+        "canGoForward" to canGoForward()
+    )
+
+    /** The page's title – but not the built-in error page's, which stands in for a failed load (see [failedUrl]). */
+    private fun reportableTitle(): String = if (failedUrl != null || interstitial) "" else title ?: ""
+
+    /** The main frame's certificate for the site-information sheet, or null on an insecure page. */
+    fun certificateInfo(): JSONObject? {
+        val cert = certificate ?: return null
+        val subject = cert.issuedTo
+        val issuer = cert.issuedBy
+        return json(
+            "subject" to (subject?.cName?.ifEmpty { null } ?: subject?.oName ?: ""),
+            "issuer" to (issuer?.oName?.ifEmpty { null } ?: issuer?.cName ?: ""),
+            "validFrom" to cert.validNotBeforeDate?.time,
+            "validTo" to cert.validNotAfterDate?.time,
+            "protocol" to null
+        )
+    }
+
+    // --- request blocking (BlockingTab) -------------------------------------------------------
+
+    override val documentUrl: String?
+        get() = currentDocument
+
+    override fun documentGeneration(newDocument: Boolean): Long =
+        if (newDocument) documentGeneration.incrementAndGet() else documentGeneration.get()
+
+    /** Coalesce the IO threads' counts into one `blocked` event per beat for the chrome. */
+    override fun onRequestsBlocked(count: Int) {
+        blockedPending.addAndGet(count)
+        if (blockedFlushScheduled.compareAndSet(false, true)) {
+            Handler(Looper.getMainLooper()).postDelayed({
+                blockedFlushScheduled.set(false)
+                val n = blockedPending.getAndSet(0)
+                val hosts = synchronized(blockedHosts) {
+                    if (blockedHosts.isEmpty()) null else blockedHosts.values.toList().also { blockedHosts.clear() }
+                }
+                if (n > 0) {
+                    val event = json("count" to n)
+                    if (hosts != null) {
+                        event.put("hosts", JSONArray().apply {
+                            for (tally in hosts) put(json("host" to tally.host, "set" to tally.set, "count" to tally.count))
+                        })
+                    }
+                    host.viewEvent(tabId, "blocked", event)
+                }
+            }, BLOCKED_FLUSH_MS)
+        }
+    }
+
+    /** A blocked request's host joins the beat's tally before the count is scheduled as before. */
+    override fun onRequestBlocked(url: String, set: String?) {
+        val hostName = runCatching { Uri.parse(url).host }.getOrNull()
+        if (!hostName.isNullOrEmpty()) {
+            synchronized(blockedHosts) {
+                val tally = blockedHosts.getOrPut(hostName) { BlockedHostTally(hostName, set) }
+                tally.count += 1
+            }
+        }
+        onRequestsBlocked(1)
+    }
+
+    /** One host's blocked requests within a beat, with the set that matched its first one. */
+    private class BlockedHostTally(val host: String, val set: String?) {
+        var count = 0
+    }
+
+    /** The engine stopped a navigation: the core shows the Ione blocked page for `url`. */
+    override fun onDocumentBlocked(url: String) {
+        Handler(Looper.getMainLooper()).post {
+            loading = false
+            host.viewEvent(
+                tabId, "failLoad",
+                json("code" to BLOCKED_BY_CLIENT, "description" to "ERR_BLOCKED_BY_CLIENT", "url" to url)
+            )
+        }
+    }
+
+    override fun onDocumentRedirected(url: String) {
+        Handler(Looper.getMainLooper()).post { loadUrl(url) }
+    }
+
+    /**
+     * Safe Browsing stopped a navigation: the core hears why first (`unsafe`), then the failed
+     * load it keys its warning page on, in that order on the one bridge.
+     */
+    override fun onDocumentUnsafe(url: String, hit: SafeBrowsingHit) {
+        Handler(Looper.getMainLooper()).post {
+            loading = false
+            host.viewEvent(tabId, "unsafe", json("url" to url, "hit" to hit.toJson()))
+            host.viewEvent(
+                tabId, "failLoad",
+                json("code" to BLOCKED_BY_CLIENT, "description" to "ERR_BLOCKED_BY_CLIENT", "url" to url)
+            )
+        }
+    }
+
+    /** HTTPS-only mode upgraded a navigation: the core remembers `from` for the fallback, then `to` loads. */
+    override fun onDocumentUpgraded(from: String, to: String) {
+        Handler(Looper.getMainLooper()).post {
+            host.viewEvent(tabId, "upgraded", json("from" to from, "to" to to))
+            loadUrl(to)
+        }
+    }
+
+    // --- WebViewClient ------------------------------------------------------------------------
+
+    private inner class Client : WebViewClient() {
+        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
+            // A speculation-rules prerender the page declared: WebView asks here for it as for a
+            // navigation (`Sec-Purpose: prefetch;prerender`, no gesture, the outermost main
+            // frame), and this answer is the embedder's only veto – the activation later runs no
+            // throttles. It is not the user's navigation, so none of a primary load's steps
+            // ([navigationTaken]) happen for it: no engine interstitial or redirect load, no App
+            // Link probe, no hold (the page's word on the next navigation's referrer policy is
+            // neither spent nor expired by it), no desktop-mode re-issue, no back preview, no
+            // `redirected` event, no document record, no settings flip. Refused where it could
+            // not go as it stands or could not run under this view's settings ([vetoPrerender]);
+            // the real tap comes through here as itself and is decided then. The prerender's
+            // requests still meet the engine in `shouldInterceptRequest`, as Chrome's do.
+            prerenderPassOrNavigation(
+                prerender = PageRules.isPrerender(request.requestHeaders) && request.isForMainFrame && !request.hasGesture(),
+                veto = { vetoPrerender(request.url.toString()) },
+                navigation = { navigationTaken(view, request) }
+            )
+
+        /** A primary load's navigation through the hook, decided by its scheme (see [webNavigationTaken] for http(s)). */
+        private fun navigationTaken(view: WebView, request: WebResourceRequest): Boolean {
+            val url = request.url
+            // An Auth Tab's redirect (CCT-13) is claimed before any scheme's own path and never
+            // loaded: the host answers the caller and closes. Every other host's `authTab` is the
+            // interface's null, so this is one null read per navigation for them. The frame goes
+            // with the URL – the main frame's alone can be the redirect (AuthTab.claimed) – and
+            // WebView brings no reload, history or app-issued load here (Chrome's chain rules).
+            val auth = host.authTab
+            if (auth != null && auth.claim(url.toString(), request.isForMainFrame)) return true
+            return when (url.scheme?.lowercase()) {
+                "http", "https" -> webNavigationTaken(
+                    engine = { interceptNavigation(request) },
+                    // A tap on another site whose app is installed may open the app instead.
+                    appLink = { host.externalProtocols.appLink(this@TabWebView, request) },
+                    hold = { holdOrApplyContentRules(request) },
+                    // A link into a site with the other desktop-site setting: switch the user
+                    // agent first and issue the load again, so the site's first request already
+                    // carries it (the core's own decision would arrive a round trip too late).
+                    desktopSwitch = {
+                        if (request.isForMainFrame && !request.isRedirect && switchDesktopModeFor(url.toString())) {
+                            view.loadUrl(url.toString())
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                )
+                "about", "data", "blob", "javascript" -> {
+                    if (interceptNavigation(request)) return true
+                    // Never governed (not a web page): nothing is held, the view's settings go
+                    // back to the defaults for the document and the mirror follows it.
+                    holdOrApplyContentRules(request)
+                }
+                "chrome-extension" -> {
+                    // An extension's own page, spelled as Chrome spells it (a link or a
+                    // `location` assignment in an extension page): the served origin is loaded
+                    // in its place. A frame cannot be sent there from here; it fails as WebView
+                    // fails any unknown scheme.
+                    if (request.isForMainFrame) loadUrl(ExtensionUrls.toServed(url.toString()))
+                    true
+                }
+                DeepLinks.INTERNAL_SCHEME, DeepLinks.PAGE_SCHEME -> {
+                    // The browser's own pages are the user's to open (typed, a menu, a deep link
+                    // from another app), never a web page's: Chrome's rule for chrome://. Only
+                    // one of Ione's own documents may link to a page, and that goes the way a
+                    // deep link does – a VIEW intent to the browser window, which a custom tab
+                    // has no chrome to draw it in either. Nothing under these schemes is ever
+                    // loaded from here.
+                    val target = url.toString()
+                    if (DeepLinks.refusedFromDocument(currentDocument, target)) {
+                        Log.i("ZenTab", "refused a navigation from web content to an internal page in $tabId")
+                    } else if (request.isForMainFrame) {
+                        host.openExternal(DeepLinks.aliasOf(target))
+                    }
+                    true
+                }
+                else -> {
+                    // mailto:, tel:, intent://, a custom scheme: held until the core (and the user) agree.
+                    host.externalProtocols.request(this@TabWebView, url.toString(), request.hasGesture())
+                    true
+                }
+            }
+        }
+
+        /**
+         * The answer for a prerender ([PageRules.isPrerender]); true refuses it. The engine is
+         * read as a navigation reads it ([interceptNavigation]) with none of the outcomes acted
+         * on – a Safe Browsing hit or a decision other than allow refuses the prerender in place
+         * of the interstitial or the redirect load – and the view's own terms are read without
+         * being changed: the target's site against the document's (one WebView, one set of
+         * WebSettings; [ContentRules.siteOf], the site the content rules are kept by) and its
+         * desktop-site setting against the mode the view is in ([PageRules.prerenderVeto]).
+         * Nothing of the tab's is written either way.
+         */
+        private fun vetoPrerender(target: String): Boolean {
+            val guardHit = host.blocking.guardNavigation(target) != null
+            val action = host.blocking.decideNavigation(this@TabWebView, target).action
+            val desktopDiffers = PageRules.isWebPage(target) && host.pageRules.desktop(target) != desktopMode
+            val currentSite = currentDocument?.let(ContentRules::siteOf)
+            return PageRules.prerenderVeto(guardHit, action, ContentRules.siteOf(target), currentSite, desktopDiffers)
+        }
+
+        override fun onReceivedHttpAuthRequest(view: WebView, handler: HttpAuthHandler, host: String, realm: String) {
+            this@TabWebView.host.security.onHttpAuth(this@TabWebView, handler, host, realm)
+        }
+
+        override fun onReceivedClientCertRequest(view: WebView, request: ClientCertRequest) {
+            host.security.onClientCertRequest(this@TabWebView, request)
+        }
+
+        /**
+         * The engine's word on a main-frame navigation: true when it took the navigation over
+         * (onto the Ione blocked or warning page, or to the redirect target), false when the
+         * page may go. Safe Browsing speaks first, then the rule sets.
+         */
+        private fun interceptNavigation(request: WebResourceRequest): Boolean {
+            if (!request.isForMainFrame) return false
+            val target = request.url.toString()
+            host.blocking.guardNavigation(target)?.let { hit ->
+                onDocumentUnsafe(target, hit)
+                return true
+            }
+            val decision = host.blocking.decideNavigation(this@TabWebView, target)
+            when (decision.action) {
+                Decision.Action.BLOCK -> {
+                    onDocumentBlocked(target)
+                    return true
+                }
+                Decision.Action.REDIRECT -> {
+                    decision.redirectUrl?.let { loadUrl(it) }
+                    return true
+                }
+                Decision.Action.UPGRADE -> if (host.blocking.applyUpgrade(this@TabWebView, target, decision)) return true
+                // The page may go; a `modifyHeaders` document's edits are the relay's, reached
+                // when its request comes through `shouldInterceptRequest` (Blocking.intercept).
+                Decision.Action.ALLOW, Decision.Action.MODIFY_HEADERS -> {}
+            }
+            // A link (or script) is about to take the page elsewhere: the last moment it is whole
+            // on screen, and the best one for its back preview.
+            if (!request.isRedirect) rememberCurrentPage()
+            // The server sent the navigation under way on from the address it was bound for. The
+            // engine is told the pair first – this hook is the one place WebView marks a hop, and
+            // the target's request, whose intercept stamps the pair for the extension runtime's
+            // `onBeforeRedirect`, goes out only after this answer; a hop back to the same address
+            // is a pair too – then the core keeps the hop and records the chain with the commit
+            // (history-23).
+            if (request.isRedirect) currentDocument?.let { from ->
+                host.blocking.noteRedirect(this@TabWebView, from, target)
+                if (from != target) host.viewEvent(tabId, "redirected", json("from" to from, "to" to target))
+            }
+            return false
+        }
+
+        /**
+         * A main-frame navigation the engine let go and no app took: the destination's content
+         * settings are the core's to decide. A site this tab has no answer for yet waits for it
+         * – true, the navigation held and re-issued with the answer in hand
+         * ([holdForContentRules]); otherwise the destination's settings and policies are set
+         * for the request about to leave and the document mirror follows it – false, the
+         * navigation goes. Runs after the App Link probe on purpose (see [webNavigationTaken]):
+         * the probe wants the tap's own request, and a navigation held here is dropped by the
+         * WebView, its re-issued load never re-entering the hook.
+         */
+        private fun holdOrApplyContentRules(request: WebResourceRequest): Boolean {
+            if (!request.isForMainFrame) return false
+            val target = request.url.toString()
+            // Every main-frame navigation through the hook spends the page's word for the one
+            // that follows the click, held or not: a later navigation is not the click's.
+            val policy = referrerPolicyWord.forNavigation(currentDocument?.let(ContentRules::siteOf), SystemClock.uptimeMillis())
+            if (holdForContentRules(target, request.isRedirect, policy)) return true
+            applyCookiePolicy(host.privacy.flags, target)
+            applyContentRules(target)
+            currentDocument = target
+            return false
+        }
+
+        /**
+         * Network thread. The unload probe's request is answered before anything
+         * ([interceptUnloadProbe]: the host's own address, nobody else's to see). The served new
+         * tab page's own icons come next, on that view alone ([newTabFavicon]; one boolean read
+         * on every other); then the viewer page's files; the extension layer next: it serves the
+         * extension origins and the CORS proxy of extension pages; then Preload pages `none`, or
+         * the system's Data Saver or Battery Saver, refuses a prefetch ([refusePreload]); anything
+         * left goes to the request engine, whose rule sets include the extensions'
+         * declarativeNetRequest rules.
+         */
+        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
+            interceptUnloadProbe(request)
+                ?: (if (servesNewTabPage) newTabFavicon(request) else null)
+                ?: PdfViewer.intercept(context, request, pdfPage)
+                ?: host.extensions?.intercept(request, this@TabWebView, null)
+                ?: refusePreload(request)
+                ?: host.blocking.intercept(this@TabWebView, request)
+
+        /**
+         * The unload probe's request ([probeThenLoad]): an empty 204 – Chromium drops a 204
+         * navigation without committing – marked `no-store`, so no cache ever stands in for the
+         * answer; nothing leaves the device for it. Stateless (a network thread, no field read):
+         * the probe origin is the host's alone, and any request to it is a probe's.
+         */
+        private fun interceptUnloadProbe(request: WebResourceRequest): WebResourceResponse? =
+            if (UnloadProbeRules.isProbeUrl(request.url.toString())) {
+                WebResourceResponse(
+                    "text/plain", "utf-8", 204, "No Content",
+                    mapOf("Cache-Control" to "no-store", "Content-Length" to "0"),
+                    ByteArrayInputStream(ByteArray(0))
+                )
+            } else {
+                null
+            }
+
+        /**
+         * The served new tab page's tile icons (NTP-35): `zen://favicon/<hash>`, the address the
+         * core gives a cached favicon (`core/favicons.ts`), answered with the icon's bytes and
+         * image type from the same store the chrome's `/zen-favicon/<hash>` route reads
+         * ([BootHandoff.favicon] – the one store read, not a second). 404 for an icon that is
+         * not there or a name that is no hash: the tile shows its letter, as the chrome's rows
+         * show their glyph. Any other request of the page (null) goes on down the chain. The
+         * icon's name being its content, the answer is cacheable for good; its bytes are binary,
+         * so no charset (WebView would append one) – the chrome route's shape.
+         */
+        private fun newTabFavicon(request: WebResourceRequest): WebResourceResponse? {
+            val hash = NewTabPage.faviconHash(request.url.toString()) ?: return null
+            val answer = host.handoff?.favicon(hash) ?: return null
+            if (!answer.ok) return WebResourceResponse("text/plain", "utf-8", 404, "Not Found", emptyMap(), null)
+            val headers = HashMap<String, String>()
+            headers["Cache-Control"] = answer.cacheControl
+            headers["Content-Length"] = answer.length.toString()
+            return WebResourceResponse(answer.mimeType, null, 200, "OK", headers, answer.stream)
+        }
+
+        /**
+         * Preload pages "No preloading" (PS-43) at the request engine, as the desktop's
+         * `PreloadHandler` enforces it: under `none` every request that arrives here marked
+         * speculative (`Sec-Purpose` / `Purpose: prefetch`; [PreloadRules]) is answered empty,
+         * so nothing leaves the device for it. [applySpeculativeLoading]'s DISABLED stops the
+         * prerenders alone (`IsPrerender2Allowed`); a speculation-rules prefetch is a request the
+         * browser process builds with both marks on it, and arrives here so marked (refused on
+         * WebView 113, run 36244937529). A `<link rel=prefetch>` does NOT on WebView 113 or 124:
+         * WebView shows it here as the plain fetch it looks like (`Accept`, `Referer`,
+         * `User-Agent` and nothing else) – Blink marks it `Purpose: prefetch` but carries the
+         * header in `cors_exempt_headers`, which `AwWebResourceRequest` omits and the network
+         * service merges into the URLRequest, where the desktop's `onBeforeSendHeaders` reads it
+         * and this hook cannot. That one prefetch is the phone's remaining limit under `none`
+         * there; from Chromium 138 it carries `Sec-Purpose: prefetch` as a real header and is
+         * refused here unchanged. The level is [Privacy.flags]' as last pushed, read per request.
+         * Ahead of the engine on purpose: the refusal is the user's setting, not a rule set's
+         * block – no decision observed, no listener told, nothing added to the tab's blocked
+         * count, as on the desktop (`HANDLER_ORDER.preload` before `ruleEngine`). An empty 403,
+         * the engine's answer for a subresource it stops: the page sees a failed fetch (the
+         * desktop's cancel is `ERR_BLOCKED_BY_CLIENT`, the same to the page), and a non-2xx that
+         * no prefetch cache will serve for the tap that follows – a 204 would, and a navigation
+         * onto a 204 commits nothing (the engine's answer for a blocked DOCUMENT), which is not
+         * what a refused prefetch may do to the link the user then taps.
+         *
+         * The same answer under the system's Data Saver (this app's data restricted on a metered
+         * network) or Battery Saver, at `standard` and `extended` too (OS-21): Chrome Android's
+         * `IsSomePreloadingEnabled` holds the pages' preloads under either mode (its one
+         * exception, the omnibox's on-press search prefetch, this omnibox does not do), and this
+         * is the phone's one preloading seam. The state is [SaverModes]' as of the last second, read
+         * only for a request that carries the mark – a page's own requests never ask the
+         * system, and the reader is created by the first marked request, not at boot.
+         */
+        private fun refusePreload(request: WebResourceRequest): WebResourceResponse? =
+            if (PreloadRules.refuses(host.privacy.flags, request.url.toString(), request.requestHeaders) { SaverModes.shared(context).state() }) {
+                Blocking.emptyResponse(403, "Forbidden", "text/plain")
+            } else {
+                null
+            }
+
+        override fun onPageStarted(view: WebView, rawUrl: String, favicon: Bitmap?) {
+            val url = pageUrlFor(rawUrl)
+            // The unload probe's address commits nothing (its answer is a 204); should a word
+            // about it come all the same, it is not the tab's (see probeThenLoad).
+            if (UnloadProbeRules.isProbeUrl(url)) return
+            unloadCheck?.let { check ->
+                // The check's blank document started: the page did not object (or the user chose
+                // to leave) and is on its way out; the view goes with it (see confirmUnload).
+                // Nothing of the blank document is the tab's.
+                if (isUnloadCheckDocument(url)) {
+                    if (!check.navigated) check.settle(leave = true, destroyView = true)
+                    return
+                }
+            }
+            // Another document is on its way: the page's dialog visit is over (its count and its
+            // silencing, PageDialogVisit), and the viewer page's file is not to be served for it.
+            dialogVisit.reset()
+            if (pdfPage != null && url != pdfPage?.url) pdfPage = null
+            // Navigations with no link click ahead of them (forms, history.back(), redirects).
+            rememberCurrentPage()
+            backTransition?.onNavigation(PageBackTransition.NavigationEvent.STARTED)
+            awaitingCommit = true
+            // The core's error page is the answer to the failure, and WebView's own error page
+            // for the failed load may commit only after this (see failedUrl).
+            if (!url.startsWith(ERROR_PAGE_PREFIX)) failedUrl = null
+            currentDocument = url
+            startedDocument = url
+            // The served new tab page starting (a load, a history step back onto it) turns its
+            // icons on; any other document starting turns them off.
+            servesNewTabPage = NewTabPage.isDocument(url)
+            // A navigation held for the core's answer is superseded by the document starting,
+            // and the page that objected to it is on its way out: its Leave is spent, and so is
+            // its script's word on the next navigation's referrer policy.
+            heldNavigation = null
+            leaveCarry.reset()
+            referrerPolicyWord.documentStarted(ContentRules.siteOf(url))
+            applyMixedContentPolicy(host.privacy.flags, url)
+            applyCookiePolicy(host.privacy.flags, url)
+            applyContentRules(url)
+            // A document the core could not be asked about ahead of its request (a form's POST, a
+            // history step, a navigation that reached here before the answer): the pushed document
+            // decided above; the core's word is asked for now and the document re-reads its own
+            // on the reply (onRulesResolved), and the site's next document starts with it.
+            if (host.contentRulesResolvable && governedByContentRules(url) && resolvedFor(url) == null) askRules(url)
+            // Without document-start scripts the signals arrive late, but they arrive.
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) signalScript?.let { evaluateJavascript(it, null) }
+            loading = true
+            domReady.documentStarted()
+            // The image search's frame registry is NOT cleared here: WebView 113 posts this
+            // callback at commit as a Java message that the new document's frame hellos, delivered
+            // inline from the native queue, can run ahead of. The main frame's own hello is the
+            // boundary (onPageMessage, [ImageOwner.documentStarted]).
+            // Whatever the user agent is now, this page was requested with it.
+            userAgentStale = false
+            // Darkening for the page that is coming, before its first paint; the core confirms.
+            if (PageRules.isWebPage(url)) setDarkening(host.pageRules.darken(url))
+            lastProgressAt = 0L
+            failPendingEvals("the page navigated away before the script finished")
+            host.extensions?.onDocumentGone(this@TabWebView, url, pdfDocumentUrl())
+            host.documentStarted(this@TabWebView)
+            host.viewEvent(tabId, "startLoading", null)
+            if (muted) setMuted(true)
+            // An extension page the runtime refused: the empty document it answered with is
+            // starting, and the load fails here, as one WebView failed does right after its start.
+            // (Any other document starting means the refused one was given up: a later load of
+            // the same URL, once the extension is enabled, is not to fail on the stale word.)
+            val refused = refusedExtensionPage
+            refusedExtensionPage = null
+            if (url == refused) failStartedExtensionPage(url)
+        }
+
+        /**
+         * A navigation committed – the moment Electron's `did-navigate` reports to the core, and
+         * the first at which the load's outcome is known: WebView fires `onPageStarted` for a
+         * failed load too (right before `onReceivedError`), so reporting from there would record
+         * a visit to a page that never loaded.
+         */
+        override fun doUpdateVisitedHistory(view: WebView, rawUrl: String, isReload: Boolean) {
+            val url = pageUrlFor(rawUrl)
+            // The unload check's blank document is not the tab's (see confirmUnload); nor the probe's address.
+            if (isUnloadCheckDocument(url) || UnloadProbeRules.isProbeUrl(url)) return
+            onHistoryCommitted(shown = url, reload = isReload)
+            backTransition?.onNavigation(PageBackTransition.NavigationEvent.HISTORY_UPDATED)
+            if (failedUrl != null && url == failedUrl) {
+                // WebView's own error page, committing under the failed URL while the core's
+                // `zen://error` page is on its way or already loading (see failedUrl). The
+                // `onPageStarted` it may follow belongs to the core's page, whose commit is next.
+                failedUrl = null
+                interstitial = true
+                interstitialUrl = url
+                host.backChanged()
+                pushHistory()
+                return
+            }
+            // pushState / hash navigations have no onPageStarted of their own.
+            val inPage = !awaitingCommit
+            awaitingCommit = false
+            // The document on screen took a new URL in place: the pixels are still its own. (Not
+            // when the one drawn is another: its own commit-visible is the word for that.)
+            if (inPage && paintedDocument != null && paintedDocument == currentDocument) paintedDocument = url
+            currentDocument = url
+            // Whatever card picture there was is of the page before – the chrome drops it on the
+            // URL change – and the next hide takes a new one, however fresh the last (BH-14).
+            host.thumbnails?.stale(tabId)
+            // Another page committed: the failed load's own error page is not coming any more.
+            failedUrl = null
+            interstitial = false
+            refusedCertificateUrl = null
+            if (!inPage) {
+                // A document whose main-frame request the engine never decided (non-http, an
+                // extension page) opens its generation here; one it did has opened it already.
+                if (documentGeneration.get() == committedGeneration) documentGeneration.incrementAndGet()
+                committedGeneration = documentGeneration.get()
+            }
+            // Before `navigated`: the core records the tab's stack as it handles that event, and
+            // reads it from the list pushed here (the view's copy, or `Host`'s for the sync call).
+            pushHistory()
+            // The committed URL as the core spells a tab's URL: an extension page's in Chrome's
+            // form (`chrome-extension://<id>/...`, as [navState] and the list's entries have it),
+            // not the served origin the WebView reported the commit under.
+            host.viewEvent(tabId, "navigated", navState().put("url", ExtensionUrls.present(url)).put("inPage", inPage).put("document", committedGeneration))
+            host.backChanged()
+        }
+
+        override fun onPageCommitVisible(view: WebView, url: String) {
+            if (isUnloadCheckDocument(url) || UnloadProbeRules.isProbeUrl(url)) return
+            // WebView's word that nothing of the page before is drawn any more: from here the
+            // pixels are this document's, and so may its card picture be.
+            documentPainted(url)
+            backTransition?.onNavigation(PageBackTransition.NavigationEvent.COMMIT_VISIBLE)
+        }
+
+        override fun onPageFinished(view: WebView, url: String) {
+            if (isUnloadCheckDocument(url)) return
+            // The probe's navigation ended (its 204 is an aborted load, for which WebView raises
+            // this and nothing else): the page's own loading is whatever it was.
+            if (UnloadProbeRules.isProbeUrl(url)) return
+            loading = false
+            // A document that finished has drawn (the word for one whose commit-visible never came).
+            documentPainted(url)
+            if (pendingFlags && host.pageScript.isNotEmpty()) {
+                evaluateJavascript(startScriptSource(), null)
+            }
+            backTransition?.onNavigation(PageBackTransition.NavigationEvent.FINISHED)
+            // A document the page script never reported ready (it did not run there, or it only
+            // runs at page finished) is ready now, before it has stopped loading, as in Electron.
+            if (domReady.pageFinished()) host.viewEvent(tabId, "domReady", null)
+            host.viewEvent(tabId, "stopLoading", navState())
+            if (muted) setMuted(true)
+            host.backChanged()
+            pushHistory()
+        }
+
+        override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+            val url = request.url.toString()
+            // The probe's 204 is an abort WebView does not report; any other word about its address is nobody's.
+            if (UnloadProbeRules.isProbeUrl(url)) return
+            host.blocking.onRequestError(this@TabWebView, request, error.errorCode)
+            if (!request.isForMainFrame) {
+                refusedCertificates.remove(url)
+                return
+            }
+            failedUrl = url
+            loading = false
+            // The request behind a refused certificate fails in turn; onReceivedSslError said it all.
+            if (url == refusedCertificateUrl) return
+            // Unless the refusal did not read as the page's own: it was, so it is the news now.
+            refusedCertificates.remove(url)?.let { refused ->
+                refusedCertificateUrl = url
+                failLoad(refused.code, NetErrors.name(refused.code) ?: "ERR_CERT_INVALID", url, refused.certificate)
+                return
+            }
+            val failure = NetErrors.failure(error.errorCode, error.description, NetErrors.offline(context))
+            failLoad(failure.code, failure.name ?: error.description.toString(), url)
+        }
+
+        /** The document's own error status (a 404, a 5xx) is the host's to note; a subresource's is nobody's. */
+        override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, errorResponse: WebResourceResponse) {
+            if (request.isForMainFrame) host.documentHttpError(this@TabWebView, request.url.toString(), errorResponse.statusCode)
+        }
+
+        /**
+         * A certificate that failed verification. The load goes ahead when the user proceeded past
+         * the interstitial for the site and certificate this session (`Security.certificateExceptions`,
+         * the core's decision mirrored here); otherwise it is refused, like Chrome does, and the
+         * page becomes the certificate interstitial: the failure with the certificate goes to the
+         * core, which renders `zen://error` with it and the offer to proceed. A resource of another
+         * site than the page's is most likely a subresource, blocked quietly (Chrome too); should
+         * the request prove to be the main frame's, `onReceivedError` renders the interstitial.
+         */
+        override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+            val url = error.url
+            val certificate = error.certificate
+            if (host.security.certificateAllowed(containerId, url, Security.fingerprintOf(certificate))) {
+                handler.proceed()
+                return
+            }
+            handler.cancel()
+            val code = NetErrors.sslCode(error.primaryError)
+            val details = Security.describeCertificate(certificate)
+            if (!readsAsPage(url)) {
+                refusedCertificates[url] = RefusedCertificate(code, details)
+                return
+            }
+            failedUrl = url
+            refusedCertificateUrl = url
+            loading = false
+            failLoad(code, NetErrors.name(code) ?: "ERR_CERT_INVALID", url, details)
+        }
+
+        /** Whether a failed resource is the document being loaded: same site as it, or no document to compare with. */
+        private fun readsAsPage(resourceUrl: String): Boolean {
+            val document = currentDocument ?: return true
+            val documentSite = CertificateExceptions.siteOf(document) ?: return true
+            return CertificateExceptions.siteOf(resourceUrl) == documentSite
+        }
+
+        /**
+         * Tell the core, in Chromium's terms: the `net::` code and the `ERR_…` name (or reason) the
+         * page prints, and for a refused certificate what the interstitial shows of it.
+         */
+        private fun failLoad(code: Int, description: String, url: String, certificate: JSONObject? = null) {
+            val event = json("code" to code, "description" to description, "url" to url)
+            if (certificate != null) event.put("certificate", certificate)
+            host.viewEvent(tabId, "failLoad", event)
+        }
+
+        override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
+            val didCrash = detail.didCrash()
+            val priority = detail.rendererPriorityAtExit()
+            Log.w("ZenTab", "renderer of $tabId gone (${if (didCrash) "crashed" else "killed"}, priority at exit $priority)")
+            // Every WebView shares the one renderer: the host classifies the exit for the pages
+            // on screen first (it outlives the chrome, which lost the renderer too and is
+            // rebuilt around a fresh one; the word reaches the rebooted core as it loads the
+            // page again). The host drops this view for that rebuild – before or after this
+            // call – and only a view that was really swapped tells the chrome its page crashed.
+            val word = host.rendererGone(this@TabWebView, didCrash, priority)
+            if (host.tabs.replaceCrashed(this@TabWebView)) {
+                host.viewEvent(tabId, "crashed", word ?: json("reason" to if (didCrash) "crashed" else "killed"))
+            }
+            return true
+        }
+    }
+
+    // --- WebChromeClient ----------------------------------------------------------------------
+
+    private inner class Chrome : WebChromeClient() {
+        // --- the page's dialogs: Ione's sheet (PUI-27, PUI-28), Chrome's own wording --------------
+
+        /**
+         * `alert` / `confirm` / `prompt`: on a host with a chrome the page waits in its call, as in
+         * Chrome, for Ione's sheet ([pageDialog]); a host without one (a custom tab) keeps the
+         * WebView's own dialogs. `url` is the calling frame's: the dialog is titled after its
+         * site, an embedded frame's told from the page's by the document's URL.
+         */
+        override fun onJsAlert(view: WebView, url: String, message: String?, result: JsResult): Boolean {
+            if (!host.pageDialogs) return false
+            pageDialog(PageDialogKind.ALERT, url, message, null, result)
+            return true
+        }
+
+        override fun onJsConfirm(view: WebView, url: String, message: String?, result: JsResult): Boolean {
+            if (!host.pageDialogs) return false
+            pageDialog(PageDialogKind.CONFIRM, url, message, null, result)
+            return true
+        }
+
+        override fun onJsPrompt(view: WebView, url: String, message: String?, defaultValue: String?, result: JsPromptResult): Boolean {
+            if (!host.pageDialogs) return false
+            pageDialog(PageDialogKind.PROMPT, url, message, defaultValue, result)
+            return true
+        }
+
+        /**
+         * The page's `beforeunload` handler objects to the navigation the WebView is about to
+         * run – the core's own (address bar, back, reload), the page's, or the unload check's
+         * blank document ([confirmUnload]) – and holds it in `result` (PUI-28). The sheet asks
+         * "Leave site?" ("Reload site?" right after the core asked for a reload, never under a
+         * check, as Electron's host tells them apart; the WebView raises the question only for a
+         * page the user has touched, as Chrome), and its answer lets the navigation go on or
+         * cancels it, the page as it was ([stayedOnPage]). A check waits as long as the question
+         * is up: its silence timer stops here, and the answer settles it.
+         *
+         * A page the user is not looking at never puts the sheet in front of them
+         * ([UnloadObjection], §9.23 on touch hosts): under a check – every touch close path –
+         * the leave is confirmed at once and the check settles as leave, the view destroyed
+         * (the chrome's close paths run with Undo on the toast, and that Undo is the
+         * protection; [confirmUnload] names the one that comes without it); a page an agent drives (OS-40:
+         * the WebView raises the question only after a user gesture, but an agent's input is
+         * trusted input, so a page it works on may object, and the question is the agent's,
+         * not the user's) is answered by the agent's dialog policy while hidden – leave by
+         * default, or stay – and reported to the agent ([DialogPolicyAnswer]), and leaves
+         * silently, with the bookkeeping a Leave runs, where the policy does not reach (its
+         * view drawn: a split's second pane, the frame of a show); a user page that
+         * is not in front – behind another tab, or under the tab overview – objecting to its
+         * own navigation, or to the reload the chrome asked of it, stays, the navigation
+         * cancelled as a Stay cancels it ([stayedOnPage]). The tab the user is on asks as it
+         * always has – its view drawn or not: the shown tab's view is GONE under the URL field
+         * and the app menu, and the typed address's load runs before the field closes, so the
+         * word is the tab's ([UnloadObjection.inFront]: `isShown`, or not [backgroundTab] – the
+         * host's own line between a cover's hide and a switch's, [BackgroundTabRule]), never
+         * the view's alone, which would cancel a typed URL or a menu Reload with no sheet.
+         */
+        override fun onJsBeforeUnload(view: WebView, url: String, message: String?, result: JsResult): Boolean {
+            if (!host.pageDialogs) return false
+            val check = unloadCheck
+            val now = SystemClock.uptimeMillis()
+            // The page objected to this very navigation a moment ago and the user chose to leave;
+            // the objection now is the re-issued load's (a navigation held for the core's
+            // content-settings answer, see resumeHeld), which the browser asked the page again
+            // for. Chrome asks once: the user's word stands, no second sheet.
+            if (check == null && leaveCarry.answers(now)) {
+                result.confirm()
+                unloadProbe?.answered(leave = true)
+                return true
+            }
+            val reloadAsked = now - reloadAskedAt < RELOAD_ASK_WINDOW_MS
+            // A page an agent drives hidden is its dialog policy's first ([DialogPolicyAnswer]):
+            // leave – the default – or stay, answered at once and reported to the core. Never
+            // under a check (the user's close is the user's: the table below settles it), never
+            // for the tab in front (its sheet is the user's). The bookkeeping is a Leave's or a
+            // Stay's, as at the sheet.
+            val policyAnswer = DialogPolicyAnswer.decide(
+                kind = if (reloadAsked) PageDialogKind.RELOAD else PageDialogKind.LEAVE,
+                policy = dialogPolicy,
+                agentDriven = agentDriven,
+                shown = isShown,
+                userUnload = check != null,
+                url = url,
+                message = message,
+                defaultValue = null
+            )
+            if (policyAnswer is DialogPolicyAnswer.Decision.Answer) {
+                if (policyAnswer.accepted) {
+                    result.confirm()
+                    leaveChosen(askedAt = now, chosenAt = now, reload = reloadAsked)
+                } else {
+                    result.cancel()
+                    stayChosen()
+                }
+                host.viewEvent(tabId, "pageDialogAnswered", policyAnswer.report.toJson())
+                return true
+            }
+            val decision = UnloadObjection.decide(
+                inFront = UnloadObjection.inFront(shown = isShown, behind = backgroundTab),
+                agentDriven = agentDriven,
+                checkInFlight = check != null,
+                reloadAsked = reloadAsked
+            )
+            when (decision) {
+                is UnloadObjection.SettleCheck -> {
+                    // No sheet is up for settle to dismiss: the navigation is let go here.
+                    result.confirm()
+                    checkNotNull(check) { "SettleCheck without a check in flight" }.settle(leave = true, destroyView = true)
+                }
+                is UnloadObjection.LeaveSilently -> {
+                    result.confirm()
+                    leaveChosen(askedAt = now, chosenAt = now, reload = decision.reload)
+                }
+                is UnloadObjection.StayHidden -> {
+                    // A page behind another tab or under the overview: the page stays, as a Stay would leave it.
+                    result.cancel()
+                    stayChosen()
+                }
+                is UnloadObjection.Sheet -> {
+                    // Never under a check (a check settles above): the question is the tab in front's own navigation's.
+                    val reload = decision.reload
+                    // A probe's watchdog waits with the sheet: the user's answer takes as long as it takes.
+                    unloadProbe?.asking()
+                    showDialog(PageDialogSpec.beforeUnload(reload), result) { leave, _ ->
+                        if (!leave) stayChosen()
+                        else leaveChosen(askedAt = now, chosenAt = SystemClock.uptimeMillis(), reload = reload)
+                    }
+                }
+            }
+            return true
+        }
+
+        /**
+         * The page's objection to a navigation of its own (no check) ends in Leave – the user's
+         * at the sheet, asked at `askedAt` and answered at `chosenAt`, or the silent one of a
+         * page an agent drives, both at once. A reload never passes shouldOverrideUrlLoading,
+         * so nothing of it is held or re-issued; any other navigation's Leave carries to the
+         * hold that follows ([LeaveCarry]). The sheet stood open from the question to the Leave,
+         * between the tap and its navigation reaching the hook: that time is not the hop's, and
+         * the page's word on this navigation's referrer policy, live when the page objected, is
+         * live for the hold past the Leave.
+         */
+        private fun leaveChosen(askedAt: Long, chosenAt: Long, reload: Boolean) {
+            // The Leave is the probe's where one stands for the load: its settling issues the
+            // load, this Leave carried to the load's own asking (LeaveCarry.probeLeft).
+            unloadProbe?.answered(leave = true)
+            if (reload) return
+            leaveCarry.leaveChosen(chosenAt)
+            referrerPolicyWord.leaveChosen(askedAt = askedAt, now = chosenAt)
+        }
+
+        override fun onReceivedTitle(view: WebView, title: String?) {
+            // The unload check's blank document has no title for the tab (see confirmUnload).
+            if (unloadCheck != null) return
+            // "Webpage not available" is the built-in error page's, not the tab's (see failedUrl).
+            if (failedUrl != null || interstitial) return
+            host.viewEvent(tabId, "title", json("title" to (title ?: "")))
+            // The entry's title in the list follows the page's.
+            pushHistory()
+        }
+
+        /**
+         * The page's load progress for the host's bar (the chrome's on the frame edge, a custom
+         * tab's under its toolbar). WebView reports it in bursts (a dozen steps within a few
+         * milliseconds on a fast page); a bar springs towards each target anyway, so one report
+         * per hundred milliseconds carries all it can show – except 100, which always goes
+         * through so the bar fills before it fades.
+         */
+        override fun onProgressChanged(view: WebView, newProgress: Int) {
+            if (!loading || unloadCheck != null || unloadProbe != null) return
+            val now = SystemClock.uptimeMillis()
+            if (newProgress < 100 && now - lastProgressAt < PROGRESS_THROTTLE_MS) return
+            lastProgressAt = now
+            host.progress(tabId, newProgress)
+        }
+
+        /** Warnings and errors only, for the extension layer's diagnostics (pages log a lot). */
+        override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+            if (message.messageLevel() == ConsoleMessage.MessageLevel.ERROR || message.messageLevel() == ConsoleMessage.MessageLevel.WARNING) {
+                synchronized(console) {
+                    console.addLast("${message.messageLevel()} ${message.sourceId()}:${message.lineNumber()} ${message.message()}")
+                    while (console.size > 100) console.removeFirst()
+                }
+            }
+            return false
+        }
+
+        override fun onReceivedIcon(view: WebView, icon: Bitmap) {
+            encoder.execute {
+                val size = 32
+                val scaled = if (icon.width > size) Bitmap.createScaledBitmap(icon, size, size, true) else icon
+                val out = ByteArrayOutputStream()
+                scaled.compress(Bitmap.CompressFormat.PNG, 100, out)
+                val data = "data:image/png;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                Handler(Looper.getMainLooper()).post { host.viewEvent(tabId, "favicon", json("url" to data)) }
+            }
+        }
+
+        override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+            host.enterFullscreen(this@TabWebView, view, callback)
+        }
+
+        override fun onHideCustomView() {
+            host.exitFullscreen(this@TabWebView)
+        }
+
+        override fun onPermissionRequest(request: PermissionRequest) {
+            host.permissions.onPermissionRequest(this@TabWebView, request)
+        }
+
+        override fun onPermissionRequestCanceled(request: PermissionRequest) {
+            host.permissions.onPermissionRequestCanceled(this@TabWebView, request)
+        }
+
+        override fun onGeolocationPermissionsShowPrompt(origin: String, callback: GeolocationPermissions.Callback) {
+            host.permissions.onGeolocation(this@TabWebView, origin, callback)
+        }
+
+        override fun onShowFileChooser(
+            webView: WebView,
+            filePathCallback: ValueCallback<Array<Uri>>,
+            fileChooserParams: FileChooserParams
+        ): Boolean {
+            if (interceptsAgentPrompts) {
+                holdFileChooser(filePathCallback, fileChooserParams)
+                return true
+            }
+            return host.activity.showFileChooser(host, filePathCallback, fileChooserParams)
+        }
+
+        override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
+            // The WebView only asks without a gesture when the site may open windows on its own.
+            if (!isUserGesture && !settings.javaScriptCanOpenWindowsAutomatically) return false
+            if (!host.popupsAsTabs) {
+                // A custom tab has one page: a popup the user asked for (target=_blank, window.open
+                // from a tap) navigates it; a popup no tap asked for is blocked, as Chrome does.
+                if (!isUserGesture) return false
+                val probe = WebView(view.context)
+                probe.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
+                        this@TabWebView.loadUrl(request.url.toString())
+                        Handler(Looper.getMainLooper()).post { probe.destroy() }
+                        return true
+                    }
+                }
+                (resultMsg.obj as WebViewTransport).webView = probe
+                resultMsg.sendToTarget()
+                return true
+            }
+            // Hand the popup a real WebView so `window.opener` keeps working, then adopt it as a tab.
+            val popup = host.tabs.createPopup(containerId)
+            (resultMsg.obj as WebViewTransport).webView = popup
+            resultMsg.sendToTarget()
+            host.hostEvent("view.adopt", json("viewId" to popup.tabId, "parentTabId" to tabId, "active" to isUserGesture))
+            return true
+        }
+
+        override fun onCloseWindow(window: WebView) {
+            // Blink asks only for a window a script may close (one it opened, or a tab still on its
+            // first document, `history.length` 1): Chrome closes the tab, and an extension page
+            // opened with `tabs.create` counts on it (Tampermonkey's install page closes itself once
+            // its background lets the request go). The view goes the way of a page-initiated close:
+            // the core hears `destroyed` and closes the tab.
+            if (window !== this@TabWebView) return
+            post { host.tabs.destroy(tabId) }
+        }
+    }
+
+    companion object {
+        private const val PULL_TAG = "ZenPull"
+        /** The text-selection action mode's life, for the emulator driver's record (`SelectionDemo`). */
+        const val SELECTION_TAG = "ZenSelection"
+        /** The core's error pages and interstitials (`ERROR_URL_PREFIX` in `src/shared/url.ts`). */
+        private const val ERROR_PAGE_PREFIX = "zen://error"
+        /** The object the page script posts to (and the wrappers in [evaluate] and [postToPage] name). */
+        private const val PAGE_BRIDGE = "__zenPageBridge"
+        private val encoder = Executors.newSingleThreadExecutor { r -> Thread(r, "zen-encode") }
+
+        /**
+         * The pure half of [backIndex]: the entry behind `currentIndex` (`entryUrlAt` reads the
+         * list's actual URLs), or the one before it when the view is on the core's error page and
+         * that entry is the one the page stands in for (`skipped`: WebView's own error page for
+         * the failed load, or the lookalike the core's question replaced). -1 with nothing behind
+         * – nothing but the skipped entry included: a tab whose first page is the question has
+         * no way back through history, and the chrome's Back takes its no-history way.
+         */
+        fun backIndexOf(currentIndex: Int, entryUrlAt: (Int) -> String?, onErrorPage: Boolean, skipped: String?): Int {
+            val behind = currentIndex - 1
+            if (behind < 0) return -1
+            if (onErrorPage && skipped != null && entryUrlAt(behind) == skipped) return behind - 1
+            return behind
+        }
+
+        /**
+         * The pure half of the mark in [loadHtml]: the committed web page `committed` when the
+         * core's `zen://error` page `url` stands in for it – the page the core turned into a
+         * question after its commit – or null: for a page still on its way (`awaitingCommit`,
+         * the failed load's case, marked at its commit), for a page that is not the web's, and
+         * for a `zen://error` page about another address (a typed lookalike held before any
+         * request, whose question stands before the page that is still the way back).
+         */
+        fun interstitialOver(url: String, committed: String?, awaitingCommit: Boolean): String? {
+            if (awaitingCommit || committed == null || !url.startsWith(ERROR_PAGE_PREFIX) || !PageRules.isWebPage(committed)) return null
+            return committed.takeIf { errorPageStandsFor(url) == it }
+        }
+
+        /**
+         * The address a `zen://error` page of the core's is about: its `url` query parameter, as
+         * `errorPageUrl` in `src/shared/url.ts` spells it (`URLSearchParams`, form-encoded), or
+         * null when the page names none.
+         */
+        fun errorPageStandsFor(url: String): String? {
+            val query = url.substringAfter('?', "").substringBefore('#')
+            val raw = query.split('&').firstOrNull { it.startsWith("url=") }?.substring(4) ?: return null
+            return runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrNull()
+        }
+
+        /**
+         * The pure half of the retry in [loadUrl]: from the core's error page, a load of the very
+         * address WebView's own error page committed under (`skipped`), when that entry is the one
+         * right behind (`behindUrl`), goes back onto it instead of making a new entry.
+         */
+        fun retriesFailedEntryOf(onErrorPage: Boolean, target: String, behindUrl: String?, skipped: String?): Boolean =
+            onErrorPage && skipped != null && target == skipped && behindUrl == skipped
+
+        /**
+         * `shouldOverrideUrlLoading`'s word on an http(s) navigation, the decisions in the order
+         * they must come, each saying true when it took the navigation over. The ENGINE first
+         * (Safe Browsing, the rule sets: a blocked address opens no app and asks the core no
+         * content question). Then the APP LINK probe: a verified App Link opens its app and the
+         * tab loads nothing, an unverified one is offered while the page loads – the probe wants
+         * the tap's own request, gesture and all, and a navigation the hold takes is dropped by
+         * the WebView and re-issued as a load of this view's, which never re-enters the hook, so
+         * a hold ahead of the probe would load the web page in place of the app on the first tap
+         * into every site the core has not answered for (an unanswered site is a cross-site one,
+         * exactly what `AppLinks.shouldProbe` fires for), and the declined-app memory would never
+         * learn. Then the HOLD for the core's content-settings answer (or the destination's
+         * settings, applied). Last the desktop-site switch's own re-issue of the link: a held
+         * navigation's re-issued load switches for itself in `loadRequested`. Pure, so the order
+         * is pinned on the JVM (`TabWebViewNavigationOrderTest`).
+         */
+        fun webNavigationTaken(engine: () -> Boolean, appLink: () -> Boolean, hold: () -> Boolean, desktopSwitch: () -> Boolean): Boolean =
+            engine() || appLink() || hold() || desktopSwitch()
+
+        /**
+         * The front of `shouldOverrideUrlLoading`: a speculation-rules prerender's pass through
+         * the hook ([PageRules.isPrerender], the outermost main frame, no gesture) is answered by
+         * the veto alone – none of a primary load's steps run for it, so none of their side
+         * effects do; in particular the hold, the one spender of the page's word on the next
+         * navigation's referrer policy ([ReferrerPolicyWord]), is not reached, and the real tap
+         * that follows finds the word within its window. Pure, so the order is pinned on the JVM
+         * (`TabWebViewNavigationOrderTest`).
+         */
+        fun prerenderPassOrNavigation(prerender: Boolean, veto: () -> Boolean, navigation: () -> Boolean): Boolean =
+            if (prerender) veto() else navigation()
+
+        /** Longer than any tool budget (browser_wait_for allows 30 s) but shorter than the socket's. */
+        private const val EVAL_TIMEOUT_MS = 45_000L
+
+        /**
+         * The most [captureLong] waits for the message strip at the frame's edge to close over
+         * the page (the card's exit and the strip's spring take a fraction of it); a strip still
+         * there at the end of it stays for good, and is held out of the capture instead.
+         */
+        private const val COVER_CLEAR_WAIT_MS = 1_500L
+
+        /** A redirect chain or a burst of pushStates must not copy the window once per hop. */
+        private const val REMEMBER_THROTTLE_MS = 300L
+
+        /** Blocked-request counts reach the chrome at most this often per tab. */
+        private const val BLOCKED_FLUSH_MS = 150L
+
+        /** `net::ERR_BLOCKED_BY_CLIENT`, what the core's blocked page is keyed on. */
+        private const val BLOCKED_BY_CLIENT = -20
+
+        /** Well inside the core's 5 s activation window, so a tap is never missed for long. */
+        private const val ACTIVATION_REPORT_INTERVAL_MS = 400L
+
+        /** Progress reports between the first and the last (see `Chrome.onProgressChanged`). */
+        private const val PROGRESS_THROTTLE_MS = 100L
+
+        /** A `beforeunload` check whose page neither goes nor objects by then may go (Electron's, `UNLOAD_CHECK_TIMEOUT_MS`). */
+        private const val UNLOAD_CHECK_TIMEOUT_MS = 5_000L
+        /**
+         * An unload probe whose renderer never acks by then has its load issued all the same
+         * (a hung page holds no typed address up: Chrome navigates one past its own budget);
+         * held while the sheet is up, and given once more past its answer ([UnloadProbe]). The
+         * check's window, by the Design Lead's word: the two never drift apart.
+         */
+        private const val UNLOAD_PROBE_TIMEOUT_MS = UNLOAD_CHECK_TIMEOUT_MS
+
+        /** A `beforeunload` objection this soon after the core asked for a reload is "Reload site?". */
+        private const val RELOAD_ASK_WINDOW_MS = 2_000L
+
+        /**
+         * A navigation held for the core's content-settings answer goes on with the pushed
+         * document by then (`holdForContentRules`): the round trip is milliseconds when the
+         * chrome's thread is free; a page keeping the shared renderer busy must not hold a link.
+         */
+        private const val RESOLVE_RULES_WATCHDOG_MS = 1_500L
+
+        /** Where the visual viewport sits in the layout viewport (non-zero only while pinch-zoomed). */
+        private const val VISUAL_OFFSET_SCRIPT =
+            "(function(){var v=window.visualViewport;return v?[v.offsetLeft,v.offsetTop]:[0,0]})()"
+    }
+}

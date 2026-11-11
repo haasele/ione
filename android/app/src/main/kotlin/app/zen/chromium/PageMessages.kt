@@ -1,0 +1,137 @@
+package app.zen.chromium
+
+import org.json.JSONObject
+
+/**
+ * What a message from the page script (src/android/pageScript.ts, over the WebMessage listener
+ * or the legacy JavaScript interface) asks of the tab's WebView. Pure, so the plumbing between
+ * the script and the view events the chrome sees can be tested off the device.
+ */
+sealed class PageMessageRoute {
+    /** Not JSON, or not carrying this session's token: a page forging browser messages. */
+    object Ignore : PageMessageRoute()
+
+    /**
+     * The script is up and wants the current flags; the reply proxy is kept for the answers.
+     * [documentStart] is the document's navigation start as the frame's `performance.timeOrigin`
+     * says it (Unix wall-clock milliseconds; every frame of the process reads one monotonic clock
+     * mapped onto it), or NaN when the hello carries none. The main frame's hello is the tab's
+     * document boundary for the image search's frame registry, and a sub-frame's hello registers
+     * with its stamp ([ImageOwner.documentStarted], [ImageOwner.registerFrame]).
+     */
+    data class Hello(val documentStart: Double) : PageMessageRoute()
+
+    /** The settled value of a Promise an `evaluate()` script returned. */
+    data class EvalResult(val id: Int, val value: String?) : PageMessageRoute()
+
+    /** The main document's DOMContentLoaded (Electron's `dom-ready`). */
+    object DomReady : PageMessageRoute()
+
+    /**
+     * A `fullscreenchange` in the page (`installFullscreenReporter`): whether the document has a
+     * fullscreen element, whether that element shows a video at all (`video`; the exit hint
+     * stands every time for one without, MED-03) and the natural size of the video it shows –
+     * 0 × 0 for no video, or a size not known yet. The host turns the screen by it
+     * ([PageHost.fullscreenVideo], MED-01); the core never sees it.
+     */
+    data class Fullscreen(val active: Boolean, val videoWidth: Int, val videoHeight: Int, val video: Boolean) : PageMessageRoute()
+
+    /**
+     * The page's own referrer policy (`referrerPolicy.ts`), for the navigation the view holds
+     * for the core's content-settings answer (`ReferrerPolicyWord`): [next] is the word for the
+     * one navigation an anchor's click is about to start, [document] the document's
+     * `<meta name=referrer>`, tagged with its [origin]. A token the script did not recognise
+     * arrives as the empty string – the default policy. The main document's alone: a frame's
+     * anchors and meta govern the frame's own navigations, which the view does not hold.
+     */
+    data class ReferrerPolicy(val next: String?, val document: String?, val origin: String?) : PageMessageRoute()
+
+    /** Anything else goes to the core as a `pageMessage` view event, without the token. */
+    data class Forward(val message: JSONObject) : PageMessageRoute()
+
+    /**
+     * Whether the view acts on this message from the frame it came from. The main document
+     * speaks for the tab; a frame's hello, `domReady` or forwarded message is not the page's and
+     * is dropped. A frame's own [Fullscreen] is heard: an embed's video (a YouTube iframe) goes
+     * fullscreen from its frame's document, the one that knows the video's size, while the main
+     * document sees only the `<iframe>`, without one. A frame's capture report is heard too
+     * (NOT-13): a meeting embedded in an iframe holds the microphone as much as a top document
+     * does, and the core folds every frame's report by the frame's id (`TabManager.refreshAlert`,
+     * the same as the desktop's preload, which runs in every frame). A frame's request
+     * observation is heard too (the extension runtime's `requestObserver.ts`): an embedded
+     * player's `fetch` / XHR are its frame's own, and a `webRequest` sniffer hears the tab's
+     * requests whichever frame made them, as Chrome reports them. A frame's answers in the image
+     * search's frame-owner protocol are heard too ([ImageOwner]): the frame that holds the
+     * image says so, and thumbnails it, from its own document.
+     */
+    fun heardFrom(isMainFrame: Boolean): Boolean =
+        isMainFrame || this is Fullscreen || (this is Forward && message.optString("type") in HEARD_FROM_FRAMES)
+
+    companion object {
+        /** The shared capture reporter's message (`captureState.ts`). */
+        const val CAPTURE_STATE = "capture-state"
+        /** The page script's observation of a `fetch` / XHR response for the extension runtime (`requestObserver.ts`). */
+        const val EXT_OBSERVATION = "ext-observation"
+        /** A frame's salted hashes of the image URLs it holds, answering `zen:image-owner?` ([ImageOwner], §2.2). */
+        const val IMAGE_OWNER = "zen:image-owner"
+        /** The owner frame's thumbnail or refusal ([ImageOwner], §2.4). */
+        const val IMAGE_THUMBNAIL = "zen:image-thumbnail"
+        /** The forwarded messages a frame is heard on. */
+        private val HEARD_FROM_FRAMES = setOf(CAPTURE_STATE, EXT_OBSERVATION, IMAGE_OWNER, IMAGE_THUMBNAIL)
+    }
+}
+
+/** Route a page-script message carrying `token` (a per-session secret pages cannot know). */
+fun routePageMessage(data: String?, token: String): PageMessageRoute {
+    if (data == null) return PageMessageRoute.Ignore
+    val obj = runCatching { JSONObject(data) }.getOrNull() ?: return PageMessageRoute.Ignore
+    if (obj.str("token") != token) return PageMessageRoute.Ignore
+    return when (obj.str("type")) {
+        // `optDouble` is NaN for a hello without the stamp or with one that is not a number.
+        "hello" -> PageMessageRoute.Hello(obj.optDouble("documentStart"))
+        "evalResult" -> PageMessageRoute.EvalResult(obj.optInt("id"), obj.strOrNull("value"))
+        "domReady" -> PageMessageRoute.DomReady
+        "fullscreen" -> {
+            val videoWidth = obj.optInt("videoWidth").coerceAtLeast(0)
+            PageMessageRoute.Fullscreen(
+                obj.optBoolean("active"),
+                videoWidth,
+                obj.optInt("videoHeight").coerceAtLeast(0),
+                // A report without the word (a script from before it) has a video where it has a size.
+                obj.optBoolean("video", videoWidth > 0)
+            )
+        }
+        "referrerPolicy" -> PageMessageRoute.ReferrerPolicy(obj.strOrNull("next"), obj.strOrNull("document"), obj.strOrNull("origin"))
+        else -> {
+            obj.remove("token")
+            PageMessageRoute.Forward(obj)
+        }
+    }
+}
+
+/**
+ * Raises a tab's `domReady` view event once per document, as Electron fires `dom-ready`: at
+ * the page script's DOMContentLoaded message, else at `onPageFinished` for a document the script
+ * could not report from (a WebView without document-start scripts injects it at page finished;
+ * a document the script did not run in has nothing to say). A new document arms it again.
+ */
+class DomReadyGate {
+    private var raised = false
+
+    /** `onPageStarted`: whatever was raised belonged to the document before this one. */
+    fun documentStarted() {
+        raised = false
+    }
+
+    /** The script's DOMContentLoaded message: raise the event now? */
+    fun scriptReady(): Boolean = raise()
+
+    /** `onPageFinished`: the document is complete; raise the event if the script never did. */
+    fun pageFinished(): Boolean = raise()
+
+    private fun raise(): Boolean {
+        if (raised) return false
+        raised = true
+        return true
+    }
+}

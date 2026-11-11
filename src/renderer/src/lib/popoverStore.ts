@@ -1,0 +1,432 @@
+import type { RefObject } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
+
+/*
+ * One popover at a time, by light dismiss that is consumed (design-language-v2-draft §9.20,
+ * amended). Every popover in the chrome layer registers here once while it is open, and the
+ * registry keeps one set of window listeners for all of them:
+ *
+ *   - A pointer press outside every open popover – the page, a bar, another anchor, the
+ *     anchor itself – closes them on `pointerdown` and goes no further: the press is cancelled
+ *     and its follow-up events (`pointerup`, the compatibility mouse events, `click`,
+ *     `auxclick`, `contextmenu`) are swallowed, so a second anchor's first press only closes
+ *     the open popover and its second press opens the new one, and the open anchor's own press
+ *     closes its popover without reopening it. Nothing beneath a popover ever receives the press
+ *     that dismissed it. The press's `click` counts whenever it comes: with the release for a
+ *     mouse, a task or more later for a touch or a pen, whose click is the browser's tap gesture
+ *     (see `TAP_CLICK_CEILING_MS`).
+ *   - A scroll anywhere outside the popovers – a wheel turned over the frame or a bar, a chrome
+ *     list scrolling – and a window resize close them. A Ctrl+wheel is a zoom, not a scroll,
+ *     and leaves them be.
+ *   - Opening a popover closes every other open one, except the popovers it sits in: a popover
+ *     whose anchor is inside an open popover (a menulist's list inside the star bubble) is that
+ *     popover's child, and a press inside the child keeps the parent open.
+ *   - Focus: a press on the anchor puts the focus there (that is where the press went, even
+ *     consumed); after any other outside press the focus that was inside a closed popover goes
+ *     back to the outermost closed popover's anchor (§9.22) unless the popover's own close
+ *     handler moved it.
+ *
+ * Escape stays with the popover: it traps the key, closes and returns focus to its anchor
+ * (§9.22), because a nested level (a submenu, a folder chooser) decides what one Escape means.
+ *
+ * The listeners sit on `window` in the capture phase, the first place a press can be seen:
+ * `#zen-chrome-layer` itself catches no pointer, and a press outside the popovers targets
+ * whatever chrome lies under it, never the layer.
+ */
+
+/** Why a popover was closed by the registry. */
+export type DismissReason =
+  /** A pointer press outside it (and not on its anchor). */
+  | 'outside'
+  /** A pointer press on its own anchor: closed, not reopened. */
+  | 'anchor'
+  /** Something outside it scrolled, or a wheel turned outside it. */
+  | 'scroll'
+  /** The window resized. */
+  | 'resize'
+  /** Another popover opened (one at a time). */
+  | 'replaced'
+  /** A frame dialog opened over the chrome, or `closeAllPopovers()` was called. */
+  | 'all'
+
+type ElementGetter = () => Element | null
+
+export interface PopoverRegistration {
+  /** The popover's root: a press inside it, or inside a popover it owns, leaves it open. */
+  element: ElementGetter
+  /**
+   * What opened it. A popover whose anchor sits inside an open popover is that popover's child;
+   * a press on the anchor closes the popover with reason `anchor`; and the anchor takes the
+   * focus back when an outside press closes a popover that held it.
+   */
+  anchor?: ElementGetter
+  close: (reason: DismissReason) => void
+}
+
+interface Entry extends PopoverRegistration {
+  id: number
+  parent: Entry | null
+}
+
+let seq = 0
+/** The open popovers in the order they opened: the last one is on top. */
+const entries: Entry[] = []
+
+/**
+ * What the registry tells its subscribers: a popover registered (`'open'`), or popovers closed
+ * for a `DismissReason` – `'all'` also for a `closeAllPopovers()` that found none open, which
+ * a frame dialog opening sends.
+ */
+export type PopoverChange = 'open' | DismissReason
+const subscribers = new Set<(change: PopoverChange) => void>()
+
+function notify(change: PopoverChange): void {
+  for (const listener of [...subscribers]) listener(change)
+}
+
+/**
+ * Run `listener` when a popover opens, when popovers are closed by the registry (a press outside,
+ * a scroll, a resize, another popover, a frame dialog) and on every `closeAllPopovers()`. For
+ * chrome that is not a popover but keeps §9.20's one at a time all the same – the tab hover
+ * card, which shows no popover beside itself and clears when one opens. A popover taking itself
+ * out (Escape, a row chosen) is not reported. Returns the unsubscribe.
+ */
+export function subscribePopovers(listener: (change: PopoverChange) => void): () => void {
+  subscribers.add(listener)
+  return () => {
+    subscribers.delete(listener)
+  }
+}
+
+const contains = (entry: Entry, node: Node): boolean => entry.element()?.contains(node) ?? false
+const anchorContains = (entry: Entry, node: Node): boolean =>
+  entry.anchor?.()?.contains(node) ?? false
+
+/** The popovers `entry` sits in, nearest first. */
+function ancestorsOf(entry: Entry): Entry[] {
+  const list: Entry[] = []
+  for (let p = entry.parent; p; p = p.parent) list.push(p)
+  return list
+}
+
+/** Take `list` out of the registry, then close each, the one on top first. */
+function closeEntries(
+  list: Entry[],
+  reason: DismissReason | ((entry: Entry) => DismissReason)
+): void {
+  if (!list.length) return
+  for (const entry of list) {
+    const at = entries.indexOf(entry)
+    if (at !== -1) entries.splice(at, 1)
+  }
+  for (const entry of entries) {
+    while (entry.parent && list.includes(entry.parent)) entry.parent = entry.parent.parent
+  }
+  syncListeners()
+  const reasonOf = (entry: Entry): DismissReason =>
+    typeof reason === 'function' ? reason(entry) : reason
+  for (let i = list.length - 1; i >= 0; i--) {
+    const entry = list[i]
+    entry.close(reasonOf(entry))
+  }
+  notify(reasonOf(list[list.length - 1]))
+}
+
+/**
+ * Register an open popover. Every other open popover closes, except the ones the new popover
+ * sits in. Returns the function that takes it out of the registry again (the popover closing
+ * by itself: Escape, a row chosen, its anchor toggled).
+ */
+export function openPopover(registration: PopoverRegistration): () => void {
+  const anchorEl = registration.anchor?.() ?? null
+  let parent: Entry | null = null
+  if (anchorEl) {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (contains(entries[i], anchorEl)) {
+        parent = entries[i]
+        break
+      }
+    }
+  }
+  const entry: Entry = { ...registration, id: ++seq, parent }
+  const keep = new Set(ancestorsOf(entry))
+  closeEntries(
+    entries.filter((e) => !keep.has(e)),
+    'replaced'
+  )
+  entries.push(entry)
+  syncListeners()
+  notify('open')
+  return () => {
+    const at = entries.indexOf(entry)
+    if (at === -1) return
+    entries.splice(at, 1)
+    for (const e of entries) if (e.parent === entry) e.parent = entry.parent
+    // A popover taking itself out (Escape, a row chosen, its anchor toggled) is not the press that
+    // dismisses one, so it consumes nothing and must leave nothing to consume: only the outside
+    // `pointerdown` that closed an open popover arms the swallow (§9.20). Any swallow still pending
+    // from an earlier press ends here – whatever the registry held after this close would otherwise
+    // eat the first event on the next anchor – and the window listeners come off unless another
+    // popover is open (the design lead's ruling on W8-F7: the residue is the bug, not the rule).
+    endSwallow()
+    syncListeners()
+  }
+}
+
+/**
+ * Close every open popover: a frame dialog opening, a command that wants the chrome clear.
+ * Subscribers hear of it whether or not any was open (see `subscribePopovers`).
+ */
+export function closeAllPopovers(reason: DismissReason = 'all'): void {
+  if (entries.length) closeEntries([...entries], reason)
+  else notify(reason)
+}
+
+/** How many popovers are open (registered). */
+export function openPopoverCount(): number {
+  return entries.length
+}
+
+/**
+ * Whether `node` lies inside the popover on top – the last one opened, the one that has the
+ * window (§9.20). False while none is open, and for a node in a popover under the top one (the
+ * star bubble's row under its menulist's list). For chrome that yields to an open popover
+ * unless it is the popover's own: the tooltip (lib/tooltip.ts) names the bubble's controls
+ * while the bubble is up and nothing outside it.
+ */
+export function insideTopPopover(node: Node): boolean {
+  const top = entries[entries.length - 1]
+  return top !== undefined && contains(top, node)
+}
+
+// ---------------------------------------------------------------------------
+// The window listeners, on while any popover is open or a consumed press is being swallowed
+// ---------------------------------------------------------------------------
+
+let installed = false
+/** The press that dismissed a popover is being swallowed through to its `click`. */
+let swallowing = false
+/**
+ * A touch or a pen has been released and the press's `click` is still to come: the swallow waits
+ * for it (bounded by `TAP_CLICK_CEILING_MS`) instead of ending on the release's timer.
+ */
+let tapClickPending = false
+let swallowTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * How long after a touch or pen release the swallow waits for the press's `click` before giving
+ * it up as not coming. A mouse's click is dispatched in the same task as its `pointerup`, so a
+ * 0 ms timer armed at the release outlives it; a tap's click is the browser's gesture, dispatched
+ * from its gesture detector in a later task – Electron 44 (Chromium 152) measured for W8-F20:
+ * 0.3–1.2 ms after `pointerup` on an idle main thread, and after a 0 ms timer armed at
+ * `pointerup` in 39 of 40 taps; with the main thread busy (the popover's close re-rendering) it
+ * lands as soon as the thread frees, input ahead of a due timer. Nothing in Chromium's detector
+ * holds a tap's click longer than the double-tap window it waits out where a double tap could
+ * zoom (300 ms on Android, the platform's `ViewConfiguration`), and the chrome root's
+ * `touch-action: manipulation` closes that window anyway – the tap is confirmed at once. The
+ * ceiling is for a release that owes no click and sent no `pointercancel` – a finger that moved
+ * past the slop where nothing scrolls, a long press the platform turned into its own gesture –
+ * so a swallow never stays armed for a click that is not coming: a second, over three of those
+ * windows with room for a slow device (Android's tablet run saw the » chip's panel back 1.75 s
+ * after the tap on the emulator, its open animation included, and its local guard used the
+ * same second). Nothing legitimate is lost inside it: the next `pointerdown` ends the swallow
+ * first, and a keyboard's click passes through it.
+ */
+export const TAP_CLICK_CEILING_MS = 1000
+
+function endSwallow(): void {
+  swallowing = false
+  tapClickPending = false
+  if (swallowTimer !== null) clearTimeout(swallowTimer)
+  swallowTimer = null
+}
+
+function endSwallowSoon(): void {
+  if (swallowTimer !== null) clearTimeout(swallowTimer)
+  // A mouse's `click` (or `auxclick`, `contextmenu`) is dispatched with its release, before any
+  // timer: whatever the release did not produce is not coming. A cancelled pointer of any kind
+  // produces no click either.
+  swallowTimer = setTimeout(() => {
+    endSwallow()
+    syncListeners()
+  }, 0)
+}
+
+/**
+ * A touch or a pen released: its `click` is the tap gesture's, a task or more away. Keep
+ * swallowing until it has been swallowed, or until `TAP_CLICK_CEILING_MS` says it is not coming.
+ */
+function awaitTapClick(): void {
+  if (swallowTimer !== null) clearTimeout(swallowTimer)
+  tapClickPending = true
+  swallowTimer = setTimeout(() => {
+    endSwallow()
+    syncListeners()
+  }, TAP_CLICK_CEILING_MS)
+}
+
+const pointerTypeOf = (e: Event): string => (e as Partial<PointerEvent>).pointerType ?? ''
+/** A touch or a pen: the pointers whose click is the tap gesture's, not the release's. */
+const isTapPointer = (e: Event): boolean => {
+  const type = pointerTypeOf(e)
+  return type === 'touch' || type === 'pen'
+}
+const CLICKS = new Set(['click', 'auxclick', 'contextmenu'])
+/**
+ * Whether a click has a pointer behind it. Chromium's click is a `PointerEvent` naming its
+ * pointer; a keyboard's (Enter or Space on the focused control) or a script's `click()` has
+ * `pointerType` '' and `detail` 0 – nobody's remainder.
+ */
+const fromPointer = (e: Event): boolean =>
+  pointerTypeOf(e) !== '' || (e instanceof MouseEvent && e.detail > 0)
+
+function onPointerDown(e: PointerEvent): void {
+  // A new press: whatever the last consumed press did not produce is over.
+  endSwallow()
+  const target = e.target
+  if (!(target instanceof Node) || !entries.length) {
+    syncListeners()
+    return
+  }
+  const keep = new Set<Entry>()
+  for (const entry of entries) {
+    if (!contains(entry, target)) continue
+    keep.add(entry)
+    for (const a of ancestorsOf(entry)) keep.add(a)
+  }
+  const closing = entries.filter((entry) => !keep.has(entry))
+  if (!closing.length) return
+  // Where the focus goes: to the anchor that was pressed, or – when the focus was inside a
+  // closing popover – back to what opened the outermost closing popover it sits in (a list's
+  // trigger inside a bubble goes with the bubble; the star that opened the bubble stays).
+  const pressed = closing.find((entry) => anchorContains(entry, target))
+  const active = document.activeElement
+  let refocus: Element | null = pressed?.anchor?.() ?? null
+  if (!refocus && active) {
+    let holder = closing.find((entry) => contains(entry, active)) ?? null
+    while (holder?.parent && closing.includes(holder.parent)) holder = holder.parent
+    refocus = holder?.anchor?.() ?? null
+  }
+  // Swallowing before the registry empties keeps the listeners on for the rest of this press.
+  swallowing = true
+  closeEntries(closing, (entry) => (entry === pressed ? 'anchor' : 'outside'))
+  // A close handler that moved the focus itself (to another chip, to the page) has the last word.
+  const now = document.activeElement
+  const unmoved = now === active || !now || now === document.body
+  if (unmoved && refocus instanceof HTMLElement) refocus.focus({ preventScroll: true })
+  e.preventDefault()
+  e.stopPropagation()
+}
+
+/** The rest of a consumed press: none of it reaches what lies under the popover it dismissed. */
+function onSwallowed(e: Event): void {
+  if (!swallowing) return
+  const click = CLICKS.has(e.type)
+  // While the swallow waits for a tap's click, a click that is no pointer's – Enter or Space on
+  // a focused control, a script's `click()` – is not the press's remainder: it passes, and the
+  // wait goes on.
+  if (tapClickPending && click && !fromPointer(e)) return
+  e.preventDefault()
+  e.stopPropagation()
+  if (tapClickPending) {
+    // Waiting for the tap's click: only that click ends the wait (the next `pointerdown` and the
+    // ceiling aside) – another pointer's release or cancel is not this press's. Swallowed, the
+    // press is over, and the listeners come off unless a popover is open behind them.
+    if (click) {
+      endSwallow()
+      syncListeners()
+    }
+    return
+  }
+  // A mouse's click came with this release (or is not coming); a touch's or a pen's is still on
+  // its way from the gesture detector. No click follows a cancelled pointer of any kind – a
+  // finger that scrolled, a press the platform took.
+  if (e.type === 'pointerup' && isTapPointer(e)) awaitTapClick()
+  else if (e.type === 'pointerup' || e.type === 'pointercancel') endSwallowSoon()
+}
+
+function onScroll(e: Event): void {
+  if (!entries.length) return
+  // A wheel turned with Ctrl held is a zoom, not a scroll: the zoom bubble goes on zooming.
+  if (e.type === 'wheel' && 'ctrlKey' in e && e.ctrlKey === true) return
+  const target = e.target
+  if (target instanceof Node && entries.some((entry) => contains(entry, target))) return
+  closeAllPopovers('scroll')
+}
+
+function onResize(): void {
+  if (entries.length) closeAllPopovers('resize')
+}
+
+const SWALLOWED = [
+  'pointerup',
+  'pointercancel',
+  'mousedown',
+  'mouseup',
+  'click',
+  'auxclick',
+  'contextmenu'
+]
+
+/**
+ * The listeners are on while a popover is open, and stay on through the swallowed remainder of
+ * the press that closed the last one.
+ */
+function syncListeners(): void {
+  const wanted = entries.length > 0 || swallowing
+  if (wanted === installed || typeof window === 'undefined') return
+  installed = wanted
+  if (wanted) {
+    window.addEventListener('pointerdown', onPointerDown, true)
+    for (const type of SWALLOWED) window.addEventListener(type, onSwallowed, true)
+    window.addEventListener('scroll', onScroll, { capture: true, passive: true })
+    window.addEventListener('wheel', onScroll, { capture: true, passive: true })
+    window.addEventListener('resize', onResize)
+  } else {
+    window.removeEventListener('pointerdown', onPointerDown, true)
+    for (const type of SWALLOWED) window.removeEventListener(type, onSwallowed, true)
+    window.removeEventListener('scroll', onScroll, true)
+    window.removeEventListener('wheel', onScroll, true)
+    window.removeEventListener('resize', onResize)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The hook popovers register through
+// ---------------------------------------------------------------------------
+
+export interface LightDismissOptions {
+  /** What opened the popover (see `PopoverRegistration.anchor`). */
+  anchor?: RefObject<Element | null> | ElementGetter
+  /** Not open: nothing is registered (a phone sheet in place of the popover, a closed list). */
+  disabled?: boolean
+}
+
+/**
+ * Register the popover at `ref` for the chrome layer's light dismiss while it is mounted (and
+ * not `disabled`): `onDismiss` runs when a press outside it, a scroll, a resize, another popover
+ * opening or a frame dialog closes it, and the popover then unmounts itself. Registers once per
+ * mount; the latest `onDismiss` and `anchor` are used without re-registering.
+ */
+export function useLightDismiss(
+  ref: RefObject<Element | null>,
+  onDismiss: (reason: DismissReason) => void,
+  options: LightDismissOptions = {}
+): void {
+  const latest = useRef({ onDismiss, anchor: options.anchor })
+  useLayoutEffect(() => {
+    latest.current = { onDismiss, anchor: options.anchor }
+  })
+  const disabled = options.disabled ?? false
+  useEffect(() => {
+    if (disabled) return
+    return openPopover({
+      element: () => ref.current,
+      anchor: () => {
+        const anchor = latest.current.anchor
+        return typeof anchor === 'function' ? anchor() : (anchor?.current ?? null)
+      },
+      close: (reason) => latest.current.onDismiss(reason)
+    })
+  }, [disabled, ref])
+}

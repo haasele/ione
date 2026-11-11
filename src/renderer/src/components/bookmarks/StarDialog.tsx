@@ -1,0 +1,275 @@
+import type { JSX } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import type { BookmarkNode, Rect, UIState } from '@shared/types'
+import type { BookmarkTree } from '@shared/bookmarks'
+import { run } from '@renderer/lib/api'
+import {
+  ChromePortal,
+  POPOVER_WIDTH,
+  placePopover,
+  popoverStyle,
+  useLightDismiss,
+  viewportSize,
+  type DismissReason
+} from '@renderer/lib/portals'
+import { isPrivateTab } from '@renderer/lib/privateTabs'
+import { isPrivateWindow } from '@renderer/lib/selectors'
+import { starSeat, type StarSeat } from '@renderer/lib/starSeat'
+import { browserStore, closeBookmarkChrome } from '@renderer/lib/ui'
+import { V2Button, V2Field, V2FormField, V2TitleBlock } from '../extensions/v2'
+import { FolderField } from './FolderField'
+import { useScrolled, wrapTab } from './popover'
+import { useBookmarkTree } from './tree'
+import { useEscapeTrap } from './escape'
+
+export interface StarTarget {
+  tabId: string
+  nodeId: string
+  created: boolean
+  /**
+   * What the bubble hangs from: the star chip, or its seat at the pill's end with the star
+   * folded away, or the ⋯ with no pill on screen (`starSeat`); null when the request arrived
+   * with nothing measured, and the dialog measures the seat itself.
+   */
+  anchor: Rect | null
+  /** The address pill the chip sits in: the bubble's top edge is the pill's bottom edge. */
+  pill: Rect | null
+}
+
+/** The form width (§9.20): the bubble is a form – a field, a menulist and a footer. */
+const WIDTH = POPOVER_WIDTH.form
+const TITLE_ID = 'zen-bm-star-title'
+const DESCRIPTION_ID = 'zen-bm-star-description'
+const NAME_ID = 'zen-bm-star-name'
+const FOLDER_ID = 'zen-bm-star-folder'
+
+/**
+ * The bubble's first line for a bookmark a private tab made (bookmarks-43, §9.19): a private
+ * window files into the profile's store, as Chrome's Incognito does, and the bubble says so
+ * where Chrome's says only "Bookmark added" – the bookmark is never a private window's secret.
+ * The title keeps the bubble's own words ("Bookmark added") and adds the one fact the user must
+ * not miss; the line under it says the consequence – "your bookmarks", not the name of the
+ * folder standing in the menulist below.
+ */
+export const PRIVATE_STAR_TITLE = 'Bookmark added from a private window'
+export const PRIVATE_STAR_DESCRIPTION = 'It is kept with your bookmarks and shows in every window.'
+/** How long a bubble waits for the node its event names before giving up on it. */
+const ARRIVAL_GRACE_MS = 2000
+
+const close = (): void => closeBookmarkChrome({ starDialog: null })
+const starChip = (): HTMLElement | null => document.querySelector<HTMLElement>('[data-bm-star]')
+/** Escape or the star's own press: the bubble goes and the star takes the focus back (§9.22). */
+const closeToAnchor = (): void => {
+  closeBookmarkChrome({ starDialog: null }, { keepFocus: true })
+  starChip()?.focus({ preventScroll: true })
+}
+
+/**
+ * Chrome's star bubble: the page was bookmarked the moment the star was pressed; this names and
+ * files it. "Remove" takes the bookmark back; "Done", Escape, a click outside or the star itself
+ * keep it, with whatever name is in the field. The URL and a folder's rename are the Edit
+ * bookmark dialog's (the bar's and the manager's "Edit…"), as in Chrome's bubble.
+ *
+ * The `bookmark.star` event and the state push that carries a new node are separate messages
+ * from the main process and can arrive in either order, so the bubble waits for the node to show
+ * up rather than reading a missing one as removed; only a node that was there and went away
+ * (deleted elsewhere, sync) closes it, and one that never comes closes it after a grace period.
+ */
+export function StarDialog({
+  state,
+  star
+}: {
+  state: UIState
+  star: StarTarget
+}): JSX.Element | null {
+  const tree = useBookmarkTree(state)
+  const node = tree.get(star.nodeId)
+  const seen = useRef(node !== undefined)
+
+  useEffect(() => {
+    if (node) {
+      seen.current = true
+      return
+    }
+    if (seen.current) {
+      close()
+      return
+    }
+    const timer = window.setTimeout(close, ARRIVAL_GRACE_MS)
+    return () => window.clearTimeout(timer)
+  }, [node])
+
+  if (!node) return null
+  const tab = state.tabs[star.tabId]
+  const fromPrivate = isPrivateWindow(state) || Boolean(tab && isPrivateTab(tab))
+  return <StarBubble tree={tree} node={node} star={star} fromPrivate={fromPrivate} />
+}
+
+/**
+ * A desktop popover (v2 draft §9.20) at the form width, 400: its top border on the pill's
+ * bottom edge, end-aligned with the star (the star sits in the pill's trailing half), placed by
+ * `placePopover` (flip, slide, shrink, 8px inside the window), no taller than 60% of it; the
+ * popover chrome (`--v2-panel`, radius 8, `--v2-shadow-panel`, no arrow). Inside, a §9.23 title
+ * block – "Bookmark added" / "Edit bookmark" – over the form (§9.12): the Name field, focused
+ * and selected on open, and the folder menulist (§9.13, whose "Choose another folder…" swaps in
+ * the tree as rows), then the §9.11 footer at the 32 control height – Remove in the danger ink,
+ * then Done as the one primary, Chrome's order. It renders through the chrome layer
+ * (`ChromePortal`), never inside the frame, and the layer's light dismiss puts it away: a press
+ * anywhere else keeps the bookmark and closes it (the press goes no further), the star's own
+ * press closes it and hands it the focus, scroll and resize close it; Escape too returns the
+ * focus to the star (§9.22). A phone never opens it: its star flow is the toast with Edit and
+ * the editor sheet (`starredOnPhone`, `BookmarkEditSheet`; HB-19).
+ *
+ * Made from a private tab (`fromPrivate`, bookmarks-43) the title block's first line is
+ * `PRIVATE_STAR_TITLE` with a line under it saying where the bookmark went; the form is the
+ * same – Ctrl+D in a private window never files a page without saying so.
+ */
+function StarBubble({
+  tree,
+  node,
+  star,
+  fromPrivate
+}: {
+  tree: BookmarkTree
+  node: BookmarkNode
+  star: StarTarget
+  fromPrivate: boolean
+}): JSX.Element {
+  const [name, setName] = useState(node.title)
+  const [nested, setNested] = useState(false)
+  const nameRef = useRef<HTMLInputElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  const bodyRef = useRef<HTMLFormElement>(null)
+  const scrolled = useScrolled(bodyRef)
+  const removed = useRef(false)
+
+  useEscapeTrap(!nested, closeToAnchor)
+
+  useEffect(() => {
+    nameRef.current?.focus()
+    nameRef.current?.select()
+  }, [])
+
+  // Whatever closes the bubble, the name in the field is kept: a rename is committed as the
+  // bubble unmounts, unless the bookmark itself was removed (here or elsewhere).
+  const pending = useRef({ id: node.id, title: name, original: node.title })
+  useEffect(() => {
+    pending.current = { id: node.id, title: name, original: node.title }
+  }, [name, node])
+  useEffect(
+    () => () => {
+      const p = pending.current
+      if (removed.current) return
+      const title = p.title.trim()
+      const alive = (browserStore.get().state?.bookmarks ?? []).some((n) => n.id === p.id)
+      if (alive && title && title !== p.original) run('bookmark.update', { id: p.id, title })
+    },
+    []
+  )
+
+  // The chrome layer's light dismiss (§9.20 amended): a press anywhere else keeps the bookmark
+  // and puts the bubble away – the star's own press hands it the focus back, as Escape does –
+  // and so do a scroll, a resize and another popover opening. The folder field's list is the
+  // bubble's child popover (its anchor is inside), so a press in it leaves the bubble alone.
+  useLightDismiss(
+    panelRef,
+    (reason: DismissReason) => (reason === 'anchor' ? closeToAnchor() : close()),
+    { anchor: starChip }
+  )
+
+  // A page a private tab has just filed is named as such; an existing bookmark starred again
+  // there is edited, not saved anew, whichever window made it.
+  const privateSave = star.created && fromPrivate
+  const title = privateSave ? PRIVATE_STAR_TITLE : star.created ? 'Bookmark added' : 'Edit bookmark'
+  const remove = (): void => {
+    removed.current = true
+    run('bookmark.remove', { ids: [node.id] })
+    close()
+  }
+  const moveTo = (folderId: string): void => {
+    if (folderId !== node.parentId) run('bookmark.move', { ids: [node.id], parentId: folderId })
+  }
+
+  const onKeyDown = (e: React.KeyboardEvent): void => {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      e.stopPropagation()
+      return
+    }
+    wrapTab(e, panelRef.current)
+  }
+
+  const body = (
+    <>
+      <V2TitleBlock
+        id={TITLE_ID}
+        title={title}
+        description={privateSave ? PRIVATE_STAR_DESCRIPTION : undefined}
+        descriptionId={privateSave ? DESCRIPTION_ID : undefined}
+        scrolled={scrolled}
+      />
+      <form
+        ref={bodyRef}
+        className="zen-bm-popover-body zen-bm-form"
+        onSubmit={(e) => {
+          e.preventDefault()
+          close()
+        }}
+      >
+        <V2FormField id={NAME_ID} label="Name">
+          {(field) => (
+            <V2Field
+              {...field}
+              ref={nameRef}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              spellCheck={false}
+              autoComplete="off"
+            />
+          )}
+        </V2FormField>
+        <V2FormField id={FOLDER_ID} label="Folder">
+          {(field) => (
+            <FolderField
+              id={field.id}
+              tree={tree}
+              value={node.parentId ?? ''}
+              onChange={moveTo}
+              onNestedChange={setNested}
+            />
+          )}
+        </V2FormField>
+        <div className="zen-bm-footer justify-end">
+          <V2Button variant="danger" onClick={remove}>
+            Remove
+          </V2Button>
+          <V2Button type="submit" variant="primary">
+            Done
+          </V2Button>
+        </div>
+      </form>
+    </>
+  )
+
+  // Hung from the star, or from the star's seat at the pill's end with the star folded away – a
+  // request that arrived with no anchor measured takes the seat as it stands now (`starSeat`).
+  const seat: StarSeat = star.anchor ? { anchor: star.anchor, pill: star.pill } : starSeat()
+  const box = placePopover(seat.anchor, seat.pill ?? seat.anchor, viewportSize(), WIDTH)
+
+  return (
+    <ChromePortal>
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-labelledby={TITLE_ID}
+        aria-describedby={privateSave ? DESCRIPTION_ID : undefined}
+        data-private-save={privateSave || undefined}
+        className="zen-v2 zen-animate-pop zen-bm-popover fixed z-[70] flex flex-col"
+        style={popoverStyle(box)}
+        onKeyDown={onKeyDown}
+      >
+        {body}
+      </div>
+    </ChromePortal>
+  )
+}
