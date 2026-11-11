@@ -184,17 +184,18 @@ function rgba(c: { r: number; g: number; b: number }, alpha: number): string {
 
 /** The gradient for a live icon address, re-read when the address changes. */
 export function useFaviconGradient(src: string | null | undefined): FaviconGradient | null {
-  const [gradient, setGradient] = useState<FaviconGradient | null>(null)
+  const [read, setRead] = useState<{ src: string; gradient: FaviconGradient | null } | null>(null)
   useEffect(() => {
-    let live = true
-    setGradient(null)
     if (!src) return undefined
-    void faviconGradient(src).then((next) => {
-      if (live) setGradient(next)
+    let live = true
+    void faviconGradient(src).then((gradient) => {
+      if (live) setRead({ src, gradient })
     })
     return () => {
       live = false
     }
   }, [src])
-  return gradient
+  // A result from the previous address is not this address's gradient; null until this one lands.
+  if (!read || read.src !== src) return null
+  return read.gradient
 }

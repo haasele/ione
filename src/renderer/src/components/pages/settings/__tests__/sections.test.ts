@@ -2977,7 +2977,7 @@ describe('the section model', () => {
     if (r.kind !== 'value') throw new Error('not a value row')
     expect(r.label).toBe('Window transparency')
     expect(r.description).toBe(
-      'Let the compositor show what is behind the window. Applies to new windows.'
+      'Let the compositor show what is behind the window. Applies to new windows; restart Ione to apply it to the main window.'
     )
     expect(r.options.map((o) => o.label)).toEqual(['Off', 'Translucent', 'Transparent'])
     expect(r.value).toBe('translucent')

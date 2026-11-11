@@ -191,7 +191,7 @@ function state(
   capabilities: HostCapabilities = DESKTOP,
   platform: UIState['platform'] = 'linux',
   settings: Partial<Settings> = {},
-  url = 'zen://settings'
+  url = 'zen://settings/look'
 ): UIState {
   const settingsTab = tab(url)
   return {
@@ -400,15 +400,60 @@ describe('the two-pane Settings tab (§10.5)', () => {
     expect(items).toContain('Compact Mode')
   })
 
-  it('shows the first category with its title first in the pane when the URL names none', () => {
-    const markup = render(state())
+  it('shows the home with every category card when the URL names no section', () => {
+    const markup = render(state(DESKTOP, 'linux', {}, 'zen://settings'))
+    expect(markup).toContain('data-layout="two-pane"')
+    expect(markup).toContain('zen-settings-home')
+    expect(markup).toContain('All settings')
+    expect(markup).toContain('zen-settings-category-grid')
     expect(markup).toContain('data-section="look"')
-    expect(markup).toMatch(
-      /<section[^>]*class="zen-settings-pane zen-animate-fade"[^>]*>\s*<h2 id="zen-settings-section-title" class="zen-settings-section-title">Look and Feel<\/h2>/
+    expect(markup).toContain('Theme, toolbar and how pages look.')
+    // Nothing is marked current on the home: the cards are the overview, not a section.
+    expect(markup).not.toMatch(/aria-current="page"/)
+  })
+
+  it('says that some changes need a restart and offers the button', () => {
+    const markup = render(state())
+    expect(markup).toContain('Some changes need a restart')
+    expect(markup).toContain('Window frame, transparency and startup switches apply after Ione restarts.')
+    expect(markup).toContain('Restart Ione')
+  })
+
+  it('makes the restart note loud while startup changes are pending', () => {
+    const s = state()
+    s.resources = { ...s.resources, restartRequired: true }
+    const markup = render(s)
+    expect(markup).toContain('Startup changes are waiting')
+    expect(markup).toContain('Your process switches take effect the next time Ione starts.')
+  })
+
+  it('restarts the app from the note', () => {
+    const el = mountPage(state())
+    const button = el.querySelector<HTMLButtonElement>('.zen-settings-restart-button')
+    expect(button).not.toBeNull()
+    act(() => button!.click())
+    expect(invoke).toHaveBeenCalledWith('resources.relaunch', undefined)
+  })
+
+  it('draws each home card with its squircle, description and submenu items', () => {
+    const markup = render(state(DESKTOP, 'linux', {}, 'zen://settings'))
+    expect(markup).toContain('class="zen-settings-category-squircle"')
+    expect(markup).toContain('Theme, toolbar and how pages look.')
+    expect(markup).toContain('Theme · Toolbar · Layout')
+  })
+
+  it('opens a section from a home card', () => {
+    const el = mountPage(state(DESKTOP, 'linux', {}, 'zen://settings'))
+    const card = el.querySelector<HTMLButtonElement>(
+      '.zen-settings-category-card[data-section="privacy"]'
     )
-    const active = markup.match(/<button[^>]*aria-current="page"[^>]*>/g) ?? []
-    expect(active).toHaveLength(1)
-    expect(active[0]).toContain('data-section="look"')
+    expect(card).not.toBeNull()
+    act(() => card!.click())
+    expect(invoke).toHaveBeenCalledWith('page.navigate', {
+      tabId: 'settings',
+      section: 'privacy',
+      replace: true
+    })
   })
 
   it("opens the section the tab's URL names and marks it in the nav", () => {
@@ -425,14 +470,13 @@ describe('the two-pane Settings tab (§10.5)', () => {
     ).not.toBeNull()
   })
 
-  it('falls back to the first category for a section this host does not have', () => {
+  it('shows the home for a section this host does not have', () => {
     // A desktop without a speech engine has no Accessibility (neither page controls nor Read aloud).
     const markup = render(
       state({ ...DESKTOP, readAloud: false }, 'linux', {}, 'zen://settings/accessibility')
     )
-    expect(markup).toMatch(
-      /aria-current="page"[^>]*data-section="look"|data-section="look"[^>]*aria-current="page"/
-    )
+    expect(markup).toContain('zen-settings-home')
+    expect(markup).not.toContain('data-section="accessibility"')
     expect(markup).not.toContain('Default zoom')
     expect(markup).not.toContain('Read aloud')
   })
@@ -719,7 +763,7 @@ describe('Find in Settings (§10.5)', () => {
 describe('below the two-pane width', () => {
   it('shows the phone landing and drill-in (§10.2) instead', () => {
     viewport(TWO_PANE_MIN_WIDTH - 1, false)
-    const markup = render(state(ANDROID, 'android'))
+    const markup = render(state(ANDROID, 'android', {}, 'zen://settings'))
     expect(markup).toContain('data-layout="phone"')
     expect(markup).toContain('zen-settings-landing')
     expect(markup).not.toContain('data-testid="settings-page"')

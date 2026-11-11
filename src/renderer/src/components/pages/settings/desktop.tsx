@@ -22,6 +22,8 @@ import { useDictionaryWords } from '@renderer/lib/spellcheckWords'
 import { syncSetupStore } from '@renderer/lib/syncSetup'
 import { openBarEditor, openOverlay } from '@renderer/lib/ui'
 import { AddressReveal } from './AddressReveal'
+import { CategoryCard, RestartNotice } from './categories'
+import { categoryDescription } from './categoryCopy'
 import { DialogStack } from './dialogs'
 import { useFontsDraft } from './fontsDraft'
 import { SECTION_GLYPH, SECTION_GLYPHS } from './glyphs'
@@ -43,8 +45,8 @@ const settingsUpdate = (patch: Partial<Settings>): void => run('settings.update'
  * groups of rows in the desktop vocabulary (`rows.tsx`: 32 px rows, menulists, checkboxes,
  * inline fields, buttons), the text column at most 664 wide inside 32 px side margins.
  *
- * There is no landing on the desktop: the tab's URL without a section shows the first category;
- * the nav switches categories through `page.navigate` with `replace: true`, so the URL follows
+ * The tab's URL without a section shows the home: the category cards under a rounded find field.
+ * The nav switches categories through `page.navigate` with `replace: true`, so the URL follows
  * (`ione://settings/<section>`) without a history entry and back leaves Settings, as Firefox's
  * `about:preferences#category` does. A link that asked for a section opened it with a history
  * entry of its own, which back and forward step through. The rows' dialogs (`dialogs.tsx`)
@@ -86,7 +88,7 @@ export function DesktopSettings({
   /** Land a section on one of its groups (`SectionContext.reveal`; the page's `?group=`). */
   land: (section: string, groupId: string) => void
 }): JSX.Element {
-  const shown = current ?? sections[0] ?? null
+  const shown = current
   const sectionId = shown?.id ?? null
   const root = useRef<HTMLDivElement>(null)
   const sheets = useSheetStack()
@@ -218,6 +220,10 @@ export function DesktopSettings({
     setQuery('')
     run('page.navigate', { tabId: tab.id, section: id, replace: true })
   }
+  const home = (): void => {
+    setQuery('')
+    run('page.navigate', { tabId: tab.id, section: null, replace: true })
+  }
 
   return (
     <div
@@ -228,8 +234,15 @@ export function DesktopSettings({
     >
       <nav className="zen-settings-nav" aria-label="Settings categories">
         <div className="zen-settings-nav-title">
-          <SettingsGlyph className="zen-settings-nav-title-glyph" aria-hidden="true" />
-          <h1>{page.title}</h1>
+          <button
+            type="button"
+            className="zen-settings-nav-title-home"
+            aria-label="Settings home"
+            onClick={home}
+          >
+            <SettingsGlyph className="zen-settings-nav-title-glyph" aria-hidden="true" />
+            <h1>{page.title}</h1>
+          </button>
         </div>
         <div className="zen-settings-nav-list">
           {landingRuns(page, sections).map((sectionsInRun, index) => (
@@ -247,9 +260,17 @@ export function DesktopSettings({
           ))}
         </div>
       </nav>
-      {shown && model && (
+      {shown && model ? (
         // Keyed on the section: a new category starts at the top of a fresh column.
-        <ContentColumn key={shown.id} section={shown} query={query} onQuery={setQuery} field={find}>
+        <ContentColumn
+          key={shown.id}
+          section={shown}
+          query={query}
+          onQuery={setQuery}
+          field={find}
+          restartAvailable={state.capabilities.resourceGovernor}
+          restartPending={state.resources.restartRequired}
+        >
           {searching ? (
             <FindResults section={shown} term={term} hits={hits} ctx={sheets.ctx} />
           ) : (
@@ -261,6 +282,19 @@ export function DesktopSettings({
             />
           )}
         </ContentColumn>
+      ) : (
+        <HomeColumn
+          sections={sections}
+          query={query}
+          onQuery={setQuery}
+          field={find}
+          term={term}
+          hits={hits}
+          ctx={sheets.ctx}
+          onOpen={open}
+          restartAvailable={state.capabilities.resourceGovernor}
+          restartPending={state.resources.restartRequired}
+        />
       )}
       {formFactor === 'phone' ? (
         // The two panes inside the phone shell (a phone in landscape): the frame's dialog host
@@ -287,6 +321,74 @@ export function DesktopSettings({
 }
 
 /**
+ * The Settings home where two panes fit (the tab's address without a section): the same big
+ * category cards as the phone landing, under a rounded find field. The nav keeps the quick
+ * category switch; the cards are the readable overview for a first visit or a user who does
+ * not know which category holds a setting.
+ */
+function HomeColumn({
+  sections,
+  query,
+  onQuery,
+  field,
+  term,
+  hits,
+  ctx,
+  onOpen,
+  restartAvailable,
+  restartPending
+}: {
+  sections: readonly InternalPageSection[]
+  query: string
+  onQuery(query: string): void
+  field: RefObject<HTMLInputElement | null>
+  term: string
+  hits: readonly SearchHit[]
+  ctx: RowContext
+  onOpen(sectionId: string): void
+  restartAvailable: boolean
+  restartPending: boolean
+}): JSX.Element {
+  return (
+    <div className="zen-settings-content zen-settings-home">
+      <FindField query={query} onQuery={onQuery} field={field} large />
+      <section className="zen-settings-pane zen-settings-home-pane" aria-label="Settings home">
+        <h2 className="zen-settings-section-title">All settings</h2>
+        <p className="zen-settings-home-intro">
+          Browse a category or search across every setting.
+        </p>
+        <RestartNotice available={restartAvailable} pending={restartPending} />
+        {term ? (
+          hits.length === 0 ? (
+            <p className="zen-settings-empty zen-settings-empty-page" role="status">
+              No settings match “{term}”
+            </p>
+          ) : (
+            <div className="zen-settings-results" aria-label="Matching settings">
+              {hits.map((hit) => (
+                <RowView
+                  key={`${hit.section.id}:${hit.row.id}`}
+                  row={hit.row}
+                  ctx={ctx}
+                  caption={hit.caption}
+                  variant="desktop"
+                />
+              ))}
+            </div>
+          )
+        ) : (
+          <div className="zen-settings-category-grid zen-settings-home-grid">
+            {sections.map((section) => (
+              <CategoryCard key={section.id} section={section} onOpen={onOpen} />
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+/**
  * The content column (§10.5): the "Find in Settings" field first, sticky at the column's top
  * with §9.7's hairline once the column has scrolled under it; then the pane – the section's
  * 22/600 title as its first element, and its body or the search's results. The column is keyed
@@ -297,12 +399,16 @@ function ContentColumn({
   query,
   onQuery,
   field,
+  restartAvailable,
+  restartPending,
   children
 }: {
   section: InternalPageSection
   query: string
   onQuery(query: string): void
   field: RefObject<HTMLInputElement | null>
+  restartAvailable: boolean
+  restartPending: boolean
   children: ReactNode
 }): JSX.Element {
   const [scrolled, setScrolled] = useState(false)
@@ -320,6 +426,7 @@ function ContentColumn({
         <h2 id="zen-settings-section-title" className="zen-settings-section-title">
           {section.label}
         </h2>
+        <RestartNotice available={restartAvailable} pending={restartPending} compact />
         {children}
       </section>
     </div>
@@ -334,15 +441,17 @@ function ContentColumn({
 function FindField({
   query,
   onQuery,
-  field
+  field,
+  large = false
 }: {
   query: string
   onQuery(query: string): void
   field: RefObject<HTMLInputElement | null>
+  large?: boolean
 }): JSX.Element {
   return (
-    <div className="zen-settings-find">
-      <div className="zen-settings-search">
+    <div className="zen-settings-find" data-large={large || undefined}>
+      <div className="zen-settings-search" data-large={large || undefined}>
         <Search className="zen-settings-search-glyph" aria-hidden="true" />
         <input
           ref={field}
@@ -472,8 +581,13 @@ function NavItem({
       aria-current={active ? 'page' : undefined}
       onClick={() => onOpen(section.id)}
     >
-      <Glyph className="zen-settings-nav-item-glyph" aria-hidden="true" />
-      <span className="zen-settings-nav-item-label">{section.label}</span>
+      <span className="zen-settings-nav-item-squircle" aria-hidden="true">
+        <Glyph className="zen-settings-nav-item-glyph" />
+      </span>
+      <span className="zen-settings-nav-item-copy">
+        <span className="zen-settings-nav-item-label">{section.label}</span>
+        <span className="zen-settings-nav-item-description">{categoryDescription(section)}</span>
+      </span>
     </button>
   )
 }

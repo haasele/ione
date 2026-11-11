@@ -29,11 +29,11 @@ import { syncSetupStore } from '@renderer/lib/syncSetup'
 import { openBarEditor, openOverlay } from '@renderer/lib/ui'
 import { TWO_PANE_MIN_WIDTH } from '../PageFrame'
 import { AddLanguagePage } from './AddLanguagePage'
+import { CategoryCard, RestartNotice } from './categories'
 import { AddressReveal } from './AddressReveal'
 import { DesktopSettings } from './desktop'
 import { DrillInBackContext } from './drillIn'
 import { useFontsDraft } from './fontsDraft'
-import { SECTION_GLYPH, SECTION_GLYPHS } from './glyphs'
 import { findRow, searchRows, type SectionModel } from './model'
 import { GroupList, RowView, type RowContext } from './rows'
 import { buildSection, buildSections, type SectionContext } from './sections'
@@ -45,8 +45,8 @@ import { useSheetStack } from './useSheetStack'
  * The Settings page inside its tab (`zen://settings[/<section>[/<page>]]`, design language v2
  * §10).
  *
- * Phone (§10.2): a landing – title block, "Find in Settings", the category list with Zen's two
- * hairlines – and, when the tab's URL names a section, a drill-in pane over it: 56 px bar header
+ * Phone (§10.2): a landing – title block, the rounded "Find in Settings" field, the category
+ * cards – and, when the tab's URL names a section, a drill-in pane over it: 56 px bar header
  * with the back chevron, then the section's groups of rows. The landing stays mounted (inert)
  * beneath the drill-in, so the predictive back gesture slides the pane off it; the chevron, the
  * bottom bar's back and the system back are all `tab.back`. A section's own drill-in page
@@ -409,6 +409,8 @@ function PhoneSettings({
         ctx={rowCtx}
         inert={current !== null}
         findRequest={findRequest}
+        restartAvailable={state.capabilities.resourceGovernor}
+        restartPending={state.resources.restartRequired}
       />
       {current && models[0] && (
         <DrillIn
@@ -420,6 +422,11 @@ function PhoneSettings({
           inert={Subpage !== undefined}
         >
           {/* The bar's title is the page's h1; the groups follow it at h2 (heading-order). */}
+          <RestartNotice
+            available={state.capabilities.resourceGovernor}
+            pending={state.resources.restartRequired}
+            compact
+          />
           <GroupList
             groups={models[0].groups}
             ctx={rowCtx}
@@ -466,7 +473,9 @@ function Landing({
   onOpen,
   ctx,
   inert,
-  findRequest
+  findRequest,
+  restartAvailable,
+  restartPending
 }: {
   page: InternalPageDefinition
   sections: readonly InternalPageSection[]
@@ -478,6 +487,8 @@ function Landing({
   inert: boolean
   /** Incremented for each "Find in Settings" request the field is to take the focus for. */
   findRequest: number
+  restartAvailable: boolean
+  restartPending: boolean
 }): JSX.Element {
   const input = useRef<HTMLInputElement>(null)
   const term = query.trim()
@@ -495,7 +506,7 @@ function Landing({
     <div className="zen-settings-landing" inert={inert || undefined}>
       <div className="zen-settings-scroll">
         <h1 className="zen-settings-page-title">{page.title}</h1>
-        <div className="zen-settings-search">
+        <div className="zen-settings-search zen-settings-search-large" data-large>
           <Search className="zen-settings-search-glyph" aria-hidden="true" />
           <input
             ref={input}
@@ -532,6 +543,7 @@ function Landing({
             </button>
           )}
         </div>
+        <RestartNotice available={restartAvailable} pending={restartPending} />
         {term ? (
           hits.length === 0 ? (
             <p className="zen-settings-empty zen-settings-empty-page" role="status">
@@ -554,37 +566,17 @@ function Landing({
             {landingRuns(page, sections).map((sectionsInRun, index) => (
               <Fragment key={sectionsInRun[0]?.id ?? index}>
                 {index > 0 && <hr className="zen-settings-hairline" />}
-                {sectionsInRun.map((section) => (
-                  <CategoryRow key={section.id} section={section} onOpen={onOpen} />
-                ))}
+                <div className="zen-settings-category-grid">
+                  {sectionsInRun.map((section) => (
+                    <CategoryCard key={section.id} section={section} onOpen={onOpen} />
+                  ))}
+                </div>
               </Fragment>
             ))}
           </nav>
         )}
       </div>
     </div>
-  )
-}
-
-/** One category (§10.2): 44 tall, the 20 px glyph at 16, the Title Case label, nothing else. */
-function CategoryRow({
-  section,
-  onOpen
-}: {
-  section: InternalPageSection
-  onOpen(sectionId: string): void
-}): JSX.Element {
-  const Glyph = SECTION_GLYPHS[section.id] ?? SECTION_GLYPH
-  return (
-    <button
-      type="button"
-      className="zen-settings-category zen-v2-row"
-      data-section={section.id}
-      onClick={() => onOpen(section.id)}
-    >
-      <Glyph className="zen-settings-category-glyph" aria-hidden="true" />
-      <span className="zen-settings-category-label">{section.label}</span>
-    </button>
   )
 }
 

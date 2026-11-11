@@ -13953,6 +13953,334 @@
 }
 
 /* ---------------------------------------------------------------------------
+ * Settings home (the modern landing, both layouts): a rounded find field, big category cards
+ * whose Lucide glyph sits in its own squircle, and the restart note. The cards are the main
+ * page's buttons; the nav keeps the quick switch on the desktop.
+ * ------------------------------------------------------------------------- */
+.zen-settings-search[data-large] {
+  margin: 0 20px 20px;
+}
+.zen-settings-search[data-large] .zen-settings-search-field {
+  height: 52px;
+  padding-left: calc(20px + 20px + 10px);
+  padding-right: 52px;
+  border: 1px solid var(--v2-card-border);
+  border-radius: 26px;
+  background: var(--v2-card);
+  font-size: var(--v2-font-heading);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.03);
+}
+.zen-settings-search[data-large] .zen-settings-search-glyph {
+  left: 20px;
+  width: 20px;
+  height: 20px;
+}
+.zen-settings-search[data-large] .zen-settings-search-clear {
+  right: 4px;
+}
+.zen-settings-home .zen-settings-find {
+  padding: 20px 20px 0;
+}
+.zen-settings-home .zen-settings-find > .zen-settings-search {
+  max-width: 760px;
+  margin-right: auto;
+  margin-left: auto;
+}
+.zen-settings-home-pane {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 8px 20px 48px;
+}
+.zen-settings-home .zen-settings-section-title {
+  margin-top: 8px;
+  font-size: 28px;
+  letter-spacing: -0.02em;
+}
+.zen-settings-home-intro {
+  margin: 0 0 20px;
+  padding: 0 16px;
+  color: var(--v2-text-deemphasized);
+  font-size: var(--v2-font-body);
+  line-height: var(--v2-line-body);
+}
+.zen-settings-category-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 12px;
+  padding: 0 16px;
+}
+.zen-settings-home-grid {
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  padding: 0;
+}
+.zen-settings-category-card {
+  display: flex;
+  min-width: 0;
+  min-height: 116px;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--v2-card-border);
+  border-radius: 20px;
+  background: var(--v2-card);
+  color: var(--v2-text);
+  text-align: left;
+  transition:
+    background var(--zen-motion-state) var(--zen-ease),
+    border-color var(--zen-motion-state) var(--zen-ease),
+    transform var(--zen-motion-state) var(--zen-ease);
+}
+:where(:root[data-hover='hover']) .zen-settings-category-card:hover {
+  border-color: color-mix(in srgb, var(--v2-accent) 35%, var(--v2-card-border));
+  background: color-mix(in srgb, var(--v2-accent) 5%, var(--v2-card));
+}
+.zen-settings-category-card:active {
+  transform: scale(0.985);
+}
+.zen-settings-category-squircle {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  flex-shrink: 0;
+  place-items: center;
+  border-radius: 17px;
+  background: color-mix(in srgb, var(--v2-accent) 14%, var(--v2-card));
+  color: var(--v2-accent);
+}
+.zen-settings-category-squircle > svg {
+  width: 23px;
+  height: 23px;
+  stroke-width: 1.8;
+}
+.zen-settings-category-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+}
+.zen-settings-category-title {
+  overflow: hidden;
+  font-size: var(--v2-font-heading);
+  font-weight: var(--v2-weight-heading);
+  line-height: var(--v2-line-heading);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.zen-settings-category-description {
+  color: var(--v2-text-deemphasized);
+  font-size: var(--v2-font-small);
+  line-height: var(--v2-line-small);
+}
+.zen-settings-category-items {
+  margin-top: 4px;
+  color: color-mix(in srgb, var(--v2-accent) 72%, var(--v2-text-deemphasized));
+  font-size: 12px;
+  line-height: 16px;
+  white-space: normal;
+}
+.zen-settings-category-chevron {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  align-self: center;
+  color: var(--v2-text-deemphasized);
+  opacity: 0.55;
+  stroke-width: 1.8;
+}
+.zen-settings-restart {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 20px 8px;
+  padding: 14px;
+  border: 1px solid var(--v2-card-border);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--v2-card) 88%, var(--v2-accent));
+}
+.zen-settings-restart[data-pending] {
+  border-color: color-mix(in srgb, var(--v2-accent) 45%, var(--v2-card-border));
+}
+.zen-settings-restart-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  place-items: center;
+  border-radius: 13px;
+  background: color-mix(in srgb, var(--v2-accent) 13%, transparent);
+  color: var(--v2-accent);
+}
+.zen-settings-restart-icon > svg {
+  width: 19px;
+  height: 19px;
+  stroke-width: 1.8;
+}
+.zen-settings-restart-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+.zen-settings-restart-title {
+  font-size: var(--v2-font-body);
+  font-weight: var(--v2-weight-heading);
+  line-height: var(--v2-line-body);
+}
+.zen-settings-restart-description {
+  color: var(--v2-text-deemphasized);
+  font-size: var(--v2-font-small);
+  line-height: var(--v2-line-small);
+}
+.zen-settings-restart-button {
+  flex-shrink: 0;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--v2-accent);
+  color: var(--v2-on-accent);
+  font-size: var(--v2-font-small);
+  font-weight: var(--v2-weight-button);
+}
+.zen-settings-restart-button:hover {
+  background: color-mix(in srgb, var(--v2-on-accent) 10%, var(--v2-accent));
+}
+
+/* The desktop nav's own cards: the glyph squircle and a description under the category. */
+.zen-settings-nav {
+  width: 280px;
+}
+.zen-settings-nav-item {
+  height: auto;
+  min-height: 56px;
+  gap: 12px;
+  padding: 7px 16px;
+}
+.zen-settings-nav-item-squircle {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  place-items: center;
+  border-radius: 13px;
+  background: var(--v2-fill);
+  color: var(--v2-text);
+  transition: background var(--zen-motion-state) var(--zen-ease);
+}
+.zen-settings-nav-item[aria-current='page'] .zen-settings-nav-item-squircle {
+  background: color-mix(in srgb, var(--v2-accent) 16%, transparent);
+  color: var(--v2-accent);
+}
+.zen-settings-nav-item-squircle > svg {
+  width: 19px;
+  height: 19px;
+  stroke-width: 1.8;
+}
+.zen-settings-nav-item-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+}
+.zen-settings-nav-item-description {
+  overflow: hidden;
+  color: var(--v2-text-deemphasized);
+  font-size: 11.5px;
+  line-height: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.zen-settings-nav > .zen-settings-restart {
+  margin: 16px 12px 0;
+  padding: 12px;
+  border-radius: 16px;
+}
+.zen-settings-nav > .zen-settings-restart .zen-settings-restart-description {
+  display: none;
+}
+.zen-settings-nav > .zen-settings-restart .zen-settings-restart-button {
+  padding: 7px 10px;
+}
+
+@media (max-width: 720px) {
+  .zen-settings-home .zen-settings-section-title,
+  .zen-settings-home-intro {
+    padding-right: 0;
+    padding-left: 0;
+  }
+  .zen-settings-category-grid,
+  .zen-settings-home-grid {
+    grid-template-columns: 1fr;
+    padding: 0;
+  }
+  .zen-settings-category-card {
+    min-height: 100px;
+  }
+  .zen-settings-restart {
+    flex-wrap: wrap;
+    margin-right: 16px;
+    margin-left: 16px;
+  }
+  .zen-settings-restart-button {
+    width: 100%;
+  }
+}
+
+/* The section's slice of the restart note: one line and the button, without the home's prose. */
+.zen-settings-restart[data-compact] {
+  margin: 0 16px 16px;
+  padding: 10px 12px;
+  border-radius: 14px;
+}
+.zen-settings-restart[data-compact] .zen-settings-restart-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 11px;
+}
+.zen-settings-restart[data-compact] .zen-settings-restart-icon > svg {
+  width: 16px;
+  height: 16px;
+}
+.zen-settings-restart[data-compact] .zen-settings-restart-title {
+  font-size: var(--v2-font-small);
+  line-height: var(--v2-line-small);
+}
+.zen-settings-restart[data-compact] .zen-settings-restart-description {
+  display: none;
+}
+.zen-settings-restart[data-compact] .zen-settings-restart-button {
+  padding: 6px 12px;
+}
+
+/* The nav title is the way home from a category; keep its gear-and-title shape. */
+.zen-settings-nav-title-home {
+  display: flex;
+  border: 0;
+  padding: 0;
+  background: none;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: var(--v2-text);
+  text-align: left;
+}
+.zen-settings-nav-title-home > h1 {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--v2-font-title);
+  font-weight: var(--v2-weight-heading);
+  line-height: var(--v2-line-title);
+  letter-spacing: -0.01em;
+}
+.zen-settings-nav-title-home:hover .zen-settings-nav-title-glyph {
+  color: var(--v2-accent);
+}
+
+/* ---------------------------------------------------------------------------
  * List pages as chrome page tabs – History, the bookmarks manager, Downloads (design language
  * v2 §10.1, `pages/PageFrame.tsx`): the page fills the content frame on `--v2-page`; its column
  * scrolls under a sticky header – the 22/600 title block (§9.26) with the page's actions in its

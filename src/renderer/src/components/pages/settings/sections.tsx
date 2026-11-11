@@ -777,7 +777,7 @@ function lookSection({
                 id: 'native-window-controls',
                 label: 'Use system window controls',
                 description:
-                  'New windows get your desktop’s own frame and buttons. Compositors without server-side decorations (niri, Hyprland) show none; their own shortcuts manage the window.',
+                  'New windows get your desktop’s own frame and buttons; restart Ione to apply it to the main window. Compositors without server-side decorations (niri, Hyprland) show none; their own shortcuts manage the window.',
                 keywords: ['titlebar', 'title bar', 'window buttons', 'decorations', 'wayland', 'hyprland', 'niri', 'minimise', 'minimize', 'close'],
                 checked: s.nativeWindowControls,
                 onChange: (v: boolean) => set({ nativeWindowControls: v })
@@ -822,7 +822,7 @@ function lookSection({
       kind: 'switch',
       id: 'window-material',
       label: 'Use Windows transparency effects',
-      description: 'Let the desktop show through the window frame (Mica). Applies to new windows.',
+      description: 'Let the desktop show through the window frame (Mica). Applies to new windows; restart Ione to apply it to the main window.',
       keywords: ['mica', 'acrylic', 'transparent'],
       checked: s.windowMaterial === 'mica',
       onChange: (v) => set({ windowMaterial: v ? 'mica' : 'none' })
@@ -836,7 +836,7 @@ function lookSection({
       choice<WindowTransparency>({
         id: 'window-transparency',
         label: 'Window transparency',
-        description: 'Let the compositor show what is behind the window. Applies to new windows.',
+        description: 'Let the compositor show what is behind the window. Applies to new windows; restart Ione to apply it to the main window.',
         keywords: [
           'transparent',
           'translucent',
