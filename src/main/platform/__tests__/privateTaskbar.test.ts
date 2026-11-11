@@ -36,10 +36,10 @@ const PRIVATE_ICO =
 describe('the private windows’ taskbar group', () => {
   it('is a second AppUserModelID: the app’s, suffixed', () => {
     expect(PRIVATE_APP_USER_MODEL_ID).toBe(`${APP_USER_MODEL_ID}.private`)
-    expect(PRIVATE_APP_USER_MODEL_ID).toBe('io.github.benitbuhner.ione.private')
+    expect(PRIVATE_APP_USER_MODEL_ID).toBe('dev.haasele.ione.private')
     expect(WINDOWS_PRIVATE_APP_ID_KEY).toBe(windowsAppIdKey(PRIVATE_APP_USER_MODEL_ID))
     expect(WINDOWS_PRIVATE_APP_ID_KEY).toBe(
-      'HKCU\\Software\\Classes\\AppUserModelId\\io.github.benitbuhner.ione.private'
+      'HKCU\\Software\\Classes\\AppUserModelId\\dev.haasele.ione.private'
     )
   })
 

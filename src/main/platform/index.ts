@@ -374,7 +374,7 @@ export class ElectronPlatform implements Platform {
       holdBackgroundWork: options.holdBackgroundWork === true,
       spawnWorker: () => createBackgroundWorker({})
     })
-    this.profileDir = join(userDataDir, 'zen')
+    this.profileDir = join(userDataDir, 'ione')
     this.io = new FileStoreIO(this.profileDir)
     this.secrets = new SafeStorageSecrets(this.io)
     this.agentSkills = new SkillInstaller({ version: this.info.version, io: this.io })

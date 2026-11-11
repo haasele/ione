@@ -594,7 +594,7 @@ describe("AndroidTabView and an agent's native prompts (agentPrompts.ts)", () =>
       kind: 'files',
       files: [
         { name: 'a.txt', mimeType: 'text/plain', base64: 'YQ==' },
-        { path: '/data/data/app.zen.chromium/shared_prefs/zen.xml' }
+        { path: '/data/data/dev.haasele.ione/shared_prefs/zen.xml' }
       ]
     })
     view.dispatch('fileChooser', { requestId: 'fc_4' })
@@ -605,7 +605,7 @@ describe("AndroidTabView and an agent's native prompts (agentPrompts.ts)", () =>
     })
     expect(notices).toHaveLength(1)
     expect(notices[0]).toMatch(/^Notice: .*tab tab_1/)
-    expect(notices[0]).toContain('/data/data/app.zen.chromium/shared_prefs/zen.xml')
+    expect(notices[0]).toContain('/data/data/dev.haasele.ione/shared_prefs/zen.xml')
     expect(notices[0]).toContain('send the file contents instead')
     expect(JSON.stringify(calls)).not.toContain('shared_prefs')
   })

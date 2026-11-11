@@ -11,7 +11,7 @@ import { openShortcutPrivateTab, PRIVATE_TABS_UNAVAILABLE } from './privateShort
 /**
  * The states the widgets and the launcher's shortcuts ask the app to open in (WID-07; WID-04's
  * `game`, Roll's 1×1 face). The words are `Landing.kt`'s: one intent extra
- * (`app.zen.chromium.extra.LANDING`), read by `MainActivity.handleIntent` and handed to
+ * (`dev.haasele.ione.extra.LANDING`), read by `MainActivity.handleIntent` and handed to
  * `ChromeWebView.land`. Cold, the chrome stashes it and the boot answer carries it
  * (`BootInfo.landing`), applied by `bootAndroid` right after `browser.start()`; warm
  * (`onNewIntent`), it reaches `window.__zenHost.land` at once.

@@ -239,7 +239,7 @@ describe('the readers (the stylesheets) and the writer (the controller)', () => 
     const probe = readFileSync(
       resolve(
         __dirname,
-        '../../../../../android/app/src/androidTest/kotlin/app/zen/chromium/FakeboxMorphDemoBase.kt'
+        '../../../../../android/app/src/androidTest/kotlin/dev/haasele/ione/FakeboxMorphDemoBase.kt'
       ),
       'utf8'
     )

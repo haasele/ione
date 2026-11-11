@@ -167,7 +167,7 @@ describe('AndroidExtensionRuntime: attaching records', () => {
     const worlds = (plansOfFirst[1].units as Array<Record<string, unknown>>).map((u) => u.world)
     expect(new Set(worlds).size).toBe(2)
     expect(worlds).toContain(`ione-ext-${ID}-user`)
-    const path2 = `/data/user/0/app.zen.chromium/files/zen/extensions/${ID2}/2.0.0`
+    const path2 = `/data/user/0/dev.haasele.ione/files/ione/extensions/${ID2}/2.0.0`
     const second = record(h, { id: ID2, path: path2 }, manifest({ version: '2.0.0' }))
     await h.runtime.attach(second)
     const plan = h.kt.calledWith('ext.configure').find((c) => c.id === ID2)

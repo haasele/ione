@@ -243,15 +243,15 @@ describe('AndroidSecrets', () => {
 
 describe('the Kotlin side these speak to', () => {
   const host = readFileSync(
-    join(repo, 'android/app/src/main/kotlin/app/zen/chromium/Host.kt'),
+    join(repo, 'android/app/src/main/kotlin/dev/haasele/ione/Host.kt'),
     'utf8'
   )
   const syncFetch = readFileSync(
-    join(repo, 'android/app/src/main/kotlin/app/zen/chromium/SyncFetch.kt'),
+    join(repo, 'android/app/src/main/kotlin/dev/haasele/ione/SyncFetch.kt'),
     'utf8'
   )
   const secrets = readFileSync(
-    join(repo, 'android/app/src/main/kotlin/app/zen/chromium/Secrets.kt'),
+    join(repo, 'android/app/src/main/kotlin/dev/haasele/ione/Secrets.kt'),
     'utf8'
   )
 

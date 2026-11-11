@@ -4,7 +4,7 @@ import { optimizer } from '@electron-toolkit/utils'
 import { registerZenScheme } from './platform/protocol'
 import { ElectronPlatform } from './platform'
 import { APP_USER_MODEL_ID } from './platform/notifications'
-import { moveLegacyDirectory } from './platform/legacyPaths'
+import { migrateProfileDirectory, moveLegacyDirectory } from './platform/legacyPaths'
 import { applyResourceSwitches } from './platform/resources/startup'
 import { installWindowsRestart } from './platform/restartRegistration'
 import { ENABLE_SANDBOX_SWITCH, sandboxRequest } from './platform/sandbox'
@@ -68,8 +68,9 @@ function main(): void {
   // Before anything reads userData (and before `ready` creates it): a profile written by the app
   // under a former name moves to the Ione directory, so tabs, spaces and settings survive the
   // rename. Newest first: a profile from the previous name wins over an older one. The MCP shim
-  // above never migrates – it only runs while the browser is running. Nor does a launch with
-  // `--user-data-dir`: the directory named is the profile, whatever the default one holds.
+  // above never migrates – it only runs while the browser is running. The former-name move does
+  // not run for `--user-data-dir`: the directory named is the profile, whatever the default one
+  // holds. The `zen/` -> `ione/` move below does run inside it, so its documents follow too.
   if (switches.userDataDir === null) {
     for (const legacy of LEGACY_APP_NAMES) {
       try {
@@ -82,6 +83,15 @@ function main(): void {
         console.error(`[ione] profile: could not take over the ${legacy} user data directory:`, error)
       }
     }
+  }
+  // The documents lived under `zen/` before the rename. They move to `ione/` once, before
+  // anything reads the profile; an existing `ione/` wins, as does an explicit userData directory.
+  try {
+    migrateProfileDirectory(app.getPath('userData'), (message) =>
+      console.warn('[ione] profile:', message)
+    )
+  } catch (error) {
+    console.error('[ione] profile: could not move zen/ to ione/:', error)
   }
 
   // Must run before `ready`.

@@ -42,7 +42,7 @@ type Answer = { status: number; body?: Uint8Array | string }
 type Route = (url: URL) => Answer | undefined
 
 class FakeKotlinStore {
-  readonly root = '/data/user/0/app.zen.chromium/files/zen/extensions'
+  readonly root = '/data/user/0/dev.haasele.ione/files/ione/extensions'
   /** Package files under cache/ext-packages, by token. */
   readonly packages = new Map<string, Uint8Array>()
   /** Version directories that were "unpacked", by path, with the request that wrote them. */
@@ -1834,9 +1834,9 @@ describe('minimum_chrome_version', () => {
 
 describe('ids for records without one', () => {
   it('are stable extension ids that differ by path', () => {
-    const a = idForUnpackedPath('/data/user/0/app/files/zen/extensions/legacy')
+    const a = idForUnpackedPath('/data/user/0/app/files/ione/extensions/legacy')
     expect(a).toMatch(/^[a-p]{32}$/)
-    expect(idForUnpackedPath('/data/user/0/app/files/zen/extensions/legacy')).toBe(a)
-    expect(idForUnpackedPath('/data/user/0/app/files/zen/extensions/other')).not.toBe(a)
+    expect(idForUnpackedPath('/data/user/0/app/files/ione/extensions/legacy')).toBe(a)
+    expect(idForUnpackedPath('/data/user/0/app/files/ione/extensions/other')).not.toBe(a)
   })
 })

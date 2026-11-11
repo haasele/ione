@@ -5,7 +5,7 @@ import type { ExtensionRecord } from '@core/extensions/registry'
  * updates) and the emulation layer that runs extensions on Android (`extensions*.ts` and the
  * Kotlin `ext/Extensions.kt`, owned by the runtime). The store keeps the registry and calls these
  * after every change it persisted; the runtime reads what it needs from the record, above all
- * `record.path`, the versioned directory (`files/zen/extensions/<id>/<version>/`) whose
+ * `record.path`, the versioned directory (`files/ione/extensions/<id>/<version>/`) whose
  * `manifest.json` it loads. Every call may reject; the store records the message as the
  * extension's load error and carries on.
  */

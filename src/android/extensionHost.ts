@@ -228,7 +228,7 @@ export interface AndroidExtensionsOptions {
  * delays them, see `applyUpdate`), and the permission-increase gate Chrome applies to
  * updates. Kotlin (`ext/ExtensionStore.kt`) moves the bytes: downloads land in a temporary file
  * the chrome document reads through the asset loader, and the archive is unpacked from that
- * file straight into `files/zen/extensions/<id>/<version>/`. Running the extensions is the
+ * file straight into `files/ione/extensions/<id>/<version>/`. Running the extensions is the
  * runtime's job, reached through `ExtensionRuntimeHooks`.
  */
 export class AndroidExtensions implements ExtensionHost {
@@ -327,7 +327,7 @@ export class AndroidExtensions implements ExtensionHost {
     this.hooks.expect?.(this.registry.extensions.filter((r) => r.enabled).map((r) => r.id))
   }
 
-  /** `files/zen/extensions`, absolute. */
+  /** `files/ione/extensions`, absolute. */
   get root(): string {
     return this.io.root
   }

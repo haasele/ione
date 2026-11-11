@@ -55,9 +55,9 @@ export const RUNTIME_ICON_DIR = 'resources/icons'
 export const ANDROID_RES = 'android/app/src/main/res'
 export const ANDROID_MANIFEST = 'android/app/src/main/AndroidManifest.xml'
 export const KOTLIN_VARIANTS =
-  'android/app/src/main/kotlin/app/zen/chromium/LauncherIconVariants.kt'
+  'android/app/src/main/kotlin/dev/haasele/ione/LauncherIconVariants.kt'
 /** The Kotlin package of the app's sources (the manifest namespace); alias classes live in `.icon`. */
-export const ANDROID_NAMESPACE = 'app.zen.chromium'
+export const ANDROID_NAMESPACE = 'dev.haasele.ione'
 
 export const MANIFEST_BEGIN = '<!-- app-icon-aliases:begin'
 export const MANIFEST_END = '<!-- app-icon-aliases:end -->'
@@ -497,7 +497,7 @@ export function icnsTypes(icns: Uint8Array): string[] {
 // Android
 // ---------------------------------------------------------------------------
 
-/** `indigo` → `Indigo`: the alias class inside `app.zen.chromium.icon`. */
+/** `indigo` → `Indigo`: the alias class inside `dev.haasele.ione.icon`. */
 export function aliasClass(variant: Pick<AppIconVariant, 'id'>): string {
   return `${ANDROID_NAMESPACE}.icon.${variant.id[0].toUpperCase()}${variant.id.slice(1)}`
 }

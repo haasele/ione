@@ -274,7 +274,7 @@ describe('ElectronShortcuts on Windows', () => {
     expect(options.target).toBe('C:\\Program Files\\Ione\\ione.exe')
     expect(options.args).toBe(`--app=${REQUEST.url}`)
     expect(options.icon).toBe(ico)
-    expect(options.appUserModelId).toBe(`io.github.benitbuhner.ione.app.${slug}`)
+    expect(options.appUserModelId).toBe(`dev.haasele.ione.app.${slug}`)
     expect(ElectronShortcuts.appUserModelId(REQUEST.id)).toBe(options.appUserModelId)
     const manifest = JSON.parse(readFileSync(join(h.profile, slug, 'launcher.json'), 'utf8'))
     expect(manifest.files).toContain(written[0].path)
@@ -290,7 +290,7 @@ describe('ElectronShortcuts on macOS', () => {
     const plist = readFileSync(join(bundle, 'Contents', 'Info.plist'), 'utf8')
     expect(plist).toContain('<string>Sketch Studio</string>')
     expect(plist).toContain(
-      `<string>io.github.benitbuhner.ione.app.${appSlug(REQUEST.id)}</string>`
+      `<string>dev.haasele.ione.app.${appSlug(REQUEST.id)}</string>`
     )
     const script = readFileSync(join(bundle, 'Contents', 'MacOS', 'app'), 'utf8')
     // Not inside a .app bundle in this harness: the executable is run directly.
@@ -361,7 +361,7 @@ describe('ElectronShortcuts with "Open as window" off', () => {
     for (const { options } of written) {
       expect(options.target).toBe('C:\\Program Files\\Ione\\ione.exe')
       expect(options.args).toBe(REQUEST.url)
-      expect(options.appUserModelId).toBe('io.github.benitbuhner.ione')
+      expect(options.appUserModelId).toBe('dev.haasele.ione')
     }
   })
 

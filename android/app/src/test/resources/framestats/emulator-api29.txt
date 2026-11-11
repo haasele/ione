@@ -1,7 +1,7 @@
 Applications Graphics Acceleration Info:
 Uptime: 412998 Realtime: 412998
 
-** Graphics info for pid 3241 [io.github.benitbuhner.ione.debug] **
+** Graphics info for pid 3241 [dev.haasele.ione.debug] **
 
 Stats since: 401220043115ns
 Total frames rendered: 27
@@ -38,7 +38,7 @@ Total memory usage:
 
 Profile data in ms:
 
-	io.github.benitbuhner.ione.debug/app.zen.chromium.MainActivity/android.view.ViewRootImpl@9e2c8b1 (visibility=0)
+	dev.haasele.ione.debug/dev.haasele.ione.MainActivity/android.view.ViewRootImpl@9e2c8b1 (visibility=0)
 
 ---PROFILEDATA---
 Flags,IntendedVsync,Vsync,OldestInputEvent,NewestInputEvent,HandleInputStart,AnimationStart,PerformTraversalsStart,DrawStart,SyncQueued,SyncStart,IssueDrawCommandsStart,SwapBuffers,FrameCompleted,DequeueBufferDuration,QueueBufferDuration,
@@ -50,7 +50,7 @@ Flags,IntendedVsync,Vsync,OldestInputEvent,NewestInputEvent,HandleInputStart,Ani
 
 View hierarchy:
 
-  io.github.benitbuhner.ione.debug/app.zen.chromium.MainActivity/android.view.ViewRootImpl@9e2c8b1
+  dev.haasele.ione.debug/dev.haasele.ione.MainActivity/android.view.ViewRootImpl@9e2c8b1
   7 views, 9.10 kB of render nodes
 
 Total ViewRootImpl   : 1

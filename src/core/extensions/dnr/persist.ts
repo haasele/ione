@@ -4,7 +4,7 @@ import type { DnrPersistedState } from './state'
  * A persisted declarativeNetRequest record (`DnrPersistedState`) read back from its JSON
  * document, or undefined when the document is not one (the host then seeds the record from the
  * manifest again). Shared by the hosts' `DnrStateIO` implementations: the desktop's file under
- * `<userData>/zen/extension-dnr/`, Android's document in the profile store.
+ * `<userData>/ione/extension-dnr/`, Android's document in the profile store.
  */
 export function parsePersistedState(text: string): DnrPersistedState | undefined {
   let parsed: unknown

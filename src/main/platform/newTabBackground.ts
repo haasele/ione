@@ -26,7 +26,7 @@ const MIME_TYPES: Record<string, string> = {
 
 /**
  * The new tab page's custom background image: a copy of the picked file under
- * `<userData>/zen/newtab/`, served to the page as `zen://newtab-background/?v=<mtime>` (the
+ * `<userData>/ione/newtab/`, served to the page as `zen://newtab-background/?v=<mtime>` (the
  * version changes with the file, so a re-pick shows up without a cache dance).
  */
 export class ElectronNewTabBackground implements NewTabBackgroundHost {

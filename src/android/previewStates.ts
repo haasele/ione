@@ -2386,7 +2386,7 @@ export function updatesFixture(status: UpdateStatus, phase: PreviewUpdatePhase):
         : null,
     downloadedPath:
       phase === 'ready'
-        ? `/data/user/0/app.zen.chromium/cache/updates/ione-${version}.apk`
+        ? `/data/user/0/dev.haasele.ione/cache/updates/ione-${version}.apk`
         : null,
     error: null
   }
@@ -2680,7 +2680,7 @@ export function extensionsFixture(state: UIState, variant: string, now: number):
             version: '4.9.132',
             description:
               'Dark mode for every website. Take care of your eyes, use dark theme for night and daily browsing.',
-            path: `/data/user/0/app.zen.chromium/files/zen/extensions/${darkReader}`,
+            path: `/data/user/0/dev.haasele.ione/files/ione/extensions/${darkReader}`,
             icon: fixtureIcon('D', '#3f3f52'),
             action: fixtureAction('Dark Reader', { popup: 'ui/popup/index.html' }),
             permissions: ['alarms', 'contextMenus', 'storage', 'tabs', 'theme', 'fontSettings'],

@@ -34,7 +34,7 @@ async function readAsset(specifier: string): Promise<ArrayBuffer> {
 }
 
 /**
- * Model files under `<userData>/zen/translate/`. Downloads stream to a `.part` file while the
+ * Model files under `<userData>/ione/translate/`. Downloads stream to a `.part` file while the
  * SHA-256 is computed, and only a complete file with the registry's checksum is renamed into
  * place, so a listing of the directory is always an inventory of usable models.
  */
@@ -209,7 +209,7 @@ export class ElectronTranslateHost implements TranslateHost {
     private readonly chromeWebContents: () => WebContents | null
   ) {
     this.models = new FileModelStore(
-      join(userDataDir, 'zen', 'translate'),
+      join(userDataDir, 'ione', 'translate'),
       `Ione/${app.getVersion()}`
     )
     this.locales = preferredLocales()

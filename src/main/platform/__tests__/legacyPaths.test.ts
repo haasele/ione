@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { moveLegacyDirectory, planLegacyMove, type DirectoryProbe } from '../legacyPaths'
+import {
+  migrateProfileDirectory,
+  moveLegacyDirectory,
+  planLegacyMove,
+  type DirectoryProbe
+} from '../legacyPaths'
 
 function probe(dirs: Record<string, 'empty' | 'full' | 'file'>): DirectoryProbe {
   return {
@@ -103,5 +108,26 @@ describe('moveLegacyDirectory', () => {
     const { legacy, current } = profile()
     expect(moveLegacyDirectory(legacy, current)).toBe('moved')
     expect(moveLegacyDirectory(legacy, current)).toBe('no-legacy')
+  })
+})
+
+describe('migrateProfileDirectory', () => {
+  it('moves the documents from zen/ to ione/', () => {
+    const userData = mkdtempSync(join(tmpdir(), 'ione-profile-'))
+    mkdirSync(join(userData, 'zen'))
+    writeFileSync(join(userData, 'zen', 'state.json'), '{"tabs":1}')
+    expect(migrateProfileDirectory(userData)).toBe('moved')
+    expect(readFileSync(join(userData, 'ione', 'state.json'), 'utf8')).toBe('{"tabs":1}')
+    expect(existsSync(join(userData, 'zen'))).toBe(false)
+  })
+
+  it('never replaces documents already under ione/', () => {
+    const userData = mkdtempSync(join(tmpdir(), 'ione-profile-'))
+    mkdirSync(join(userData, 'zen'))
+    writeFileSync(join(userData, 'zen', 'state.json'), '{"tabs":1}')
+    mkdirSync(join(userData, 'ione'))
+    writeFileSync(join(userData, 'ione', 'state.json'), '{"tabs":2}')
+    expect(migrateProfileDirectory(userData)).toBe('current-in-use')
+    expect(readFileSync(join(userData, 'ione', 'state.json'), 'utf8')).toBe('{"tabs":2}')
   })
 })

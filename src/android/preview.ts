@@ -1434,7 +1434,7 @@ export function createPreviewBridge(): NativeBridge {
       model: 'Preview',
       webViewPackage: 'com.android.webview',
       userAgent: navigator.userAgent,
-      profilePath: '/data/user/0/app.zen.chromium/files/zen'
+      profilePath: '/data/user/0/dev.haasele.ione/files/ione'
     }),
     'window.setFullscreen': ({ fullscreen }) => {
       if (fullscreen) void document.documentElement.requestFullscreen?.()

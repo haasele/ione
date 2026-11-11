@@ -7,7 +7,7 @@ WITHOUT (a debug-only hold, `UnloadProbeRules.debugHoldProbe`), back to back on 
 the number judged is `loadUrl` → the target's `onPageStarted`, in ms. The result is one text
 block to paste back whole. Nothing is asserted on the numbers: the Design Lead decides step 2
 (skipping the probe where no handler is armed) on them. Driver: `UnloadProbeLatency`
-(`android/app/src/androidTest/kotlin/app/zen/chromium/UnloadProbeLatency.kt`); arithmetic:
+(`android/app/src/androidTest/kotlin/dev/haasele/ione/UnloadProbeLatency.kt`); arithmetic:
 `UnloadProbeLatencyStats` (`src/sharedTest`). Opt-in: no nightly manifest lists it.
 
 ## Prerequisites
@@ -27,7 +27,7 @@ From the repo root:
 
 ```sh
 cd android && ./gradlew :app:connectedDebugAndroidTest \
-  -Pandroid.testInstrumentationRunnerArguments.class=app.zen.chromium.UnloadProbeLatency \
+  -Pandroid.testInstrumentationRunnerArguments.class=dev.haasele.ione.UnloadProbeLatency \
   -Pandroid.testInstrumentationRunnerArguments.holdBackgroundWork=true \
   -Pandroid.enableAdditionalTestOutput=true
 ```
@@ -46,8 +46,8 @@ installed:
 
 ```sh
 cd android && ./gradlew :app:installDebug :app:installDebugAndroidTest && \
-adb shell am instrument -w -e class app.zen.chromium.UnloadProbeLatency -e holdBackgroundWork true \
-  io.github.benitbuhner.ione.debug.test/androidx.test.runner.AndroidJUnitRunner
+adb shell am instrument -w -e class dev.haasele.ione.UnloadProbeLatency -e holdBackgroundWork true \
+  dev.haasele.ione.debug.test/androidx.test.runner.AndroidJUnitRunner
 ```
 
 ## Getting the findings
@@ -75,9 +75,9 @@ The block is written to four places; any one is enough.
 4. **While the app is still installed** (the `am instrument` route):
 
    ```sh
-   adb pull /sdcard/Android/data/io.github.benitbuhner.ione.debug/files/unload-probe-latency.txt .
+   adb pull /sdcard/Android/data/dev.haasele.ione.debug/files/unload-probe-latency.txt .
    # or
-   adb shell run-as io.github.benitbuhner.ione.debug cat files/unload-probe-latency/unload-probe-latency.txt
+   adb shell run-as dev.haasele.ione.debug cat files/unload-probe-latency/unload-probe-latency.txt
    ```
 
 The file has one line per load first (`sample pair 01 with probe  started 123.4 …
@@ -143,4 +143,4 @@ phone was left alone.
   – a VPN or a firewall app on the phone intercepting 127.0.0.1, or the app was sent to the
   background; run again with the phone left alone.
 - The block says `the hold never took`: the hold did not reach the view (a release build, or a
-  stale APK on the phone) – `adb uninstall io.github.benitbuhner.ione.debug` and run again.
+  stale APK on the phone) – `adb uninstall dev.haasele.ione.debug` and run again.

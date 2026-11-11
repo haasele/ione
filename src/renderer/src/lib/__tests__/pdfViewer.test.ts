@@ -184,7 +184,7 @@ describe('the overflow’s Save and Print rows (CT-44)', () => {
     )
     // Below Android 10 the host writes under its own files: the same folder by name.
     expect(
-      pdfSavedMessage('/storage/emulated/0/Android/data/app.zen/files/Download/mooring.pdf')
+      pdfSavedMessage('/storage/emulated/0/Android/data/dev.haasele.ione/files/Download/mooring.pdf')
     ).toBe('Saved to Downloads')
     // A host that names no path answers the row's address: no folder to name.
     expect(pdfSavedMessage('content://media/external/downloads/1042')).toBe('Saved to Downloads')

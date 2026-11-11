@@ -25,9 +25,9 @@
         <intent
             android:action="android.intent.action.MAIN"
             android:targetPackage="${applicationId}"
-            android:targetClass="app.zen.chromium.LauncherIconActivity">
+            android:targetClass="dev.haasele.ione.LauncherIconActivity">
             <extra
-                android:name="app.zen.chromium.extra.LANDING"
+                android:name="dev.haasele.ione.extra.LANDING"
                 android:value="newTab" />
         </intent>
     </shortcut>
@@ -38,9 +38,9 @@
         android:shortcutShortLabel="@string/shortcut_private_short"
         android:shortcutLongLabel="@string/shortcut_private_long">
         <intent
-            android:action="app.zen.chromium.NEW_PRIVATE_TAB"
+            android:action="dev.haasele.ione.NEW_PRIVATE_TAB"
             android:targetPackage="${applicationId}"
-            android:targetClass="app.zen.chromium.LauncherIconActivity" />
+            android:targetClass="dev.haasele.ione.LauncherIconActivity" />
     </shortcut>
     <shortcut
         android:shortcutId="search"
@@ -51,9 +51,9 @@
         <intent
             android:action="android.intent.action.MAIN"
             android:targetPackage="${applicationId}"
-            android:targetClass="app.zen.chromium.LauncherIconActivity">
+            android:targetClass="dev.haasele.ione.LauncherIconActivity">
             <extra
-                android:name="app.zen.chromium.extra.LANDING"
+                android:name="dev.haasele.ione.extra.LANDING"
                 android:value="search" />
         </intent>
     </shortcut>
@@ -66,9 +66,9 @@
         <intent
             android:action="android.intent.action.MAIN"
             android:targetPackage="${applicationId}"
-            android:targetClass="app.zen.chromium.LauncherIconActivity">
+            android:targetClass="dev.haasele.ione.LauncherIconActivity">
             <extra
-                android:name="app.zen.chromium.extra.LANDING"
+                android:name="dev.haasele.ione.extra.LANDING"
                 android:value="scan" />
         </intent>
     </shortcut>

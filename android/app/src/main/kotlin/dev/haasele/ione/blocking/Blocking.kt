@@ -1,0 +1,1034 @@
+package dev.haasele.ione.blocking
+
+import android.content.Context
+import android.content.res.AssetManager
+import android.os.SystemClock
+import android.util.Log
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import dev.haasele.ione.Storage
+import dev.haasele.ione.ext.ExtensionUrls
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayInputStream
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.util.WeakHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.zip.GZIPInputStream
+
+/**
+ * The Android request engine. The core persists its rule sets under `files/ione/blocking/`
+ * (`index.json` with every set's summary, `sets/<name>.json` with a set's structured rules, one
+ * file per set with its filter text – the same documents the desktop reads); this class
+ * compiles them into an [EngineSnapshot] on a background thread whenever the index is rewritten
+ * (the core writes a set's documents before the index that names them) and answers
+ * `shouldInterceptRequest` from the current snapshot on WebView's IO threads. It also hands the core the bundled snapshot of
+ * the default lists (`assets/blocking/`), the `BlockingHost` half of the platform contract, and
+ * hosts the `chrome.webRequest`-style [listeners] the extension platform's emulation registers
+ * (the Android half of the desktop multiplexer's listener contract, see `WebRequest.kt`). The
+ * extension runtime's declarativeNetRequest sets are among the persisted sets (`ext:` ids,
+ * scoped to the partitions their extension runs in); it hears the engine's decisions through
+ * [observer] and substitutes redirected subresources through [redirector].
+ *
+ * One instance per process ([shared]): the browser window's `Host` and every custom tab's
+ * `CustomTabHost` read the same files, so they share one compiled snapshot – the default lists
+ * are a few hundred thousand filters, one copy is enough – and it outlives any one activity.
+ *
+ * Matcher choice: pure Kotlin (`FilterIndex`, `NetworkFilter`, `UrlPattern`). adblock-rust behind
+ * a JNI wrapper would need a Rust toolchain and NDK in the Gradle CI plus a native library per
+ * ABI; the hostname map and token buckets here answer in microseconds for the default lists,
+ * which is what the IO thread needs.
+ */
+class Blocking(private val storage: Storage, private val assets: AssetManager) {
+    @Volatile
+    var snapshot: EngineSnapshot = EngineSnapshot.EMPTY
+        private set
+
+    private val builder = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "zen-blocking") }
+    private var scheduled: ScheduledFuture<*>? = null
+    /** Builder thread only: the text engines of the last build that read any, keyed by the fingerprint of the sets each was parsed from. */
+    private var cachedText: Map<String, TextEngine> = emptyMap()
+    /** Builder thread only: keeps the compiled rules of the sets the last read saw. */
+    private val indexReader = IndexReader { line -> Log.w(TAG, line) }
+
+    /** The listener registry; one for every tab and profile, like the desktop multiplexer. */
+    val listeners = WebRequestListeners().also { registry ->
+        registry.onListenerFailure = { registrant, error -> Log.e(TAG, "webRequest listener of $registrant failed", error) }
+    }
+
+    /**
+     * The privacy policy's word ahead of the rule sets (Safe Browsing, the plaintext allowances
+     * of HTTPS-only mode); set once by `privacy/Privacy.kt`, read on the IO threads.
+     */
+    @Volatile
+    var policy: RequestPolicy? = null
+
+    /**
+     * Told of every decision the engine takes on a page's request, on the IO thread that took
+     * it (the Android half of the desktop's `ElectronBlocking.onDecision`): the extension
+     * runtime routes the decisions that named an extension's rule into `getMatchedRules`, the
+     * action counts and `onRuleMatchedDebug`, and the observational `webRequest` events. Must be
+     * cheap; it runs before the request goes out.
+     */
+    @Volatile
+    var observer: DecisionObserver? = null
+
+    /**
+     * Honours a `redirect` (or another set's `upgradeScheme`) decision on a subresource, which
+     * WebView cannot redirect from `shouldInterceptRequest`: the extension runtime's
+     * `Extensions.redirect()` substitutes the target's response. Null lets the request through.
+     */
+    @Volatile
+    var redirector: RedirectExecutor? = null
+
+    /**
+     * The headers-received stage for documents ([HeaderStage]): a document request whose
+     * request-stage allow a header-conditioned rule could overturn, or whose cookies the cookie
+     * policy withholds ([RequestPolicy.cookiesWithheld]), is relayed through it. The extension
+     * runtime installs its own while it runs; without one the engine's default relays over the
+     * profiles' cookie jars ([defaultHeaderStage]), so the cookie policy holds in a custom tab
+     * and before the runtime is up.
+     */
+    @Volatile
+    var headerStage: HeaderStage? = null
+
+    /** The header stage of a process without an extension runtime; its jar is the profile's `CookieManager`. */
+    private val defaultHeaderStage: HeaderStage by lazy { HeaderStage(ProfileCookieStore) }
+
+    /** Each tab's pending redirect hop, stamped by its navigation hook and spent by the target's intercept ([Request.redirectedFrom]). */
+    private val redirectPairs = RedirectPairs()
+
+    /**
+     * The tab's navigation hook saw WebView send a main-frame navigation on by a server redirect
+     * (`shouldOverrideUrlLoading` with `isRedirect`, UI thread): `from` is the document the hop
+     * left, `to` the URL it was sent on to. Kept for `to`'s main-frame intercept, which stamps
+     * the pair on the record ([RedirectPairs]); WebView issues `to`'s request only after the
+     * hook has answered, so the stamp is in place when the intercept reads it.
+     */
+    fun noteRedirect(tab: BlockingTab, from: String, to: String) = redirectPairs.note(tab, from, to)
+
+    /**
+     * Whether the response stage of media-element requests is observed (`ext.observeResponses`,
+     * contract 7.1): then a `Range` GET without `Origin` of a subresource the request stage let
+     * through – a media element's, by round 14's measurement ([RelaySelection]) – is relayed
+     * through the header stage's [HeaderStage.relayMedia], which serves the origin's response as it is and
+     * reports its headers and its end to [observer] under the request's id. Set by the extension
+     * runtime while an extension holds a response-stage `webRequest` listener, cleared with it;
+     * off, nothing is relayed and every request is answered exactly as before.
+     */
+    @Volatile
+    var observeResponses: Boolean = false
+
+    /** Wall-clock milliseconds of the last build, for the settings sheet and the demo. */
+    @Volatile
+    var lastBuildMs: Long = 0
+        private set
+
+    @Volatile
+    var builds: Int = 0
+        private set
+
+    /** Characters of the index text the last build read (what a rebuild costs the heap while it parses), for the log and `stats()`. */
+    @Volatile
+    var lastIndexChars: Int = 0
+        private set
+
+    /** A rewrite of the index by any host's storage (the core writes through the browser window's). */
+    private val onStorageChanged: (String) -> Unit = { name ->
+        if (name == Storage.BLOCKING_INDEX) scheduleRebuild(REBUILD_DELAY_MS)
+    }
+
+    /** Follow the core's index; the first snapshot is built right away. */
+    fun start() {
+        Storage.addChangeListener(onStorageChanged)
+        scheduleRebuild(0)
+    }
+
+    fun stop() {
+        Storage.removeChangeListener(onStorageChanged)
+        builder.shutdownNow()
+    }
+
+    @Synchronized
+    private fun scheduleRebuild(delayMs: Long) {
+        scheduled?.cancel(false)
+        scheduled = runCatching { builder.schedule({ rebuildLogged() }, delayMs, TimeUnit.MILLISECONDS) }.getOrNull()
+    }
+
+    /** The executor would swallow a failed build; log it and keep the previous snapshot. */
+    private fun rebuildLogged() {
+        try {
+            rebuild()
+            Log.i(
+                TAG,
+                "snapshot: ${snapshot.filterCount} network filters and ${snapshot.ruleCount} rules from ${snapshot.setCount} sets " +
+                    "(index ${lastIndexChars / 1024} K chars) in $lastBuildMs ms"
+            )
+        } catch (e: Throwable) {
+            Log.e(TAG, "rule-set snapshot not rebuilt", e)
+        }
+    }
+
+    /**
+     * Read the index and every enabled set's text; called on the builder thread. The general
+     * text engine is parsed from the enabled lists every partition reads; a partition some
+     * list is scoped to or stands aside from (`textPartitions` in `engine.ts` – the private
+     * partition when "Always use Strict in private windows" is on and the level is below
+     * Strict) gets an engine of its own over the lists that apply there, the same way the
+     * desktop compiles a matcher per such partition. Every engine is kept across builds by
+     * the fingerprint of the sets it was parsed from, so a settings change that leaves a
+     * partition's lists as they were costs it nothing.
+     *
+     * The snapshot is assigned in two stages when a partition's engine has to be parsed: one
+     * with the general engine as soon as that is ready – a normal tab's time to its first
+     * filter is the general parse, as it was before the partition engines –, then one with
+     * every engine when the partition's parse lands. In the first, a partition still parsing
+     * keeps the engine the previous snapshot answered it with, and one that had none reads the
+     * general engine, as the desktop's partitions do until their compile lands. Each snapshot
+     * is built whole before it is assigned, so a request sees the previous one or the new one,
+     * never a half-built one. A build with no partition engine to parse – the defaults, a
+     * rebuild that left a partition's lists as they were – assigns once, as before.
+     */
+    internal fun rebuild() {
+        val started = SystemClock.elapsedRealtime()
+        val sets = readIndex()
+        val withText = sets.filter { it.enabled && it.hasFilterText && it.file != null }
+        if (withText.isEmpty()) {
+            // The master switch off disables every list: keep the parsed lists for when it comes
+            // back on, so that is a rebuild of a few milliseconds and not a re-parse of them all.
+            snapshot = EngineSnapshot(sets, null)
+        } else {
+            val engines = textEngines(withText, cachedText, snapshot.textEngineByPartition, { readFilterText(it) }) { general, ready ->
+                snapshot = EngineSnapshot(sets, general, ready)
+                Log.i(TAG, "snapshot: general text engine ready in ${SystemClock.elapsedRealtime() - started} ms; a partition's engine is parsing")
+            }
+            cachedText = engines.cache
+            snapshot = EngineSnapshot(sets, engines.general, engines.byPartition)
+        }
+        lastBuildMs = SystemClock.elapsedRealtime() - started
+        builds++
+    }
+
+    /**
+     * The index set by set, each set's rules streamed from its document under `blocking/sets/`
+     * (one rule's text in memory at a time, never the document whole); the compiled rules of a
+     * set that did not change since the previous read are the previous read's, its document
+     * unopened, and a disabled set's document stays closed too ([IndexReader]). An unreadable
+     * index is an empty one, as before.
+     */
+    private fun readIndex(): List<RuleSetInfo> {
+        val raw = storage.read(Storage.BLOCKING_INDEX) ?: return emptyList()
+        lastIndexChars = raw.length
+        return runCatching {
+            indexReader.read(raw, IndexReader.Documents { name ->
+                storage.open("${Storage.BLOCKING_DIR}/$name")?.let { InputStreamReader(it.stream, Charsets.UTF_8) }
+            })
+        }.getOrElse { e ->
+            Log.w(TAG, "blocking index unreadable", e)
+            emptyList()
+        }
+    }
+
+    private fun readFilterText(set: RuleSetInfo): String? {
+        val raw = storage.read("${Storage.BLOCKING_DIR}/${set.file}") ?: return null
+        return extractFilterText(raw)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // shouldInterceptRequest
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * The answer for a page's request, or null to let WebView load it. Runs on an IO thread:
+     * nothing here touches the WebView. The engine decides first, then the `onBeforeRequest`
+     * listeners ([evaluate]). Blocked subresources get an empty 403 (the page sees a failed load,
+     * as it would from a cancelled request on the desktop); `$redirect` filters get an empty
+     * resource of the right type instead, like uBlock Origin's neutered resources; a blocked
+     * document is answered with 204 – Chromium drops the navigation without committing – and the
+     * tab is told so it can show the Ione blocked page; a listener's `data:` redirect becomes
+     * the body it encodes; a media element's request relayed for its response stage
+     * ([observeResponses]) is the origin's response, streamed.
+     */
+    fun intercept(tab: BlockingTab, request: WebResourceRequest): WebResourceResponse? {
+        val url = request.url.toString()
+        val redirectedFrom = redirectPairs.redirectedFrom(tab, url, request.isForMainFrame)
+        val verdict = evaluate(
+            snapshot, listeners, tab, url, request.isForMainFrame,
+            request.requestHeaders ?: emptyMap(), request.method ?: "GET", policy, observer, observeResponses, redirectedFrom
+        )
+        return when (verdict) {
+            Verdict.Pass -> null
+            is Verdict.Empty -> emptyResponse(verdict.status, verdict.reason, "text/plain")
+            is Verdict.Neutered -> neuteredResponse(verdict.type)
+            is Verdict.Body -> WebResourceResponse(
+                verdict.mimeType, verdict.charset, 200, "OK",
+                mapOf("Content-Length" to verdict.bytes.size.toString()), ByteArrayInputStream(verdict.bytes)
+            )
+            is Verdict.Redirect -> redirector?.redirect(tab, request, verdict.url, verdict.type)
+            is Verdict.HeaderStage -> (headerStage ?: defaultHeaderStage)
+                .relay(snapshot, tab, verdict.request, request.requestHeaders ?: emptyMap(), observer, verdict.decision, verdict.withCookies)
+                ?.toResponse()
+            is Verdict.MediaRelay -> (headerStage ?: defaultHeaderStage)
+                .relayMedia(tab, verdict.request, request.requestHeaders ?: emptyMap(), observer, verdict.withCookies)
+                ?.toResponse()
+        }
+    }
+
+    /** `WebViewClient.onReceivedError`: the request failed; the `onErrorOccurred` listeners hear of it. */
+    fun onRequestError(tab: BlockingTab, request: WebResourceRequest, webViewError: Int) {
+        if (!listeners.hasListeners(WebRequestEvent.ON_ERROR_OCCURRED)) return
+        val url = request.url.toString()
+        if (!isHttp(url)) return
+        val record = listeners.recordFor(
+            tab, url, request.method ?: "GET", request.isForMainFrame,
+            ResourceType.guessKnown(url, request.isForMainFrame, request.requestHeaders?.get("Accept"))
+        )
+        listeners.errorOccurred(record, WebRequestListeners.netErrorName(webViewError))
+    }
+
+    /** Register a `chrome.webRequest`-style listener (see `WebRequest.kt`); returns its remover. */
+    fun addListener(event: WebRequestEvent, listener: WebRequestListener, options: ListenerOptions): () -> Unit =
+        listeners.addListener(event, listener, options)
+
+    /** Remove every listener of a registrant (an extension was unloaded). */
+    fun removeListenersOf(registrant: String) = listeners.removeListenersOf(registrant)
+
+    /** A main-frame navigation the tab is about to follow (`shouldOverrideUrlLoading`): block it? */
+    fun decideNavigation(tab: BlockingTab, url: String): Decision = decideNavigation(snapshot, tab, url)
+
+    /**
+     * Safe Browsing's word on a main-frame navigation, ahead of [decideNavigation]: the hit, or
+     * null. Main thread (`shouldOverrideUrlLoading`), so it never waits for the tables: the
+     * document's request comes through [intercept] on a network thread right after, and that
+     * check is the one that may.
+     */
+    fun guardNavigation(url: String): SafeBrowsingHit? {
+        val policy = policy ?: return null
+        return if (isWeb(url)) policy.unsafe(url) else null
+    }
+
+    /** Honour an `upgradeScheme` decision on a navigation of `tab` from `url`; see the companion's. */
+    fun applyUpgrade(tab: BlockingTab, url: String, decision: Decision): Boolean = applyUpgrade(policy, tab, url, decision)
+
+    // ---------------------------------------------------------------------------------------------
+    // Bundled snapshot (BlockingHost)
+    // ---------------------------------------------------------------------------------------------
+
+    /** The lists this build ships a snapshot of (`assets/blocking/manifest.json`), as the core expects them. */
+    fun bundledLists(): JSONArray {
+        val manifest = manifest() ?: return JSONArray()
+        val builtAt = manifest.optLong("builtAt", 0L)
+        val out = JSONArray()
+        val lists = manifest.optJSONArray("lists") ?: return out
+        for (i in 0 until lists.length()) {
+            val l = lists.optJSONObject(i) ?: continue
+            out.put(
+                JSONObject()
+                    .put("id", l.optString("id"))
+                    .put("version", l.opt("version") ?: JSONObject.NULL)
+                    .put("builtAt", builtAt)
+                    .put("filterCount", l.optInt("filterCount"))
+            )
+        }
+        return out
+    }
+
+    /**
+     * Write the bundled snapshot of `set.id` to `file` (a profile path the core chose) as the
+     * complete rule-set document, on the storage thread so it lands before the index that will
+     * point at it. `done` gets the snapshot's metadata, or null when the build has no snapshot.
+     */
+    fun installBundled(set: JSONObject, file: String, done: (JSONObject?) -> Unit) {
+        val manifest = manifest()
+        val entry = manifest?.optJSONArray("lists")?.let { lists ->
+            (0 until lists.length()).map { lists.optJSONObject(it) }.firstOrNull { it?.optString("id") == set.optString("id") }
+        }
+        if (manifest == null || entry == null) {
+            done(null)
+            return
+        }
+        val id = entry.optString("id")
+        storage.execute {
+            val started = SystemClock.elapsedRealtime()
+            val result = runCatching {
+                val text = readBundledText(entry.optString("file")) { name -> runCatching { assets.open(name) }.getOrNull() }
+                    ?: throw java.io.FileNotFoundException("assets/blocking/${entry.optString("file")}")
+                val document = JSONObject(set.toString()).put("filterText", text)
+                storage.writeSync(file, document.toString())
+                JSONObject()
+                    .put("id", id)
+                    .put("version", entry.opt("version") ?: JSONObject.NULL)
+                    .put("builtAt", manifest.optLong("builtAt", 0L))
+                    .put("filterCount", entry.optInt("filterCount"))
+            }.onFailure { e -> Log.w(TAG, "bundled list $id not installed", e) }.getOrNull()
+            if (result != null) Log.i(TAG, "bundled list $id installed in ${SystemClock.elapsedRealtime() - started} ms")
+            done(result)
+        }
+    }
+
+    private fun manifest(): JSONObject? = runCatching {
+        JSONObject(assets.open("blocking/manifest.json").bufferedReader().readText())
+    }.getOrNull()
+
+    /** Diagnostics for the settings sheet and the demo driver. */
+    fun stats(): JSONObject = JSONObject()
+        .put("sets", snapshot.setCount)
+        .put("filters", snapshot.filterCount)
+        .put("rules", snapshot.ruleCount)
+        .put("builds", builds)
+        .put("lastBuildMs", lastBuildMs)
+        .put("indexChars", lastIndexChars)
+
+    /** The text engines of one build ([textEngines]): the general one, each named partition's own, and the cache the next build starts from. */
+    internal class TextEngines(val general: TextEngine?, val byPartition: Map<String, TextEngine?>, val cache: Map<String, TextEngine>)
+
+    companion object {
+        private const val TAG = "zen-blocking"
+
+        /**
+         * The text engines of a build over `withText`, the enabled sets with filter text in index
+         * order: the general engine over the sets every partition reads ([RuleSetInfo.appliesTo]
+         * of no partition) and, for each partition some set is scoped to or stands aside from,
+         * an engine over the sets that apply there. An engine is parsed once per distinct
+         * fingerprint of its sets – `previous` is the last build's engines by fingerprint, and
+         * two scopes over the same sets share one – with `read` giving a set's filter text (read
+         * once per set per build, an unreadable set's null remembered like a text). An engine
+         * without a filter is null in the result but kept in the cache.
+         *
+         * A build in one go; the overload below is the staged one [rebuild] uses.
+         */
+        internal fun textEngines(
+            withText: List<RuleSetInfo>,
+            previous: Map<String, TextEngine>,
+            read: (RuleSetInfo) -> String?
+        ): TextEngines = textEngines(withText, previous, emptyMap(), read) { _, _ -> }
+
+        /**
+         * [textEngines] in two stages: when a partition's engine has to be parsed, `onGeneral` is
+         * told once – after the general engine is ready, before any partition's parse – with the
+         * general engine and the partition engines a snapshot can already hold: a partition's own
+         * where it needs no parse, else the engine `carried` (the previous snapshot's, by
+         * partition) has for it, else no entry, so its requests read the general engine. A build
+         * with no partition engine to parse never tells it.
+         */
+        internal fun textEngines(
+            withText: List<RuleSetInfo>,
+            previous: Map<String, TextEngine>,
+            carried: Map<String, TextEngine?>,
+            read: (RuleSetInfo) -> String?,
+            onGeneral: (general: TextEngine?, byPartition: Map<String, TextEngine?>) -> Unit
+        ): TextEngines {
+            val used = HashMap<String, TextEngine>()
+            val texts = HashMap<String, String?>()
+            // A set's text once per build, whichever scopes it is in: a null read is remembered
+            // too (`getOrPut` takes a stored null for a miss and would read the set once per scope).
+            fun textOf(set: RuleSetInfo): String? =
+                if (texts.containsKey(set.id)) texts[set.id] else read(set).also { texts[set.id] = it }
+            fun fingerprintOf(scoped: List<RuleSetInfo>): String = scoped.joinToString("|") { "${it.id}=${it.textFingerprint}" }
+            /** The engine over the sets of `fingerprint` that needs no parse: this build's or the last one's. */
+            fun known(fingerprint: String): TextEngine? = used[fingerprint] ?: previous[fingerprint]
+            fun engineOver(scoped: List<RuleSetInfo>): TextEngine? {
+                if (scoped.isEmpty()) return null
+                val fingerprint = fingerprintOf(scoped)
+                val engine = known(fingerprint) ?: TextEngine.parse(scoped.mapNotNull { textOf(it) })
+                used[fingerprint] = engine
+                return engine.takeIf { it.filterCount > 0 }
+            }
+            val general = engineOver(withText.filter { it.appliesTo(null) })
+            val partitions = LinkedHashSet<String>()
+            for (set in withText) {
+                set.partitions?.let(partitions::addAll)
+                set.excludedPartitions?.let(partitions::addAll)
+            }
+            val scoped = partitions.associateWith { partition -> withText.filter { it.appliesTo(partition) } }
+            // Stage one: a partition whose engine has to be parsed keeps the carried one meanwhile.
+            val ready = LinkedHashMap<String, TextEngine?>()
+            var parsing = false
+            for ((partition, sets) in scoped) {
+                when {
+                    sets.isEmpty() -> ready[partition] = null
+                    known(fingerprintOf(sets)) != null -> ready[partition] = engineOver(sets)
+                    else -> {
+                        parsing = true
+                        if (carried.containsKey(partition)) ready[partition] = carried[partition]
+                    }
+                }
+            }
+            if (parsing) onGeneral(general, ready)
+            val byPartition = LinkedHashMap<String, TextEngine?>()
+            for ((partition, sets) in scoped) byPartition[partition] = engineOver(sets)
+            return TextEngines(general, byPartition, used)
+        }
+
+        /**
+         * The text of the bundled list the manifest names `file` (`easylist.txt.gz`), through
+         * `open` on an asset path. The Android Gradle plugin's asset merger inflates a `.gz`
+         * asset and drops the extension, so the APK holds `blocking/easylist.txt`; a build that
+         * packages the resources verbatim still holds the gzip. Null when neither is there.
+         */
+        fun readBundledText(file: String, open: (String) -> InputStream?): String? {
+            val inflated = file.removeSuffix(".gz")
+            if (inflated != file) {
+                open("blocking/$inflated")?.use { return it.bufferedReader().readText() }
+            }
+            return open("blocking/$file")?.use { input ->
+                (if (file.endsWith(".gz")) GZIPInputStream(input) else input).bufferedReader().readText()
+            }
+        }
+
+        /** The core debounces its index writes; one more beat coalesces a burst of set changes. */
+        private const val REBUILD_DELAY_MS = 300L
+
+        @Volatile
+        private var sharedEngine: Blocking? = null
+
+        /**
+         * The process's engine, started on first use over a storage of its own on the same
+         * files. Never stopped: it belongs to no activity.
+         */
+        fun shared(context: Context): Blocking {
+            sharedEngine?.let { return it }
+            synchronized(this) {
+                sharedEngine?.let { return it }
+                val app = context.applicationContext
+                return Blocking(Storage(app), app.assets).also {
+                    it.start()
+                    sharedEngine = it
+                }
+            }
+        }
+
+        private fun isHttp(url: String): Boolean =
+            url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)
+
+        /**
+         * An `http(s)` URL that is a web page's, not an extension's own: the origin the runtime
+         * serves an extension's pages on (`https://<id>.ext.ione.invalid/`, [ExtensionUrls]) is
+         * exempt from the rules as `chrome-extension://` is in Chrome, whose `RulesetManager`
+         * never evaluates a request for a `chrome-extension://` URL (contract 1.11) – and from
+         * the Safe Browsing question, which no `.invalid` host can answer. Read of the request's
+         * URL only: a request an extension page makes to the web is a web request.
+         */
+        private fun isWeb(url: String): Boolean = isHttp(url) && !ExtensionUrls.isExtensionUrl(url)
+
+        /**
+         * The whole of `shouldInterceptRequest` but the `WebResourceResponse`: the engine's
+         * verdict first ([evaluate] below), then – for a request the engine let through – the
+         * `onBeforeRequest` listeners, whose composed answer is applied the way WebView allows:
+         * a cancel is an empty 403 (204 and the blocked page for a navigation), a `data:` or
+         * `about:blank` redirect is the body it stands for, an `http(s)` redirect of a navigation
+         * is loaded by the tab, an `http(s)` redirect of a subresource cannot be honoured and is
+         * recorded as unsupported. A request that goes out is shown to the `onSendHeaders`
+         * listeners; a cancelled one to the `onErrorOccurred` listeners as
+         * `net::ERR_BLOCKED_BY_CLIENT`, as Chromium does. `observeResponses` is the engine's
+         * switch of the same name: a `Range` GET without `Origin` the request stage let through
+         * is then relayed for its response ([Verdict.MediaRelay], contract 7.2 / 7.10,
+         * [RelaySelection]) – a request that goes out too.
+         */
+        fun evaluate(
+            snap: EngineSnapshot,
+            listeners: WebRequestListeners,
+            tab: BlockingTab,
+            url: String,
+            isMainFrame: Boolean,
+            headers: Map<String, String>,
+            method: String,
+            policy: RequestPolicy? = null,
+            observer: DecisionObserver? = null,
+            observeResponses: Boolean = false,
+            redirectedFrom: String? = null
+        ): Verdict {
+            val ranged = observeResponses && RelaySelection.hasHeader(headers, "Range")
+            val hasOrigin = ranged && RelaySelection.hasHeader(headers, "Origin")
+            val engine = evaluate(snap, tab, url, isMainFrame, headers["Accept"], method, policy, observer, observeResponses, ranged, hasOrigin, redirectedFrom)
+            if (listeners.isEmpty || !isHttp(url)) return engine
+            val record = listeners.begin(tab, url, method, isMainFrame, ResourceType.guessKnown(url, isMainFrame, headers["Accept"]))
+            // A relay – to the header stage, or of a media request for its response – is a
+            // request that goes out: the listeners see it as one.
+            if (engine !is Verdict.Pass && engine !is Verdict.HeaderStage && engine !is Verdict.MediaRelay) {
+                if (engine is Verdict.Empty) listeners.errorOccurred(record, WebRequestListeners.BLOCKED_BY_CLIENT)
+                else listeners.end(record)
+                return engine
+            }
+            val composed = listeners.beforeRequest(record)
+            if (composed.cancel) {
+                listeners.errorOccurred(record, WebRequestListeners.BLOCKED_BY_CLIENT)
+                return if (isMainFrame) {
+                    tab.onDocumentBlocked(url)
+                    Verdict.Empty(204, "No Content")
+                } else Verdict.Empty(403, "Forbidden")
+            }
+            val redirect = composed.redirectUrl
+            if (redirect != null) {
+                if (redirect == "about:blank") {
+                    listeners.end(record)
+                    return Verdict.Body("text/html", "utf-8", ByteArray(0))
+                }
+                DataUrl.parse(redirect)?.let {
+                    listeners.end(record)
+                    return Verdict.Body(it.mimeType, it.charset, it.bytes)
+                }
+                if (isMainFrame) {
+                    listeners.end(record)
+                    tab.onDocumentRedirected(redirect)
+                    return Verdict.Empty(204, "No Content")
+                }
+                listeners.unsupported(composed.redirectedBy ?: "", "redirectUrl", url)
+            }
+            listeners.sendHeaders(record, headers)
+            return engine
+        }
+
+        /**
+         * Decide one request against `snap` and tell `tab` what happened. Everything
+         * `shouldInterceptRequest` does except building the `WebResourceResponse`, so it runs on
+         * the JVM in tests. The `policy` (Safe Browsing) speaks first, on documents and frames
+         * only, whatever the rule sets say: a listed document is dropped and the tab shows the
+         * warning page; a listed frame gets an empty 403. A document's check is marked as the
+         * navigation it is (the process's first may wait for the tables, here on a network
+         * thread); a frame's is not.
+         *
+         * `observeResponses` is [Blocking.observeResponses]; `ranged` and `hasOrigin` say whether
+         * the request's headers carry `Range` and `Origin`. The switch on, a `GET` subresource the
+         * rules allow that carries `Range` and no `Origin` – a media element's request, by round
+         * 14's measurement; a cors-mode `fetch` / XHR carries `Origin` – is answered
+         * [Verdict.MediaRelay] in place of [Verdict.Pass] ([RelaySelection.selects], contract
+         * 7.2 as 7.10 amends it: no type in the choice, the runtime's twin has none to read).
+         * `redirectedFrom` is stamped on the record for the observer ([Request.redirectedFrom]);
+         * the rules do not read it.
+         */
+        fun evaluate(
+            snap: EngineSnapshot,
+            tab: BlockingTab,
+            url: String,
+            isMainFrame: Boolean,
+            accept: String?,
+            method: String,
+            policy: RequestPolicy? = null,
+            observer: DecisionObserver? = null,
+            observeResponses: Boolean = false,
+            ranged: Boolean = false,
+            hasOrigin: Boolean = false,
+            redirectedFrom: String? = null
+        ): Verdict {
+            // Outside the web – `data:`, `about:`, an extension's own page in either spelling –
+            // nothing is asked, the policy included: the pass, before any rule.
+            if (!isWeb(url)) return Verdict.Pass
+            val known = ResourceType.guessKnown(url, isMainFrame, accept)
+            val type = known ?: ResourceType.XMLHTTPREQUEST
+            if (policy != null && (isMainFrame || type == ResourceType.SUB_FRAME)) {
+                val hit = policy.unsafe(url, navigation = isMainFrame)
+                if (hit != null) {
+                    if (isMainFrame) {
+                        tab.onDocumentUnsafe(url, hit)
+                        return Verdict.Empty(204, "No Content")
+                    }
+                    tab.onRequestBlocked(url, BlockingTab.SAFE_BROWSING_SET)
+                    return Verdict.Empty(403, "Forbidden")
+                }
+            }
+            // A navigation opens the tab's next document: its own decision and every subresource
+            // decision after it carry the new generation (see BlockingTab.documentGeneration).
+            val generation = tab.documentGeneration(isMainFrame)
+            // The cookie policy's word on a document: withheld cookies send it through the relay
+            // whatever the rule sets say (an empty snapshot included).
+            val isDocument = isMainFrame || type == ResourceType.SUB_FRAME
+            val withheld = isDocument && policy != null &&
+                policy.cookiesWithheld(url, if (isMainFrame) null else tab.documentUrl, tab.containerId)
+            if (snap === EngineSnapshot.EMPTY && observer == null && !withheld) return Verdict.Pass
+            val req = Request(
+                url, type, if (isMainFrame) null else tab.documentUrl, method,
+                tabId = tab.tabId, typeMask = known?.bit ?: ResourceType.AMBIGUOUS_MASK,
+                partition = tab.containerId, documentGeneration = generation, redirectedFrom = redirectedFrom
+            )
+            val cpuBefore = if (observer != null) ThreadCpu.nanos() else -1L
+            val started = System.nanoTime()
+            val decision = if (snap === EngineSnapshot.EMPTY) Decision.ALLOW else snap.decide(req)
+            if (observer != null) {
+                val elapsed = System.nanoTime() - started
+                val cpuAfter = if (cpuBefore < 0) -1L else ThreadCpu.nanos()
+                observer.onDecision(tab, req, decision, elapsed, if (cpuAfter < 0) -1L else cpuAfter - cpuBefore)
+            }
+            // A media element's `Range` GET while an extension listens for the response stage
+            // (contract 7.2 / 7.10): the shared selection – allowed, not a document (a frame's
+            // counts as one here), GET, `Range` and no `Origin`; the cookie word is the policy's
+            // for the request under the tab's document, as it is for a relayed document. (The
+            // empty snapshot without an observer returned above: nobody would hear the relay.)
+            val mediaRelay = observeResponses &&
+                RelaySelection.selects(decision.action == Decision.Action.ALLOW, isDocument, method, ranged, hasOrigin)
+            return when (decision.action) {
+                // A document allowed for now that a header-conditioned rule may still overturn,
+                // or whose cookies the cookie policy withholds, goes through the header stage's
+                // relay (HeaderStage); a media request observed for its response through the
+                // same stage's media relay; other requests keep the allow.
+                Decision.Action.ALLOW -> when {
+                    isDocument && (decision.needsHeaders || withheld) -> Verdict.HeaderStage(req, decision, withCookies = !withheld)
+                    mediaRelay -> Verdict.MediaRelay(req, withCookies = policy?.cookiesWithheld(url, tab.documentUrl, tab.containerId) != true)
+                    else -> Verdict.Pass
+                }
+                // A document's header edits are the relay's: it builds the request's headers and
+                // serves the response. A subresource's cannot be honoured from here (WebView
+                // sends the request itself and the relay is for documents only): it goes out
+                // unchanged – the recorded limit of `modifyHeaders` on Android.
+                Decision.Action.MODIFY_HEADERS ->
+                    if (isDocument) Verdict.HeaderStage(req, decision, withCookies = !withheld) else Verdict.Pass
+                Decision.Action.BLOCK -> {
+                    if (isMainFrame) {
+                        tab.onDocumentBlocked(url)
+                        Verdict.Empty(204, "No Content")
+                    } else {
+                        tab.onRequestBlocked(url, decision.matchedSet)
+                        Verdict.Empty(403, "Forbidden")
+                    }
+                }
+                Decision.Action.REDIRECT -> when {
+                    decision.matchedSet == Decision.TEXT_SET_ID -> {
+                        // A filter list's `$redirect`: the neutered stand-in, counted as blocked.
+                        tab.onRequestBlocked(url, decision.matchedSet)
+                        Verdict.Neutered(type)
+                    }
+                    decision.redirectUrl == null -> Verdict.Pass
+                    isMainFrame -> {
+                        tab.onDocumentRedirected(decision.redirectUrl)
+                        Verdict.Empty(204, "No Content")
+                    }
+                    // WebView cannot redirect a subresource from here: the redirect executor
+                    // substitutes the target's response, or the request goes out unchanged.
+                    else -> Verdict.Redirect(decision.redirectUrl, type)
+                }
+                Decision.Action.UPGRADE -> when {
+                    isMainFrame -> if (applyUpgrade(policy, tab, url, decision)) Verdict.Empty(204, "No Content") else Verdict.Pass
+                    // HTTPS-only mode's subresource upgrades (`always` mode) are the desktop's;
+                    // here the page's mixed-content mode stands in.
+                    decision.matchedSet == HTTPS_ONLY_SET || decision.redirectUrl == null -> Verdict.Pass
+                    // An extension's `upgradeScheme` on a subresource: fetched over https by the executor.
+                    else -> Verdict.Redirect(decision.redirectUrl, type)
+                }
+            }
+        }
+
+        fun decideNavigation(snap: EngineSnapshot, tab: BlockingTab, url: String): Decision {
+            if (snap === EngineSnapshot.EMPTY || !isWeb(url)) return Decision.ALLOW
+            return snap.decide(Request(url, ResourceType.MAIN_FRAME, null, "GET", tabId = tab.tabId, partition = tab.containerId))
+        }
+
+        /** The core's rule set for HTTPS-only mode (`BUILTIN_RULE_SETS.httpsOnly` in `rules.ts`). */
+        const val HTTPS_ONLY_SET = "builtin:https-only"
+
+        /**
+         * Honour an `upgradeScheme` decision on a main-frame navigation from `url`. HTTPS-only
+         * mode's upgrade is reported as such – the tab remembers the plaintext URL so the core
+         * can offer it when https fails – unless the user allowed the site over plaintext since
+         * the engine last reloaded the rule; any other set's upgrade is a plain redirect. True
+         * when the tab took the navigation over.
+         */
+        fun applyUpgrade(policy: RequestPolicy?, tab: BlockingTab, url: String, decision: Decision): Boolean {
+            val target = decision.redirectUrl ?: return false
+            if (decision.matchedSet == HTTPS_ONLY_SET) {
+                if (policy?.plaintextAllowed(url) == true) return false
+                tab.onDocumentUpgraded(url, target)
+            } else {
+                tab.onDocumentRedirected(target)
+            }
+            return true
+        }
+
+        private val TRANSPARENT_GIF = byteArrayOf(
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80.toByte(), 0x00, 0x00,
+            0x00, 0x00, 0x00, 0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0x21, 0xf9.toByte(), 0x04,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+            0x02, 0x02, 0x44, 0x01, 0x00, 0x3b
+        )
+
+        fun emptyResponse(status: Int, reason: String, mimeType: String): WebResourceResponse =
+            WebResourceResponse(mimeType, "utf-8", status, reason, mapOf("Content-Length" to "0"), ByteArrayInputStream(ByteArray(0)))
+
+        /** uBlock Origin's `noop` resources by type: something harmless the page can load. */
+        fun neuteredResponse(type: ResourceType): WebResourceResponse = when (type) {
+            ResourceType.SCRIPT -> WebResourceResponse("application/javascript", "utf-8", ByteArrayInputStream(ByteArray(0)))
+            ResourceType.STYLESHEET -> WebResourceResponse("text/css", "utf-8", ByteArrayInputStream(ByteArray(0)))
+            ResourceType.IMAGE -> WebResourceResponse("image/gif", null, ByteArrayInputStream(TRANSPARENT_GIF))
+            ResourceType.SUB_FRAME -> WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(ByteArray(0)))
+            ResourceType.XMLHTTPREQUEST -> WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+            else -> emptyResponse(403, "Forbidden", "text/plain")
+        }
+
+        /**
+         * The `filterText` of a persisted rule-set document without materialising the whole
+         * multi-megabyte JSON object: the value is scanned as a JSON string literal.
+         */
+        fun extractFilterText(json: String): String? {
+            val key = "\"filterText\":"
+            var from = 0
+            while (true) {
+                val at = json.indexOf(key, from)
+                if (at == -1) return null
+                var i = at + key.length
+                while (i < json.length && json[i].isWhitespace()) i++
+                if (i < json.length && json[i] == '"') {
+                    decodeStringLiteral(json, i + 1)?.let { return it }
+                }
+                from = at + key.length
+            }
+        }
+
+        /** Decode the JSON string literal that opens before `start`; null when it never closes. */
+        private fun decodeStringLiteral(s: String, start: Int): String? {
+            val out = StringBuilder(s.length - start)
+            var i = start
+            while (i < s.length) {
+                val c = s[i]
+                when (c) {
+                    '"' -> return out.toString()
+                    '\\' -> {
+                        if (i + 1 >= s.length) return null
+                        when (val e = s[i + 1]) {
+                            'n' -> out.append('\n')
+                            't' -> out.append('\t')
+                            'r' -> out.append('\r')
+                            'b' -> out.append('\b')
+                            'f' -> out.append('\u000c')
+                            'u' -> {
+                                if (i + 5 >= s.length) return null
+                                val code = s.substring(i + 2, i + 6).toIntOrNull(16) ?: return null
+                                out.append(code.toChar())
+                                i += 4
+                            }
+                            else -> out.append(e) // `"`, `\`, `/`
+                        }
+                        i += 2
+                        continue
+                    }
+                    else -> out.append(c)
+                }
+                i++
+            }
+            return null
+        }
+    }
+}
+
+/** What `shouldInterceptRequest` answers, before it becomes a `WebResourceResponse`. */
+sealed class Verdict {
+    /** Let WebView load the request. */
+    object Pass : Verdict()
+
+    /** An empty body with this status: 403 for blocked subresources, 204 for dropped navigations. */
+    class Empty(val status: Int, val reason: String) : Verdict()
+
+    /** uBlock Origin's neutered stand-in for a `$redirect` filter. */
+    class Neutered(val type: ResourceType) : Verdict()
+
+    /** A body a listener's `data:` / `about:blank` redirect stands for, served as 200. */
+    class Body(val mimeType: String, val charset: String?, val bytes: ByteArray) : Verdict()
+
+    /**
+     * A rule's `redirect` / `upgradeScheme` of a subresource to `url`: for the [RedirectExecutor]
+     * to substitute; the request goes out unchanged when there is none.
+     */
+    class Redirect(val url: String, val type: ResourceType) : Verdict()
+
+    /**
+     * A document the request stage allowed subject to its response headers
+     * ([Decision.needsHeaders]), one whose headers `modifyHeaders` rules edit
+     * ([Decision.Action.MODIFY_HEADERS]: the relay sends the edited request headers and serves
+     * the edited response), or one the cookie policy sends without cookies (`withCookies`
+     * false: no `Cookie` goes, no `Set-Cookie` is kept): relayed through the [HeaderStage],
+     * which decides it again with the real headers. `decision` is the request stage's, so the
+     * header stage reports only a decision that names another match (the desktop's `sameMatch`,
+     * contract 5.5).
+     */
+    class HeaderStage(val request: Request, val decision: Decision, val withCookies: Boolean = true) : Verdict()
+
+    /**
+     * A media element's `Range` GET (no `Origin`: [RelaySelection]) the request stage let through
+     * while the response stage is observed ([Blocking.observeResponses], contract 7.2 / 7.10): relayed through
+     * [HeaderStage.relayMedia], which serves the origin's response as it is – its status,
+     * `Content-Range`, the body streamed – and reports its headers and its end to the observer
+     * under the request's id ([DecisionObserver.onResponse]). `request` is the instance the
+     * request stage reported. `withCookies` false is the cookie policy's word for the request
+     * under the tab's document: no `Cookie` goes, no `Set-Cookie` is kept.
+     */
+    class MediaRelay(val request: Request, val withCookies: Boolean = true) : Verdict()
+}
+
+/**
+ * The cookie jar the engine's own header stage relays over: the profile's `CookieManager`
+ * (`Profiles.cookieManager`), read and written on the intercept thread – the manager is
+ * thread-safe. A profile that cannot be reached (the JVM's stubs in tests) has no cookies.
+ */
+object ProfileCookieStore : HeaderStage.CookieStore {
+    override fun cookieHeader(partition: String, url: String): String? =
+        runCatching { dev.haasele.ione.Profiles.cookieManager(partition).getCookie(url) }.getOrNull()?.ifEmpty { null }
+
+    override fun store(partition: String, url: String, setCookie: List<String>) {
+        val manager = runCatching { dev.haasele.ione.Profiles.cookieManager(partition) }.getOrNull() ?: return
+        for (cookie in setCookie) manager.setCookie(url, cookie)
+    }
+}
+
+/**
+ * Hears every decision the engine takes on a page's request, and the response stage of the
+ * media requests relayed for it; see [Blocking.observer]. A functional interface still:
+ * [onDecision] is its one abstract member, [onResponse] has a default, so an observer that
+ * hears decisions only is a lambda as before.
+ */
+fun interface DecisionObserver {
+    /**
+     * `elapsedNanos` is the wall-clock time `EngineSnapshot.decide` took (the latency the IO
+     * thread paid), `cpuNanos` the CPU time the same thread spent in it (the matcher's own cost,
+     * without the scheduling and collection pauses of a loaded device), or -1 where the platform
+     * cannot tell.
+     */
+    fun onDecision(tab: BlockingTab, request: Request, decision: Decision, elapsedNanos: Long, cpuNanos: Long)
+
+    /**
+     * The response stage of a media request relayed for it ([Verdict.MediaRelay], contract 7.4):
+     * `request` is the instance [onDecision] reported – the pairing rides on
+     * [Request.observerRequestId] – and `response` the origin's headers once they are in
+     * ([RelayedResponse.Stage.HEADERS]), then once more when the body was read to its end
+     * ([RelayedResponse.Stage.COMPLETE]) or failed ([RelayedResponse.Stage.ERROR]). Called on the
+     * intercept thread for the headers and the relay's own failures, on the thread reading the
+     * body for its end. Nothing by default.
+     */
+    fun onResponse(tab: BlockingTab, request: Request, response: RelayedResponse) {}
+}
+
+/**
+ * A relayed media response as the observer hears it (contract 7.4): the origin's status and
+ * status line (the connection's own, or `HTTP/1.1 <status> <reason>` composed when it has
+ * none), its headers one entry per header line as the fetch returned them (duplicates as
+ * separate entries – Chrome's `HttpHeader[]` –, the status line's null key skipped, nothing
+ * filtered: the runtime filters per `extraInfoSpec`), the stage, and the `net::ERR_*` name at
+ * [Stage.ERROR]. [Stage.COMPLETE] and [Stage.ERROR] repeat the [Stage.HEADERS] report's status
+ * and headers, as Chrome's `onCompleted` carries them; a relay that never had headers (a
+ * failed connect) reports status 0, an empty line and no headers.
+ */
+class RelayedResponse(
+    val statusCode: Int,
+    val statusLine: String,
+    val headers: List<Pair<String, String>>,
+    val at: Stage,
+    val error: String? = null
+) {
+    enum class Stage { HEADERS, COMPLETE, ERROR }
+}
+
+/** The calling thread's CPU clock; -1 where there is none (the JVM's `android.jar` stubs throw). */
+internal object ThreadCpu {
+    @Volatile
+    private var available = true
+
+    fun nanos(): Long {
+        if (!available) return -1L
+        return try {
+            android.os.Debug.threadCpuTimeNanos()
+        } catch (e: RuntimeException) {
+            available = false
+            -1L
+        }
+    }
+}
+
+/**
+ * The pair a main-frame redirect hop makes ([Request.redirectedFrom]). WebView never tells the
+ * embedder a navigation's 3xx: it follows the redirect itself and marks the hop on the NAVIGATION
+ * path alone – the target comes through `shouldOverrideUrlLoading` with `isRedirect` on the UI
+ * thread, before its request is issued – while the `WebResourceRequest` the intercept is handed
+ * for that same request carries no mark (`isRedirect` is false there on the device, Extensions'
+ * finding on #670: WebView builds the intercept's request without it). So the tab's navigation
+ * hook stamps the pair here ([note]: `from`, the document the hop left; `to`, the URL it was
+ * sent on to) and the target's main-frame intercept spends it ([redirectedFrom]); the extension
+ * runtime makes `webRequest.onBeforeRedirect` of the pair. One pending hop per tab: a chain
+ * A→B→C is stamped A→B, spent by B's intercept, then stamped B→C before C's request goes out.
+ * Written on the UI thread, read on WebView's intercept threads (there are several), every
+ * access under the map's lock; keyed weakly by the tab, so a closed tab's entry goes with it.
+ */
+internal class RedirectPairs {
+    /** A hop stamped and not yet spent: the request for [to] is the one to pair with [from]. */
+    private class Hop(val from: String, val to: String)
+
+    private val pending = WeakHashMap<BlockingTab, Hop>()
+
+    /**
+     * WebView is sending `tab`'s navigation on from `from` to `to` by a server redirect: the
+     * pair waits for `to`'s main-frame request. A hop still waiting is replaced – its target's
+     * request never came (the app or an interstitial took the navigation) and the newer hop is
+     * the one in flight. A hop back to the same URL (`from == to`) is still a hop.
+     */
+    fun note(tab: BlockingTab, from: String, to: String) {
+        synchronized(pending) { pending[tab] = Hop(from, to) }
+    }
+
+    /**
+     * A request of `tab` for `url` came in. A main-frame request for the pending hop's target
+     * spends the hop and is answered with the URL it hopped from; a second main-frame request
+     * for the same URL (a reload) gets null, the hop being spent. A main-frame request for
+     * another URL gets null and drops the hop: the navigation went elsewhere, the target never
+     * came, and a later plain load of it must not read as the hop's. A subresource is never
+     * paired and leaves the hop waiting for the document.
+     */
+    fun redirectedFrom(tab: BlockingTab, url: String, isMainFrame: Boolean): String? {
+        if (!isMainFrame) return null
+        val hop = synchronized(pending) { pending.remove(tab) } ?: return null
+        return if (hop.to == url) hop.from else null
+    }
+}
+
+/** Substitutes the response of a redirected subresource; see [Blocking.redirector]. */
+fun interface RedirectExecutor {
+    /** The response standing in for `request`, redirected to `target`; null to let WebView load `request` itself. */
+    fun redirect(tab: BlockingTab, request: WebResourceRequest, target: String, type: ResourceType): WebResourceResponse?
+}
+
+/** What the engine needs from a tab and tells it (implemented by `TabWebView`). */
+interface BlockingTab {
+    val tabId: String
+
+    /** The tab's profile (`default`, a container id or `private`): the listeners' `partition`. */
+    val containerId: String
+
+    /** The URL of the document the tab shows; read from any thread. */
+    val documentUrl: String?
+
+    /**
+     * The generation of the document the tab is loading or showing, as a counter the engine
+     * advances: it asks for the next one with every main-frame request it decides
+     * (`newDocument`, on the IO thread that took the request) and reads the current one with
+     * every other decision, so the extension runtime can tell one document's decisions from the
+     * next's before the commit has reached the UI thread – the subresources of a new page are
+     * often decided ahead of its `navigated` event. 0 for a tab that keeps no count.
+     */
+    fun documentGeneration(newDocument: Boolean): Long = 0L
+
+    /** `count` more subresources of the current document were blocked (IO thread). */
+    fun onRequestsBlocked(count: Int)
+
+    /**
+     * One more subresource of the current document was blocked (IO thread): `url` is the
+     * request's, `set` the id of the rule set that matched (`Decision.TEXT_SET_ID`, `user`,
+     * `ext:…`, [SAFE_BROWSING_SET] for a frame Safe Browsing refused) or null. The chrome's
+     * tracker report is built from these; a tab that only counts keeps the default.
+     */
+    fun onRequestBlocked(url: String, set: String?) = onRequestsBlocked(1)
+
+    companion object {
+        /** The `set` [onRequestBlocked] reports for a frame Safe Browsing refused. */
+        const val SAFE_BROWSING_SET = "safe-browsing"
+    }
+
+    /** The navigation to `url` was blocked before it committed (IO thread). */
+    fun onDocumentBlocked(url: String)
+
+    /** Safe Browsing refused the navigation to `url` (IO thread): the core shows the warning page. */
+    fun onDocumentUnsafe(url: String, hit: SafeBrowsingHit)
+
+    /** A `redirect` rule (or another set's `upgradeScheme`) sends the navigation to `url` instead (IO thread). */
+    fun onDocumentRedirected(url: String)
+
+    /** HTTPS-only mode's rule sends the navigation to `to` instead of the plaintext `from` (IO thread). */
+    fun onDocumentUpgraded(from: String, to: String)
+}

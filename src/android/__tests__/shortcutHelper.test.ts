@@ -17,7 +17,7 @@ const ROOT = resolve(__dirname, '../../..')
  */
 function chromesRows(): Set<string> {
   const kotlin = readFileSync(
-    resolve(ROOT, 'android/app/src/main/kotlin/app/zen/chromium/ShortcutHelper.kt'),
+    resolve(ROOT, 'android/app/src/main/kotlin/dev/haasele/ione/ShortcutHelper.kt'),
     'utf8'
   )
   const actions = [...kotlin.matchAll(/ChromeRow\("([a-zA-Z0-9.]+)"/g)].map((m) => m[1])

@@ -374,14 +374,14 @@ describe('asset selection', () => {
 describe('the Android debug-id gate', () => {
   it('recognises the debug build type by its applicationIdSuffix', () => {
     expect(ANDROID_DEBUG_ID_SUFFIX).toBe('.debug')
-    expect(isDebugApplicationId('app.zen.chromium.debug')).toBe(true)
+    expect(isDebugApplicationId('dev.haasele.ione.debug')).toBe(true)
     expect(isDebugApplicationId(`org.example.ione${ANDROID_DEBUG_ID_SUFFIX}`)).toBe(true)
   })
 
   it('leaves release ids, look-alikes and the preview host (no id) alone', () => {
-    expect(isDebugApplicationId('app.zen.chromium')).toBe(false)
-    expect(isDebugApplicationId('app.zen.chromium.debugger')).toBe(false)
-    expect(isDebugApplicationId('app.zen.debug.chromium')).toBe(false)
+    expect(isDebugApplicationId('dev.haasele.ione')).toBe(false)
+    expect(isDebugApplicationId('dev.haasele.ione.debugger')).toBe(false)
+    expect(isDebugApplicationId('org.example.zen.debug.chromium')).toBe(false)
     expect(isDebugApplicationId('')).toBe(false)
     expect(isDebugApplicationId(null)).toBe(false)
   })

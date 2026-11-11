@@ -43,7 +43,7 @@ export function appliedStartupProfile(): StartupProfile | null {
 
 function readPersistedResourceSettings(userDataDir: string): ResourceSettings {
   const store = new JsonStore<{ settings?: { resources?: unknown } }>(
-    new FileStoreIO(join(userDataDir, 'zen')),
+    new FileStoreIO(join(userDataDir, 'ione')),
     'state.json'
   )
   const data = store.readSync()

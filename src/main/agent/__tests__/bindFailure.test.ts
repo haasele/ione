@@ -64,11 +64,11 @@ describe("the shim's reader of agent.json", () => {
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
   })
 
-  function profileWith(document: unknown): string {
+  function profileWith(document: unknown, name = 'ione'): string {
     const dir = mkdtempSync(join(tmpdir(), 'zen-agent-bind-'))
     dirs.push(dir)
-    mkdirSync(join(dir, 'zen'))
-    writeFileSync(join(dir, 'zen', 'agent.json'), JSON.stringify(document, null, 2))
+    mkdirSync(join(dir, name))
+    writeFileSync(join(dir, name, 'agent.json'), JSON.stringify(document, null, 2))
     return dir
   }
 
@@ -94,6 +94,14 @@ describe("the shim's reader of agent.json", () => {
       port: 41735,
       url: 'http://127.0.0.1:41735/mcp'
     })
+    expect(readEndpoint(dir)).toEqual({ url: 'http://127.0.0.1:41735/mcp', token })
+  })
+
+  it('reads a profile the rename has not moved yet', () => {
+    const dir = profileWith(
+      { token, running: true, port: 41735, url: 'http://127.0.0.1:41735/mcp' },
+      'zen'
+    )
     expect(readEndpoint(dir)).toEqual({ url: 'http://127.0.0.1:41735/mcp', token })
   })
 })

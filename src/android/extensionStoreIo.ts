@@ -107,7 +107,7 @@ export class AndroidExtensionStoreIo {
   private readonly tokens = new WeakMap<Uint8Array, string>()
 
   /**
-   * @param root `files/zen/extensions`, absolute (Kotlin names it in the boot payload): where
+   * @param root `files/ione/extensions`, absolute (Kotlin names it in the boot payload): where
    *   installs live, and what every managed registry path starts with.
    */
   constructor(

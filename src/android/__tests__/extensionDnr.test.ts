@@ -18,7 +18,7 @@ import {
 
 const ID = 'abcdefghijklmnopabcdefghijklmnop'
 const ID2 = 'ponmlkjihgfedcbaponmlkjihgfedcba'
-const PATH = `/data/user/0/app.zen.chromium/files/zen/extensions/${ID}/1.0.0`
+const PATH = `/data/user/0/dev.haasele.ione/files/ione/extensions/${ID}/1.0.0`
 
 /** The runtime as the layer sees it: profile documents, the package's files, tabs, the badge. */
 class FakeHost implements DnrHost {

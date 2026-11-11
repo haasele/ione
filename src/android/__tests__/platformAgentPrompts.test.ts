@@ -222,7 +222,7 @@ describe("a view's word for the agent driving its tab (AndroidTabViewHost.agentN
       {
         onFileChooser: async () => ({
           kind: 'files',
-          files: [{ path: '/data/data/app.zen.chromium/x' }]
+          files: [{ path: '/data/data/dev.haasele.ione/x' }]
         })
       } as never
     )
@@ -235,7 +235,7 @@ describe("a view's word for the agent driving its tab (AndroidTabViewHost.agentN
     platform.viewEvent('tab_1', 'fileChooser', { requestId: 'fc_2' })
     await flush()
     expect(notices).toHaveLength(1)
-    expect(notices[0]).toContain('/data/data/app.zen.chromium/x')
+    expect(notices[0]).toContain('/data/data/dev.haasele.ione/x')
     expect(sent.filter((c) => c.method === 'view.fileChooserAnswer')).toEqual([
       {
         method: 'view.fileChooserAnswer',

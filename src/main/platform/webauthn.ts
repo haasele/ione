@@ -3,7 +3,7 @@ import type { Browser } from '../../core/browser'
 import type { ElectronTabViewHost } from './views'
 
 /** The bundle id of the app (electron-builder.yml `appId`); the keychain group hangs off it. */
-const BUNDLE_ID = 'io.github.benitbuhner.ione'
+const BUNDLE_ID = 'dev.haasele.ione'
 
 /**
  * Passkeys with platform authenticators. Chromium services Windows Hello and roaming security

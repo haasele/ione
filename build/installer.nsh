@@ -7,7 +7,8 @@
 ; so Windows treats Ione as a program unrelated to either former name and a plain install would
 ; leave the old copy, its shortcuts and its uninstaller entry behind. Both are removed by running
 ; their own uninstallers silently, the way electron-builder replaces a previous version of the
-; same GUID (installUtil.nsh, uninstallOldVersion).
+; same GUID (installUtil.nsh, uninstallOldVersion). The same applies to the appId Ione used
+; before `dev.haasele.ione`; its uninstaller is run here too, and its profile is kept.
 ;
 ; User data is kept: the electron-builder uninstaller only deletes %APPDATA% with --delete-app-data,
 ; which is never passed here, and Ione moves %APPDATA%\Zenium / %APPDATA%\Zen to %APPDATA%\Ione
@@ -23,6 +24,9 @@
 !define ZEN_LEGACY_UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${ZEN_LEGACY_GUID}"
 !define ZEN_LEGACY_INSTALL_KEY "Software\${ZEN_LEGACY_GUID}"
 !define ZEN_LEGACY_EXECUTABLE "zen.exe"
+!define IONE_LEGACY_GUID "d29f1ef3-646b-569b-9d96-581ed59a9feb"
+!define IONE_LEGACY_UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${IONE_LEGACY_GUID}"
+!define IONE_LEGACY_INSTALL_KEY "Software\${IONE_LEGACY_GUID}"
 
 ; The app icon colour picked in Settings → Look and Feel. The running app can change its window
 ; and taskbar icon, but the Start menu and desktop shortcuts carry the icon the installer gave
@@ -156,6 +160,13 @@
 !macroend
 
 !macro customInstall
+  ; The previous appId's uninstall entry points at the same install directory (the product name
+  ; did not change), so its files are the ones this install just replaced. Drop the stale entry
+  ; without running that uninstaller: it would delete the newly installed files and shortcuts.
+  DetailPrint "Retiring the previous Ione application entry (your data is kept)"
+  DeleteRegKey HKEY_CURRENT_USER "${IONE_LEGACY_UNINSTALL_KEY}"
+  DeleteRegKey HKEY_CURRENT_USER "${IONE_LEGACY_INSTALL_KEY}"
+
   ; Declared here rather than at file scope: makensis also compiles this script for the
   ; uninstaller, where the macro is not inserted, and treats an unreferenced variable as a
   ; warning (electron-builder turns warnings into errors).

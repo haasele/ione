@@ -254,7 +254,7 @@ describe('planAppIcons', () => {
     const kotlin = text(KOTLIN_VARIANTS)
     expect(kotlin).toContain(`const val DEFAULT = "${APP_ICON_DEFAULT}"`)
     for (const v of APP_ICON_VARIANTS) {
-      const cls = `app.zen.chromium.icon.${v.id[0].toUpperCase()}${v.id.slice(1)}`
+      const cls = `dev.haasele.ione.icon.${v.id[0].toUpperCase()}${v.id.slice(1)}`
       expect(kotlin).toContain(`"${v.id}" to "${cls}"`)
     }
   })

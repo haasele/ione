@@ -48,7 +48,7 @@ const DNR_PERMISSIONS = ['declarativeNetRequest', 'declarativeNetRequestWithHost
 /**
  * `chrome.declarativeNetRequest` for the browser layer: one `DnrState` per loaded extension that
  * holds the permission (static `rule_resources` read from the install directory, the persisted
- * record under `<userData>/zen/extension-dnr/<id>.json`), the routed API over it, and a
+ * record under `<userData>/ione/extension-dnr/<id>.json`), the routed API over it, and a
  * `DnrTranslator` keeping the rule sink (the request-blocking engine, see `dnrSink.ts`) in step
  * with every state change; `decided` takes the engine's decisions back into the matched-rule log,
  * the action counts and `onRuleMatchedDebug`. Manifest rulesets marked `enabled` are active from

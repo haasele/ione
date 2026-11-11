@@ -2934,7 +2934,7 @@ export interface TranslateModelDownload {
 }
 
 /**
- * Translation model files on the device (`<userData>/zen/translate/` on desktop, the app's files
+ * Translation model files on the device (`<userData>/ione/translate/` on desktop, the app's files
  * on Android). Models are downloaded on first use and never bundled.
  */
 export interface TranslateModelStore {

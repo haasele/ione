@@ -36,7 +36,7 @@ const INPUT = {
   userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152.0.0.0 Safari/537.36',
   argv: ['/opt/ione/ione', '--no-sandbox'],
   execPath: '/opt/ione/ione',
-  profilePath: '/home/u/.config/ione/zen'
+  profilePath: '/home/u/.config/ione/ione'
 }
 
 describe('desktopVersionFacts (SET-66)', () => {
@@ -51,7 +51,7 @@ describe('desktopVersionFacts (SET-66)', () => {
       userAgent: INPUT.userAgent,
       commandLine: '/opt/ione/ione --no-sandbox',
       executablePath: '/opt/ione/ione',
-      profilePath: '/home/u/.config/ione/zen'
+      profilePath: '/home/u/.config/ione/ione'
     })
   })
 
@@ -86,7 +86,7 @@ describe('desktopVersionFacts (SET-66)', () => {
 
   it('reads the primitives from Electron, the process and the session as the page is requested', () => {
     const ses = { getUserAgent: () => 'UA of the session' } as unknown as Session
-    const input = readDesktopVersionInput(ses, '/profile/zen')
+    const input = readDesktopVersionInput(ses, '/profile/ione')
     expect(input).toMatchObject({
       version: '0.5.9',
       packaged: true,
@@ -97,13 +97,13 @@ describe('desktopVersionFacts (SET-66)', () => {
       userAgent: 'UA of the session',
       argv: process.argv,
       execPath: process.execPath,
-      profilePath: '/profile/zen'
+      profilePath: '/profile/ione'
     })
     expect(input.osType).not.toBe('')
     // Read again after a change: nothing is kept from the first read.
     fake.packaged = false
     fake.translated = true
-    expect(readDesktopVersionInput(ses, '/profile/zen')).toMatchObject({
+    expect(readDesktopVersionInput(ses, '/profile/ione')).toMatchObject({
       packaged: false,
       translated: true
     })

@@ -34,7 +34,7 @@ const BING = {
   startup_pages: ['https://www.bing.com/?pc=__PARAM__BG00']
 }
 
-const PATH2 = `/data/user/0/app.zen.chromium/files/zen/extensions/${ID2}/1.0.0`
+const PATH2 = `/data/user/0/dev.haasele.ione/files/ione/extensions/${ID2}/1.0.0`
 
 describe('chrome_settings_overrides.search_provider on the phone', () => {
   it('an attached extension declaring an engine with is_default puts it in the model and holds the default', async () => {

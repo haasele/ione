@@ -111,7 +111,7 @@ describe('desktopEntry', () => {
       name: 'Sketch\nStudio',
       url: 'https://app.example/',
       exec: '"/opt/ione" "--app=https://app.example/"',
-      icon: '/home/u/.config/Ione/zen/webapps/abc/icon.png',
+      icon: '/home/u/.config/Ione/ione/webapps/abc/icon.png',
       wmClass: 'ione'
     })
     expect(entry).toContain('[Desktop Entry]\n')
@@ -119,7 +119,7 @@ describe('desktopEntry', () => {
     expect(entry).toContain('Name=Sketch Studio\n')
     expect(entry).toContain('Comment=https://app.example/\n')
     expect(entry).toContain('Exec="/opt/ione" "--app=https://app.example/"\n')
-    expect(entry).toContain('Icon=/home/u/.config/Ione/zen/webapps/abc/icon.png\n')
+    expect(entry).toContain('Icon=/home/u/.config/Ione/ione/webapps/abc/icon.png\n')
     expect(entry).toContain('StartupWMClass=ione\n')
     expect(entry).toContain('X-Ione-WebApp=true\n')
     expect(entry.endsWith('\n')).toBe(true)
@@ -130,7 +130,7 @@ describe('macOS bundle files', () => {
   it('writes an Info.plist naming the launcher, its icon and the app URL', () => {
     const plist = macInfoPlist({
       name: 'Sketch & Co',
-      bundleId: 'io.github.benitbuhner.ione.app.abc',
+      bundleId: 'dev.haasele.ione.app.abc',
       executable: 'app',
       iconFile: 'app.icns',
       url: 'https://app.example/?a=1&b=<2>'
@@ -139,7 +139,7 @@ describe('macOS bundle files', () => {
     expect(plist).toContain('<key>CFBundleExecutable</key>\n\t<string>app</string>')
     expect(plist).toContain('<key>CFBundleIconFile</key>\n\t<string>app.icns</string>')
     expect(plist).toContain(
-      '<key>CFBundleIdentifier</key>\n\t<string>io.github.benitbuhner.ione.app.abc</string>'
+      '<key>CFBundleIdentifier</key>\n\t<string>dev.haasele.ione.app.abc</string>'
     )
     expect(plist).toContain('<string>https://app.example/?a=1&amp;b=&lt;2&gt;</string>')
     expect(plist.startsWith('<?xml version="1.0" encoding="UTF-8"?>')).toBe(true)

@@ -7,7 +7,7 @@ import type { NotificationPermissionStatus } from '../../shared/notifications'
  * shortcuts (`WinShell::SetLnkAUMI`), and Windows groups taskbar buttons and toast notifications
  * by it. A test holds the two in step.
  */
-export const APP_USER_MODEL_ID = 'io.github.benitbuhner.ione'
+export const APP_USER_MODEL_ID = 'dev.haasele.ione'
 
 /**
  * Where Windows looks a desktop app's AppUserModelId up when no shortcut carries it. Under the

@@ -464,7 +464,7 @@ export interface BootInfo {
   deferred?: DeferredDocument[]
   downloadsDir: string
   /**
-   * Absolute path of `files/zen/extensions`, where the extension store installs (absent in the
+   * Absolute path of `files/ione/extensions`, where the extension store installs (absent in the
    * preview host, which has no files and therefore no extensions).
    */
   extensionsRoot?: string
@@ -1498,7 +1498,7 @@ export class AndroidPlatform implements Platform {
   private readonly heldDownloads = new Map<string, { token: string; bind: () => void }>()
   private readonly agentTransport: AndroidAgentTransport
   private readonly updateHost: AndroidUpdateHost
-  /** `files/zen/extensions` when Kotlin has one; the preview host installs nothing. */
+  /** `files/ione/extensions` when Kotlin has one; the preview host installs nothing. */
   private readonly extensionsRoot: string | null
   private extensions: AndroidExtensions | null = null
   /** The runtime behind the store, once `createExtensions` built it (null in the preview host). */
@@ -1980,7 +1980,7 @@ export class AndroidPlatform implements Platform {
 
   /**
    * The extension store (`extensionHost.ts`) with the runtime (`extensionRuntime.ts`) behind it:
-   * the store installs from the stores and from files into `files/zen/extensions`, keeps the
+   * the store installs from the stores and from files into `files/ione/extensions`, keeps the
    * registry and updates; the runtime runs what the store hands over. Without an install root
    * (the preview host) the built-in stand-in answers, and the capability above keeps the UI away.
    */

@@ -22,7 +22,7 @@ import skillMarkdown from '../../../resources/skills/ione-browser/SKILL.md?raw'
 
 /** The skill directory's name; the spec requires it to equal the frontmatter `name`. */
 export const SKILL_NAME = 'ione-browser'
-/** The manifest's document name under the profile's `zen/` directory. */
+/** The manifest's document name under the profile's `ione/` directory. */
 export const SKILLS_MANIFEST = 'skills.json'
 
 /** One file of the skill as shipped: its path inside the skill directory and its text. */

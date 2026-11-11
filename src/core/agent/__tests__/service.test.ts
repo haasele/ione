@@ -456,7 +456,7 @@ describe('the Agent Skill host', () => {
       expect(errors).not.toHaveBeenCalled()
 
       const thrown: NodeJS.ErrnoException = new Error(
-        "EACCES: permission denied, open '/home/someone/.config/ione/zen/skills.json.1.tmp'"
+        "EACCES: permission denied, open '/home/someone/.config/ione/ione/skills.json.1.tmp'"
       )
       thrown.code = 'EACCES'
       throwing = thrown

@@ -102,14 +102,14 @@ Rule-(b) value: `git diff b5de02664 HEAD -- <file> | grep '^[+-][^+-]' | sha1sum
 | `cbd5bad6d7ce` | `src/android/platform.ts`                                          | `agentPrompts` list; `download.started` gains `saveAs` and routes Save As through `agents.downloadDestination`; `certificate.request` host event → `security.clientCertificate` → `certificate.respond`. |
 | `3ed72be3d83b` | `src/android/__tests__/agentPrompts.test.ts`                       | New vitest for the helpers (6 tests).                                                                                                                                                                    |
 | `ec8d69190920` | `src/android/__tests__/views.test.ts`                              | Adds "AndroidTabView and an agent's native prompts" (intercept toggle, chooser answers files/cancel/user, core-without-handler → user, `setInputFiles` ok/error).                                        |
-| `fb98e326cfd5` | `android/app/src/main/kotlin/app/zen/chromium/AgentPrompts.kt`     | New. Pure logic: chooser event/answer parsing, `uploadFileName`, `CertificateAnswer`, `describeCertificate`, `commonNameOf`, `downloadName`; `AgentUploads.write/sweep`.                                 |
-| `4ec9ea625554` | `android/app/src/main/kotlin/app/zen/chromium/TabWebView.kt`       | `interceptsAgentPrompts`; holds `onShowFileChooser` callbacks; `answerFileChooser`; `onReceivedClientCertRequest` passes the tab to `Security`; held choosers cancelled on `destroy()`.                  |
-| `eac45fd9f8ff` | `android/app/src/main/kotlin/app/zen/chromium/Security.kt`         | `onClientCertRequest(tab, request)`: remembered → KeyChain chooser → or `askAgent`; `respondClientCertificate`; `proceed(key: String?)` only remembers when `key != null`.                               |
-| `174ac4a2f8b1` | `android/app/src/main/kotlin/app/zen/chromium/Downloads.kt`        | `saveAs` in `download.started`; `destination.agent` honoured in `bind` (no sheet, agent's filename, `namedByAgent` guards the header rename).                                                            |
-| `de62f7599375` | `android/app/src/main/kotlin/app/zen/chromium/Host.kt`             | Commands `view.interceptAgentPrompts`, `view.fileChooserAnswer`, `certificate.respond`.                                                                                                                  |
-| `1d59820565a2` | `android/app/src/main/kotlin/app/zen/chromium/BrowserActivity.kt`  | Start-up sweep also clears stale `agent-uploads`.                                                                                                                                                        |
+| `fb98e326cfd5` | `android/app/src/main/kotlin/dev/haasele/ione/AgentPrompts.kt`     | New. Pure logic: chooser event/answer parsing, `uploadFileName`, `CertificateAnswer`, `describeCertificate`, `commonNameOf`, `downloadName`; `AgentUploads.write/sweep`.                                 |
+| `4ec9ea625554` | `android/app/src/main/kotlin/dev/haasele/ione/TabWebView.kt`       | `interceptsAgentPrompts`; holds `onShowFileChooser` callbacks; `answerFileChooser`; `onReceivedClientCertRequest` passes the tab to `Security`; held choosers cancelled on `destroy()`.                  |
+| `eac45fd9f8ff` | `android/app/src/main/kotlin/dev/haasele/ione/Security.kt`         | `onClientCertRequest(tab, request)`: remembered → KeyChain chooser → or `askAgent`; `respondClientCertificate`; `proceed(key: String?)` only remembers when `key != null`.                               |
+| `174ac4a2f8b1` | `android/app/src/main/kotlin/dev/haasele/ione/Downloads.kt`        | `saveAs` in `download.started`; `destination.agent` honoured in `bind` (no sheet, agent's filename, `namedByAgent` guards the header rename).                                                            |
+| `de62f7599375` | `android/app/src/main/kotlin/dev/haasele/ione/Host.kt`             | Commands `view.interceptAgentPrompts`, `view.fileChooserAnswer`, `certificate.respond`.                                                                                                                  |
+| `1d59820565a2` | `android/app/src/main/kotlin/dev/haasele/ione/BrowserActivity.kt`  | Start-up sweep also clears stale `agent-uploads`.                                                                                                                                                        |
 | `d020799b3c90` | `android/app/src/main/res/xml/file_paths.xml`                      | `cache-path agent-uploads` for the FileProvider.                                                                                                                                                         |
-| `82a0f15cfe85` | `android/app/src/test/kotlin/app/zen/chromium/AgentPromptsTest.kt` | New. 10 JUnit tests over `AgentPrompts` and `AgentUploads`.                                                                                                                                              |
+| `82a0f15cfe85` | `android/app/src/test/kotlin/dev/haasele/ione/AgentPromptsTest.kt` | New. 10 JUnit tests over `AgentPrompts` and `AgentUploads`.                                                                                                                                              |
 
 ## Tests run
 
@@ -215,15 +215,15 @@ Rule-(b) values against the new merge-base `f83345782` (identical against `1be1a
 | `1183eea121e0` | `src/android/__tests__/agentPrompts.test.ts`                       |
 | `84ac8808eabb` | `src/android/__tests__/views.test.ts`                              |
 | `62b410fd4dc6` | `src/android/__tests__/platformAgentPrompts.test.ts` (new)         |
-| `5c7e0c2af3a2` | `android/app/src/main/kotlin/app/zen/chromium/AgentPrompts.kt`     |
-| `7372159624cf` | `android/app/src/main/kotlin/app/zen/chromium/TabWebView.kt`       |
-| `7f1b0439d319` | `android/app/src/main/kotlin/app/zen/chromium/Security.kt`         |
-| `7ea25642d5c5` | `android/app/src/main/kotlin/app/zen/chromium/Downloads.kt`        |
-| `aa4d34e5a445` | `android/app/src/main/kotlin/app/zen/chromium/TabHost.kt` (new)    |
-| `de62f7599375` | `android/app/src/main/kotlin/app/zen/chromium/Host.kt`             |
-| `1d59820565a2` | `android/app/src/main/kotlin/app/zen/chromium/BrowserActivity.kt`  |
+| `5c7e0c2af3a2` | `android/app/src/main/kotlin/dev/haasele/ione/AgentPrompts.kt`     |
+| `7372159624cf` | `android/app/src/main/kotlin/dev/haasele/ione/TabWebView.kt`       |
+| `7f1b0439d319` | `android/app/src/main/kotlin/dev/haasele/ione/Security.kt`         |
+| `7ea25642d5c5` | `android/app/src/main/kotlin/dev/haasele/ione/Downloads.kt`        |
+| `aa4d34e5a445` | `android/app/src/main/kotlin/dev/haasele/ione/TabHost.kt` (new)    |
+| `de62f7599375` | `android/app/src/main/kotlin/dev/haasele/ione/Host.kt`             |
+| `1d59820565a2` | `android/app/src/main/kotlin/dev/haasele/ione/BrowserActivity.kt`  |
 | `d020799b3c90` | `android/app/src/main/res/xml/file_paths.xml`                      |
-| `d7450625b81a` | `android/app/src/test/kotlin/app/zen/chromium/AgentPromptsTest.kt` |
+| `d7450625b81a` | `android/app/src/test/kotlin/dev/haasele/ione/AgentPromptsTest.kt` |
 
 Checks on `a04907dc2`: `bun run typecheck` pass; `bun run lint` 0 errors (pre-existing prettier warnings, none in
 PR files); `bunx vitest run src/android/__tests__/agentPrompts.test.ts src/android/__tests__/views.test.ts

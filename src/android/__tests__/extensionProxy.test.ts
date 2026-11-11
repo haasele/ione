@@ -18,7 +18,7 @@ function events(h: Harness, ep: string, key: string): Record<string, unknown>[] 
   return h.kt.to(ep).filter((m) => m.t === 'event' && `${String(m.ns)}.${String(m.name)}` === key)
 }
 
-const PATH2 = `/data/user/0/app.zen.chromium/files/zen/extensions/${ID2}/1.0.0`
+const PATH2 = `/data/user/0/dev.haasele.ione/files/ione/extensions/${ID2}/1.0.0`
 
 /** Touch VPN's shape: the `proxy` permission and a worker that sets `fixed_servers`. */
 async function withProxy(

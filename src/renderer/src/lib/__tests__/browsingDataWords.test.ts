@@ -247,7 +247,7 @@ describe('the Delete browsing data words (W8-7): Chrome M124+’s "Delete" on ev
     expect(paths).toContain('src/shared/shortcutReference.ts')
     expect(paths).toContain('src/core/menus.ts')
     expect(paths).toContain(
-      'android/app/src/androidTest/kotlin/app/zen/chromium/SiteControlsDemo.kt'
+      'android/app/src/androidTest/kotlin/dev/haasele/ione/SiteControlsDemo.kt'
     )
     expect(paths.some((p) => p.includes('__tests__') || /\.test\.tsx?$/.test(p))).toBe(false)
     // The extractor finds the words on each surface: a broken read would pass an empty sweep.
@@ -294,7 +294,7 @@ describe('the Delete browsing data words (W8-7): Chrome M124+’s "Delete" on ev
     // The phone's demo driver looks the sheet up by the new words.
     expect(
       find(
-        'android/app/src/androidTest/kotlin/app/zen/chromium/SiteControlsDemo.kt',
+        'android/app/src/androidTest/kotlin/dev/haasele/ione/SiteControlsDemo.kt',
         'Delete browsing data'
       )
     ).toBe(true)
@@ -360,7 +360,7 @@ describe('the verb’s remainder (W8-11): the site-data viewer, History’s pair
   const HISTORY = 'src/renderer/src/components/phone/PhoneHistoryPanel.tsx'
   const HISTORY_PAGE = 'src/renderer/src/components/pages/history/HistoryPage.tsx'
   const SECTIONS = 'src/renderer/src/components/pages/settings/sections.tsx'
-  const KT = 'android/app/src/androidTest/kotlin/app/zen/chromium/'
+  const KT = 'android/app/src/androidTest/kotlin/dev/haasele/ione/'
 
   it('finds the viewer’s new words: Chrome’s "Delete data" / "Delete all data" / "Delete all data?", the per-site question, the item sheet’s row', () => {
     // The row's button (`IDS_SETTINGS_SITE_SETTINGS_DELETE`), the footer's

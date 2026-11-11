@@ -30,7 +30,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application android:label="Nimbus News">
         <receiver
-            android:name="app.zen.chromium.ManagedTestAdmin"
+            android:name="dev.haasele.ione.ManagedTestAdmin"
             android:exported="true"
             android:label="Demo harness managed-configuration admin"
             android:permission="android.permission.BIND_DEVICE_ADMIN">
@@ -42,10 +42,10 @@
             </intent-filter>
         </receiver>
         <receiver
-            android:name="app.zen.chromium.ManagedSeedReceiver"
+            android:name="dev.haasele.ione.ManagedSeedReceiver"
             android:exported="true" />
         <service
-            android:name="app.zen.chromium.EventsTapService"
+            android:name="dev.haasele.ione.EventsTapService"
             android:exported="true"
             android:label="Demo harness events tap"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
@@ -57,13 +57,13 @@
                 android:resource="@xml/events_tap_service" />
         </service>
         <activity
-            android:name="app.zen.chromium.CustomTabCallerActivity"
+            android:name="dev.haasele.ione.CustomTabCallerActivity"
             android:exported="true"
             android:label="Nimbus News"
             android:launchMode="singleTask"
             android:theme="@android:style/Theme.Material.Light.NoActionBar" />
         <activity
-            android:name="app.zen.chromium.ShareTargetActivity"
+            android:name="dev.haasele.ione.ShareTargetActivity"
             android:exported="true"
             android:label="Nimbus Notes"
             android:launchMode="singleTop"

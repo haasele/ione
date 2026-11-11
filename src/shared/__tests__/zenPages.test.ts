@@ -1594,8 +1594,8 @@ describe('zenPageHtml', () => {
       targetSdkVersion: '35',
       userAgent:
         'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36',
-      executablePath: '/data/app/app.zen.chromium/base.apk',
-      profilePath: '/data/user/0/app.zen.chromium/files/zen'
+      executablePath: '/data/app/dev.haasele.ione/base.apk',
+      profilePath: '/data/user/0/dev.haasele.ione/files/ione'
     }
 
     it("lays the host's facts out as Chrome's rows, in Chrome's order and under its labels", () => {
@@ -1621,7 +1621,7 @@ describe('zenPageHtml', () => {
       ])
       expect(html).toContain('<td>0.5.9 (Official Build) (64-bit)</td>')
       expect(html).toContain('<td>Android 14; Pixel 7 Build/UQ1A.240105.004; 34; REL</td>')
-      expect(html).toContain('<td>/data/user/0/app.zen.chromium/files/zen</td>')
+      expect(html).toContain('<td>/data/user/0/dev.haasele.ione/files/ione</td>')
     })
 
     it("prints the desktop's rows – JavaScript and Command Line – when the host has them, and escapes every value", () => {

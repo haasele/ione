@@ -31,7 +31,7 @@ describe('the folder a saved file sits in – what a save toast reports (§9.33)
       folderNameOf('content://com.android.providers.downloads.documents/document/msf%3A1042')
     ).toBe('Downloads')
     // Below Android 10 the host writes under its own external files: the same directory by name.
-    expect(folderNameOf('/storage/emulated/0/Android/data/app.zen/files/Download/x.png')).toBe(
+    expect(folderNameOf('/storage/emulated/0/Android/data/dev.haasele.ione/files/Download/x.png')).toBe(
       'Downloads'
     )
     // Only that directory, spelt as Android spells it: another folder keeps its own name.

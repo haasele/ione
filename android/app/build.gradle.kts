@@ -128,15 +128,15 @@ val ciDebugAlias = "ione-ci-debug"
 val ciDebugPassword = "ione-ci-debug"
 
 android {
-    // The code package (R, BuildConfig, relative class names in the manifest). It moves together
-    // with the Kotlin sources in a later pass; the app's identity on the device is applicationId.
-    namespace = "app.zen.chromium"
+    // The code package (R, BuildConfig, relative class names in the manifest).
+    namespace = "dev.haasele.ione"
     compileSdk = 35
 
     defaultConfig {
-        // Ione is a new app to Android: it installs alongside the old app.zen.chromium "Zen"
-        // (v0.2.0 and earlier), which nothing can migrate; the updater says so (src/core/updates.ts).
-        applicationId = "io.github.benitbuhner.ione"
+        // This identity is new to Android: it installs alongside the old Zen (`app.zen.chromium`,
+        // v0.2.0 and earlier) and the previous Ione (`io.github.benitbuhner.ione`). Android cannot
+        // migrate either app's private data; the updater says so (src/core/updates.ts).
+        applicationId = "dev.haasele.ione"
         minSdk = 26
         targetSdk = 35
         versionCode = appVersionCode

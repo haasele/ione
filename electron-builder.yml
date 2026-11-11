@@ -1,4 +1,4 @@
-appId: io.github.benitbuhner.ione
+appId: dev.haasele.ione
 productName: Ione
 directories:
   buildResources: build

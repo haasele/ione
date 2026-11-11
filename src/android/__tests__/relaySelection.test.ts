@@ -4,7 +4,7 @@ import { relayServedObservation, selects } from '../relaySelection'
 /**
  * The relay selection's truth table (blocking-rule-interface.md 7.10): the five facts and the
  * answer. The same rows, in the same order, with the same answers, are pinned in
- * `android/app/src/test/kotlin/app/zen/chromium/blocking/BlockingTest.kt` – the engine chooses
+ * `android/app/src/test/kotlin/dev/haasele/ione/blocking/BlockingTest.kt` – the engine chooses
  * with the Kotlin twin, the runtime drops the relay's page-script observations with this one.
  */
 const table: Array<

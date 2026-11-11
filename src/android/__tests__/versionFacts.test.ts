@@ -19,8 +19,8 @@ const ANSWER = {
   webViewVersion: '152.0.7977.89',
   userAgent:
     'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36',
-  apkPath: '/data/app/~~x==/app.zen.chromium-y==/base.apk',
-  profilePath: '/data/user/0/app.zen.chromium/files/zen'
+  apkPath: '/data/app/~~x==/dev.haasele.ione-y==/base.apk',
+  profilePath: '/data/user/0/dev.haasele.ione/files/ione'
 }
 
 describe('androidVersionFacts (SET-66)', () => {

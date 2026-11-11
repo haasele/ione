@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline'
  * `ione --mcp` (the .deb also keeps `zen-chromium --mcp` for one release): the stdio face of the
  * MCP server, for agent clients that launch a command rather than connect to a URL. The running
  * browser owns the server; this process relays each newline-delimited JSON-RPC message from
- * stdin to `http://127.0.0.1:<port>/mcp` (found in the profile's `zen/agent.json`, together with
+ * stdin to `http://127.0.0.1:<port>/mcp` (found in the profile's `ione/agent.json`, together with
  * the token that skips the approval prompt) and writes the responses to stdout. When stdin closes
  * the session is deleted and the process exits.
  *
@@ -427,17 +427,21 @@ export async function runStdioShim(userDataDir: string): Promise<number> {
 }
 
 export function readEndpoint(userDataDir: string): RelayEndpoint | null {
-  try {
-    const raw = JSON.parse(readFileSync(join(userDataDir, 'zen', 'agent.json'), 'utf8')) as {
-      url?: string | null
-      token?: string
-      running?: boolean
+  // `zen` is the pre-rename document directory: the shim may run before the browser has
+  // migrated it, or beside an older running build.
+  for (const dir of ['ione', 'zen']) {
+    try {
+      const raw = JSON.parse(readFileSync(join(userDataDir, dir, 'agent.json'), 'utf8')) as {
+        url?: string | null
+        token?: string
+        running?: boolean
+      }
+      if (raw.running && raw.url && raw.token) return { url: raw.url, token: raw.token }
+    } catch {
+      // Try the next name.
     }
-    if (!raw.running || !raw.url || !raw.token) return null
-    return { url: raw.url, token: raw.token }
-  } catch {
-    return null
   }
+  return null
 }
 
 function isTimeout(error: unknown): boolean {

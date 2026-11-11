@@ -83,8 +83,8 @@ export class ApiStore {
     const loaded = this.main.readSync()
     this.data =
       loaded && loaded.version === 1 ? { ...emptyPersisted(), ...loaded } : emptyPersisted()
-    this.syncIo = new FileStoreIO(join(userDataDir, 'zen', 'extension-sync'))
-    this.userScriptsIo = new FileStoreIO(join(userDataDir, 'zen', 'extension-user-scripts'))
+    this.syncIo = new FileStoreIO(join(userDataDir, 'ione', 'extension-sync'))
+    this.userScriptsIo = new FileStoreIO(join(userDataDir, 'ione', 'extension-user-scripts'))
     this.managedDir = join(userDataDir, 'extensions', 'managed')
   }
 

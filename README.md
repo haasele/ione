@@ -43,7 +43,10 @@ become `Ione`, and a `zen-sync` / `zenium-sync` folder becomes `ione-sync`); the
 and the `.deb` remove the old installations, macOS users delete the old `Zen.app` / `Zenium.app`
 themselves, and on Android Ione is a new app that installs alongside Zen (uninstall Zen
 afterwards). On Linux the old `zen-chromium` command stays available as an alias of `ione` for one
-release.
+release. Ione itself used the application id `io.github.benitbuhner.ione` before `dev.haasele.ione`;
+the Windows installer retires that older uninstall entry (its files are the ones the new install
+replaces) and keeps the profile, while Android treats the new id as a separate app and cannot
+migrate the old app's private data.
 
 ### Automatic updates
 
@@ -140,8 +143,8 @@ tab shown in another window.
 All browser state lives in the core and is shared by every synced window; each window receives its
 own snapshot (its selection, Glance, find bar, compact state) and only sends commands over
 `window.zen` (Electron: IPC through the preload; Android: a direct in-process call, since core and
-chrome share the WebView). State is persisted atomically to `<userData>/zen/*.json` on desktop and
-`files/zen/*.json` on Android; blank and private windows are never persisted.
+chrome share the WebView). State is persisted atomically to `<userData>/ione/*.json` on desktop and
+`files/ione/*.json` on Android; blank and private windows are never persisted.
 
 Because the core and the chrome are shared, a feature landed for the desktop app is the same
 feature on Android; only the host adapters (`src/main/platform`, `src/android` + `android/`)
@@ -290,7 +293,7 @@ bun run build:android:release    # release APK (R8) → android/app/build/output
 Or use Android Studio: open `android/`; the Gradle build runs the Vite build first (pass
 `-PskipWeb` to skip it when the assets are already built).
 
-The APK (applicationId `io.github.benitbuhner.ione`) is named after the version
+The APK (applicationId `dev.haasele.ione`) is named after the version
 (`ione-<version>-release.apk`), its `versionName` is the
 `package.json` version and its `versionCode` is derived from it (`major·1000000 + minor·10000 +
 patch·100 + channel`, where a pre-release such as `-beta.2` sorts below the final release; pass

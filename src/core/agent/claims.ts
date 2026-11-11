@@ -12,7 +12,7 @@ import { randomToken } from './util'
  * the claim's secret key (`ione_session resume`), or by itself when the browser can prove it is
  * the same client (`AgentService.resurrect`, the stdio relay's renewal).
  *
- * Kept in the profile's `zen/agent-claims.json`, local to this device: the folder marks that
+ * Kept in the profile's `ione/agent-claims.json`, local to this device: the folder marks that
  * sync (`Folder.agent`) carry no claim, and a claim never travels.
  */
 

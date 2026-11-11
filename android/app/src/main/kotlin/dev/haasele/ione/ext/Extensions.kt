@@ -1,0 +1,2849 @@
+package dev.haasele.ione.ext
+
+import android.content.Intent
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Base64
+import android.util.Log
+import android.view.Choreographer
+import android.view.WindowManager
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import androidx.webkit.JavaScriptReplyProxy
+import androidx.webkit.ScriptHandler
+import androidx.webkit.WebResourceResponseCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import dev.haasele.ione.BridgeAdmission
+import dev.haasele.ione.Host
+import dev.haasele.ione.Profiles
+import dev.haasele.ione.TabWebView
+import dev.haasele.ione.arr
+import dev.haasele.ione.blocking.BlockingTab
+import dev.haasele.ione.blocking.Decision
+import dev.haasele.ione.blocking.DecisionObserver
+import dev.haasele.ione.blocking.Domains
+import dev.haasele.ione.blocking.HeaderStage
+import dev.haasele.ione.blocking.ListenerOptions
+import dev.haasele.ione.blocking.ProfileCookieStore
+import dev.haasele.ione.blocking.RedirectExecutor
+import dev.haasele.ione.blocking.RelayedResponse
+import dev.haasele.ione.blocking.Request
+import dev.haasele.ione.blocking.ResourceType
+import dev.haasele.ione.blocking.WebRequestDetails
+import dev.haasele.ione.blocking.WebRequestEvent
+import dev.haasele.ione.blocking.WebRequestListener
+import dev.haasele.ione.bool
+import dev.haasele.ione.json
+import dev.haasele.ione.num
+import dev.haasele.ione.obj
+import dev.haasele.ione.str
+import dev.haasele.ione.strOrNull
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayInputStream
+import java.io.File
+import java.io.InputStream
+import java.lang.ref.WeakReference
+import java.security.SecureRandom
+import java.util.Locale
+import java.util.WeakHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicLongArray
+
+/**
+ * The Kotlin half of the extension runtime. The browser core (`src/android/extensionRuntime.ts`,
+ * in the chrome WebView) owns the extension model: it takes the records the store installed,
+ * parses their manifests, plans content-script units, routes messages and implements the
+ * `chrome.*` calls. This class is the platform it needs, one extension at a time:
+ *
+ *  - `ext.open` reads a record's manifest and locale files from its directory;
+ *  - `ext.configure` compiles that extension's units (bootstrap + sources + config, one script
+ *    per world and origin-rule set, [UnitCompiler] caching per extension and version) and
+ *    installs them on every tab WebView, replacing only that extension's earlier handlers, so a
+ *    reconfigure of one extension leaves every other extension's injected scripts alone;
+ *  - the synthetic origin `https://<id>.ext.ione.invalid/`, served from the record's
+ *    directory through `shouldInterceptRequest` of every WebView (tab pages see only
+ *    web-accessible resources; extension pages see everything, plus the generated background page);
+ *  - the `__zenExtBridge` WebMessageListener of the main world and of each of a fixed pool of
+ *    isolated worlds ([WorldSlots]), all registered when a tab view is built: every frame that
+ *    runs a content script or an extension page says hello with an endpoint id; its
+ *    JavaScriptReplyProxy is kept so the core can answer it (`ext.send`);
+ *  - the transport janitor (`ext-janitor.js`) in the main world of every tab frame, ahead of
+ *    every page script, so a late boot for `scripting.executeScript` into a document that
+ *    predates the extension's world finds an unspoofable bridge;
+ *  - hidden background WebViews (started and stopped by the core's lifecycle policy) and the
+ *    popup / options bottom sheet;
+ *  - the extension seams of the request engine (`blocking/`): declarativeNetRequest itself is
+ *    the core's translator writing `ext:` rule sets into the persisted index the engine
+ *    compiles, scoped to the partitions the extension runs in; this class hears the engine's
+ *    decisions ([DecisionObserver]) and reports the ones an extension's rule took – and, while
+ *    an extension listens for `webRequest`, every one – as `ext.request`, the headers WebView
+ *    sends with a request that goes out while an extension listens for the request-header
+ *    stage (`ext.observeRequestHeaders`, one observing listener of ours on the engine's
+ *    `onSendHeaders` seam) as `ext.requestHeaders`, the response stage of the media requests
+ *    the engine relays for it while an extension listens for that (`ext.observeResponses`) as
+ *    `ext.response`, and substitutes the response of a redirected subresource
+ *    ([RedirectExecutor], see [redirect]).
+ *
+ * Protocol (the core → here), keyed by extension id where it applies: `ext.env`, `ext.open`,
+ * `ext.configure`, `ext.detach`, `ext.background.start` / `stop`, `ext.popup.open` / `close`,
+ * `ext.send`, `ext.exec`, `ext.readFile`, `ext.cookies.get` / `set`, `ext.observeRequests`,
+ * `ext.observeRequestHeaders`, `ext.observeResponses`, `ext.proxy.set` / `clear`
+ * (`chrome.proxy.settings` over the WebView's proxy override, [ExtensionProxy]).
+ * Here → the core (host events): `ext.message`, `ext.gone`, `ext.popupClosed`, `ext.request`,
+ * `ext.requestHeaders`, `ext.response`.
+ */
+class Extensions(private val host: Host) {
+    /** Every bridge message carries this; pages never see it (it lives in closures only). */
+    val token: String = SecureRandom().let { r -> ByteArray(16).also(r::nextBytes).joinToString("") { "%02x".format(it) } }
+
+    /**
+     * Real isolated worlds: `JS_INJECTION_IN_FRAME_AND_WORLD` (androidx.webkit 1.17, Chromium 146+
+     * WebView). Content-script units then run in a per-extension world and the emulation proxy is
+     * off. Decided once, here on the main thread while the host is built, so the boot payload can
+     * carry it to the core before any extension runs (`reducedExtensionIsolation`).
+     */
+    val isolatedWorlds: Boolean =
+        runCatching { WebViewFeature.isFeatureSupported(WebViewFeature.JS_INJECTION_IN_FRAME_AND_WORLD) }.getOrDefault(false)
+
+    private val bootstrap: String by lazy { host.activity.assets.open("ext.js").bufferedReader().readText() }
+    private val janitor: String by lazy {
+        val script = host.activity.assets.open("ext-janitor.js").bufferedReader().readText()
+        "(function(){var __zenExtBoot={token:${JSONObject.quote(token)}};\n$script\n})();"
+    }
+    /**
+     * The units' compiler, with the unit store under the app's files (`ext-units/`, a directory
+     * per runtime named by the process: a unit of [UnitCompiler.FILE_UNIT_CHARS] or more lives
+     * there between installs, not in the heap – compat round 24's R24-1; the store's leavings of
+     * a process that died are swept at the next process's first compile).
+     */
+    private val compiler = UnitCompiler(store = File(host.activity.filesDir, "ext-units"), owner = "p${android.os.Process.myPid()}") { bootstrap }
+    private val main = Handler(Looper.getMainLooper())
+    private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "zen-ext") }
+
+    /**
+     * Set by [destroy] (main thread): nothing is installed or held after it. A configure whose
+     * compile was in flight lands on it and installs nothing; a configure asked after it is
+     * refused – the old core runs on for a moment after its WebView is destroyed.
+     */
+    @Volatile private var destroyed = false
+
+    /**
+     * One document-start script of one extension, injected into frames whose origin matches
+     * `origins`; into the named isolated world when `world` is set. Over the compiler's unit
+     * ([UnitCompiler.Compiled]): its [text] is the held string, or – a unit of the store – read
+     * from its file for the install and let go after ([chars] and [stored] say which without a
+     * read).
+     */
+    class ScriptUnit(val extensionId: String, val key: String, val origins: Set<String>, val world: String?, private val compiled: UnitCompiler.Compiled) {
+        /** The script's characters, held or stored. */
+        val chars: Int get() = compiled.chars
+
+        /** Whether the unit lives in the store between installs rather than in the heap. */
+        val stored: Boolean get() = compiled.file != null
+
+        /** The script to hand the WebView, or why there is none: read now for a stored unit ([UnitCompiler.Compiled.read]). */
+        fun read(): UnitCompiler.Read = compiled.read()
+
+        /** [read]'s text, or null for every other answer. */
+        fun text(): String? = compiled.text()
+    }
+
+    /**
+     * One [installExtension] pass: its time in milliseconds (the reads and the handoffs), how
+     * many stored units it read from the disk, how many it took soft-held from the last read,
+     * and how many it could not install – their file gone, or their read out of heap.
+     */
+    class Installed(val ms: Long, val readFromDisk: Int, val softHeld: Int, val gone: Int, val outOfHeap: Int) {
+        val skipped: Int get() = gone + outOfHeap
+
+        companion object {
+            val NONE = Installed(0L, 0, 0, 0, 0)
+        }
+    }
+
+    /** What the core configured for one attached extension. */
+    class Served(
+        val id: String,
+        val version: String,
+        /** The record's directory (`<root>/<id>/<version>`), where every file is read from. */
+        val dir: File,
+        val allowFileAccess: Boolean,
+        /**
+         * Whether the extension runs in private tabs (Chrome's "allow in Incognito"): without it
+         * no unit is injected there, its origin is not served to them and its rules do not
+         * apply to their requests.
+         */
+        val allowPrivate: Boolean,
+        /** `web_accessible_resources` globs (tab pages may only fetch these). */
+        val webAccessible: List<Regex>,
+        /** `host_permissions` (and MV2 origin permissions): the hosts the CORS proxy reaches for the extension's pages. */
+        val hosts: List<MatchPattern>,
+        /** The generated background page, or null when the extension has none / an MV2 page. */
+        val backgroundHtml: String?,
+        val backgroundUrl: String?,
+        /** Page-mode boot config (JSON) without `context`; set per WebView kind. */
+        val pageConfig: String,
+        /** Content-mode boot config (JSON) of a late boot: no groups, `with` isolation. */
+        val lateConfig: String,
+        /**
+         * The substitution map of the extension's stylesheets (`cssSubstitutionMap` in the core):
+         * every `text/css` file served on the extension's origin has its `__MSG_name__`
+         * placeholders replaced from it, as Chrome's renderer does for a `chrome-extension://`
+         * stylesheet response (`ExtensionFiles.localizeCss`).
+         */
+        val cssMessages: Map<String, String> = emptyMap()
+    )
+
+    /**
+     * A frame (or extension page) that said hello. `url` is the document's `location.href` at
+     * hello time and `doc` the bootstrap's document id (the endpoint id's first segment, derived
+     * from the document's `performance.timeOrigin`, so every unit of one document, in whichever
+     * world, reports the same id): a main frame saying hello with another `doc` is a new document.
+     * `world` marks an endpoint inside a real isolated world (the `world` unit of its extension) as
+     * opposed to the frame's main-world endpoint.
+     */
+    class Endpoint(
+        val view: WebView,
+        val proxy: JavaScriptReplyProxy,
+        val context: String,
+        val extensionId: String,
+        val isMainFrame: Boolean,
+        val url: String,
+        val doc: String,
+        /** The world slot the endpoint's bridge listener belongs to; null in the main world. */
+        val slot: Int?
+    ) {
+        val world: Boolean get() = slot != null
+    }
+
+    /**
+     * Per tab WebView: the janitor's handler, `chrome.fontSettings`' stylesheet's, `chrome.privacy`'s
+     * `navigator.doNotTrack` script's, and, per extension, the handlers of its units.
+     */
+    private class ViewHandlers {
+        var janitor: ScriptHandler? = null
+        var fonts: ScriptHandler? = null
+        var privacy: ScriptHandler? = null
+        val byExtension = HashMap<String, MutableList<ScriptHandler>>()
+    }
+
+    /**
+     * `chrome.fontSettings`' layer over the user's page fonts (`ext.fonts.apply`; [ExtensionFontLayer]):
+     * what every tab's `TabWebView.applyFonts` lays over `Host.pageFonts`, [EMPTY][ExtensionFontLayer.EMPTY]
+     * while no extension holds a value. Main thread.
+     */
+    var fontLayer: ExtensionFontLayer = ExtensionFontLayer.EMPTY
+        private set
+
+    /**
+     * `chrome.privacy`'s document-start layer (`ext.privacy.apply`; [ExtensionPrivacyLayer]): whether
+     * `navigator.doNotTrack` reads `'1'` in regular and in private tabs' documents. Main thread.
+     */
+    var privacyLayer: ExtensionPrivacyLayer = ExtensionPrivacyLayer.EMPTY
+        private set
+
+    @Volatile private var served: Map<String, Served> = emptyMap()
+    /**
+     * Tab pages requested on an extension's origin before its configure (a restored tab at
+     * boot): held on an empty document and loaded again when the extension is served, failed
+     * when it is not coming (see [HeldPages]).
+     */
+    private val heldPages = HeldPages<TabWebView>()
+    /**
+     * The extension frame documents each tab's page holds, for [intercept] to tell a frame's
+     * own Referer-less requests from the page's (see [FrameOwnership]); network threads.
+     */
+    private val frames = FrameOwnership<TabWebView>()
+    /** Per extension, the units currently installed on every tab (main thread). */
+    private val units = LinkedHashMap<String, List<ScriptUnit>>()
+    /**
+     * How many reads of a stored unit did not fit the heap over the runtime's life
+     * ([UnitCompiler.Read.OutOfHeap]; main thread) – each one a unit the tabs of a pass were
+     * without, said in an error line at the time and counted in [unitMemory] and the configure
+     * line so the reading is never silent.
+     */
+    private var storeReadsOutOfHeap = 0
+    /**
+     * Whether an extension listens for `webRequest` right now (`ext.observeRequests`): then every
+     * decision of the engine is reported, not only those an extension's rule took.
+     */
+    @Volatile private var observeRequests = false
+    /**
+     * The request-header stage (`ext.observeRequestHeaders`): while an extension listens for
+     * `webRequest.onBeforeSendHeaders` / `onSendHeaders`, one observing listener of ours on the
+     * engine's `onSendHeaders` seam ([WebRequestEvent.ON_SEND_HEADERS]) reports the headers
+     * WebView is about to send ([onSendHeaders]); none otherwise, since the seam costs every
+     * request a record while anyone listens. Its remover while registered; main thread.
+     */
+    private var requestHeadersListener: (() -> Unit)? = null
+    /**
+     * The `ext.request` payload [onDecision] built last on this intercept thread, for
+     * [onSendHeaders] to pair the header stage with. The engine decides a request and then runs
+     * the listeners of the same request on one thread, one after the other
+     * (`Blocking.evaluate`), so the pairing rides on the thread; the URL is checked besides
+     * ([RequestHeadersReport.build]) – a request the engine never decided (an extension page's
+     * own, off the web) would find the thread's last one, stale.
+     */
+    private val lastDecision = ThreadLocal<JSONObject?>()
+    /** `ext.request` ids: one sequence per process, like Chrome's request ids. */
+    private val requestIds = AtomicLong(1)
+    /** The `identity.launchWebAuthFlow` sheets open right now, by the runtime's view id (`ext.auth.*`). */
+    private val authSheets = HashMap<Int, ExtensionAuthSheet>()
+    @Volatile var debug = true
+        private set
+    private val handlers = WeakHashMap<WebView, ViewHandlers>()
+    /**
+     * The isolated worlds every tab view registers a bridge listener for when it is built, and
+     * which extension's world each one carries right now (see [WorldSlots] for why the pool is
+     * fixed at construction). Empty pool without world injection.
+     */
+    private val worldSlots = WorldSlots(if (isolatedWorlds) WORLD_SLOTS else 0)
+    /**
+     * Which attach each extension is on: a configure's off-thread compile lands only while the
+     * attach it was requested for is still the current one (see [AttachEpochs]).
+     */
+    private val attachEpochs = AttachEpochs()
+    /** The extension's configures between request and landing ([ConfiguresInFlight]); `unitMemory` reports the count. Main thread. */
+    private val configuresInFlight = ConfiguresInFlight()
+    /**
+     * A background document's own worker script is served to it once: the generated page's own
+     * `<script src>`; a `<script>` the worker script appends through the page's bare `document`
+     * with a src that resolves to the script's own path would run the bundle again (see
+     * [WorkerScriptGate]). WebView's IO threads, in the requests' order.
+     */
+    private val workerScriptGate = WorkerScriptGate()
+    /**
+     * Written on the main thread (a hello, a document gone, an extension stopped) and read there
+     * and on the JavaBridge thread ([sendFromHop]: the reply hop's `ext.send` looks its endpoint
+     * up where it arrives), so a concurrent map – every read off the main thread is a lookup or a
+     * weakly consistent walk of `val` fields.
+     */
+    private val endpoints = ConcurrentHashMap<String, Endpoint>()
+    private val backgrounds = HashMap<String, ExtensionWebView>()
+    /**
+     * How many times each extension's background has been started here since the process came
+     * up (instrumentation): a worker with no view and a start on record has idled out – an MV3
+     * worker stops half a minute after its last traffic, as Chrome's does – where one with no
+     * start never ran.
+     */
+    private val backgroundStarts = HashMap<String, Int>()
+    /** `chrome.offscreen`'s hidden page per extension: a background-like view on the URL the extension named. */
+    private val offscreens = HashMap<String, ExtensionWebView>()
+    private var popup: ExtensionPopup? = null
+    /**
+     * `chrome.power`: the extensions holding a keep-awake request right now (`ext.power.keepAwake`),
+     * with the level each asked. The window keeps its screen on while the set is not empty;
+     * a request goes with its extension when it detaches, and with the runtime (main thread).
+     */
+    private val keepAwake = LinkedHashMap<String, String>()
+    /** The user agent extension pages send (set when the first extension view is built), for the CORS proxy's requests. */
+    @Volatile var userAgent: String? = null
+    /** Optional host permissions granted at runtime (`chrome.permissions.request`), per extension; read on request threads. */
+    @Volatile private var grantedHosts: Map<String, List<MatchPattern>> = emptyMap()
+    /** The jar half of `chrome.cookies` (see [ExtensionCookies]). */
+    private val cookies = ExtensionCookies()
+    /** The shade half of `chrome.notifications` (see [ExtensionNotifications]). */
+    private val notifications = ExtensionNotifications(host.activity, io) { id, notificationId, event, index ->
+        onNotificationEvent(id, notificationId, event, index)
+    }
+    /**
+     * Taps on cards of extensions not attached right now (the card outlived the process, or the
+     * chrome is still booting): delivered when `ext.configure` brings the extension back.
+     */
+    private val pendingNotificationEvents = HashMap<String, ArrayDeque<JSONObject>>()
+    /**
+     * Whether the WebView stores the cookies of an intercepted response handed over through
+     * `WebResourceResponseCompat.setCookies` (`COOKIE_INTERCEPT`, Chromium 137+); read once, and
+     * defensively, as [NavigationReports] reads its features.
+     */
+    val cookieIntercept: Boolean by lazy {
+        runCatching { WebViewFeature.isFeatureSupported(WebViewFeature.COOKIE_INTERCEPT) }.getOrDefault(false)
+    }
+    /**
+     * Cross-origin fetches of extension pages to permitted hosts (see [CorsProxy]). A credentialed
+     * response's `Set-Cookie` reaches the WebView's jar as the response's cookies where the WebView
+     * files those itself, through `CookieManager` otherwise.
+     */
+    private val corsProxy = CorsProxy(
+        object : CorsProxy.Cookies {
+            override val intercepts: Boolean get() = cookieIntercept
+            override fun header(url: String): String? = CookieManager.getInstance().getCookie(url)
+            override fun store(url: String, setCookie: String) = CookieManager.getInstance().setCookie(url, setCookie)
+        }
+    ) { userAgent }
+    /**
+     * The engine's last decisions on the tabs' requests ("allow|block|redirect|upgrade type
+     * <micros>us <cpuMicros>cpu url": the wall-clock time `EngineSnapshot.decide` took and the
+     * CPU time the thread spent in it, `?cpu` where the platform cannot tell), kept while `debug`
+     * for instrumentation (the demo's latency figures).
+     */
+    val decisions = ArrayDeque<String>()
+    /** While `debug`: the CORS proxy's last outcomes ("<ext> METHOD <status | words> url" – [recordProxy]), for instrumentation. */
+    val proxied = ArrayDeque<String>()
+    /**
+     * While `debug`: the intercept's last answers on the extensions' origins and the page alias
+     * (ServedRecord's lines – [recorded]), for instrumentation: the sweep reads whether a content
+     * script's insertion of an extension file was served, which the page's Resource Timing cannot
+     * show (compat round 24, AdGuard Extra's row).
+     */
+    val servedRecord = ArrayDeque<String>()
+    /**
+     * While `debug`: `"<ext> <ns>.<method>"` → `[calls, failed replies, unanswered]` over the
+     * bridge, so the demo can grade messaging and storage per real extension (`msg` counts as
+     * `runtime.sendMessage`, `connect` as `runtime.connect`, `portMsg` as `port.postMessage`).
+     * Unanswered: the two `runtime.lastError` outcomes of a normal Chrome run (`UNANSWERED`).
+     */
+    val callStats = HashMap<String, IntArray>()
+    private val pendingCalls = HashMap<String, String>()
+    /** While `debug`: the wall clock at each pending call's receipt (`"<ep>:<id>"`), for its reply's legs ([ReplyTiming]). */
+    private val pendingWall = HashMap<String, Long>()
+    /** While `debug`: the last few hundred bridge messages, one line each (see [trace]). */
+    private val bridgeTrace = ArrayDeque<String>()
+    /**
+     * Times `onPageStarted` arrived after the new document's bootstrap had already said hello
+     * (evidence for the ordering `onDocumentGone` tolerates), for instrumentation.
+     */
+    var lateOnPageStarted = 0
+        private set
+    /** Late boots `ext.exec` had to run (a document without the extension's scope), for instrumentation. */
+    var lateBoots = 0
+        private set
+    /** `ext.configure` outcomes per extension (`{ units: [{ key, chars, cached }], ms }`), for instrumentation. */
+    val configureStats = HashMap<String, JSONObject>()
+    /**
+     * The bridge's traffic so far, three counters on the main thread, for instrumentation (the
+     * frame budget reads them around a scroll): `[0]` messages from frames to the host (a content
+     * script's or an extension page's `postMessage`, host-bound), `[1]` events the runtime raised
+     * into the chrome's core on their behalf (`ext.*`: a message forwarded, a request observed, an
+     * endpoint gone – each an `evaluateJavascript` on the chrome WebView), `[2]` messages from the
+     * host to frames (replies, deliveries, events; page-bound). Always on: three increments –
+     * `[2]`'s on the JavaBridge thread as well since the reply hop ([sendFromHop]), so atomic.
+     */
+    private val bridgeCounters = AtomicLongArray(3)
+
+    /** A copy of the bridge counters (see [bridgeCounters]): frames to host, host to chrome, host to frames. */
+    fun bridgeCounts(): LongArray = LongArray(3) { bridgeCounters.get(it) }
+
+    /**
+     * The flood guard's counters ([BridgeForward]): messages forwarded to the core, action updates
+     * folded into a newer one, action updates dropped at the pending bound, messages refused there.
+     */
+    fun floodGuardCounts(): LongArray = longArrayOf(forward.forwarded, forward.superseded, forward.dropped, forward.refused)
+
+    /** An `ext.*` event into the chrome's core, counted ([bridgeCounters]). */
+    private fun chromeEvent(name: String, payload: Any?) {
+        bridgeCounters.incrementAndGet(1)
+        host.chrome.hostEvent(name, payload)
+    }
+
+    /**
+     * The page-to-host flood guard in front of `ext.message` ([BridgeForward]): action state
+     * coalesced per frame, the forward paced by a frame budget, what waits bounded. Frames come
+     * from the Choreographer; nothing goes while the chrome is not ready for events (it is
+     * rebuilding). `setIcon` pixels are scaled here ([ActionCalls], [IconScaling]) before they
+     * cross; a bound hit puts a line on the extension's error console ([consoleLine]).
+     */
+    private val forward = BridgeForward(
+        frames = { tick -> Choreographer.getInstance().postFrameCallback { tick.run() } },
+        ready = { host.chrome.ready },
+        sink = object : BridgeForward.Sink {
+            override fun forward(ep: String, tabId: String?, top: Boolean, origin: String, text: CharSequence) {
+                // The message goes to the core as the frame wrote it (one copy, no rebuild); the
+                // core drops the token it carries (`extensionRuntime.onMessage`).
+                val event = StringBuilder(text.length + 128)
+                    .append("{\"ep\":").append(JSONObject.quote(ep))
+                    .append(",\"tabId\":").append(if (tabId == null) "null" else JSONObject.quote(tabId))
+                    .append(",\"top\":").append(top)
+                    .append(",\"origin\":").append(JSONObject.quote(origin))
+                    .append(",\"message\":").append(text)
+                    .append('}')
+                bridgeCounters.incrementAndGet(1)
+                host.chrome.hostEventJson("ext.message", event)
+            }
+
+            override fun rewrite(message: JSONObject, text: String): String? = ActionCalls.rewriteIcon(message, text, IconScaling)
+
+            override fun warn(source: BridgeForward.Source, message: String) = consoleLine(source, message)
+        }
+    )
+
+    /**
+     * A warning on an extension's error console (`ExtensionInfo.errors`, the extensions page's
+     * "Errors"), through the core (`ext.console`): attributed to the endpoint's kind of context
+     * as Chrome's console sources go – its background as the worker's, a content script's as
+     * `content`, any page of its own as `page`.
+     */
+    private fun consoleLine(source: BridgeForward.Source, message: String) {
+        val kind = when (source.context) {
+            "background", "offscreen" -> "worker"
+            "content" -> "content"
+            else -> "page"
+        }
+        chromeEvent(
+            "ext.console",
+            json("id" to source.extensionId, "level" to "warning", "source" to kind, "message" to message, "url" to source.url.ifEmpty { null }, "context" to source.context)
+        )
+    }
+
+    val origin = ORIGIN_SUFFIX
+
+    /** The engine's extension seams, this runtime's (see the class comment). */
+    private val observer = object : DecisionObserver {
+        override fun onDecision(tab: BlockingTab, request: Request, decision: Decision, elapsedNanos: Long, cpuNanos: Long) =
+            this@Extensions.onDecision(tab, request, decision, elapsedNanos, cpuNanos)
+
+        override fun onResponse(tab: BlockingTab, request: Request, response: RelayedResponse) =
+            this@Extensions.onResponse(tab, request, response)
+    }
+    private val redirector = RedirectExecutor { tab, request, target, type -> redirect(target, request, type, tab) }
+
+    /**
+     * The engine's headers-received stage for documents ([HeaderStage]): its relay reads and
+     * writes the cookies of the tab's profile, since WebView neither sends its cookies with a
+     * fetch made here nor keeps the `Set-Cookie` of an intercepted response.
+     */
+    private val headerStage = HeaderStage(ProfileCookieStore)
+
+    init {
+        // The engine is the process's; the window's runtime is the one that hears it (a custom
+        // tab has no extensions, its requests are still decided by the same snapshot).
+        host.blocking.observer = observer
+        host.blocking.redirector = redirector
+        host.blocking.headerStage = headerStage
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Native methods (from the core)
+    // ---------------------------------------------------------------------------------------------
+
+    fun handle(method: String, args: JSONObject, reply: (Any?) -> Unit) {
+        when (method) {
+            "ext.env" -> {
+                // A runtime asking for its environment is a new one (the chrome booted): whatever
+                // an earlier runtime left running is history, and it re-attaches what it wants.
+                reset()
+                reply(
+                    json(
+                        "token" to token,
+                        "uiLanguage" to Locale.getDefault().toLanguageTag(),
+                        "isolatedWorlds" to isolatedWorlds,
+                        "worldSlots" to worldSlots.size,
+                        "navigationListener" to NavigationReports.supported,
+                        // The engines' `maxMessageLength`: half the bridge's own message limit,
+                        // as the core re-serializes a delivered message inside `ext.send`'s
+                        // arguments (a string in a string, its quotes escaped) before the
+                        // bridge measures that call (BridgeAdmission).
+                        "messageLimit" to host.chrome.bridge.admission.messageLimitChars / 2
+                    )
+                )
+            }
+            "ext.open" -> open(args.str("id"), args.str("path"), reply)
+            "ext.fileSizes" -> fileSizes(args, reply)
+            "ext.configure" -> configure(args, reply)
+            "ext.detach" -> { detachExtension(args.str("id")); reply(null) }
+            "ext.expect" -> {
+                // The extensions the core is about to configure (told before it restores the
+                // windows), or, with an empty list once its start is over, none: a page still
+                // held for an extension that is not coming fails now.
+                val ids = args.arr("ids").let { a -> List(a.length()) { i -> a.optString(i, "") }.filter(VALID_ID::matches) }
+                for (held in heldPages.expect(ids)) failHeld(held)
+                reply(null)
+            }
+            "ext.observeRequests" -> { observeRequests = args.bool("on"); reply(null) }
+            "ext.observeRequestHeaders" -> { setObserveRequestHeaders(args.bool("on")); reply(null) }
+            // The engine's switch (contract 7.1): the process's engine relays media requests for
+            // their response stage while it is on; this runtime hears them through [observer].
+            // The pages' observer of their own fetch / XHR responses (7.10) follows the same
+            // word: every live document is told now, a new one learns it at its hello.
+            "ext.observeResponses" -> { setObserveResponses(args.bool("on")); reply(null) }
+            "ext.send" -> { send(args.str("ep"), args.str("message"), args.optJSONArray("at")); reply(null) }
+            "ext.background.start" -> { startBackground(args.str("id"), args.str("reason", "unsaid")); reply(null) }
+            "ext.background.stop" -> { stopBackground(args.str("id"), args.str("reason", "unsaid")); reply(null) }
+            "ext.popup.open" -> { openPopup(args.str("id"), args.str("url"), args.str("context", "popup"), args.str("title", "")); reply(null) }
+            "ext.popup.close" -> { closePopup(); reply(null) }
+            "ext.offscreen.open" -> { openOffscreen(args.str("id"), args.str("url")); reply(null) }
+            "ext.offscreen.close" -> { closeOffscreen(args.str("id")); reply(null) }
+            "ext.auth.open" -> { openAuthSheet(args.getInt("viewId"), args.str("id"), args.str("url"), args.str("title")); reply(null) }
+            "ext.auth.show" -> { authSheets[args.getInt("viewId")]?.show(); reply(null) }
+            "ext.auth.close" -> { authSheets.remove(args.getInt("viewId"))?.close(); reply(null) }
+            "ext.hosts" -> {
+                val id = args.str("id")
+                val hosts = args.arr("hosts").let { a -> MatchPattern.compileAll(List(a.length()) { i -> a.optString(i, "") }) }
+                grantedHosts = if (hosts.isEmpty()) grantedHosts - id else grantedHosts + (id to hosts)
+                reply(null)
+            }
+            "ext.exec" -> exec(args, reply)
+            "ext.contextMenuEvent" -> { contextMenuEvent(args); reply(null) }
+            "ext.cookies.read" -> reply(cookies.read(args.str("container", Profiles.DEFAULT_CONTAINER), args.str("url")))
+            "ext.cookies.write" -> cookies.write(args.str("container", Profiles.DEFAULT_CONTAINER), args.str("url"), args.str("cookie"), reply)
+            "ext.notifications.show" -> { showNotification(args.str("id"), args.obj("notification")); reply(null) }
+            "ext.notifications.hide" -> { notifications.hide(args.str("id"), args.str("notificationId")); reply(null) }
+            "ext.notifications.forget" -> { notifications.forget(args.str("id")); reply(null) }
+            "ext.notifications.allowed" -> reply(notifications.allowed())
+            "ext.proxy.set" -> ExtensionProxy.apply(ExtensionProxy.Plan.of(args), { r -> main.post(r) }) { error ->
+                reply(if (error == null) null else Host.Rejection(error))
+            }
+            "ext.proxy.clear" -> ExtensionProxy.clear({ r -> main.post(r) }) { error ->
+                reply(if (error == null) null else Host.Rejection(error))
+            }
+            "ext.readFile" -> {
+                val id = args.str("id")
+                val path = args.str("path")
+                io.execute {
+                    // Never a multi-megabyte answer: quoting one took the browser process's heap
+                    // (ExtensionFiles.BRIDGE_TEXT_LIMIT); the runtime streams such files itself.
+                    val file = fileFor(id, path)
+                    val text = ExtensionFiles.bridgeText(file)
+                    if (text == null && file?.isFile == true) Log.w(TAG, "ext.readFile $id $path: ${file.length()} bytes is too large for a bridge answer")
+                    main.post { reply(text) }
+                }
+            }
+            "ext.i18n.detectLanguage" -> {
+                // The classifier is a call into the system's text-classification service; a
+                // failure of that service is a text nobody could place.
+                val text = args.str("text")
+                io.execute {
+                    val detected = runCatching { LanguageDetection.detect(host.activity, text) }
+                        .getOrElse { e -> Log.w(TAG, "detectLanguage: ${e.message}"); LanguageDetection.NONE }
+                    main.post { reply(detected) }
+                }
+            }
+            "ext.system.cpu" -> {
+                // `/proc` reads are file IO (and refused by the sandbox as often as not): off the main thread.
+                io.execute {
+                    val reading = SystemInfo.cpu()
+                    main.post { reply(reading) }
+                }
+            }
+            "ext.system.memory" -> reply(SystemInfo.memory(host.activity))
+            "ext.power.keepAwake" -> {
+                setKeepAwake(args.str("id"), args.strOrNull("level"))
+                reply(null)
+            }
+            "ext.fonts.apply" -> { setFontLayer(ExtensionFontLayer.fromJson(args)); reply(null) }
+            "ext.privacy.apply" -> { setPrivacyLayer(ExtensionPrivacyLayer.fromJson(args)); reply(null) }
+            "ext.fonts.list" -> {
+                // The configuration files and the font files' `name` tables: file IO, off the main thread.
+                io.execute {
+                    val list = runCatching { FontFiles.list() }.getOrElse { e -> Log.w(TAG, "fonts.list: ${e.message}"); emptyList() }
+                    main.post { reply(JSONArray(list.map { it.toJson() })) }
+                }
+            }
+            else -> throw IllegalArgumentException("Unknown method: $method")
+        }
+    }
+
+    /**
+     * `chrome.power`: hold (`level` `system` or `display`) or release (null) the extension's
+     * keep-awake request and set the window's screen-on flag from what is held. Both levels keep
+     * the screen on: the phone has no wake lock an app may hold for a user with the screen off.
+     * The window flag is the app's own holder; WebView's fullscreen video keeps the screen on
+     * through its view's flag, which the framework ORs with this one, so neither clears the other.
+     */
+    private fun setKeepAwake(id: String, level: String?) {
+        val before = keepAwake.isNotEmpty()
+        if (level == null) keepAwake.remove(id) else keepAwake[id] = level
+        val after = keepAwake.isNotEmpty()
+        if (before == after) return
+        val window = host.activity.window
+        if (after) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        Log.i(TAG, "keep awake ${if (after) "on" else "off"} (${keepAwake.keys.joinToString { it.take(8) }})")
+    }
+
+    /** Every keep-awake request released: the runtime is going, or starting from nothing. */
+    private fun releaseKeepAwake() {
+        for (id in keepAwake.keys.toList()) setKeepAwake(id, null)
+    }
+
+    /**
+     * `ext.open { id, path }` → `{ manifest, locales: { <locale>: <messages.json> } }`. The path is
+     * the record's directory; it has to lie under the store's install root. Only the locales the
+     * core can use (the UI locale, its language, the manifest default) travel.
+     */
+    private fun open(id: String, path: String, reply: (Any?) -> Unit) {
+        io.execute {
+            val dir = recordDir(path)
+            if (dir == null) {
+                main.post { reply(Host.Rejection("The extension directory is not under the install root")) }
+                return@execute
+            }
+            val manifestText = runCatching { File(dir, "manifest.json").readText() }.getOrNull()
+            if (manifestText == null) {
+                main.post { reply(Host.Rejection("manifest.json is missing or unreadable")) }
+                return@execute
+            }
+            val manifest = runCatching { JSONObject(manifestText) }.getOrNull()
+            val locales = JSONObject()
+            val defaultLocale = manifest?.strOrNull("default_locale")
+            val ui = Locale.getDefault()
+            for (candidate in listOf(ui.toLanguageTag(), ui.language, defaultLocale).filterNotNull().map { it.replace('-', '_') }) {
+                if (candidate.isEmpty() || locales.has(candidate) || !LOCALE_DIR.matches(candidate)) continue
+                val file = File(dir, "_locales/$candidate/messages.json")
+                if (file.isFile) runCatching { locales.put(candidate, file.readText()) }
+            }
+            Log.i(TAG, "opened ${id.take(8)} from ${dir.path} (${locales.length()} locale file(s))")
+            main.post { reply(json("manifest" to manifestText, "locales" to locales)) }
+        }
+    }
+
+    /**
+     * `ext.fileSizes`: `{ id, path, files: [extension-relative path] }` → `{ sizes: { path:
+     * bytes } }` for the files that are there, unread – what the core's planner folds a plan of
+     * many hostname units by (`units.ts`, `foldUnits`; `UnitCompiler` measures a unit the same
+     * way before reading it). File IO, so off the main thread.
+     */
+    private fun fileSizes(args: JSONObject, reply: (Any?) -> Unit) {
+        val id = args.str("id")
+        if (!VALID_ID.matches(id)) {
+            reply(Host.Rejection("'$id' is not an extension id"))
+            return
+        }
+        val dir = recordDir(args.str("path"))
+        if (dir == null) {
+            reply(Host.Rejection("The extension directory is not under the install root"))
+            return
+        }
+        val files = args.arr("files")
+        io.execute {
+            val sizes = JSONObject()
+            for (i in 0 until files.length()) {
+                val path = files.optString(i, "")
+                if (path.isEmpty()) continue
+                val length = fileIn(dir, path)?.takeIf { it.isFile }?.length() ?: continue
+                sizes.put(path, length)
+            }
+            main.post { reply(json("sizes" to sizes)) }
+        }
+    }
+
+    /**
+     * `ext.configure { id, name, version, path, allowFileAccess, allowPrivate, units: [{ key,
+     * origins, world, config, groups: [{ ext, index, js, isolation }], css: [{ ext, path }] }],
+     * served: { webAccessible, backgroundHtml, backgroundUrl, page, late }, debug }` → `{ units:
+     * [{ key, chars, cached, refused? }], ms }`. Reading the sources is file IO, so the units are
+     * compiled off the main thread and installed on it, on every tab, in place of this
+     * extension's earlier units only. A unit the heap cannot hold ([UnitCompiler.Refused]) is
+     * not installed anywhere and is named once on the extension's error console; the rest of
+     * the extension goes on. A configure whose extension was detached (or whose runtime was
+     * reset) while its units compiled installs nothing and answers its stats with
+     * `dropped: "detached"` (see [AttachEpochs]).
+     */
+    private fun configure(args: JSONObject, reply: (Any?) -> Unit) {
+        val id = args.str("id")
+        if (!VALID_ID.matches(id)) {
+            reply(Host.Rejection("'$id' is not an extension id"))
+            return
+        }
+        val name = args.str("name").ifEmpty { id }
+        val debug = args.bool("debug", true)
+        val epoch = attachEpochs.current(id)
+        // The runtime is destroyed (its io executor with it): the old core asking after its
+        // WebView went is told so, instead of an executor's refusal.
+        if (destroyed) {
+            reply(Host.Rejection("The extension runtime is destroyed"))
+            return
+        }
+        configuresInFlight.begun(id)
+        io.execute {
+            val started = System.nanoTime()
+            val dir = recordDir(args.str("path"))
+            if (dir == null) {
+                main.post {
+                    configuresInFlight.landed(id)
+                    reply(Host.Rejection("The extension directory is not under the install root"))
+                }
+                return@execute
+            }
+            // The plan as it arrives, before a file is read: what the compile is about to do
+            // and the heap it does it on (compat round 21 – a 60-unit plan met a heap the
+            // blocking engine's rules had half filled, and only the death told of it), and
+            // whether the runtime destroyed before this one is collected yet (round 21b – a
+            // browser restarted in the same process compiled on top of the old runtime's units).
+            val planned = args.arr("units")
+            val runtime = Runtime.getRuntime()
+            Log.i(
+                TAG,
+                "configure ${id.take(8)} ${args.str("version")}: ${planned.length()} unit(s) planned, " +
+                    "${(0 until planned.length()).sumOf { i -> planned.optJSONObject(i)?.optString("config")?.length ?: 0 }} config chars, " +
+                    "shapes ${(0 until planned.length()).map { i -> planned.optJSONObject(i)?.optString("shape", ExtensionScripts.SHAPE_WHOLE) ?: ExtensionScripts.SHAPE_WHOLE }.groupingBy { it }.eachCount().entries.joinToString(" ") { (shape, n) -> "$n $shape" }}, " +
+                    "heap ${(runtime.totalMemory() - runtime.freeMemory()) shr 20}/${runtime.maxMemory() shr 20} MB, " +
+                    "previous runtime ${previousRuntime()}"
+            )
+            val s = args.obj("served")
+            val servedNow = Served(
+                id = id,
+                version = args.str("version"),
+                dir = dir,
+                allowFileAccess = args.bool("allowFileAccess"),
+                allowPrivate = args.bool("allowPrivate"),
+                webAccessible = s.arr("webAccessible").let { a -> List(a.length()) { i -> globToRegex(a.optString(i, "")) } },
+                hosts = s.arr("hosts").let { a -> MatchPattern.compileAll(List(a.length()) { i -> a.optString(i, "") }) },
+                backgroundHtml = s.strOrNull("backgroundHtml"),
+                backgroundUrl = s.strOrNull("backgroundUrl"),
+                pageConfig = s.str("page", "{}"),
+                lateConfig = s.str("late", "{}"),
+                cssMessages = s.obj("cssMessages").let { m -> m.keys().asSequence().associateWith { k -> m.optString(k, "") } }
+            )
+            val compiled = compiler.compile(
+                id, servedNow.version, args.arr("units"), debug,
+                read = { path -> fileIn(dir, path)?.takeIf { it.isFile }?.readText() },
+                size = { path -> fileIn(dir, path)?.takeIf { it.isFile }?.length() }
+            )
+            val unitsNow = compiled.filter { it.refused == null }
+                .map { ScriptUnit(id, it.key, it.origins.toSet(), it.world?.takeIf { isolatedWorlds }, it) }
+            val ms = (System.nanoTime() - started) / 1_000_000
+            val stats = json(
+                "units" to JSONArray(compiled.map {
+                    json("key" to it.key, "chars" to it.chars, "cached" to it.cached, "refused" to it.refused?.chars, "stored" to (it.file != null))
+                }),
+                "ms" to ms
+            )
+            main.post {
+                // Landed, whatever comes of it below: the runtime's units for the extension are
+                // its last configure's from here (ConfiguresInFlight, for the heap instrumentation).
+                configuresInFlight.landed(id)
+                // Destroyed while the units compiled: the runtime holds nothing any more, and
+                // the core that asked is gone with its WebView – nothing installed, no answer.
+                if (destroyed) {
+                    Log.i(TAG, "configure of ${id.take(8)} ${servedNow.version} dropped: the runtime was destroyed while its ${compiled.size} unit(s) compiled ($ms ms)")
+                    return@post
+                }
+                // Detached (or reset) while the units compiled: the core has dropped this attach,
+                // and units installed for it now would stay on every tab until the next one.
+                if (!attachEpochs.isCurrent(id, epoch)) {
+                    Log.i(TAG, "configure of ${id.take(8)} ${servedNow.version} dropped: detached while its ${unitsNow.size} unit(s) compiled ($ms ms)")
+                    reply(stats.put("dropped", "detached"))
+                    return@post
+                }
+                // The extension's worlds take slots of the fixed pool first; the core keeps within
+                // the budget `ext.env` told it, so a refusal here is a bug on one side or the other.
+                val wantedWorlds = unitsNow.mapNotNull { it.world }.toSet()
+                if (!worldSlots.assign(id, wantedWorlds)) {
+                    reply(
+                        Host.Rejection(
+                            "No isolated world slot for the extension's ${wantedWorlds.size} world(s): " +
+                                "${worldSlots.size - worldSlots.free()} of ${worldSlots.size} in use"
+                        )
+                    )
+                    return@post
+                }
+                this.debug = debug
+                served = served + (id to servedNow)
+                units[id] = unitsNow
+                // One pass over the tabs: a stored unit is read once for all of them, not once a tab.
+                val install = installExtension(host.tabs.all(), servedNow, unitsNow)
+                configureStats[id] = stats
+                flushNotificationEvents(id)
+                // A tab that asked for one of the extension's pages before this: the empty
+                // document it holds is loaded again, now that the origin answers (units first,
+                // so the page's document-start script is the extension's).
+                releaseHeld(id)
+                for (unit in compiled) {
+                    val refused = unit.refused ?: continue
+                    if (!unit.cached) unitRefusedLine(id, name, refused)
+                }
+                // The shapes (`ExtensionScripts.SHAPE_*`) name what the chars are: a world's
+                // bootstrap once in a carrier or a holder, its other rule sets thin. The
+                // builders' pre-size against the chars, and how many grew: the assembly counts
+                // its text exactly so that none does (compat round 21b – one that grew by
+                // doubling at 10.6 million characters was the allocation that took the app down).
+                val assembled = compiled.filter { it.refused == null }
+                val shapes = assembled.groupingBy { it.shape }.eachCount()
+                val stored = assembled.filter { it.file != null }
+                Log.i(
+                    TAG,
+                    "configured ${id.take(8)} ${servedNow.version}: ${unitsNow.size} unit(s), " +
+                        "${unitsNow.sumOf { it.chars }} chars (${compiled.count { it.cached }} cached, " +
+                        "${compiled.count { it.refused != null }} refused) in $ms ms, " +
+                        "builders presized ${assembled.sumOf { it.presized.toLong() }} for ${assembled.sumOf { it.chars.toLong() }} chars " +
+                        "(${assembled.count { it.grown }} grown), " +
+                        "${stored.size} stored (${stored.sumOf { it.chars.toLong() }} chars), " +
+                        "installed on ${host.tabs.all().size} tab(s) (${install.ms} ms" +
+                        (if (install.skipped > 0) "; ${install.gone} unit(s) gone, ${install.outOfHeap} out of heap – the tabs are without them" else "") + "), " +
+                        "shapes ${shapes.entries.joinToString(" ") { (shape, n) -> "$n $shape" }}, " +
+                        "worlds ${unitsNow.mapNotNull { u -> u.world?.let(worldSlots::slot) }.toSet()}, " +
+                        "heap ${(runtime.totalMemory() - runtime.freeMemory()) shr 20}/${runtime.maxMemory() shr 20} MB"
+                )
+                reply(stats)
+            }
+        }
+    }
+
+    /**
+     * The one line an extension's error console gets for a unit the heap cannot hold (the
+     * extension's name, the unit's size and the budget); an `error`, since the unit's content
+     * scripts do not run, attributed to `content` as their own console lines would be.
+     */
+    private fun unitRefusedLine(id: String, name: String, refused: UnitCompiler.Refused) {
+        val groups = if (refused.groups == 1) "one group of scripts" else "${refused.groups} groups of scripts"
+        Log.w(TAG, "refused a unit of ${id.take(8)}: ${refused.chars} chars over ${refused.groups} group(s), budget ${refused.budgetChars}")
+        chromeEvent(
+            "ext.console",
+            json(
+                "id" to id,
+                "level" to "error",
+                "source" to "content",
+                "message" to "$name: a set of its content scripts was not injected. As one page script it would run to " +
+                    "${UnitCompiler.millions(refused.chars)} characters ($groups), more than the " +
+                    "${UnitCompiler.millions(refused.budgetChars.toLong())} this device's memory allows for one; " +
+                    "the extension's pages and background still run.",
+                "url" to null,
+                "context" to "content"
+            )
+        )
+    }
+
+    // --- notifications ---------------------------------------------------------------------------
+
+    /**
+     * `ext.notifications.show`: the card, once the app may post (Android 13's one ask for the whole
+     * app, shared with web notifications and the downloader: `Permissions.ensureNotificationsAllowed`;
+     * a refusal leaves the card unposted, `getPermissionLevel` says so).
+     */
+    private fun showNotification(id: String, notification: JSONObject) {
+        val dir = served[id]?.dir
+        host.permissions.ensureNotificationsAllowed { notifications.show(id, dir, notification) }
+    }
+
+    /** A tap or a button on a card: the activity intent [MainActivity] received. */
+    fun onNotificationIntent(intent: Intent): Boolean = notifications.onIntent(intent)
+
+    private fun onNotificationEvent(id: String, notificationId: String, event: String, index: Int) {
+        val payload = json("id" to id, "notificationId" to notificationId, "event" to event, "index" to index)
+        if (served.containsKey(id)) chromeEvent("ext.notification", payload)
+        else pendingNotificationEvents.getOrPut(id) { ArrayDeque() }.addLast(payload)
+    }
+
+    private fun flushNotificationEvents(id: String) {
+        val queue = pendingNotificationEvents.remove(id) ?: return
+        for (payload in queue) chromeEvent("ext.notification", payload)
+    }
+
+    // --- detach ----------------------------------------------------------------------------------
+
+    /**
+     * `ext.detach { id }`: the extension's units leave every tab; its pages and cache go. A
+     * configure of it still compiling lands on nothing ([AttachEpochs]).
+     */
+    private fun detachExtension(id: String) {
+        attachEpochs.detached(id)
+        units.remove(id)
+        served = served - id
+        for (held in heldPages.dropped(id)) failHeld(held)
+        for (view in handlers.keys.toList()) removeExtension(view, id)
+        stopBackground(id, "detach")
+        closeOffscreen(id)
+        if (popup?.extensionId == id) closePopup()
+        // The core dropped these endpoints already; the frames keep running what was injected.
+        endpoints.entries.removeAll { it.value.extensionId == id }
+        forward.forgetExtension(id)
+        // Its world slots are free for the next extension; a straggling hello from a document
+        // that still runs the old world's script claims this id and is refused by the slot check.
+        worldSlots.releaseAll(id)
+        io.execute { compiler.forget(id) }
+        configureStats.remove(id)
+        notifications.forget(id)
+        pendingNotificationEvents.remove(id)
+        closeAuthSheets(id)
+        setKeepAwake(id, null)
+        Log.i(TAG, "detached ${id.take(8)}")
+    }
+
+    /** A new core runtime starts from nothing: every extension of the previous one goes. */
+    private fun reset() {
+        attachEpochs.reset()
+        configuresInFlight.reset()
+        closePopup()
+        for (id in backgrounds.keys.toList()) stopBackground(id, "reset")
+        workerScriptGate.reset()
+        for (id in units.keys.toList()) {
+            for (view in handlers.keys.toList()) removeExtension(view, id)
+            io.execute { compiler.forget(id) }
+        }
+        units.clear()
+        served = emptyMap()
+        frames.clear()
+        endpoints.clear()
+        worldSlots.clear()
+        configureStats.clear()
+        observeRequests = false
+        setObserveRequestHeaders(false)
+        // The engine's switch is the runtime's that set it: off with the runtime that goes, when
+        // this one still owns the seams (a newer window's may have taken them over).
+        if (host.blocking.observer === observer) setObserveResponses(false)
+        closeAuthSheets()
+        releaseKeepAwake()
+        // The runtime that goes held the layers; the new one lays its own as its extensions attach.
+        setFontLayer(ExtensionFontLayer.EMPTY)
+        setPrivacyLayer(ExtensionPrivacyLayer.EMPTY)
+    }
+
+    /**
+     * The response-stage switch (contract 7.1 / 7.10): the engine's relay of media-element
+     * requests and the pages' observer of their fetch / XHR responses turn together. Every live
+     * document hears a change at once ([TabWebView.setExtObserve]); a new document learns the
+     * current word at its hello (`TabWebView.sendFlags`).
+     */
+    private fun setObserveResponses(on: Boolean) {
+        val changed = host.blocking.observeResponses != on
+        host.blocking.observeResponses = on
+        if (!changed) return
+        for (view in host.tabs.all()) view.setExtObserve(on)
+    }
+
+    /**
+     * The request-header switch (`ext.observeRequestHeaders`): the runtime turns it on while an
+     * extension holds an `onBeforeSendHeaders` / `onSendHeaders` listener (Speak Subtitles for
+     * YouTube reads the player's `/api/timedtext` URL off one) and off with the last of them.
+     * On, one observing listener of ours joins the engine's `onSendHeaders` seam under the
+     * registrant [REQUEST_HEADERS_REGISTRANT]; off, it leaves. Main thread.
+     */
+    private fun setObserveRequestHeaders(on: Boolean) {
+        if (on == (requestHeadersListener != null)) return
+        if (on) {
+            requestHeadersListener = host.blocking.addListener(
+                WebRequestEvent.ON_SEND_HEADERS,
+                WebRequestListener { details -> onSendHeaders(details); null },
+                ListenerOptions(registrant = REQUEST_HEADERS_REGISTRANT)
+            )
+        } else {
+            requestHeadersListener?.invoke()
+            requestHeadersListener = null
+        }
+    }
+
+    /**
+     * Host → endpoint: the reply proxy of the frame that said hello. A dead frame reports
+     * `ext.gone`. [at] is a call reply's two runtime stamps while `debug` (`ext.send`'s `at`:
+     * when the runtime saw the call, when it posted the reply), for the trace line's legs
+     * ([ReplyTiming]); null for everything else.
+     */
+    private fun send(ep: String, message: String, at: JSONArray? = null) {
+        val endpoint = endpoints[ep] ?: return
+        bridgeCounters.incrementAndGet(2)
+        if (debug) recordReply(ep, message, at)
+        val ok = runCatching { endpoint.proxy.postMessage(message) }.isSuccess
+        if (!ok) {
+            // The endpoint's bookkeeping is the main thread's; off it (the reply hop) the loss is
+            // handed over.
+            if (Looper.myLooper() === Looper.getMainLooper()) gone(listOf(ep)) else main.post { gone(listOf(ep)) }
+        }
+    }
+
+    /**
+     * `ext.send` off the reply hop ([ExtReplyHop], on the JavaBridge thread): the same [send],
+     * where it arrives – the endpoint looked up in the concurrent map, the counter atomic, the
+     * trace and the call statistics under their locks as ever, and the proxy's `postMessage`
+     * posting its one UI task itself (Chromium's `JsReplyProxy.postMessage` runs on the UI
+     * thread or posts to it). The reply's parse for the trace line (`debug`) runs here too, off
+     * the main thread. Compat round 20: the storage round trip's `back` leg, one UI turn where the
+     * port's path took two.
+     */
+    fun sendFromHop(ep: String, message: String, at: JSONArray?) {
+        send(ep, message, at)
+    }
+
+    /**
+     * One line of the extension's proxied requests while `debug` (`proxied`): `<ext> METHOD <outcome> <url>`,
+     * the outcome a status, or the words for a redirect or a failure left to the WebView and for a
+     * host the extension has no permission for; the latter three in logcat as well.
+     */
+    private fun recordProxy(extensionId: String, request: CorsProxy.Request, outcome: String) {
+        synchronized(proxied) {
+            if (proxied.size >= 200) proxied.removeFirst()
+            proxied.addLast("$extensionId ${request.method} $outcome ${request.url}")
+        }
+        if (!outcome.first().isDigit()) Log.w(TAG, "cors proxy ${extensionId.take(8)} ${request.method} ${request.url}: $outcome")
+    }
+
+    /**
+     * The intercept's answer on an extension's origin or the page alias, recorded while `debug`
+     * (`servedRecord`, ServedRecord.line: the status, the path as spelled, the frame, the side,
+     * the word of a refusal and the Referer; the sweep reads it through [servedMatching]) and
+     * returned as it is. `foreign` is null where the answer came before the side was told.
+     */
+    private fun recorded(id: String, request: WebResourceRequest, foreign: Boolean?, response: WebResourceResponse, why: String? = null): WebResourceResponse {
+        if (!debug) return response
+        val url = request.url
+        val line = ServedRecord.line(
+            id,
+            response.statusCode,
+            (url.path ?: "/").trimStart('/'),
+            url.query,
+            request.isForMainFrame,
+            when (foreign) { null -> null; true -> "foreign"; false -> "own" },
+            why,
+            request.requestHeaders?.get("Referer")
+        )
+        synchronized(servedRecord) { ServedRecord.add(servedRecord, line) }
+        return response
+    }
+
+    private fun recordCall(ep: String, message: JSONObject, chars: Int) {
+        val ext = endpoints[ep]?.extensionId ?: message.str("ext")
+        trace(">", ep, ext, message, chars)
+        val key = when (message.str("t")) {
+            "call" -> "$ext ${message.str("ns")}.${message.str("method")}"
+            "msg" -> "$ext runtime.sendMessage"
+            "connect" -> "$ext runtime.connect"
+            "portMsg" -> "$ext port.postMessage"
+            else -> return
+        }
+        synchronized(callStats) {
+            callStats.getOrPut(key) { IntArray(3) }[0]++
+            if (message.has("id")) {
+                val slot = "$ep:${message.opt("id")}"
+                pendingCalls[slot] = key
+                pendingWall[slot] = System.currentTimeMillis()
+            }
+            if (pendingCalls.size > 4000) {
+                pendingCalls.clear()
+                pendingWall.clear()
+            }
+        }
+    }
+
+    /**
+     * A message to a frame while `debug`: its trace line, and a reply's account in the call
+     * statistics. [at] is the runtime's two stamps for a call reply ([send]); with the wall
+     * clock at the call's receipt ([recordCall]) and now, the trace line places the round
+     * trip's time in its legs ([ReplyTiming.legs]).
+     */
+    private fun recordReply(ep: String, message: String, at: JSONArray? = null) {
+        val reply = BridgeEnvelope.read(message) ?: return
+        val slot = if (reply.optString("t") == "reply") "$ep:${reply.opt("id")}" else null
+        val legs = if (slot == null) "" else synchronized(callStats) { ReplyTiming.legs(pendingWall.remove(slot), at, System.currentTimeMillis()) }
+        trace("<", ep, endpoints[ep]?.extensionId ?: "", reply, message.length, legs)
+        if (slot == null) return
+        synchronized(callStats) {
+            val key = pendingCalls.remove(slot) ?: return
+            if (!reply.optBoolean("ok", true)) {
+                val counts = callStats.getOrPut(key) { IntArray(3) }
+                // The two outcomes Chrome itself reports through runtime.lastError in normal
+                // operation (a tab without a listener, a listener that never answered) are not
+                // failures of the layer; they are counted apart so a grader can tell them.
+                if (reply.optString("error") in UNANSWERED) counts[2]++ else counts[1]++
+            }
+        }
+    }
+
+    /**
+     * One line per bridge message while `debug`: direction, extension, endpoint context, message
+     * type and the little that tells messages apart (a call's method, a message's `type` field,
+     * a reply's outcome), then `id=<n>` on a call and its reply (the sweep's storage round-trip
+     * reading pairs the two by it, `ext-compat-storage-latency.mjs`) and a call reply's legs
+     * ([legs], `hop= run= back=`). Instrumentation reads it to see where a handshake stopped.
+     */
+    private fun trace(direction: String, ep: String, ext: String, message: JSONObject, chars: Int = 0, legs: String = "") {
+        val context = endpoints[ep]?.context ?: message.str("ctx", "?")
+        val t = message.str("t")
+        // A big message is an envelope here (its nested values unread): its size stands in for them.
+        val size = if (chars >= BridgeEnvelope.BIG_MESSAGE) " chars=$chars" else ""
+        val id = if ((t == "call" || t == "reply") && message.has("id")) " id=${message.opt("id")}" else ""
+        val detail = when (t) {
+            "call" -> "${message.str("ns")}.${message.str("method")}"
+            "msg", "deliver" -> {
+                val target = message.optJSONObject("target")
+                val data = message.opt("data")
+                // The message's own discriminator, under the names extensions use for it.
+                val kind = (data as? JSONObject)?.let { d ->
+                    listOf("type", "t", "handler", "action", "method", "kind", "cmd").firstNotNullOfOrNull { k -> d.optString(k, "").ifEmpty { null } }
+                } ?: ""
+                // The page a message speaks of, when it names one (a content script's report of
+                // what it found on its page carries the page's address: the sweep reads the
+                // discovery off this line), at the top or one level down in a `data`, `payload`,
+                // `message` or `params` object (RSS Feed Reader's `{type, data: {feeds, url}}`).
+                val about = (data as? JSONObject)?.let { d ->
+                    (listOf(d) + listOf("data", "payload", "message", "params").mapNotNull { d.optJSONObject(it) })
+                        .firstNotNullOfOrNull { o -> o.optString("url", "").ifEmpty { null } }
+                }
+                listOfNotNull(
+                    target?.opt("tabId")?.let { "tab=$it" },
+                    target?.opt("frameId")?.let { "frame=$it" },
+                    kind.takeIf { it.isNotEmpty() }?.let { "type=$it" },
+                    (message.optJSONObject("sender")?.has("tab"))?.let { "senderTab=$it" },
+                    about?.let { "url=${it.take(80)}" }
+                ).joinToString(" ")
+            }
+            "msgReply" -> "handled=${message.opt("handled")} willRespond=${message.opt("willRespond")} listeners=${message.opt("listeners")}"
+            "reply" -> if (message.optBoolean("ok", true)) "ok" else "error=${message.optString("error").take(80)}"
+            "event" -> "${message.str("ns")}.${message.str("name")}"
+            // A page policy's refusal handed to the host (or a webpack chunk of a module graph for
+            // the content script's scope): the extension file asked for, and the answer.
+            "mainScript", "extFetch", "chunkScript" -> message.str("url").take(100)
+            "extProxyFetch" -> "${message.str("method")} ${message.str("url").take(100)}"
+            "mainScriptDone", "extFetchDone", "chunkDone" -> if (message.optBoolean("ok", true)) "ok" else "error=${message.optString("error").take(80)}"
+            "extProxyDone" -> if (message.optBoolean("ok", true)) "ok status=${message.opt("status")}" else "error=${message.optString("error").take(80)}"
+            else -> ""
+        }
+        synchronized(bridgeTrace) {
+            if (bridgeTrace.size >= TRACE_LINES) bridgeTrace.removeFirst()
+            bridgeTrace.addLast("${SystemClock.uptimeMillis()} $direction ${ext.take(8)}/$context $t $detail$id$legs$size".trimEnd())
+        }
+    }
+
+    /** A snapshot of `callStats` for instrumentation. */
+    fun callStatsSnapshot(): Map<String, IntArray> = synchronized(callStats) { callStats.mapValues { it.value.copyOf() } }
+
+    /** The bridge trace lines mentioning `extensionId` (its first eight characters), oldest first. */
+    fun traceSnapshot(extensionId: String): List<String> =
+        synchronized(bridgeTrace) { bridgeTrace.filter { it.contains(" ${extensionId.take(8)}/") } }
+
+    /**
+     * The endpoints a view holds right now, one line each (context, extension, main frame, URL,
+     * endpoint id), for instrumentation: whether the document a blank extension page shows is
+     * still one the host can answer.
+     */
+    fun endpointSnapshot(view: WebView): List<String> =
+        endpoints.entries.filter { it.value.view === view }.map { (ep, e) ->
+            "${e.context} ${e.extensionId.take(8)} main=${e.isMainFrame} world=${e.world} url=${e.url} ep=$ep"
+        }
+
+    /**
+     * Instrumentation only: run `script` in the isolated world of `extensionId`'s main-frame
+     * content endpoint on `view` and hand back the JSON-encoded result, or null when the
+     * extension has no world endpoint there (or worlds are off). `evaluateJavascript` only sees
+     * the main world; the reply proxy is the way into a world. Main thread.
+     */
+    fun evalInWorld(view: WebView, extensionId: String, script: String, callback: (String?) -> Unit) {
+        val endpoint = endpoints.values.firstOrNull {
+            it.view === view && it.extensionId == extensionId && it.context == "content" && it.isMainFrame && it.world
+        }
+        if (endpoint == null) {
+            callback(null)
+            return
+        }
+        val delivered = runCatching {
+            endpoint.proxy.executeJavaScript(script, object : androidx.webkit.WebViewOutcomeReceiver<String, androidx.webkit.JavaScriptExecutionException> {
+                override fun onResult(result: String?) { callback(result) }
+                override fun onError(error: androidx.webkit.JavaScriptExecutionException) { callback(null) }
+            })
+        }.isSuccess
+        if (!delivered) callback(null)
+    }
+
+    /**
+     * Instrumentation only: `code` run in `extensionId`'s content scope on `view`'s main frame
+     * the way `scripting.executeScript({ code })` runs it ([exec]'s main-frame path) – the
+     * isolated world where the frame has one, else the main world's `with` scope through the
+     * bootstrap (a late boot when the document has no scope for the extension yet) – with the
+     * guarded JSON handed back as the WebView gave it (`{"v": …}` or `{"e": …}`), null when
+     * nothing answered. The driver reads what a content script's own `window.postMessage`
+     * does in that scope. Main thread.
+     */
+    fun evalInScope(view: WebView, extensionId: String, code: String, callback: (String?) -> Unit) {
+        val ext = served[extensionId]
+        if (ext == null) {
+            callback(null)
+            return
+        }
+        val mine = endpoints.values.filter { it.view === view && it.extensionId == extensionId && it.context == "content" && it.isMainFrame }
+        val world = if (isolatedWorlds) mine.firstOrNull { it.world } else null
+        if (world != null) {
+            val call = ExtensionScripts.execScript(token, extensionId, "js", JSONObject(), code, emptyList(), null, null, null, false, false)
+            val delivered = runCatching {
+                world.proxy.executeJavaScript(call, object : androidx.webkit.WebViewOutcomeReceiver<String, androidx.webkit.JavaScriptExecutionException> {
+                    override fun onResult(result: String?) { callback(result) }
+                    override fun onError(error: androidx.webkit.JavaScriptExecutionException) { callback(null) }
+                })
+            }.isSuccess
+            if (!delivered) callback(null)
+            return
+        }
+        val prefix = if (mine.none { !it.world }) ExtensionScripts.lateBoot(bootstrap, ext.lateConfig, debug) else null
+        val script = ExtensionScripts.execScript(token, extensionId, "js", JSONObject(), code, emptyList(), null, null, prefix, true, true)
+        view.evaluateJavascript(script) { result -> callback(result) }
+    }
+
+    /**
+     * The page's `contextmenu` event for a long press the embedder answered with the sheet
+     * ([ContextMenuEvent]), dispatched into the tab's main frame when the runtime gathers the
+     * extensions' items for it. The point arrives as the sheet's anchor (dp in the view's parent,
+     * `TabWebView.onLongPress`); the page is given the view's own pixels. A tab gone meanwhile
+     * has no page to tell. The script's answer is read only to log a page that threw.
+     */
+    private fun contextMenuEvent(args: JSONObject) {
+        val tab = host.tabs.get(args.str("tabId")) ?: return
+        val density = tab.resources.displayMetrics.density
+        val x = ContextMenuEvent.viewPixels(args.num("x", Double.NaN), tab.left, density)
+        val y = ContextMenuEvent.viewPixels(args.num("y", Double.NaN), tab.top, density)
+        tab.evaluateJavascript(ContextMenuEvent.script(x, y)) { result ->
+            if (result != null && result.startsWith("\"error")) Log.w(TAG, "contextmenu event: $result")
+        }
+    }
+
+    /**
+     * `scripting.executeScript` / `insertCSS` / MV2 `tabs.executeScript` into a frame of a tab.
+     * The code runs through the bootstrap's `__zenExtExec` in the extension's scope: in its
+     * isolated world through the world endpoint's reply proxy when the frame has one; else in
+     * the main world with `evaluateJavascript`, after a late boot when the document has no scope
+     * for the extension yet (a tab that predates the extension, a page none of its declarations
+     * matched, or a WebView without worlds). `world: "MAIN"` injections take the main-world path.
+     *
+     * A subframe (`doc`: its document id, see [Endpoint]) is reached through its own endpoint's
+     * reply proxy, the one handle a WebView gives to a frame (`evaluateJavascript` takes none), so
+     * it needs a WebView with `JS_INJECTION_IN_FRAME_AND_WORLD` and a frame the extension has a
+     * script in: the world endpoint for the isolated world, the main-world one for `world: "MAIN"`.
+     *
+     * The extension's own files (`files`, extension-relative paths) are read here and streamed
+     * into the script ([ExtensionScripts.execScript]) rather than sent as `code`: a missing one is
+     * Chrome's `Could not load file` rejection. The read is off the main thread; where the script
+     * runs is decided first, with the endpoints this call saw.
+     */
+    private fun exec(args: JSONObject, reply: (Any?) -> Unit) {
+        val tab = host.tabs.get(args.str("tabId"))
+        if (tab == null) {
+            reply(Host.Rejection("No tab with that id"))
+            return
+        }
+        val id = args.str("ext")
+        val ext = served[id]
+        if (ext == null) {
+            reply(Host.Rejection("The extension is not attached"))
+            return
+        }
+        val payload = args.obj("payload")
+        val paths = args.optJSONArray("files")?.let { a -> List(a.length()) { i -> a.optString(i, "") } } ?: emptyList()
+        val files = ArrayList<File>(paths.size)
+        for (path in paths) {
+            val file = fileIn(ext.dir, path)?.takeIf { it.isFile }
+            if (file == null) {
+                reply(Host.Rejection("Could not load file: '$path'."))
+                return
+            }
+            files.add(file)
+        }
+        val wantMain = payload.optString("world") == "MAIN"
+        val doc = args.strOrNull("doc")
+        var prefix: String? = null
+        var named = false
+        val run: (String) -> Unit
+        if (doc != null) {
+            if (!isolatedWorlds) {
+                reply(Host.Rejection("This WebView cannot run a script in a subframe (Chromium 146 and later can)"))
+                return
+            }
+            val frame = endpoints.values.filter { it.view === tab && it.extensionId == id && it.context == "content" && !it.isMainFrame && it.doc == doc }
+            if (frame.isEmpty()) {
+                reply(Host.Rejection("No such frame in the tab (it navigated away, or the extension has no script in it)"))
+                return
+            }
+            val endpoint = frame.firstOrNull { it.world == !wantMain }
+            if (endpoint == null) {
+                reply(Host.Rejection("The extension has no ${if (wantMain) "main-world" else "isolated-world"} script in that frame"))
+                return
+            }
+            run = { call -> runInFrame(endpoint, call, reply) }
+        } else {
+            val mine = endpoints.values.filter { it.view === tab && it.extensionId == id && it.context == "content" && it.isMainFrame }
+            val world = if (isolatedWorlds && !wantMain) mine.firstOrNull { it.world } else null
+            if (world != null) {
+                run = { call -> runInFrame(world, call, reply) }
+            } else {
+                if (mine.none { !it.world }) {
+                    lateBoots++
+                    prefix = ExtensionScripts.lateBoot(bootstrap, ext.lateConfig, debug)
+                }
+                // Named like the document-start script: the injected function's DOM writes are the extension's too.
+                named = true
+                run = { script -> tab.evaluateJavascript(script) { result -> reply(unwrap(result)) } }
+            }
+        }
+        // Evaluated in the main world for the extension's own scope (not a `world: "MAIN"`
+        // injection): the bootstrap gives it the `with` scope proxy, and the body must resolve its
+        // bare identifiers there, as a content script's group does.
+        val scoped = named && !wantMain
+        val assemble = {
+            ExtensionScripts.execScript(
+                token, id, args.str("kind", "js"), payload, args.strOrNull("code"), files,
+                args.strOrNull("funcSource"), args.optJSONArray("args")?.toString(), prefix, named, scoped
+            )
+        }
+        if (files.isEmpty()) {
+            run(assemble())
+            return
+        }
+        io.execute {
+            val script = runCatching(assemble)
+            main.post {
+                script.fold(run) { e -> reply(Host.Rejection("Could not load file: ${e.message ?: e.javaClass.simpleName}.")) }
+            }
+        }
+    }
+
+    /** [ExtensionScripts.guarded] `call`, run in the frame and world of `endpoint` through its reply proxy. */
+    private fun runInFrame(endpoint: Endpoint, call: String, reply: (Any?) -> Unit) {
+        val delivered = runCatching {
+            endpoint.proxy.executeJavaScript(call, object : androidx.webkit.WebViewOutcomeReceiver<String, androidx.webkit.JavaScriptExecutionException> {
+                override fun onResult(result: String?) { main.post { reply(unwrap(result)) } }
+                override fun onError(error: androidx.webkit.JavaScriptExecutionException) { main.post { reply(Host.Rejection(error.message ?: "script failed")) } }
+            })
+        }.isSuccess
+        if (!delivered) reply(Host.Rejection("The frame is gone"))
+    }
+
+    /** The JSON of a [ExtensionScripts.guarded] evaluation → the value, or a rejection with its error. */
+    private fun unwrap(result: String?): Any {
+        val text = result ?: return Host.Rejection("The script did not run (no scope for the extension in that document)")
+        val outcome = runCatching { JSONObject(text) }.getOrNull() ?: return Host.RawJson(text)
+        if (outcome.has("e")) return Host.Rejection(outcome.optString("e", "script failed"))
+        val value = outcome.opt("v") ?: return Host.RawJson("null")
+        return Host.RawJson(
+            when (value) {
+                JSONObject.NULL -> "null"
+                is String -> JSONObject.quote(value)
+                is JSONObject, is JSONArray -> value.toString()
+                else -> value.toString()
+            }
+        )
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Tab WebViews
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Called from every tab WebView's constructor, and again when a custom tab's page is adopted by
+     * the browser window (a page that never had an extension layer, so no document of it holds a
+     * bridge binding yet): the bridge listener of the main world and of every world slot, the
+     * janitor and the units of every attached extension, once per view. All of a view's bridge
+     * listeners are registered here and never later: `addWebMessageListener` on a view with live
+     * frames strands the bindings those frames already hold (see [WorldSlots]).
+     */
+    fun attach(view: TabWebView) {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER) ||
+            !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+        ) return
+        if (handlers.containsKey(view)) return
+        WebViewCompat.addWebMessageListener(view, BRIDGE, setOf("*")) { v, message, origin, isMainFrame, proxy ->
+            onBridgeMessage(v, message.data, origin, isMainFrame, proxy, "content", slot = null)
+        }
+        for (slot in 0 until worldSlots.size) {
+            val world = WebViewCompat.getExecutionWorld(view, worldSlots.worldName(slot))
+            WebViewCompat.addWebMessageListener(view, BRIDGE, setOf("*"), world) { v, message, origin, isMainFrame, proxy ->
+                onBridgeMessage(v, message.data, origin, isMainFrame, proxy, "content", slot)
+            }
+        }
+        val mine = ViewHandlers()
+        // The janitor first: document-start scripts run in registration order, and it has to take
+        // the bridge object off the main world's global before any unit or page script looks.
+        mine.janitor = runCatching { WebViewCompat.addDocumentStartJavaScript(view, janitor, setOf("*")) }.getOrNull()
+        // `chrome.fontSettings`' stylesheet, for the documents this view will load (its WebSettings
+        // values the view took in `applyFonts` as it was built).
+        if (fontLayer.css.isNotEmpty()) mine.fonts = addFontStylesheet(view, fontLayer)
+        // `chrome.privacy`'s `navigator.doNotTrack`, for the documents this view will load, by its kind of tab.
+        if (privacyLayer.holds(view.isPrivateTab)) mine.privacy = addPrivacyScript(view, privacyLayer)
+        handlers[view] = mine
+        for ((id, list) in units) served[id]?.let { installExtension(listOf(view), it, list) }
+    }
+
+    /**
+     * `ext.privacy.apply`: the Do Not Track value the extensions hold moved for regular or private
+     * tabs. Every open tab of a kind whose value moved has the document-start script re-registered
+     * (on) or dropped (off) for its next documents, and its open document's `navigator.doNotTrack`
+     * moved in place with the matching script. The `DNT: 1` header is the blocking engine's rule
+     * set, installed by the core, not this layer's.
+     */
+    private fun setPrivacyLayer(next: ExtensionPrivacyLayer) {
+        val prev = privacyLayer
+        if (next == prev) return
+        privacyLayer = next
+        var applied = 0
+        for (view in host.tabs.all()) {
+            val mine = handlers[view] ?: continue
+            val privateTab = view.isPrivateTab
+            if (next.holds(privateTab) == prev.holds(privateTab)) continue
+            mine.privacy?.let { runCatching { it.remove() } }
+            mine.privacy = if (next.holds(privateTab)) addPrivacyScript(view, next) else null
+            if (view.currentUrl != null) next.scriptFor(privateTab)?.let { view.evaluateJavascript(it, null) }
+            applied++
+        }
+        Log.i(TAG, "privacy: ${next.summary()}; applied to $applied page(s)")
+    }
+
+    private fun addPrivacyScript(view: WebView, layer: ExtensionPrivacyLayer): ScriptHandler? =
+        layer.on.ifEmpty { null }?.let { script ->
+            runCatching { WebViewCompat.addDocumentStartJavaScript(view, script, setOf("*")) }
+                .onFailure { e -> Log.w(TAG, "privacy: the doNotTrack document-start script was refused: ${e.message}") }
+                .getOrNull()
+        }
+
+    /**
+     * `ext.fonts.apply`: the layer every tab lays over the user's page fonts moved. The WebSettings
+     * values go to every tab through `TabWebView.applyFonts` (the open document restyled where a
+     * family alone moved, as the user's own change is handled); the stylesheet – what WebSettings
+     * cannot carry – is re-registered at document start on every view and replaced in place in
+     * every open document (the main frame; a frame takes the new sheet with its next document).
+     */
+    private fun setFontLayer(next: ExtensionFontLayer) {
+        val prev = fontLayer
+        if (next == prev) return
+        fontLayer = next
+        val tabs = host.tabs.all()
+        for (view in tabs) view.applyFonts()
+        if (next.css != prev.css) {
+            for (view in tabs) {
+                val mine = handlers[view] ?: continue
+                mine.fonts?.let { runCatching { it.remove() } }
+                mine.fonts = if (next.css.isEmpty()) null else addFontStylesheet(view, next)
+                // The open document: the sheet replaced, or taken out by the empty layer's script.
+                if (view.currentUrl != null && next.script.isNotEmpty()) view.evaluateJavascript(next.script, null)
+            }
+        }
+        Log.i(TAG, "fontSettings: ${next.summary()}; applied to ${tabs.size} page(s)")
+    }
+
+    private fun addFontStylesheet(view: WebView, layer: ExtensionFontLayer): ScriptHandler? =
+        runCatching { WebViewCompat.addDocumentStartJavaScript(view, layer.script, setOf("*")) }
+            .onFailure { e -> Log.w(TAG, "fontSettings: the stylesheet's document-start script was refused: ${e.message}") }
+            .getOrNull()
+
+    /**
+     * One extension's handlers on the given views (every tab at a configure, the new tab at an
+     * attach): the previous ones go, the current units come. A private tab gets nothing from an
+     * extension not allowed there (documents already running its script keep it, as in Chrome,
+     * until they navigate). Unit by unit over the views, not view by view over the units: a
+     * unit of the store ([ScriptUnit.stored]) is read once here for all the views of the pass
+     * and let go as the pass moves on – its string is live for the handoffs of one unit, never
+     * two units' at once – where a held unit's string is the one the compiler keeps, and a
+     * stored unit's text soft-held from its last read is taken as it is ([UnitCompiler.Read]).
+     * A stored unit whose file is gone is skipped with a warning line, one whose read did not
+     * fit the heap with an error line and a count ([storeReadsOutOfHeap], in the runtime's
+     * memory reading and the configure line) – the extension's other units go on either way,
+     * and the line says which unit the tabs are without. Answers the pass ([Installed]: its
+     * time – the reads and the handoffs; the configure line carries it –, its reads and its
+     * skips; an attach's pass with a read in it says so at info level).
+     */
+    private fun installExtension(views: Collection<WebView>, ext: Served, list: List<ScriptUnit>): Installed {
+        val started = SystemClock.uptimeMillis()
+        val targets = ArrayList<WebView>(views.size)
+        for (view in views) {
+            if (handlers[view] == null) continue
+            removeExtension(view, ext.id)
+            if (view.isPrivateTab && !ext.allowPrivate) continue
+            targets.add(view)
+        }
+        if (targets.isEmpty()) return Installed.NONE
+        val added = HashMap<WebView, ArrayList<ScriptHandler>>(targets.size)
+        for (view in targets) {
+            val own = ArrayList<ScriptHandler>(list.size + 1)
+            // Extension pages opened as tabs (options pages, a changelog the background opens with
+            // `tabs.create`): the page bootstrap on the extension's own origin.
+            runCatching {
+                WebViewCompat.addDocumentStartJavaScript(view, pageScript(ext, "page"), setOf("https://${ext.id}$ORIGIN_SUFFIX"))
+            }.getOrNull()?.let(own::add)
+            added[view] = own
+        }
+        var readFromDisk = 0
+        var softHeld = 0
+        var gone = 0
+        var outOfHeap = 0
+        for (unit in list) {
+            val text = when (val got = unit.read()) {
+                is UnitCompiler.Read.Text -> {
+                    if (unit.stored) if (got.fromDisk) readFromDisk++ else softHeld++
+                    got.text
+                }
+                is UnitCompiler.Read.Gone -> {
+                    gone++
+                    Log.w(TAG, "install of ${ext.id.take(8)}: unit ${unit.key} (${unit.chars} chars, stored) has no file at ${got.file.name} (${got.error}) – the tabs of this pass are without it; the extension's other units go on")
+                    continue
+                }
+                is UnitCompiler.Read.OutOfHeap -> {
+                    outOfHeap++
+                    storeReadsOutOfHeap++
+                    val heap = Runtime.getRuntime()
+                    Log.e(
+                        TAG,
+                        "install of ${ext.id.take(8)}: unit ${unit.key} (${got.chars} chars, ${got.bytes} bytes in the store) did not fit the heap " +
+                            "(${(heap.totalMemory() - heap.freeMemory()) shr 20}/${heap.maxMemory() shr 20} MB used/max) – the tabs of this pass are WITHOUT it " +
+                            "(the runtime's $storeReadsOutOfHeap. such read); the extension's other units go on"
+                    )
+                    continue
+                }
+                UnitCompiler.Read.Refused -> continue
+            }
+            for (view in targets) {
+                val handler = runCatching { addUnit(view, unit, text, unit.origins) }
+                    .recoverCatching {
+                        // An origin rule the WebView rejects: fall back to every origin (the bootstrap matches anyway).
+                        addUnit(view, unit, text, setOf("*"))
+                    }.getOrNull() ?: continue
+                added.getValue(view).add(handler)
+            }
+        }
+        for ((view, own) in added) handlers[view]?.byExtension?.set(ext.id, own)
+        val ms = SystemClock.uptimeMillis() - started
+        if ((readFromDisk > 0 || softHeld > 0) && views.size == 1) {
+            Log.i(
+                TAG,
+                "install of ${ext.id.take(8)} on a tab: ${list.size} unit(s), $readFromDisk read from the store, $softHeld soft-held from the last read " +
+                    "(${list.filter { it.stored }.sumOf { it.chars.toLong() }} stored chars) in $ms ms" +
+                    (if (gone + outOfHeap > 0) ", $gone gone, $outOfHeap out of heap" else "")
+            )
+        }
+        return Installed(ms, readFromDisk, softHeld, gone, outOfHeap)
+    }
+
+    private fun removeExtension(view: WebView, id: String) {
+        handlers[view]?.byExtension?.remove(id)?.forEach { runCatching { it.remove() } }
+    }
+
+    /**
+     * Main world: `addDocumentStartJavaScript`. Isolated world: `addJavaScriptOnEvent(DOCUMENT_START)`
+     * in the slot world the extension's world name is mapped to (its bridge listener has been on
+     * the view since construction; the injected object is world-scoped and comes first). `text`
+     * is the unit's script as [installExtension] read it for the pass.
+     */
+    private fun addUnit(view: WebView, unit: ScriptUnit, text: String, origins: Set<String>): ScriptHandler {
+        val worldName = unit.world ?: return WebViewCompat.addDocumentStartJavaScript(view, text, origins)
+        val slot = worldSlots.slot(worldName) ?: throw IllegalStateException("$worldName has no world slot")
+        val world = WebViewCompat.getExecutionWorld(view, worldSlots.worldName(slot))
+        return WebViewCompat.addJavaScriptOnEvent(view, text, WebViewCompat.INJECTION_EVENT_DOCUMENT_START, origins, world)
+    }
+
+    /**
+     * `onPageStarted(url)` of a WebView: the previous document's endpoints are gone. The callback
+     * is posted at commit and can land after the new document's bootstrap already said hello
+     * (measured on the emulator: background pages register and make their first calls before
+     * it arrives), so endpoints of a main frame that reported exactly the new URL are kept – or
+     * [documentUrl], the address the document reads as its own where that differs from the
+     * tab's (the PDF viewer page: `zen://pdf` for the tab, the PDF's URL for the document).
+     * Passing no URL (the view is going away) drops everything.
+     */
+    fun onDocumentGone(view: WebView, url: String? = null, documentUrl: String? = null) {
+        val mine = endpoints.filterValues { it.view === view }
+        val kept = if (url == null) emptyMap() else mine.filterValues { it.isMainFrame && (it.url == url || it.url == documentUrl) }
+        if (kept.isNotEmpty()) {
+            lateOnPageStarted++
+            Log.d(TAG, "onPageStarted($url) after ${kept.size} endpoint(s) of the new document said hello; kept")
+        }
+        val dead = mine.keys.filter { it !in kept }
+        if (dead.isNotEmpty()) gone(dead)
+    }
+
+    /** A main frame said hello: whatever else the view registered under another bootstrap is the old document. */
+    private fun onNewDocument(view: WebView, doc: String) {
+        val dead = endpoints.filterValues { it.view === view && it.doc != doc }.keys.toList()
+        if (dead.isNotEmpty()) gone(dead)
+    }
+
+    fun detach(view: WebView) {
+        onDocumentGone(view)
+        handlers.remove(view)
+    }
+
+    private fun gone(eps: List<String>) {
+        for (ep in eps) endpoints.remove(ep)
+        forward.forget(eps)
+        chromeEvent("ext.gone", json("eps" to JSONArray(eps)))
+    }
+
+    /**
+     * A message from a frame's bridge object: the main world's (`slot` null: content scripts under
+     * the emulation proxy, extension pages) or a world slot's. A hello from a slot has to claim
+     * the extension the slot carries: the token is the same for every extension, so this is what
+     * keeps one extension's world from speaking for another (and a document still running a
+     * detached extension's world from speaking at all).
+     */
+    private fun onBridgeMessage(view: WebView, data: String?, origin: Uri, isMainFrame: Boolean, proxy: JavaScriptReplyProxy, kind: String, slot: Int?) {
+        val text = data ?: return
+        // The host reads the envelope (top-level scalars) and hands the text on as it came; a big
+        // message is never built whole on this thread (`BridgeEnvelope`).
+        val message = BridgeEnvelope.read(text) ?: return
+        if (message.str("token") != token) return
+        val ep = message.str("ep")
+        if (ep.isEmpty()) return
+        // The bridge's raw-length admission for this direction (BridgeAdmission): a message over
+        // the host's limit is answered with Chrome's oversized-message error and copied no
+        // further (into the core's event, the core's parse, a delivery). The engines refuse at
+        // half the limit in the sender's realm, so only an older bootstrap or a hand-built
+        // envelope gets this far.
+        if (!host.chrome.bridge.admission.admitUnqueued(text.length)) {
+            refuseBridgeMessage(proxy, ep, message, text.length)
+            return
+        }
+        bridgeCounters.incrementAndGet(0)
+        if (slot != null) {
+            val known = endpoints[ep]
+            val claimed = if (known != null) known.extensionId else message.str("ext")
+            if (worldSlots.owner(slot) != claimed || (known != null && known.slot != slot)) return
+        }
+        // A private tab's document still running the script of an extension no longer allowed
+        // there (the toggle flipped after the document started) has no bridge.
+        if (view.isPrivateTab && served[endpoints[ep]?.extensionId ?: message.str("ext")]?.allowPrivate != true) return
+        if (debug) recordCall(ep, message, text.length)
+        when (message.str("t")) {
+            "hello" -> {
+                val context = message.str("ctx", kind)
+                val doc = ep.substringBefore('.')
+                if (isMainFrame) onNewDocument(view, doc)
+                endpoints[ep] = Endpoint(view, proxy, context, message.str("ext"), isMainFrame, message.str("url"), doc, slot)
+            }
+            "popupSize" -> {
+                popup?.resize(message.optInt("width"), message.optInt("height"))
+                return
+            }
+            "proxyBody" -> {
+                // The body of a bodied cross-origin fetch, ahead of the request naming its ticket (CorsProxy).
+                val bytes = runCatching { Base64.decode(message.str("body"), Base64.DEFAULT) }.getOrNull() ?: return
+                corsProxy.putBody(message.str("ticket"), bytes)
+                return
+            }
+            "closePopup" -> {
+                closePopup()
+                return
+            }
+            "mainScript" -> {
+                mainWorldScript(view, proxy, isMainFrame, ep, message)
+                return
+            }
+            "chunkScript" -> {
+                chunkScript(view, proxy, isMainFrame, ep, message)
+                return
+            }
+            "extFetch" -> {
+                extensionFetch(proxy, ep, message)
+                return
+            }
+            "extProxyFetch" -> {
+                extensionProxyFetch(proxy, ep, message)
+                return
+            }
+        }
+        val tabId = (view as? TabWebView)?.tabId
+        // To the core through the flood guard: now, at a later frame, folded into a newer action
+        // update, or refused with an answer to the frame (see BridgeForward).
+        val endpoint = endpoints[ep]
+        val source = BridgeForward.Source(
+            ep,
+            endpoint?.extensionId ?: message.str("ext"),
+            endpoint?.context ?: kind,
+            endpoint?.url ?: message.str("url")
+        ) { reply ->
+            if (debug) recordReply(ep, reply)
+            runCatching { proxy.postMessage(reply) }
+        }
+        forward.offer(source, message, text, tabId, isMainFrame, origin.toString())
+    }
+
+    /**
+     * The answer to a bridge message refused on length: a `msg` or `call` hears its reply fail
+     * with Chrome's text (`runtime.sendMessage`'s promise rejects, `lastError` for a callback);
+     * a `portMsg` has its port closed with it (`onDisconnect`, `lastError`), the one signal the
+     * host can give a port whose message it never saw whole, and one that also ends the
+     * broadcast a page keeps repeating on it. Other kinds are dropped.
+     */
+    private fun refuseBridgeMessage(proxy: JavaScriptReplyProxy, ep: String, message: JSONObject, chars: Int) {
+        val admission = host.chrome.bridge.admission
+        val count = admission.refused.get()
+        if (count == 1 || count % 100 == 0) {
+            Log.w(TAG, "a ${message.str("t")} of $chars chars from $ep refused, over the bridge's message limit of ${admission.messageLimitChars} chars ($count so far)")
+        }
+        val reply = when (message.str("t")) {
+            "msg", "call" -> json("t" to "reply", "ep" to ep, "id" to message.opt("id"), "ok" to false, "error" to BridgeAdmission.MESSAGE_TOO_LONG)
+            "portMsg" -> json("t" to "portDisconnect", "ep" to ep, "portId" to message.str("portId"), "error" to BridgeAdmission.MESSAGE_TOO_LONG)
+            else -> return
+        }.toString()
+        if (debug) recordReply(ep, reply)
+        runCatching { proxy.postMessage(reply) }
+    }
+
+    /**
+     * A content script inserted `<script src="https://<id>.ext.ione.invalid/…">` into the page
+     * and the page's Content-Security-Policy refused it. In Chrome an extension's resources are
+     * beyond a page's policy (`chrome-extension:` bypasses CSP); the emulated origin is an https
+     * origin any `script-src` can refuse. The world reports the refused element; the file, when
+     * it is web-accessible, runs in the main world through `evaluateJavascript`, which no page
+     * policy governs, and the world hears back so it can fire the element's `load`. In a subframe
+     * (`evaluateJavascript` takes no frame) the file runs through the reply proxy of the frame's
+     * main-world endpoint, when some extension's main-world script gave it one (Chromium 146+).
+     */
+    private fun mainWorldScript(view: WebView, proxy: JavaScriptReplyProxy, isMainFrame: Boolean, ep: String, message: JSONObject) {
+        val id = message.opt("id")
+        val url = message.str("url")
+        val extId = endpoints[ep]?.extensionId ?: message.str("ext")
+        fun done(error: String?) {
+            val reply = json("t" to "mainScriptDone", "ep" to ep, "id" to id, "ok" to (error == null), "error" to error).toString()
+            main.post {
+                if (debug) recordReply(ep, reply)
+                runCatching { proxy.postMessage(reply) }
+            }
+        }
+        val uri = Uri.parse(url)
+        val ext = served[extId]
+        val path = (uri.path ?: "/").trimStart('/')
+        val doc = endpoints[ep]?.doc ?: ep.substringBefore('.')
+        val frameMain = if (isMainFrame || !isolatedWorlds) null else
+            endpoints.values.firstOrNull { it.view === view && it.context == "content" && !it.isMainFrame && !it.world && it.doc == doc }
+        when {
+            ext == null -> done("the extension is not attached")
+            uri.scheme != "https" || uri.host != "$extId$ORIGIN_SUFFIX" -> done("$url is not on the extension's origin")
+            !isMainFrame && frameMain == null -> done("no main-world script of an extension runs in that frame, and only its bridge could run the file there")
+            !ext.webAccessible.any { it.matches(path) } -> done("$path is not a web-accessible resource")
+            else -> io.execute {
+                val text = fileIn(ext.dir, path)?.takeIf { it.isFile }?.let { f -> runCatching { f.readText() }.getOrNull() }
+                if (text == null) {
+                    done("$path was not found")
+                    return@execute
+                }
+                // `;void 0` keeps the script's last expression out of the result string.
+                val script = "$text\n;void 0;\n//# sourceURL=$url"
+                main.post {
+                    if (frameMain == null) {
+                        view.evaluateJavascript(script) { done(null) }
+                        return@post
+                    }
+                    // A script that throws still ran (its element gets `load`, as in Chrome).
+                    val delivered = runCatching {
+                        frameMain.proxy.executeJavaScript(script, object : androidx.webkit.WebViewOutcomeReceiver<String, androidx.webkit.JavaScriptExecutionException> {
+                            override fun onResult(result: String?) = done(null)
+                            override fun onError(error: androidx.webkit.JavaScriptExecutionException) {
+                                if (debug) Log.d(TAG, "$url threw in the frame's main world: ${error.message}")
+                                done(null)
+                            }
+                        })
+                    }.isSuccess
+                    if (!delivered) done("the frame is gone")
+                }
+            }
+        }
+    }
+
+    /**
+     * A content script's module graph on a WebView without isolated worlds asked for a webpack
+     * chunk, or a script-shaped module (ExtensionScripts.isScriptShapedModule), and was served
+     * the stub (ExtensionScripts.chunkStub); the bootstrap now asks for the file to run as a
+     * block of the extension's `with` scope, where its bare identifiers resolve as the content
+     * script's own do (its top level stays its own: no mirror, as a module's is in Chrome). The
+     * file, when it is web-accessible, runs through
+     * `evaluateJavascript` (the main frame; a subframe's stub imports the chunk plain) as an exec
+     * of kind `chunk`, the same shape as a scoped `scripting.executeScript` file: the bootstrap
+     * runs it in the scope and settles the stub's wait itself. Whatever the host refuses – and a
+     * file `evaluateJavascript` could not run at all (a syntax error, no bootstrap in the
+     * document) – is answered with `chunkDone`, and the stub imports the chunk plain, bracketed,
+     * as it was served before the stub.
+     */
+    private fun chunkScript(view: WebView, proxy: JavaScriptReplyProxy, isMainFrame: Boolean, ep: String, message: JSONObject) {
+        val id = message.opt("id")
+        val url = message.str("url")
+        val extId = endpoints[ep]?.extensionId ?: message.str("ext")
+        fun refuse(error: String) {
+            val reply = json("t" to "chunkDone", "ep" to ep, "id" to id, "ok" to false, "error" to error).toString()
+            main.post {
+                if (debug) recordReply(ep, reply)
+                runCatching { proxy.postMessage(reply) }
+            }
+        }
+        val ext = served[extId]
+        // The file at the extension's origin, or at its page-origin alias – the spelling a
+        // content script's own `import()` asks with once the page's policy refused the origin
+        // (`extensionScriptRecovery.ts`); the alias is served from the same directory.
+        val path = ExtensionUrls.ownFile(url, extId)
+        when {
+            ext == null -> refuse("the extension is not attached")
+            path == null -> refuse("$url is not on the extension's origin")
+            !isMainFrame -> refuse("a chunk runs in the content script's scope of a main frame only")
+            !ext.webAccessible.any { it.matches(path) } -> refuse("$path is not a web-accessible resource")
+            else -> io.execute {
+                val file = fileIn(ext.dir, path)?.takeIf { it.isFile }
+                if (file == null) {
+                    refuse("$path was not found")
+                    return@execute
+                }
+                val payload = JSONObject().put("id", id).put("url", url)
+                val script = runCatching {
+                    ExtensionScripts.execScript(token, extId, "chunk", payload, null, listOf(file), null, null, null, false, scoped = true, mirror = false)
+                }.getOrElse { e ->
+                    refuse("Could not load file: ${e.message ?: e.javaClass.simpleName}.")
+                    return@execute
+                }
+                main.post {
+                    view.evaluateJavascript(script) { result ->
+                        val outcome = unwrap(result)
+                        // A text `evaluateJavascript` could not run at all (a syntax error in the
+                        // chunk) answers a bare null, which the guard never does: the stub imports
+                        // the chunk plain, and the error shows where the import's own would have.
+                        if (outcome is Host.Rejection) refuse(outcome.message)
+                        else if (result == null || result == "null") refuse("the chunk's text did not run in the document")
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * A content script asked for a file of its own extension
+     * (`https://<id>.ext.ione.invalid/locales/en.json`, or Chrome's spelling of it) through
+     * its `fetch` or `XMLHttpRequest`: in Chrome the isolated world's request carries the
+     * extension's origin and the page's Content-Security-Policy (`connect-src`) never sees it,
+     * where a WebView's world runs under the document's policy and the `with` fallback's
+     * request is the page's outright. So the content scripts' `fetch` and `XMLHttpRequest` ask
+     * here first, over the bridge, which no page policy governs (`extensionFetchRelay.ts`,
+     * `extensionXhrRelay.ts`); the file service ([ExtensionFileAnswer]) answers the
+     * web-accessible file's bytes and type, or the reason, and then the request goes the page's
+     * way, the served origin's answer under the page's policy as before.
+     */
+    private fun extensionFetch(proxy: JavaScriptReplyProxy, ep: String, message: JSONObject) {
+        val id = message.opt("id")
+        val url = message.str("url")
+        val extId = endpoints[ep]?.extensionId ?: message.str("ext")
+        fun reply(answer: ExtensionFileAnswer.Answer) {
+            val text = json(
+                "t" to "extFetchDone", "ep" to ep, "id" to id, "ok" to answer.ok, "error" to answer.error, "mime" to answer.mime,
+                "body" to answer.body?.let { Base64.encodeToString(it, Base64.NO_WRAP) }
+            ).toString()
+            main.post {
+                if (debug) recordReply(ep, text)
+                runCatching { proxy.postMessage(text) }
+            }
+        }
+        val ext = served[extId]
+        val path = ExtensionFileAnswer.ownPath(url, extId)
+        when {
+            ext == null -> reply(ExtensionFileAnswer.refused("the extension is not attached"))
+            path == null -> reply(ExtensionFileAnswer.refused("$url is not on the extension's origin"))
+            else -> io.execute { reply(ExtensionFileAnswer.answer(ext.dir, path, ext.webAccessible, ext.cssMessages)) }
+        }
+    }
+
+    /**
+     * A content script's CROSS-ORIGIN `fetch` / `XMLHttpRequest` the page's Content-Security-Policy
+     * refused (`connect-src`): Chrome runs the isolated world under the extension's policy, not
+     * the page's, and sends the request as the page's own CORS request – its `Origin` the page's,
+     * no host permission consulted (Chrome 85), the server's consent read from the response. A
+     * WebView's world runs under the document's policy, so the world asks here over the bridge
+     * once the policy has refused it (`extensionCorsRelay.ts`, `extensionFetchRelay.ts`): the
+     * proxy performs the request framed as the page's ([CorsProxy.Framing.contentScript]) and
+     * answers status, reason, headers, body and final URL for the world to judge as Chrome's
+     * renderer does – the CORS check, the exposed headers, an opaque answer for `no-cors` are the
+     * world's. Refused: an extension not attached, a URL off http(s), a request body the message
+     * did not carry whole, an answer past the bridge's size, a network failure (each with its
+     * reason; the world's rejection then stands as the page's did). Recorded in `proxied` while
+     * `debug` as `<status> for the content script` (compat round 26, RoValra's `config.json`).
+     */
+    private fun extensionProxyFetch(proxy: JavaScriptReplyProxy, ep: String, message: JSONObject) {
+        val id = message.opt("id")
+        val extId = endpoints[ep]?.extensionId ?: message.str("ext")
+        val url = message.str("url")
+        val method = message.str("method", "GET").uppercase(Locale.ROOT)
+        fun reply(fields: JSONObject) {
+            val text = fields.put("t", "extProxyDone").put("ep", ep).put("id", id).toString()
+            main.post {
+                if (debug) recordReply(ep, text)
+                runCatching { proxy.postMessage(text) }
+            }
+        }
+        fun refuse(why: String) = reply(json("ok" to false, "error" to why))
+        val ext = served[extId]
+        if (ext == null) return refuse("the extension is not attached")
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return refuse("$url is not an http(s) URL")
+        // The envelope reader keeps a big message's top-level scalars alone, so the headers come
+        // as one JSON text and the body as one base64 text.
+        val headers = LinkedHashMap<String, String>()
+        runCatching {
+            val pairs = JSONArray(message.str("headers", "[]"))
+            for (i in 0 until pairs.length()) {
+                val pair = pairs.optJSONArray(i) ?: continue
+                headers[pair.optString(0)] = pair.optString(1)
+            }
+        }
+        // The proxy reads a credentialed request off its marker header, as it does an extension page's.
+        if (message.optBoolean("credentials")) headers[CorsProxy.CREDENTIALS_HEADER] = "include"
+        val body = if (message.has("body") && !message.isNull("body")) {
+            runCatching { Base64.decode(message.str("body"), Base64.DEFAULT) }.getOrNull()
+                ?: return refuse("the request body did not arrive whole over the bridge")
+        } else null
+        val request = CorsProxy.Request(method, url, headers)
+        val framing = CorsProxy.Framing.contentScript(message.str("origin").ifEmpty { "null" }, message.strOrNull("referer"))
+        io.execute {
+            val answer = runCatching { corsProxy.forward(request, "https://$extId$ORIGIN_SUFFIX", body, framing) }
+                .getOrElse { e ->
+                    val why = "${e.javaClass.simpleName}: ${e.message ?: "no message"}"
+                    if (debug) recordProxy(extId, request, "failed ($why) for the content script")
+                    refuse(why)
+                    return@execute
+                }
+            val bytes = runCatching {
+                answer.body.use { stream ->
+                    val out = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = stream.read(buffer)
+                        if (n < 0) break
+                        out.write(buffer, 0, n)
+                        if (out.size() > ExtensionFileAnswer.MAX_BYTES) break
+                    }
+                    out.toByteArray()
+                }
+            }.getOrElse { e ->
+                if (debug) recordProxy(extId, request, "failed (${e.javaClass.simpleName} reading the body) for the content script")
+                refuse("${e.javaClass.simpleName}: ${e.message ?: "the body could not be read"}")
+                return@execute
+            }
+            if (bytes.size > ExtensionFileAnswer.MAX_BYTES) {
+                if (debug) recordProxy(extId, request, "${answer.status} for the content script, the body past the bridge's ${ExtensionFileAnswer.MAX_BYTES} bytes")
+                refuse("the answer is past the bridge's size")
+                return@execute
+            }
+            if (debug) recordProxy(extId, request, "${answer.status} for the content script")
+            val headerObject = JSONObject()
+            for ((name, value) in answer.headers) headerObject.put(name, value)
+            reply(
+                json(
+                    "ok" to true, "status" to answer.status, "reason" to answer.reason, "url" to answer.url,
+                    "redirected" to answer.redirected, "mime" to answer.mime, "charset" to answer.charset,
+                    "headers" to headerObject, "body" to Base64.encodeToString(bytes, Base64.NO_WRAP)
+                )
+            )
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Request path: the extension origin, the CORS proxy, and the engine's extension seams
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Every WebView's `shouldInterceptRequest` (background thread), ahead of the request engine.
+     * Tab pages: a top-level navigation to an extension origin gets any file (Chrome lets any
+     * extension page open as a tab), other frames only its web-accessible resources – and the
+     * extension's own frame in the tab, once such a document is in it, any file again, told by
+     * its Referer, its CORS requests' `Origin`, or the frame document served before where the
+     * frame sends no Referer ([FrameOwnership]); a fetch of
+     * an extension page to a permitted host goes through the CORS proxy. Extension WebViews: any
+     * file of their own extension, another extension's web-accessible resources only, and the
+     * background view's document is the generated background page wherever the
+     * core put it (`backgroundDocument`: an MV3 worker's page lives at the worker script's URL,
+     * so `self.location` reads as in Chrome), and that document's own script is served to it
+     * once – its own `<script src>` – and refused as a sub-resource after that ([WorkerScriptGate]:
+     * a `<script>` the worker script appends resolving to its own URL would run it again). Null
+     * for everything else: a tab's request then
+     * goes to `Blocking.intercept`, where the extensions' declarativeNetRequest sets are among
+     * the rule sets; an extension page's request goes out as it is (Chrome exempts an
+     * extension's own requests from its rules).
+     */
+    fun intercept(
+        request: WebResourceRequest,
+        tab: TabWebView?,
+        extensionPage: Served?,
+        backgroundDocument: Boolean = false
+    ): WebResourceResponse? {
+        val url = request.url
+        // The tab's page is going with a main-frame request, and its frames with it.
+        if (tab != null && request.isForMainFrame) frames.forget(tab)
+        val hostName = url.host ?: return null
+        if (hostName.endsWith(ORIGIN_SUFFIX)) {
+            val id = hostName.removeSuffix(ORIGIN_SUFFIX)
+            // A tab's document on an origin the runtime does not serve: held while the core is
+            // about to configure the extension, failed as Chrome fails it otherwise; anything
+            // else of an unserved extension (a frame, a resource) is simply not there.
+            // (A tab's document on an unserved origin is HeldPages' matter, not the record's: the
+            // hold's release asks the intercept again, and that answer is recorded.)
+            val ext = served[id] ?: return if (tab != null && request.isForMainFrame) unservedPage(request, tab, id) else recorded(id, request, null, notFound(NetErrorAnswer.BLOCKED), ServedRecord.UNSERVED)
+            // Chrome does not load a chrome-extension:// URL in incognito for an extension not allowed there.
+            if (tab?.isPrivateTab == true && !ext.allowPrivate) {
+                return recorded(id, request, null, if (request.isForMainFrame) refusedPage(tab, url.toString()) else notFound(NetErrorAnswer.BLOCKED), ServedRecord.PRIVATE)
+            }
+            val path = (url.path ?: "/").trimStart('/')
+            val origin = "https://$hostName/"
+            val referer = request.requestHeaders?.get("Referer")
+            val originHeader = request.requestHeaders?.entries?.firstOrNull { it.key.equals("Origin", ignoreCase = true) }?.value
+            val document = ExtensionScripts.mimeType(path) == "text/html"
+            // The extension's own frame in a web tab is told by its Referer – or, where the
+            // frame's document sends none (`no-referrer`), by its CORS requests' `Origin` and by
+            // the frame document served into the tab before (FrameOwnership).
+            val ownPage = tab != null && (
+                request.isForMainFrame ||
+                    referer?.startsWith(origin) == true ||
+                    tab.currentUrl?.startsWith(origin) == true ||
+                    frames.ownRequest(tab, id, "https://$hostName", referer, originHeader, document)
+                )
+            // A foreign page (a web page, or another extension's own view asking for this one's
+            // files: `chrome-extension://<other>/...` spelled out in Read&Write's offscreen
+            // document resolves here, ExtensionPageNavigation) gets the web-accessible resources
+            // only, as Chrome serves them; the extension's own pages get any file.
+            val foreign = if (extensionPage != null) extensionPage.id != id else !ownPage
+            if (foreign && !ext.webAccessible.any { it.matches(path) }) return recorded(id, request, true, notFound(NetErrorAnswer.BLOCKED), ServedRecord.NOT_WEB_ACCESSIBLE)
+            // A web-accessible document going into a frame of the tab's page: its own requests follow.
+            if (foreign && tab != null && !request.isForMainFrame && document) frames.framed(tab, id)
+            if (backgroundDocument && ext.backgroundHtml != null && "$origin$path" == ext.backgroundUrl) {
+                if (request.isForMainFrame) {
+                    workerScriptGate.documentServed(id)
+                    return recorded(id, request, foreign, response("text/html", 200, "OK", ext.backgroundHtml.toByteArray()))
+                }
+                // The background document's own path asked for as a sub-resource of itself: the
+                // generated page's own `<script src>` for the worker script once, and after it
+                // only a `<script>` the worker script appended through the page's bare `document`
+                // with a src that resolved to its own URL (tl;dv's Firebase Auth loader, compat
+                // round 18: `?onload=__iframefcb<N>`), which would run the whole bundle again as a
+                // classic script of the page – a chain that took WebView's one shared renderer
+                // down. Refused, the element gets its `error` event: the loader's own rejection
+                // path, where Chrome's worker (no `document`) leaves it with a ReferenceError.
+                if (extensionPage?.id == id) {
+                    when (workerScriptGate.scriptRequest(id)) {
+                        WorkerScriptGate.Verdict.SERVE -> {}
+                        WorkerScriptGate.Verdict.REFUSE -> {
+                            Log.w(TAG, "refused the ${id.take(8)} background document's own script as a sub-resource: ${url.encodedPath}${url.encodedQuery?.let { "?${it.take(120)}" } ?: ""} (a <script> the worker script appended through the page's document would run the worker again; the element gets its error event)")
+                            return recorded(id, request, foreign, notFound(), ServedRecord.WORKER_SCRIPT)
+                        }
+                        WorkerScriptGate.Verdict.REFUSED_AGAIN -> return recorded(id, request, foreign, notFound(), ServedRecord.WORKER_SCRIPT)
+                    }
+                }
+            }
+            // A module a content script imports on a WebView without isolated worlds evaluates on
+            // the page's real global, where the `with` scope's `chrome` is not: the served text is
+            // bracketed so the bootstrap's accessor answers the extension's `chrome` while it runs
+            // (ExtensionScripts.moduleChromeWrap). A module request is a CORS one and carries the
+            // page's `Origin`; a classic `<script src>` (no-cors, no `Origin`) runs as a page script
+            // in Chrome too and is served as it is. Extension pages have their own `chrome`. The
+            // graph is told by the document, not the Referer (ExtensionScripts.isPageModuleGraph:
+            // a dependency's referrer is the module that imports it). A webpack chunk of the graph
+            // is served as the stub that runs it in the content script's scope, unless this is the
+            // stub's own plain request for it (ExtensionScripts.chunkStub). A CORS request naming
+            // the extension's own origin is an extension document's (a frame's module script or
+            // font), not a graph of the page's.
+            val moduleGraph = tab != null && extensionPage == null && ExtensionScripts.isPageModuleGraph(
+                path,
+                request.isForMainFrame,
+                tab.currentUrl,
+                origin,
+                originHeader != null && originHeader != "https://$hostName",
+                isolatedWorlds
+            )
+            val chunkStubUrl = if (moduleGraph && url.getQueryParameter(ExtensionScripts.PLAIN_QUERY) == null) url.toString() else null
+            return recorded(id, request, foreign, serve(ext, path, if (moduleGraph) id else null, chunkStubUrl))
+        }
+        // A module graph a page's policy refused at the extension's origin, asked for again from
+        // the page's own origin (`/.ione-ext/<id>/<path>`, the bootstrap's retry in
+        // extensionScriptRecovery.ts; `script-src 'self'` admits it where the served origin was
+        // refused). Served as the extension's origin serves a foreign page – the web-accessible
+        // resources only – for a subresource of a tab's page, never a navigation (no document:
+        // a frame of the extension's under the page's origin would be a page of the page's) and
+        // never an extension view's request. The module bracket and the chunk stub go with it on
+        // the one-realm WebView (the graph evaluates on the page's real global there); in an
+        // isolated world the world's own `import()` asked, and the file is served as it is.
+        if (tab != null && extensionPage == null && !request.isForMainFrame && (request.method ?: "GET").equals("GET", ignoreCase = true)) {
+            val alias = ExtensionUrls.pageAlias(url.path ?: "")
+            if (alias != null) {
+                val (id, path) = alias
+                val ext = served[id] ?: return recorded(id, request, true, notFound(), ServedRecord.UNSERVED)
+                if (tab.isPrivateTab && !ext.allowPrivate) return recorded(id, request, true, notFound(), ServedRecord.PRIVATE)
+                if (path.isEmpty() || ExtensionScripts.mimeType(path) == "text/html") return recorded(id, request, true, notFound(), ServedRecord.ALIAS_DOCUMENT)
+                if (!ext.webAccessible.any { it.matches(path) }) return recorded(id, request, true, notFound(), ServedRecord.NOT_WEB_ACCESSIBLE)
+                // A same-origin module request carries no `Origin`, so the graph is told by the
+                // WebView alone; only a script is bracketed (a stylesheet or an image goes as it is).
+                val moduleGraph = !isolatedWorlds && ExtensionScripts.isScriptPath(path)
+                val chunkStubUrl = if (moduleGraph && url.getQueryParameter(ExtensionScripts.PLAIN_QUERY) == null) url.toString() else null
+                return recorded(id, request, true, serve(ext, path, if (moduleGraph) id else null, chunkStubUrl))
+            }
+        }
+        // A fetch or XHR of an extension page to a host its permissions cover: Chrome skips CORS
+        // there, the proxy stands in (CorsProxy). The request's `Origin` names the extension, so
+        // a popup, a background view and an extension page opened in a tab are one case.
+        val corsOrigin = request.requestHeaders?.entries?.firstOrNull { it.key.equals("Origin", true) }?.value
+        if (corsOrigin != null && corsOrigin.startsWith("https://") && corsOrigin.endsWith(ORIGIN_SUFFIX)) {
+            val id = corsOrigin.removePrefix("https://").removeSuffix(ORIGIN_SUFFIX)
+            val ext = served[id]
+            if (ext != null && (tab?.isPrivateTab != true || ext.allowPrivate)) {
+                val proxied = CorsProxy.Request(request.method ?: "GET", url.toString(), request.requestHeaders ?: emptyMap())
+                val hosts = grantedHosts[id]?.let { ext.hosts + it } ?: ext.hosts
+                // The record while `debug` (`proxied`; the sweep reads it): every outcome for an
+                // http(s) request off the extension's origin – answered with its status, a redirect
+                // or a failure left to the WebView, or the proxy standing aside for a host the
+                // extension has no permission for (compat round 22: Temp Mail's popup drew an empty
+                // address with nothing on record, a request the proxy could not answer as absent as
+                // one never made).
+                val offOrigin = (proxied.url.startsWith("http://") || proxied.url.startsWith("https://")) &&
+                    !proxied.url.startsWith("$corsOrigin/") && proxied.header(CorsProxy.PROXY_HEADER) != CorsProxy.SKIP
+                if (!corsProxy.applies(proxied, corsOrigin, hosts)) {
+                    if (debug && offOrigin) recordProxy(id, proxied, "not proxied: no host permission for the URL")
+                } else {
+                    val reply = corsProxy.handle(proxied, id, corsOrigin) { why -> if (debug) recordProxy(id, proxied, "failed ($why); left to the WebView") }
+                    // A 3xx the proxy could not follow cannot be a WebResourceResponse; the WebView tries itself.
+                    if (reply != null && reply.status in 300..399 && debug) recordProxy(id, proxied, "${reply.status} redirect left to the WebView")
+                    if (reply != null && reply.status !in 300..399) {
+                        if (debug) recordProxy(id, proxied, reply.status.toString())
+                        if (reply.cookies.isEmpty()) {
+                            return WebResourceResponse(reply.mime, reply.charset, reply.status, reply.reason, reply.headers, reply.body)
+                        }
+                        // COOKIE_INTERCEPT: the WebView stores the response's cookies itself (it drops a
+                        // plain Set-Cookie header of an intercepted response).
+                        return WebResourceResponseCompat(reply.mime, reply.charset, reply.status, reply.reason, reply.headers, reply.body)
+                            .apply { setCookies(reply.cookies) }
+                            .toWebResourceResponse()
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * The engine decided a tab's request ([DecisionObserver], on the IO thread that took it).
+     * A decision an extension's rule took (`ext:` set) always reaches the core – it is that
+     * extension's matched rule, action count and `onRuleMatchedDebug` event; while an extension
+     * listens for `webRequest`, every decision does, as the material of the observational events.
+     * The rest is only counted here while `debug`.
+     *
+     * Every event carries the tab's document generation the request belonged to
+     * (`BlockingTab.documentGeneration`): the core tells one document's matches from the
+     * next's by it, since the tab's `navigated` event, posted at commit, often lands after the
+     * new page's first decisions.
+     */
+    private fun onDecision(tab: BlockingTab, request: Request, decision: Decision, elapsedNanos: Long, cpuNanos: Long) {
+        // A decision not reported leaves nothing for the header stage to pair with.
+        lastDecision.remove()
+        val micros = elapsedNanos / 1_000
+        val cpuMicros = if (cpuNanos < 0) null else cpuNanos / 1_000
+        val action = when (decision.action) {
+            Decision.Action.ALLOW -> "allow"
+            Decision.Action.BLOCK -> "block"
+            Decision.Action.REDIRECT -> "redirect"
+            Decision.Action.UPGRADE -> "upgrade"
+            Decision.Action.MODIFY_HEADERS -> "modifyHeaders"
+        }
+        val type = request.type.dnrName
+        if (debug) synchronized(decisions) {
+            if (decisions.size >= 400) decisions.removeFirst()
+            decisions.addLast("$action $type ${micros}us ${cpuMicros ?: "?"}cpu ${request.url}")
+        }
+        val extensionRule = decision.matchedSet?.startsWith(EXT_SET_PREFIX) == true
+        // A document's decision while `debug`, with the redirect pair the navigation hook stamped
+        // on it (#707) or its absence, and whether it reaches the runtime: the trace of a
+        // `webRequest.onBeforeRedirect` that never formed (compat round 26, R26-1).
+        if (debug && request.type == ResourceType.MAIN_FRAME)
+            Log.i(TAG, "ext.request document tab=${tab.tabId} url=${request.url.take(160)} redirectedFrom=${request.redirectedFrom?.take(160)} action=$action observe=$observeRequests rule=$extensionRule${if (!extensionRule && !observeRequests) " (not reported)" else ""}")
+        if (!extensionRule && !observeRequests) return
+        // The id rides on the request: a media response relayed for this request is reported
+        // under it (onResponse, contract 7.4). A document the header stage decides again is
+        // reported again under a fresh one, as before.
+        val requestId = requestIds.getAndIncrement().toString()
+        request.observerRequestId = requestId
+        val payload = json(
+            "tabId" to tab.tabId,
+            "requestId" to requestId,
+            "url" to request.url,
+            "type" to type,
+            "method" to request.method,
+            // Chrome's `initiator` is the requesting document's origin, none for a navigation.
+            "initiator" to request.documentUrl?.let { Domains.originOf(it) },
+            "mainFrame" to (request.type == ResourceType.MAIN_FRAME),
+            "document" to request.documentGeneration,
+            "redirectedFrom" to request.redirectedFrom,
+            "action" to action,
+            "matchedSet" to (decision.matchedSet?.takeIf { extensionRule }),
+            "matchedRule" to (if (extensionRule) decision.matchedRule else null),
+            "micros" to micros,
+            "cpuMicros" to cpuMicros
+        )
+        lastDecision.set(payload)
+        main.post { chromeEvent("ext.request", payload) }
+    }
+
+    /**
+     * The engine's `onSendHeaders` seam ([requestHeadersListener], on the intercept thread right
+     * after [onDecision] for a request that goes out): the headers WebView is about to send,
+     * reported as `ext.requestHeaders` under the `ext.request` id the same request's decision
+     * carried ([lastDecision]) – the material of the runtime's `onBeforeSendHeaders` and
+     * `onSendHeaders`, which Chrome fires with the same headers for an observer (WebView's
+     * headers are read-only, so no blocking variant is offered). A request whose decision was
+     * not reported (the requests switch off; an extension page's own request, which the engine
+     * never decides) reports nothing.
+     */
+    private fun onSendHeaders(details: WebRequestDetails) {
+        val decided = lastDecision.get()
+        lastDecision.remove()
+        val payload = RequestHeadersReport.build(decided, details.url, details.requestHeaders) ?: return
+        main.post { chromeEvent("ext.requestHeaders", payload) }
+    }
+
+    /**
+     * The response stage of a media request the engine relayed for it
+     * ([DecisionObserver.onResponse]: on the intercept thread for the headers and the relay's own
+     * failures, on the thread WebView reads the body from for its end), reported as
+     * `ext.response` under the `ext.request` id [onDecision] gave the same request (contract 7.4
+     * / 7.5) – the material of the runtime's `onHeadersReceived`, `onResponseStarted`,
+     * `onBeforeRedirect`, `onCompleted` and `onErrorOccurred`. A request never reported (the
+     * switch on without `ext.observeRequests`, which the runtime never does) gets a fresh id.
+     */
+    private fun onResponse(tab: BlockingTab, request: Request, response: RelayedResponse) {
+        val requestId = request.observerRequestId ?: requestIds.getAndIncrement().toString().also { request.observerRequestId = it }
+        val headers = JSONArray()
+        for ((name, value) in response.headers) headers.put(json("name" to name, "value" to value))
+        val payload = json(
+            "tabId" to tab.tabId,
+            "requestId" to requestId,
+            "url" to request.url,
+            "type" to request.type.dnrName,
+            "method" to request.method,
+            "statusCode" to response.statusCode,
+            "statusLine" to response.statusLine,
+            "responseHeaders" to headers,
+            "at" to when (response.at) {
+                RelayedResponse.Stage.HEADERS -> "headers"
+                RelayedResponse.Stage.COMPLETE -> "complete"
+                RelayedResponse.Stage.ERROR -> "error"
+            },
+            "relayed" to true
+        )
+        response.error?.let { payload.put("error", it) }
+        main.post { chromeEvent("ext.response", payload) }
+    }
+
+    /**
+     * The engine's redirect executor ([RedirectExecutor]): a `redirect` or `upgradeScheme` rule
+     * of a subresource, which WebView cannot answer with a real redirect (`WebResourceResponse`
+     * throws for any status in 300..399; measured, it took the process down). Redirects are
+     * therefore emulated: frames get a page that replaces itself with the target, targets on an
+     * extension origin are served in place (uBlock Origin Lite's neutered scripts), and other
+     * subresources are fetched here on the intercept thread and their body substituted. Non-GET
+     * requests, and a target the fetch cannot stand in for, are let through unchanged.
+     */
+    private fun redirect(ruleTarget: String, request: WebResourceRequest, type: ResourceType, tab: BlockingTab): WebResourceResponse? {
+        // A rule may name the extension's own resource as Chrome spells it; the served origin answers.
+        val location = ExtensionUrls.toServed(ruleTarget)
+        if (type == ResourceType.MAIN_FRAME || type == ResourceType.SUB_FRAME) {
+            val html = "<!doctype html><meta charset=\"utf-8\"><script>location.replace(${JSONObject.quote(location)})</script>"
+            return response("text/html", 200, "OK", html.toByteArray())
+        }
+        val target = Uri.parse(location)
+        val targetHost = target.host ?: return null
+        if (targetHost.endsWith(ORIGIN_SUFFIX)) {
+            val ext = served[targetHost.removeSuffix(ORIGIN_SUFFIX)] ?: return notFound()
+            // The rule applied in this partition, so the extension runs there; the private check
+            // is the same one a page's own fetch of the resource would meet.
+            if (tab.containerId == Profiles.PRIVATE_CONTAINER && !ext.allowPrivate) return notFound()
+            return serve(ext, (target.path ?: "/").trimStart('/'))
+        }
+        return fetchSubstitute(location, request)
+    }
+
+    /** A blocking fetch of `location` whose response stands in for the intercepted request. */
+    private fun fetchSubstitute(location: String, request: WebResourceRequest): WebResourceResponse? {
+        val method = request.method ?: "GET"
+        if (method != "GET" && method != "HEAD") return null
+        return runCatching {
+            val connection = java.net.URL(location).openConnection() as java.net.HttpURLConnection
+            connection.requestMethod = method
+            connection.instanceFollowRedirects = true
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 15_000
+            request.requestHeaders?.forEach { (name, value) ->
+                // Host is the target's; Accept-Encoding stays with HttpURLConnection so it decodes transparently.
+                if (!name.equals("Host", true) && !name.equals("Accept-Encoding", true)) connection.setRequestProperty(name, value)
+            }
+            val status = connection.responseCode
+            if (status < 100 || status in 300..399 || status > 599) return null
+            val body = (if (status >= 400) connection.errorStream else connection.inputStream) ?: ByteArrayInputStream(ByteArray(0))
+            val contentType = connection.contentType ?: "application/octet-stream"
+            val mime = contentType.substringBefore(';').trim().ifEmpty { "application/octet-stream" }
+            val charset = contentType.substringAfter("charset=", "").substringBefore(';').trim().ifEmpty { null }
+            val headers = HashMap<String, String>()
+            for ((name, values) in connection.headerFields) {
+                if (name == null || values.isNullOrEmpty()) continue
+                // Body arrives decoded and re-framed; the length and encoding headers would lie.
+                if (name.equals("Content-Length", true) || name.equals("Content-Encoding", true) || name.equals("Transfer-Encoding", true)) continue
+                headers[name] = values.joinToString(", ")
+            }
+            headers["X-Ione-Redirected-From"] = request.url.toString()
+            WebResourceResponse(mime, charset, status, connection.responseMessage?.ifEmpty { null } ?: "OK", headers, body)
+        }.getOrNull()
+    }
+
+    /**
+     * A file of the extension; with `moduleChromeFor`, a script bracketed for that extension's
+     * module graph, and with `chunkStubUrl` (the request's URL) a webpack chunk of the graph, or
+     * a module whose text is script-shaped (no `import`, `export` or `import.meta`:
+     * ExtensionScripts.isScriptShapedModule), is answered with the stub that runs the file in
+     * the content script's scope instead (ExtensionScripts.chunkStub; the stub's own plain
+     * request comes without it).
+     */
+    private fun serve(ext: Served, path: String, moduleChromeFor: String? = null, chunkStubUrl: String? = null): WebResourceResponse {
+        if (path == GENERATED_BACKGROUND) {
+            val html = ext.backgroundHtml ?: return notFound()
+            return response("text/html", 200, "OK", html.toByteArray())
+        }
+        // A file the extension has not is Chrome's `ERR_FILE_NOT_FOUND`: no response, a network error.
+        val file = fileIn(ext.dir, path) ?: return notFound(NetErrorAnswer.FILE_NOT_FOUND)
+        if (!file.isFile) return notFound(NetErrorAnswer.FILE_NOT_FOUND)
+        val mime = ExtensionScripts.mimeType(path)
+        if (moduleChromeFor != null && chunkStubUrl != null &&
+            (ExtensionScripts.isWebpackChunk(ExtensionFiles.head(file, ExtensionScripts.WEBPACK_CHUNK_HEAD)) || ExtensionScripts.isScriptShapedModule(file))
+        ) {
+            return response(mime, 200, "OK", ExtensionScripts.chunkStub(moduleChromeFor, chunkStubUrl).toByteArray())
+        }
+        // A stylesheet is localized as Chrome's renderer localizes a `chrome-extension://` one
+        // (`ExtensionLocalizationThrottle`): read whole, its placeholders substituted, whatever
+        // linked it. Anything else streams from disk.
+        if (mime == "text/css" && ext.cssMessages.isNotEmpty() && file.length() <= ExtensionFiles.LOCALIZED_CSS_LIMIT) {
+            val text = runCatching { file.readText() }.getOrNull() ?: return notFound(NetErrorAnswer.FILE_NOT_FOUND)
+            return response(mime, 200, "OK", ExtensionFiles.localizeCss(text, ext.cssMessages).toByteArray())
+        }
+        // Streamed from disk, the module bracket on either side (ExtensionFiles.servedBody); the
+        // prologue is chosen by the file's head (a webpack chunk binds its own `chrome` / `self`,
+        // a module declaring `chrome` itself keeps the bare entry), read up to a MiB, never whole.
+        val body = ExtensionFiles.servedBody(
+            file,
+            moduleChromeFor?.let { ExtensionScripts.moduleChromeOpen(it, ExtensionFiles.head(file, ExtensionScripts.MODULE_SCAN_HEAD)) },
+            moduleChromeFor?.let(ExtensionScripts::moduleChromeClose)
+        ) ?: return notFound(NetErrorAnswer.FILE_NOT_FOUND)
+        return response(mime, 200, "OK", body.stream, body.length)
+    }
+
+    private fun response(mime: String, status: Int, reason: String, body: ByteArray, extra: Map<String, String> = emptyMap()): WebResourceResponse =
+        response(mime, status, reason, ByteArrayInputStream(body), body.size.toLong(), extra)
+
+    private fun response(mime: String, status: Int, reason: String, body: InputStream, length: Long, extra: Map<String, String> = emptyMap()): WebResourceResponse {
+        val headers = HashMap<String, String>(extra)
+        headers["Access-Control-Allow-Origin"] = "*"
+        headers["Cache-Control"] = "no-cache"
+        headers["Content-Length"] = length.toString()
+        return WebResourceResponse(mime, if (mime.startsWith("text/") || mime.contains("javascript") || mime.contains("json")) "utf-8" else null, status, reason, headers, body)
+    }
+
+    /**
+     * Not Found; with [netError] (a [NetErrorAnswer] code) the refusal Chrome gives as a network
+     * error, which the extension page's `fetch` rejects (`extensionCorsProxy.ts`).
+     */
+    private fun notFound(netError: String? = null) = response(
+        "text/plain",
+        404,
+        "Not Found",
+        ByteArray(0),
+        if (netError == null) emptyMap() else NetErrorAnswer.headers(netError)
+    )
+
+    /**
+     * A tab's document on the origin of an extension that is not served (network thread). While
+     * the core is about to configure the extension the page is held: an empty document under
+     * the page's URL, loaded again from [releaseHeld] once the configure completes. Otherwise it
+     * fails like a page of an extension Chrome has not enabled, `ERR_BLOCKED_BY_CLIENT`, through
+     * the core's error page: the empty document stands under the URL as WebView's own error
+     * page does for a failed load, and the tab steps over it on the way back.
+     */
+    private fun unservedPage(request: WebResourceRequest, tab: TabWebView, id: String): WebResourceResponse {
+        val href = request.url.toString()
+        if (heldPages.expects(id)) {
+            heldPages.hold(id, tab, href)
+            // The configure may have completed between the served check and the hold; then the
+            // real answer, and no reload of a page that loads on its own.
+            if (served[id] == null) return heldPage()
+            heldPages.unhold(id, tab, href)
+            return intercept(request, tab, null) ?: notFound()
+        }
+        return refusedPage(tab, href)
+    }
+
+    /** The empty document a refused page shows; the tab fails the load as the document starts. */
+    private fun refusedPage(tab: TabWebView, href: String): WebResourceResponse {
+        tab.refuseExtensionPage(href)
+        return heldPage()
+    }
+
+    private fun heldPage(): WebResourceResponse = response("text/html", 200, "OK", HELD_PAGE_HTML.toByteArray())
+
+    /** The pages held for `id`, loaded again now that its origin answers (main thread). */
+    private fun releaseHeld(id: String) {
+        val tabs = host.tabs.all()
+        for (held in heldPages.served(id)) {
+            val view = held.view
+            // A tab that moved on, or went, keeps its own page.
+            if (view !in tabs || view.currentUrl != held.url) continue
+            Log.i(TAG, "reloading a held page of ${id.take(8)}: ${held.url.take(80)}")
+            view.reload()
+        }
+    }
+
+    /** A page held for an extension that is not coming: it fails (main thread). */
+    private fun failHeld(held: HeldPages.Held<TabWebView>) {
+        val view = held.view
+        if (view !in host.tabs.all() || view.currentUrl != held.url) return
+        view.failExtensionPage(held.url)
+    }
+
+    /**
+     * A record's directory, or null when the path is not a directory under the store's install
+     * root (`files/ione/extensions`): the runtime only serves what the store installed.
+     */
+    private fun recordDir(path: String): File? {
+        if (path.isEmpty()) return null
+        val dir = File(path)
+        val canonical = runCatching { dir.canonicalPath }.getOrNull() ?: return null
+        val root = runCatching { host.extStore.root.canonicalPath }.getOrNull() ?: return null
+        if (!canonical.startsWith(root + File.separator)) return null
+        return if (dir.isDirectory) dir else null
+    }
+
+    /** A file inside an attached extension's directory, or null when the path escapes it. */
+    fun fileFor(id: String, path: String): File? {
+        val ext = served[id] ?: return null
+        return fileIn(ext.dir, path)
+    }
+
+    /** `path` resolved inside `dir`, or null when it escapes it (`..`, symlinks). */
+    private fun fileIn(dir: File, path: String): File? = ExtensionFileAnswer.fileIn(dir, path)
+
+    fun servedFor(id: String): Served? = served[id]
+
+    /** The hidden background WebView of an attached extension (instrumentation reads its console). */
+    fun backgroundView(id: String): ExtensionWebView? = backgrounds[id]
+
+    /** The extension's offscreen document's view (`chrome.offscreen`), when one is open (instrumentation reads its state). */
+    fun offscreenView(id: String): ExtensionWebView? = offscreens[id]
+
+    /** How many times the extension's background has been started here (instrumentation; see [backgroundStarts]). */
+    fun backgroundStarts(id: String): Int = backgroundStarts[id] ?: 0
+
+    /**
+     * Ask the runtime to run an extension's stopped background (an MV3 worker idles out half a
+     * minute after its last traffic), as Chrome's management page starts an inactive worker when
+     * its view is inspected. Instrumentation: the driver probes a worker's APIs through its view.
+     */
+    fun wakeBackground(id: String) = chromeEvent("ext.wake", json("id" to id))
+
+    /** The document-start script units currently installed in every tab, across extensions. */
+    fun scriptUnits(): List<ScriptUnit> = units.values.flatten()
+
+    /**
+     * The Java heap the runtime holds for one extension's content-script units, for
+     * instrumentation ([UnitCompiler.memoryOf]: the compiled scripts held in memory – the one
+     * copy the compiler's cache and the tabs' [ScriptUnit]s share –, the units of the store
+     * counted apart with their characters and in no heap figure but for the texts soft-held
+     * from their last read, and the soft-held sources), with the units installed on the tabs
+     * counted, the runtime's count of store reads that did not fit the heap
+     * (`storeReadsOutOfHeap`, [storeReadsOutOfHeap]), and the extension's configures in flight
+     * (`pending`, [ConfiguresInFlight]: requested, their post not landed yet). Main thread; does
+     * not wait on a compile in flight (`compiling: true` then, the compiler's counts absent). The
+     * reading is settled – the units installed are the last configure's, the compiler's cache
+     * theirs – when `pending` is 0 and `compiling` false; a reading taken while a configure is
+     * in flight counts the plan being replaced (compat round 22's `[lane]` run, Adblock Ad
+     * Blocker Pro's heap split: the compiler's 11 units against 1 installed).
+     */
+    fun unitMemory(id: String): JSONObject =
+        compiler.memoryOf(id).put("installed", units[id]?.size ?: 0).put("pending", configuresInFlight.pending(id))
+            .put("storeReadsOutOfHeap", storeReadsOutOfHeap)
+
+    /**
+     * Let the runtime's share of an extension's heap go while the extension stays attached, for
+     * instrumentation: the sweep reads the heap before and after this, then once more after the
+     * disable, so the units' bytes stand against the rules' and the rest's measured rather than
+     * summed. The compiled units and their sources are dropped and no new tab receives them; the
+     * tabs that have them keep them (the WebView holds its copy off this heap); the next
+     * `ext.configure` compiles them again. Main thread; the compiler's lock is brief unless a
+     * compile of the extension's is in flight.
+     */
+    fun releaseUnitsForInstrumentation(id: String) {
+        units.remove(id)
+        compiler.forget(id)
+    }
+
+    /**
+     * The extensions' rule sets in the engine's current snapshot, for instrumentation: per set,
+     * its rule count and how many of its rules the index cannot bucket (`wildcard`), with the
+     * partitions it is scoped to.
+     */
+    fun ruleSetStats(): JSONArray {
+        val out = JSONArray()
+        for (set in host.blocking.snapshot.ruleSets) {
+            if (!set.id.startsWith(EXT_SET_PREFIX)) continue
+            out.put(
+                json(
+                    "id" to set.id, "rules" to set.rules.size, "wildcard" to set.index.wildcardCount,
+                    "hosts" to set.index.hostCount, "priority" to set.priority,
+                    "partitions" to (set.partitions?.let { JSONArray(it.sorted()) })
+                )
+            )
+        }
+        return out
+    }
+
+    /** The WebView of the open popup / options sheet, if any. */
+    fun popupView(): ExtensionWebView? = popup?.webView
+
+    /** The WebView of an extension's open `identity.launchWebAuthFlow` sheet, if any (instrumentation). */
+    fun authSheetView(extensionId: String): WebView? = authSheets.values.firstOrNull { it.extensionId == extensionId }?.webView
+
+    /** Whether the CORS proxy's log (`proxied`) has an answer for a URL containing `fragment`, as "METHOD status url" lines. */
+    fun proxiedMatching(fragment: String): List<String> = synchronized(proxied) { proxied.filter { it.contains(fragment) } }
+
+    /** The served-resource record's lines (`servedRecord`, ServedRecord.line) containing `fragment` – a file's name, an id's start –, oldest first. */
+    fun servedMatching(fragment: String): List<String> = synchronized(servedRecord) { servedRecord.filter { it.contains(fragment) } }
+
+    // ---------------------------------------------------------------------------------------------
+    // Background pages and popups
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * The core's lifecycle policy (`runtime/background.ts`) asks for a start only when it holds
+     * no page: whatever runs here under that id is a leftover it cannot see (a start whose stop
+     * has not reported gone yet, or an earlier runtime's page), so the page is always fresh.
+     * `reason` is the policy's (`attach`, `wake`, `message`, `event:<name>`, `restart`), for the
+     * log: the `I/ZenExt background start` / `stop` lines are the lifecycle's one trace in a
+     * lane's logcat (an idle stop is otherwise visible only as the refused replies it leaves).
+     */
+    private fun startBackground(id: String, reason: String) {
+        val ext = served[id] ?: return
+        val url = ext.backgroundUrl ?: return
+        if (backgrounds.containsKey(id)) stopBackground(id, "replaced")
+        val view = ExtensionWebView(host, this, ext, "background")
+        backgrounds[id] = view
+        backgroundStarts[id] = backgroundStarts(id) + 1
+        host.attachHidden(view)
+        view.loadUrl(url)
+        Log.i(TAG, "background start ${id.take(8)} ${ext.version} on $reason, start #${backgroundStarts(id)}")
+    }
+
+    /** `reason`: the core's (`idle`, `remove`) or this host's own (`replaced`, `detach`, `reset`, `renderer gone`, `destroy`). */
+    private fun stopBackground(id: String, reason: String) {
+        val view = backgrounds.remove(id) ?: return
+        Log.i(TAG, "background stop ${id.take(8)} on $reason")
+        // The document's count of refused requests for its own script, once, as it goes: Blink
+        // reports a failed sub-resource to the console from the network source, which WebView's
+        // onConsoleMessage never sees, so this line is the only count of them in the log.
+        val refusals = workerScriptGate.refusals(id)
+        if (refusals > 0) Log.i(TAG, "the ${id.take(8)} background document asked for its own script as a sub-resource $refusals time(s) beyond the page's own tag; all refused (WorkerScriptGate)")
+        workerScriptGate.forget(id)
+        onDocumentGone(view)
+        host.detachHidden(view)
+        view.destroy()
+    }
+
+    /**
+     * `ext.offscreen.open`: the extension's one offscreen document (`chrome.offscreen`), a hidden
+     * view like the background's on the page the extension named; its bootstrap says hello as an
+     * `offscreen` endpoint, which is what the core's `createDocument` waits for. An earlier one
+     * under the id is replaced (the core refuses a second `createDocument`; this is its retry).
+     */
+    private fun openOffscreen(id: String, url: String) {
+        val ext = served[id] ?: return
+        closeOffscreen(id)
+        val view = ExtensionWebView(host, this, ext, "offscreen")
+        offscreens[id] = view
+        host.attachHidden(view)
+        view.loadUrl(url)
+    }
+
+    private fun closeOffscreen(id: String) {
+        val view = offscreens.remove(id) ?: return
+        onDocumentGone(view)
+        host.detachHidden(view)
+        view.destroy()
+    }
+
+    private fun openPopup(id: String, url: String, context: String, title: String) {
+        closePopup()
+        val ext = served[id] ?: return
+        lateinit var sheet: ExtensionPopup
+        sheet = ExtensionPopup(host, this, ext, title, url, context) {
+            // A dialog's dismiss listener runs a loop after `dismiss()`, so the sheet this one
+            // replaced reports its close once the new sheet is up: only the sheet still in place
+            // gives up the slot and tells the core (UltraSurf's worker opens its popup at install
+            // with `action.openPopup()`, and the user's tap replaces it; the replaced sheet's late
+            // report left the tap's sheet on screen with nothing tracking it, compat rounds 11-12).
+            if (popup === sheet) {
+                popup = null
+                chromeEvent("ext.popupClosed", json("id" to id))
+            }
+        }
+        popup = sheet
+        sheet.show()
+    }
+
+    fun closePopup() {
+        popup?.dismiss()
+        popup = null
+    }
+
+    /**
+     * `ext.auth.open`: the sheet of an `identity.launchWebAuthFlow`, loading hidden until the flow
+     * says `ext.auth.show`; what happens in it goes back as `ext.authView` (see [ExtensionAuthSheet]).
+     */
+    private fun openAuthSheet(viewId: Int, id: String, url: String, title: String) {
+        authSheets.remove(viewId)?.close()
+        val sheet = ExtensionAuthSheet(host, viewId, id, title) { event, target ->
+            if (event == ExtensionAuthSheet.EVENT_CLOSED) authSheets.remove(viewId)
+            chromeEvent("ext.authView", json("viewId" to viewId, "event" to event, "url" to target))
+        }
+        authSheets[viewId] = sheet
+        sheet.load(url)
+    }
+
+    /** Every auth sheet, or those of one extension, down without a word (the core ended the flows). */
+    private fun closeAuthSheets(extensionId: String? = null) {
+        val going = authSheets.values.filter { extensionId == null || it.extensionId == extensionId }
+        for (sheet in going) {
+            authSheets.remove(sheet.viewId)
+            sheet.close()
+        }
+    }
+
+    /** Endpoints of a WebView are dropped when it is destroyed. */
+    fun onWebViewDestroyed(view: WebView) = detach(view)
+
+    /**
+     * The renderer behind an extension view is gone (every WebView of the app shares it, so the
+     * chrome lost it too). A dead background view goes; its endpoints report gone and the core's
+     * lifecycle restarts it when something needs it. A dead popup is closed.
+     */
+    fun onRendererGone(view: ExtensionWebView) {
+        val id = backgrounds.entries.firstOrNull { it.value === view }?.key
+        if (id != null) stopBackground(id, "renderer gone")
+        // A dead offscreen page goes the same way; `hasDocument` says false once its endpoint is gone.
+        val offscreen = offscreens.entries.firstOrNull { it.value === view }?.key
+        if (offscreen != null) closeOffscreen(offscreen)
+        if (popup?.webView === view) closePopup()
+    }
+
+    fun pageScript(ext: Served, context: String): String {
+        val config = runCatching { JSONObject(ext.pageConfig) }.getOrDefault(JSONObject())
+        config.put("context", context)
+        return ExtensionScripts.page(bootstrap, config.toString(), debug)
+    }
+
+    fun onBridgeMessageFromPage(view: WebView, data: String?, origin: Uri, isMainFrame: Boolean, proxy: JavaScriptReplyProxy) =
+        onBridgeMessage(view, data, origin, isMainFrame, proxy, "page", slot = null)
+
+    /**
+     * The window's runtime goes with the window. Besides its pages, sheets and seams, it lets go
+     * of everything it holds for the tabs – the compiler's compiled units and soft-held sources,
+     * the units installed per extension, the served records, the per-view handlers, the
+     * endpoints, the frames, the held pages, the world slots, the configure stats – so that its
+     * retained size is nothing whatever still refers to it. A browser restarted in the same
+     * process (`MainActivity` started over the old one with `CLEAR_TASK`: the compat sweep's
+     * restart proof, an app link or a shortcut into a running process) builds a new runtime
+     * while the old one is still referenced for some seconds – by the tab WebViews' bridge
+     * listeners ([attach]'s `addWebMessageListener` closures capture it, and a destroyed
+     * WebView's Java object lives until the view tree and the WebView's own cleanup let it go),
+     * by the old core's `@JavascriptInterface` hop while that core runs on for a moment after
+     * its WebView is destroyed, by any lambda still queued on the main handler – and the new
+     * runtime's configure compiled the same extensions on top of the old one's units: on a
+     * 192 MB heap Adblock Ad Blocker Pro's 66 MB twice, and the new carrier's builder found 25 MB
+     * free (compat round 21b, the class's second trigger). The last destroyed runtime is kept
+     * weakly ([lastDestroyed]) so the next one's configure line can say whether it was collected.
+     */
+    fun destroy() {
+        destroyed = true
+        closePopup()
+        closeAuthSheets()
+        releaseKeepAwake()
+        for (id in backgrounds.keys.toList()) stopBackground(id, "destroy")
+        for (id in offscreens.keys.toList()) closeOffscreen(id)
+        notifications.destroy()
+        io.shutdownNow()
+        // The engine outlives the window; a runtime that is gone must not be called (a newer
+        // window's runtime may already have taken the seams over). Its switches go with it.
+        setObserveRequestHeaders(false)
+        if (host.blocking.observer === observer) {
+            host.blocking.observeResponses = false
+            host.blocking.observer = null
+        }
+        if (host.blocking.redirector === redirector) host.blocking.redirector = null
+        if (host.blocking.headerStage === headerStage) host.blocking.headerStage = null
+        // The release. The compiler does not wait on a compile in flight: that compile sees
+        // the close at its next unit and releases (`UnitCompiler.close`).
+        val released = compiler.close()
+        configuresInFlight.reset()
+        val installedUnits = units.values.sumOf { it.size }
+        val installedChars = units.values.sumOf { list -> list.sumOf { it.chars.toLong() } }
+        val installedStored = units.values.sumOf { list -> list.count { it.stored } }
+        units.clear()
+        served = emptyMap()
+        configureStats.clear()
+        handlers.clear()
+        endpoints.clear()
+        frames.clear()
+        heldPages.expect(emptyList())
+        worldSlots.clear()
+        pendingNotificationEvents.clear()
+        forward.forgetAll()
+        lastDestroyed = WeakReference(this)
+        lastDestroyedAt = SystemClock.uptimeMillis()
+        Log.i(
+            TAG,
+            "destroy: released $installedUnits installed unit(s) of $installedChars chars ($installedStored stored); compiler " +
+                (if (released.deferred) "releasing in the compile in flight" else "${released.extensions} extension(s), ${released.units} unit(s) of ${released.unitChars} chars (${released.storedUnits} stored, the store directory removed), ${released.sources} held source(s)")
+        )
+    }
+
+    /**
+     * The runtime destroyed last in this process against this one, for the configure line:
+     * `none` (the first runtime of the process), `collected` (its weak reference cleared – the GC
+     * found nothing referring to it), or not yet, with the seconds since its destroy (a GC has
+     * not run since, or something still refers to it – its retained size is nothing either way,
+     * [destroy] having released it).
+     */
+    private fun previousRuntime(): String {
+        val ref = lastDestroyed ?: return "none"
+        if (ref.get() == null) return "collected"
+        return "not collected yet (destroyed ${(SystemClock.uptimeMillis() - lastDestroyedAt) / 1000} s ago, released)"
+    }
+
+    companion object {
+        const val TAG = "ZenExt"
+        const val BRIDGE = "__zenExtBridge"
+
+        /**
+         * The runtime [destroy]ed last in this process, weakly, and when: the next runtime's
+         * configure line says whether it has been collected (see [previousRuntime]). A weak
+         * reference holds nothing up; a strong one here would be the referrer this round looks for.
+         */
+        @Volatile private var lastDestroyed: WeakReference<Extensions>? = null
+        @Volatile private var lastDestroyedAt = 0L
+        /**
+         * Isolated worlds a tab view can host at once (one per extension, two for an extension
+         * with a `USER_SCRIPT` world). Each costs one listener registration per tab view at
+         * construction and nothing at run time until a unit is injected into it; the core plans
+         * an extension beyond the budget under the emulation proxy instead.
+         */
+        const val WORLD_SLOTS = 16
+        /** Bridge trace lines kept for instrumentation (one line per message, all extensions together). */
+        const val TRACE_LINES = 2400
+        /** The registrant of this runtime's own `onSendHeaders` listener on the engine's registry (no extension's id). */
+        const val REQUEST_HEADERS_REGISTRANT = "ione:webRequest"
+        /** Reply errors Chrome raises in normal operation: a message to a tab without a listener, a listener that never answered. */
+        val UNANSWERED = setOf(
+            "Could not establish connection. Receiving end does not exist.",
+            "The message port closed before a response was received."
+        )
+        const val ORIGIN_SUFFIX = ".ext.ione.invalid"
+        const val GENERATED_BACKGROUND = "_generated_background_page.html"
+        /**
+         * The document a tab shows while its extension page is held (or is being failed): empty,
+         * in the page's colour scheme, so it reads as a page still loading, not as a page.
+         */
+        const val HELD_PAGE_HTML =
+            "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+                "<style>:root{color-scheme:light dark}</style></head><body></body></html>"
+        /** The id prefix of the extensions' rule sets in the engine (`engineSetId` in `core/extensions/dnr/sink.ts`). */
+        const val EXT_SET_PREFIX = "ext:"
+        val VALID_ID = Regex("^[a-p]{32}$")
+        /** `_locales/<dir>`: a language tag with underscores, nothing that could leave the directory. */
+        val LOCALE_DIR = Regex("^[A-Za-z0-9_]{1,16}$")
+
+        /** A tab view of the private container (extension WebViews and ordinary tabs are not). */
+        val WebView.isPrivateTab: Boolean
+            get() = (this as? TabWebView)?.containerId == Profiles.PRIVATE_CONTAINER
+
+        /** `web_accessible_resources` glob → regex (`*` spans path separators, as in Chrome). */
+        fun globToRegex(glob: String): Regex {
+            val clean = glob.trimStart('/')
+            val sb = StringBuilder("^")
+            for (ch in clean) {
+                when (ch) {
+                    '*' -> sb.append(".*")
+                    else -> if (ch in ".+?^\${}()|[]\\/") sb.append('\\').append(ch) else sb.append(ch)
+                }
+            }
+            return Regex(sb.append('$').toString())
+        }
+    }
+}

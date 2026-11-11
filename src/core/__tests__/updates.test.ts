@@ -550,19 +550,19 @@ describe('UpdateService', () => {
   it('treats an APK with another applicationId as a new app, whatever its key', async () => {
     const host = new FakeHost({ os: 'android', arch: 'universal', kind: 'apk' })
     host.installedSigner = 'f'.repeat(64) // not the release's 'e' key
-    host.installedPackage = 'app.zen.chromium'
+    host.installedPackage = 'io.github.benitbuhner.ione'
     const renamed = manifestFor('0.2.0').replace(
       '"signer":"eeee',
-      '"packageName":"io.github.benitbuhner.ione","signer":"eeee'
+      '"packageName":"dev.haasele.ione","signer":"eeee'
     )
-    expect(renamed).toContain('io.github.benitbuhner.ione')
+    expect(renamed).toContain('dev.haasele.ione')
     const { browser, toasts } = fakeBrowser('0.1.0', {
       [`${LATEST}/update-manifest.json`]: { ok: true, status: 200, text: renamed }
     })
     const service = new UpdateService(browser, host)
     await service.check({ manual: false })
     expect(service.status().phase).toBe('available')
-    expect(service.status().release?.asset?.packageName).toBe('io.github.benitbuhner.ione')
+    expect(service.status().release?.asset?.packageName).toBe('dev.haasele.ione')
     expect(service.status().packageChange).toBe(true)
     // The key comparison is meaningless for a different package: it must not block the download.
     expect(service.status().signerMismatch).toBe(false)
@@ -573,7 +573,7 @@ describe('UpdateService', () => {
     expect(toasts.at(-1)).toMatch(/alongside/)
 
     // Same applicationId: the signer check applies as before.
-    host.installedPackage = 'io.github.benitbuhner.ione'
+    host.installedPackage = 'dev.haasele.ione'
     const same = new UpdateService(browser, host)
     await same.check({ manual: false })
     expect(same.status().packageChange).toBe(false)

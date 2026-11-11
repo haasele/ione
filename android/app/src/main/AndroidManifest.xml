@@ -135,7 +135,7 @@
       downloads metadata, remembered permissions and the agent token must not leave the device.
     -->
     <application
-        android:name=".ZenApplication"
+        android:name=".IoneApplication"
         android:allowBackup="false"
         android:fullBackupContent="@xml/ione_backup_rules"
         android:dataExtractionRules="@xml/ione_data_extraction_rules"

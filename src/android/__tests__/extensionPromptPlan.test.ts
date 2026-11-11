@@ -101,7 +101,7 @@ describe('nativePromptPlan', () => {
     expect(drawables).toEqual([...union].sort())
     // And the Kotlin table that keeps the drawables through the resource shrinker names each one.
     const table = readFileSync(
-      resolve(root, 'android/app/src/main/kotlin/app/zen/chromium/ext/ExtensionPromptFallback.kt'),
+      resolve(root, 'android/app/src/main/kotlin/dev/haasele/ione/ext/ExtensionPromptFallback.kt'),
       'utf8'
     )
     for (const kind of union) {

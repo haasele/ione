@@ -59,14 +59,14 @@ describe("an agent's file chooser on Android (agentPrompts.ts)", () => {
     // the agent token store) and handed to the page the agent drives: never, from any agent.
     const files = [
       { name: 'b.txt', base64: 'Yg==' },
-      { path: '/data/data/app.zen.chromium/app_webview/Default/Cookies' }
+      { path: '/data/data/dev.haasele.ione/app_webview/Default/Cookies' }
     ]
     expect(fileChooserAnswerWire({ kind: 'files', files })).toEqual({ kind: 'cancel' })
     expect(
       fileChooserAnswerWire({ kind: 'files', files: [{ path: '/sdcard/Download/a.pdf' }] })
     ).toEqual({ kind: 'cancel' })
     const refusal = uploadPathsRefusal(files)
-    expect(refusal).toContain('/data/data/app.zen.chromium/app_webview/Default/Cookies')
+    expect(refusal).toContain('/data/data/dev.haasele.ione/app_webview/Default/Cookies')
     expect(refusal).toContain('send the file contents instead')
     expect(uploadPathsRefusal([{ name: 'b.txt', base64: 'Yg==' }])).toBeNull()
     // The same sentence `setInputFiles` answers with, so the agent is told one thing.

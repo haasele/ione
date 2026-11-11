@@ -1,4 +1,5 @@
 import { cpSync, existsSync, readdirSync, renameSync, rmdirSync, rmSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 
 /**
  * The browser has been renamed twice. Its directories carried the name it had then – Electron's
@@ -88,4 +89,16 @@ export const fsProbe: DirectoryProbe = {
       return false
     }
   }
+}
+
+/**
+ * The profile's documents moved from `zen/` to `ione/` with the rename. They follow the same
+ * rule as the former application directories: an existing `ione/` wins, and a failed rename
+ * copies instead of losing the profile.
+ */
+export function migrateProfileDirectory(
+  userDataDir: string,
+  log: (message: string) => void = () => undefined
+): LegacyMoveResult {
+  return moveLegacyDirectory(join(userDataDir, 'zen'), join(userDataDir, 'ione'), log)
 }

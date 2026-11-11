@@ -34,7 +34,7 @@ import {
 /** A Node-shaped error: the message carries what must never reach a row. */
 function errno(code: string): NodeJS.ErrnoException {
   const error: NodeJS.ErrnoException = new Error(
-    `${code}: permission denied, open '/home/someone/.config/ione/zen/skills.json.4242.1.tmp'`
+    `${code}: permission denied, open '/home/someone/.config/ione/ione/skills.json.4242.1.tmp'`
   )
   error.code = code
   return error
@@ -299,7 +299,7 @@ describe('SkillInstaller', () => {
     await fs.mkdir(join(home, '.claude'), { recursive: true })
     await fs.mkdir(join(home, '.cursor'), { recursive: true })
     await fs.mkdir(join(home, '.gemini'), { recursive: true })
-    io = new RefusingIO(new FileStoreIO(join(root, 'profile', 'zen')))
+    io = new RefusingIO(new FileStoreIO(join(root, 'profile', 'ione')))
   })
 
   afterEach(async () => {

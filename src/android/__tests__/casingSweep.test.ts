@@ -49,8 +49,8 @@ const SWEPT = [
  * behind an old exemption.
  */
 const OTHER_SENSES: ReadonlyArray<readonly [file: string, text: string]> = [
-  ['android/app/src/main/kotlin/app/zen/chromium/DownloadLogic.kt', 'Out of storage space'],
-  ['android/app/src/main/kotlin/app/zen/chromium/DownloadLogic.kt', 'No space']
+  ['android/app/src/main/kotlin/dev/haasele/ione/DownloadLogic.kt', 'Out of storage space'],
+  ['android/app/src/main/kotlin/dev/haasele/ione/DownloadLogic.kt', 'No space']
 ]
 
 interface Literal {
@@ -209,7 +209,7 @@ describe('the §9.1 casing sweep of the Android-owned strings (W6-S14)', () => {
       flag("const all = ['http://*/*', 'https://*/*']\nconst t = 'Open in a new space'")
     ).toHaveLength(1)
     // Kotlin and the resources.
-    const kt = join(repo, 'android/app/src/main/kotlin/app/zen/chromium/Host.kt')
+    const kt = join(repo, 'android/app/src/main/kotlin/dev/haasele/ione/Host.kt')
     expect(strays(literalsOf(kt, 'toast("Moved to the new space")'))).toHaveLength(1)
     expect(strays(literalsOf(kt, 'Log.d(TAG, "the space changed")'))).toEqual([])
     const xml = join(repo, 'android/app/src/main/res/values/strings.xml')

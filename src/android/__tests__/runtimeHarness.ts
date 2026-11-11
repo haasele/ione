@@ -823,7 +823,7 @@ export function harness(
 
 export const ID = 'abcdefghijklmnopabcdefghijklmnop'
 export const ID2 = 'ponmlkjihgfedcbaponmlkjihgfedcba'
-export const PATH = `/data/user/0/app.zen.chromium/files/zen/extensions/${ID}/1.0.0`
+export const PATH = `/data/user/0/dev.haasele.ione/files/ione/extensions/${ID}/1.0.0`
 
 export function manifest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

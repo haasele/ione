@@ -115,7 +115,7 @@ describe('Windows app id', () => {
 
   it('reads the whole key in one query and parses reg.exe’s listing', () => {
     expect(WINDOWS_APP_ID_KEY).toBe(
-      'HKCU\\Software\\Classes\\AppUserModelId\\io.github.benitbuhner.ione'
+      'HKCU\\Software\\Classes\\AppUserModelId\\dev.haasele.ione'
     )
     expect(WINDOWS_APP_ID_QUERY).toEqual({ file: 'reg.exe', args: ['query', WINDOWS_APP_ID_KEY] })
     const listing = [

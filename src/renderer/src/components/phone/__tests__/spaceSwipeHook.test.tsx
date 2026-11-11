@@ -352,7 +352,7 @@ describe('the space swipe (GN-19)', () => {
     const kotlin = readFileSync(
       resolve(
         __dirname,
-        '../../../../../../android/app/src/androidTest/kotlin/app/zen/chromium/OverviewCleanupDemo.kt'
+        '../../../../../../android/app/src/androidTest/kotlin/dev/haasele/ione/OverviewCleanupDemo.kt'
       ),
       'utf8'
     )

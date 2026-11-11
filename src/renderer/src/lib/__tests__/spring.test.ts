@@ -368,7 +368,7 @@ describe('the harness twin (MotionPerfDemo.kt)', () => {
     const kotlin = readFileSync(
       resolve(
         __dirname,
-        '../../../../../android/app/src/androidTest/kotlin/app/zen/chromium/MotionPerfDemo.kt'
+        '../../../../../android/app/src/androidTest/kotlin/dev/haasele/ione/MotionPerfDemo.kt'
       ),
       'utf8'
     )

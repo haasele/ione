@@ -321,7 +321,7 @@ export class ExtensionApiHost implements ApiHost, ExtensionApiHooks {
       ruleSink,
       this.action,
       this.activeTab,
-      join(userDataDir, 'zen', 'extension-dnr')
+      join(userDataDir, 'ione', 'extension-dnr')
     )
     this.webRequest = new WebRequestApi(this)
     this.fontSettings = new FontSettingsApi(this)
