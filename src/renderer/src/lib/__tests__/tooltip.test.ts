@@ -12,11 +12,9 @@ import {
   TOOLTIP_DELAY,
   TOOLTIP_GAP,
   TOOLTIP_HIDDEN,
-  TOOLTIP_NO_COVER_ATTR,
   TOOLTIP_ROOM_CEILING_MS,
   tooltipBlocked,
   TooltipController,
-  tooltipMayCover,
   tooltipPaneOf,
   tooltipRoomStore,
   tooltipSize,
@@ -202,17 +200,6 @@ describe('placeTooltip', () => {
     )
     expect(placed.box.side).toBe('below')
     expect(placed.coversPage).toBe(true)
-  })
-})
-
-describe('tooltipMayCover', () => {
-  it('a control in the views’ gaps says no; any other yes', () => {
-    document.body.innerHTML = `
-      <div ${TOOLTIP_NO_COVER_ATTR}><button ${TOOLTIP_ATTR}="Layout" id="layout"></button></div>
-      <aside><button ${TOOLTIP_ATTR}="Back" id="back"></button></aside>`
-    expect(tooltipMayCover(document.getElementById('layout')!)).toBe(false)
-    expect(tooltipMayCover(document.getElementById('back')!)).toBe(true)
-    document.body.innerHTML = ''
   })
 })
 
@@ -579,7 +566,7 @@ describe('tooltipBlocked', () => {
     expect(tooltipBlocked(dialogButton)).toBe(true)
   })
 
-  it('the UI state’s surfaces block a control anywhere, the hover card and the tooltip’s own cover excepted', () => {
+  it('the UI state’s surfaces block a control anywhere, the hover card excepted', () => {
     uiStore.set({ downloadsOpen: true })
     expect(tooltipBlocked(toolbarButton)).toBe(true)
     uiStore.set({
@@ -589,7 +576,6 @@ describe('tooltipBlocked', () => {
     expect(tooltipBlocked(toolbarButton)).toBe(false)
     uiStore.set({ hoverCard: HOVER_CARD_HIDDEN, floatingChrome: 1 })
     expect(tooltipBlocked(toolbarButton)).toBe(true)
-    expect(tooltipBlocked(toolbarButton, 1)).toBe(false)
   })
 
   it('a drag or a native menu blocks every control, the open popover’s too', () => {

@@ -66,10 +66,8 @@ export function SplitChrome({ state, group, area, activeTabId }: Props): JSX.Ele
         const title = tabTitle(tab)
         // The header stands in the gap between the views and goes with the page when the page is
         // hidden (ContentArea mounts this chrome only while the content shows): its controls'
-        // tooltips never put the page under its picture (`data-tooltip-no-cover`, lib/tooltip.ts
-        // `TOOLTIP_NO_COVER_ATTR`) – a top pane's show above the header, beside the page; a lower
-        // pane's, with a view on either side, stay hidden rather than take the header out from
-        // under the pointer.
+        // tooltips are placed on the clear side of the page – a top pane's show above the
+        // header, beside the page; a lower pane's, with a view on either side, wait hidden.
         return (
           <div
             key={pane.tabId}

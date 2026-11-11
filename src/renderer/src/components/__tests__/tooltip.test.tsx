@@ -22,7 +22,6 @@ const {
   TOOLTIP_BROWSE,
   TOOLTIP_DELAY,
   TOOLTIP_ID,
-  TOOLTIP_NO_COVER_ATTR,
   tooltip,
   tooltipRoomStore
 } = await import('@renderer/lib/tooltip')
@@ -407,7 +406,6 @@ describe('Tooltip host', () => {
     beforeEach(() => {
       contentAreaStore.set({ area })
       gap = document.createElement('div')
-      gap.setAttribute(TOOLTIP_NO_COVER_ATTR, '')
       layout = control('Layout: vertical (click to change)')
       midLayout = control('Un-split this tab (Shift: keep focus in the split)')
       gap.append(layout, midLayout)
@@ -437,16 +435,18 @@ describe('Tooltip host', () => {
       delete (HTMLElement.prototype as { offsetHeight?: number }).offsetHeight
     })
 
-    it('a pane-less control over the page puts the page under its picture first, and shows once it is', async () => {
+    it('a pane-less control over the page leaves the page alone and falls back to its native title', async () => {
       pointer('pointerover', free, null)
       tick(TOOLTIP_DELAY)
       const tip = shown()!
       expect(tip.getAttribute('data-side')).toBe('below')
       await settle()
-      expect(uiStore.get().floatingChrome).toBe(1)
-      expect(tip.style.visibility).toBe('visible')
-      pointer('pointerout', free, null)
+      // The page is not hidden or parked: no video pause, no visibility change.
       expect(uiStore.get().floatingChrome).toBe(0)
+      expect(tip.style.visibility).toBe('hidden')
+      expect(free.getAttribute('title')).toBe('Somewhere over the page')
+      pointer('pointerout', free, null)
+      expect(free.getAttribute('title')).toBeNull()
     })
 
     it('a top pane’s header control shows above, beside the page, with no hold on the page', async () => {

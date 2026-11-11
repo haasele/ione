@@ -3,14 +3,11 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { KEYBOARD_FOCUS_ATTR } from '@renderer/lib/panes'
 import { subscribePopovers } from '@renderer/lib/popoverStore'
 import { ChromePortal, toRect, viewportSize } from '@renderer/lib/portals'
-import { activeTab } from '@renderer/lib/selectors'
 import {
   placeTooltip,
   TOOLTIP_ATTR,
   TOOLTIP_ID,
   tooltip,
-  tooltipCoverHeld,
-  tooltipMayCover,
   tooltipPaneOf,
   tooltipRoomStore,
   tooltipSize,
@@ -19,13 +16,7 @@ import {
   tooltipText,
   type TooltipPlacement
 } from '@renderer/lib/tooltip'
-import {
-  browserStore,
-  contentAreaStore,
-  holdFloatingChrome,
-  pageHidden,
-  uiStore
-} from '@renderer/lib/ui'
+import { contentAreaStore } from '@renderer/lib/ui'
 
 /**
  * The chrome tooltip's host (lib/tooltip.ts; design-language-v2-draft §9.31, a11y-26): one
@@ -38,12 +29,11 @@ import {
  * whatever it is for the control: one press), the window losing focus, a scroll or resize, the
  * control leaving the DOM or losing its text, and other chrome opening.
  *
- * The tab views draw above the chrome's DOM: a tooltip that has to lie over the page (a toolbar
- * band with the page right under it; §9.29's layouts) waits for the page to go under its
- * picture first (`holdFloatingChrome`, the hover card's and the popovers' way), and keeps that
- * one hold while the pointer browses from control to control, so the page does not flash back
- * between two tooltips. A tooltip that fits in its pane – every one in the sidebar – touches
- * the page not at all.
+ * The tab views draw above the chrome's DOM: a tooltip placed over the page cannot be drawn
+ * there. Rather than hiding the page – which pauses a playing video and tells the site its tab
+ * went away – such a tooltip falls back to the control's native `title` while the pointer rests
+ * on it. Tooltips that fit in their pane (every one in the sidebar) and those that fit beside
+ * the page (a split pane's top header, on the caption band) keep the chrome's own panel.
  *
  * A window resize takes the tooltip down (`resize: 'hide'`, the shells' way: the controls move
  * under a still pointer, and the one the pointer lands on starts its own dwell). The popup
@@ -66,12 +56,7 @@ export function Tooltip({ resize = 'hide' }: TooltipProps): JSX.Element | null {
   // Counts the window's resizes while the host places through them (`resize: 'place'`): the
   // placement runs again for each, in the document's new size.
   const [resized, setResized] = useState(0)
-  // Whether the page is under its picture right now – by the tooltip's own hold once the
-  // capture is in place (`floatingChrome`), or by other chrome's – which is when a tooltip over
-  // the page's box may show.
-  const pageUnderCover = uiStore.use(pageHidden)
   const ref = useRef<HTMLDivElement>(null)
-  const hold = useRef<Hold | null>(null)
 
   // The document's events, once, for every control now or later in the DOM. A touch or pen
   // pointer shows nothing (§9.31): the row's context menu header carries the full title there.
@@ -204,44 +189,23 @@ export function Tooltip({ resize = 'hide' }: TooltipProps): JSX.Element | null {
     setPlacement(placed)
   }, [target, text, resized, roomAwaited])
 
-  // Over the page, the page goes under its picture first – unless it is under one already (a
-  // revealed compact sidebar, another overlay) – and the one hold stays across the controls the
-  // pointer browses; it is let go when a tooltip fits beside the page again or none is up. A
-  // tooltip the pointer put up while the page had the keyboard gives it back on release
-  // (`pageHadFocus`); one on a focused control leaves the keyboard on the control (§9.22).
-  // Chrome in the views' gaps (a split pane's header, `TOOLTIP_NO_COVER_ATTR`) takes no hold:
-  // the cover would unmount the control under its own tooltip. Its tooltip shows where it
-  // misses the page and waits, hidden, where it cannot.
-  const covers = placement?.coversPage ?? null
-  useLayoutEffect(() => {
-    if (!target) {
-      releaseHold(hold)
-      return
+  // A tooltip that would lie over a page view cannot be drawn in the chrome (the native view
+  // composites above it). Use the control's native `title` for that case instead of hiding the
+  // page: hiding pauses video and sends the site a visibility change it did not ask for.
+  const native = placement?.coversPage === true
+  useEffect(() => {
+    if (!target || !native || !text) return undefined
+    const before = target.getAttribute('title')
+    target.setAttribute('title', text)
+    return () => {
+      if (before === null) target.removeAttribute('title')
+      else target.setAttribute('title', before)
     }
-    if (covers === null) return
-    if (!covers || !tooltipMayCover(target)) {
-      releaseHold(hold)
-      return
-    }
-    if (hold.current || pageHidden(uiStore.get())) return
-    const state = browserStore.get().state
-    const pageHadFocus =
-      by === 'pointer' &&
-      (document.activeElement === null || document.activeElement === document.body)
-    const taken = holdFloatingChrome(state ? (activeTab(state)?.id ?? null) : null, {
-      pageHadFocus
-    })
-    const entry: Hold = { release: taken.release }
-    hold.current = entry
-    void taken.ready.then((held) => {
-      if (hold.current === entry && held) tooltipCoverHeld(true)
-    })
-  }, [target, covers, by])
-  useEffect(() => () => releaseHold(hold), [])
+  }, [target, native, text])
 
   if (!target || !text) return null
   // Placed, over a covered page or beside it, and with its room landed where it asked one.
-  const shown = placement !== null && (!placement.coversPage || pageUnderCover) && !roomAwaited
+  const shown = placement !== null && !placement.coversPage && !roomAwaited
   return (
     <ChromePortal>
       <div
@@ -273,18 +237,6 @@ export interface TooltipProps {
    * lets one on its way keep its dwell.
    */
   resize?: 'hide' | 'place'
-}
-
-interface Hold {
-  release: () => void
-}
-
-function releaseHold(hold: { current: Hold | null }): void {
-  const entry = hold.current
-  if (!entry) return
-  hold.current = null
-  tooltipCoverHeld(false)
-  entry.release()
 }
 
 /**

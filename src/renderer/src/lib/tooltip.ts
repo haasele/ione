@@ -31,16 +31,6 @@ import { HOVER_CARD_HIDDEN, overlayCoversContent, uiStore } from './ui'
 export const TOOLTIP_ATTR = 'data-tooltip'
 export const TOOLTIP_ID = 'zen-tooltip'
 /**
- * Chrome drawn in the gaps between the page views – a split pane's header (SplitChrome) –
- * carries this on its root: a tooltip for a control inside it never puts the page under its
- * picture (`holdFloatingChrome`), because the gap chrome goes with the page when the page is
- * hidden (ContentArea mounts SplitChrome only while the content shows), and the control would
- * leave the DOM under its own tooltip – the tooltip going with it, the page flashing back, the
- * control returning, and round again. Such a tooltip shows where it misses the page
- * (`placeTooltip` takes the clear side first) and stays hidden where it cannot.
- */
-export const TOOLTIP_NO_COVER_ATTR = 'data-tooltip-no-cover'
-/**
  * How long the pointer rests on a control before its tooltip shows: §9.31 as amended – 500 ms,
  * the platform's (Chrome's views, GTK, Windows and Firefox share the number; the draft's 600 was
  * the lead's own and is corrected).
@@ -236,15 +226,6 @@ export function tooltipPaneOf(target: HTMLElement): HTMLElement | null {
 }
 
 /**
- * Whether the tooltip of `target` may put the page under its picture to show over it: not for
- * a control in the views' gaps (`TOOLTIP_NO_COVER_ATTR` on it or an ancestor), which the cover
- * would take out of the DOM with the page.
- */
-export function tooltipMayCover(target: HTMLElement): boolean {
-  return target.closest(`[${TOOLTIP_NO_COVER_ATTR}]`) === null
-}
-
-/**
  * §9.20's one at a time, seen from the tooltip of `target`: other chrome has the window while a
  * popover is registered with the chrome layer, while a frame dialog holds the window chrome
  * inert, or while the UI state says something else is over the page – the URL bar, a menu, an
@@ -257,21 +238,15 @@ export function tooltipMayCover(target: HTMLElement): boolean {
  * the frame or over it, so a control anywhere waits on them. A drag blocks every tooltip, the
  * pointer being spoken for; a native menu the same, the window being its. The hover card is
  * not other chrome to it (a focused control's tooltip and the card the pointer rests a row for
- * may stand together), and neither is the page's cover the tooltip itself holds
- * (`floatingChrome`, see components/Tooltip.tsx): `ownHolds` are taken off the count before it
- * is read. In one line, the lead's W5-1 ruling 5: a tooltip is "blocked from behind a surface,
- * never inside it".
+ * may stand together). In one line, the lead's W5-1 ruling 5: a tooltip is "blocked from behind
+ * a surface, never inside it".
  */
-export function tooltipBlocked(target: HTMLElement, ownHolds = 0): boolean {
+export function tooltipBlocked(target: HTMLElement): boolean {
   const ui = uiStore.get()
   if (ui.drag !== null || ui.menu !== null) return true
   if (openPopoverCount() > 0) return !insideTopPopover(target)
   if (chromeInertHeld()) return !insideFrameDialog(target)
-  return overlayCoversContent({
-    ...ui,
-    hoverCard: HOVER_CARD_HIDDEN,
-    floatingChrome: Math.max(0, ui.floatingChrome - ownHolds)
-  })
+  return overlayCoversContent({ ...ui, hoverCard: HOVER_CARD_HIDDEN })
 }
 
 export interface TooltipBox {
@@ -290,7 +265,7 @@ export interface TooltipBox {
 
 export interface TooltipPlacement {
   box: TooltipBox
-  /** Whether the tooltip lies over the page's box, so the page must go under its picture first. */
+  /** Whether the tooltip lies over the page's box; the host then uses the control's native title. */
   coversPage: boolean
 }
 
@@ -524,15 +499,7 @@ export function awaitTooltipRoom(answer: Promise<Size | null>): () => void {
   return wait.end
 }
 
-/** How many of `floatingChrome`'s holds are the tooltip host's own (0 or 1). */
-let ownHolds = 0
-
-/** The host says whether it holds the page under its picture right now (see `tooltipBlocked`). */
-export function tooltipCoverHeld(held: boolean): void {
-  ownHolds = held ? 1 : 0
-}
-
 /** The app's controller; the host (`components/Tooltip.tsx`) feeds it the document's events. */
 export const tooltip = new TooltipController(tooltipStore, {
-  blocked: (target) => tooltipBlocked(target, ownHolds)
+  blocked: (target) => tooltipBlocked(target)
 })
