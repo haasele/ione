@@ -372,6 +372,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ione-android-${{ inputs.version }}
-          path: android/app/build/outputs/apk/release/ione-*.apk
+          path: android/app/build/outputs/apk/release/ione-${{ inputs.version }}.apk
           if-no-files-found: error
           retention-days: 7
