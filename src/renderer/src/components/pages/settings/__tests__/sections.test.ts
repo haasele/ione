@@ -7072,6 +7072,30 @@ describe('CT-07 / CT-19: the Spell check group of Languages on a phone', () => {
   })
 })
 
+describe('the built-in uBlock Origin Lite', () => {
+  it('replaces the legacy filter-list groups with the extension card', () => {
+    const s = state()
+    s.extensions = [
+      {
+        id: 'ublock',
+        name: 'uBlock Origin Lite',
+        version: '1',
+        enabled: true,
+        error: null,
+        toolbarPinned: true
+      } as (typeof s.extensions)[number]
+    ]
+    const privacy = buildSection(
+      PAGE.sections.find((x) => x.id === 'privacy')!,
+      context(s).ctx
+    )
+    const group = privacy.groups.find((g) => g.id === 'ublock-origin-lite')
+    expect(group?.heading).toBe('uBlock Origin Lite')
+    expect(findRow(privacy.groups, 'tracking-prevention')).toBeNull()
+    expect(findRow(privacy.groups, 'ublock-origin-lite-open')).not.toBeNull()
+  })
+})
+
 describe('automatic picture-in-picture is opt-in', () => {
   it('ships off and turns on from Tab Management', () => {
     expect(DEFAULT_SETTINGS.autoPictureInPicture).toBe(false)

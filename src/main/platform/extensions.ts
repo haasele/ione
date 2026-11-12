@@ -43,6 +43,7 @@ import {
 import { manifestIssueReport, withheldPermissionReport } from '../../core/extensions/errorConsole'
 import {
   ChromePrompts,
+  packageFromZip,
   type ConfirmInstall,
   type InstallConfirmation
 } from '../../core/extensions/hostStore'
@@ -245,6 +246,25 @@ export type AttachedApi = ExtensionApiHooks & {
  * Hook points for the chrome.* API layer: `onLoaded` / `onUnloaded` fire per session, and
  * `loaded(id)` looks up a running extension.
  */
+/** The built-in content blocker's package and the name that keeps its sideload id stable. */
+const BUNDLED_UBOLITE_NAME = 'uBlock Origin Lite'
+const BUNDLED_UBOLITE_FILE = 'ublock-origin-lite.zip'
+
+/** The bundled file in a development run, an installed app, or an AppImage's mount. */
+function bundledResource(name: string): string | null {
+  const roots = [
+    join(app.getAppPath(), 'resources'),
+    join(process.cwd(), 'resources'),
+    join(process.resourcesPath, 'app.asar.unpacked', 'resources'),
+    join(process.resourcesPath, 'resources')
+  ]
+  for (const root of roots) {
+    const candidate = join(root, name)
+    if (existsSync(candidate)) return candidate
+  }
+  return null
+}
+
 export class ExtensionService implements ExtensionHost {
   /** `<userData>/extensions`: where store and file installs live. */
   readonly root: string
@@ -397,9 +417,103 @@ export class ExtensionService implements ExtensionHost {
 
   async start(): Promise<void> {
     await sweepStagingDirs(this.root).catch(() => [])
+    await this.seedBundled()
     await this.attach(this.loadEnabled())
     this.browser.state.commitVolatile()
     this.scheduleUpdateChecks()
+  }
+
+  /**
+   * The built-in uBlock Origin Lite: the app ships its package and installs it here on first
+   * launch (and again after an app update). The package is unsigned, so its id comes from the
+   * stable package name (`packageFromZip`); the extension's storage and its per-site modes stay
+   * with that id across updates. It is enabled and pinned to the toolbar, as a browser's own
+   * blocker is. A profile that has not opted in keeps the legacy rule sets off (State's v8
+   * migration); this extension is the blocker from here on.
+   */
+  private async seedBundled(): Promise<void> {
+    const zipPath = bundledResource(BUNDLED_UBOLITE_FILE)
+    if (!zipPath) {
+      console.warn(`[zen] extensions: bundled ${BUNDLED_UBOLITE_FILE} not found`)
+      return
+    }
+    try {
+      const bytes = new Uint8Array(await fs.readFile(zipPath))
+      const pkg = await packageFromZip(bytes, {
+        locale: app.getLocale(),
+        chromiumVersion: process.versions.chrome
+      })
+      if (pkg.manifest.name !== BUNDLED_UBOLITE_NAME) {
+        console.warn(
+          `[zen] extensions: ${BUNDLED_UBOLITE_FILE} is ${pkg.manifest.name}, not ${BUNDLED_UBOLITE_NAME}; skipped`
+        )
+        return
+      }
+      const existing = this.record(pkg.id)
+      // Do not downgrade a package a newer build already installed (an older app opened on a
+      // profile that a newer one updated); an equal version is already in place.
+      if (existing && existing.version >= pkg.version) {
+        this.disableLegacyBlocker()
+        if (!existing.enabled) {
+          existing.enabled = true
+          existing.enabledAt = Date.now()
+          await this.load(existing)
+        }
+        if (!existing.toolbarPinned) {
+          existing.toolbarPinned = true
+          existing.toolbarPinnedAt = Date.now()
+          this.persist()
+          this.browser.state.commitVolatile()
+        }
+        return
+      }
+      const outcome = await this.installPackage(
+        pkg,
+        { source: 'zip', publisher: null, updateUrl: null },
+        { confirm: false }
+      )
+      if (outcome.status === 'installed') {
+        outcome.record.enabled = true
+        outcome.record.enabledAt = Date.now()
+        outcome.record.toolbarPinned = true
+        outcome.record.toolbarPinnedAt = Date.now()
+        // A content blocker is one of the few extensions that belongs in private windows too.
+        outcome.record.allowPrivate = true
+        this.persist()
+        this.browser.state.commitVolatile()
+        this.disableLegacyBlocker()
+        console.log(`[zen] extensions: bundled ${BUNDLED_UBOLITE_NAME} ${pkg.version} at ${pkg.id}`)
+      }
+    } catch (error) {
+      console.warn('[zen] extensions: could not install the bundled uBlock Origin Lite:', error)
+    }
+  }
+
+  /**
+   * The bundled extension is the blocker. The legacy list engine stays as the DNR executor for
+   * extensions, but its own filter-list sets must not compete with uBlock Origin Lite: clear
+   * them once when the built-in package is present. Android, which cannot run extensions, never
+   * reaches this and keeps its own blocker.
+   */
+  private disableLegacyBlocker(): void {
+    const settings = this.browser.state.settings.blocking
+    if (
+      settings.level === 'off' &&
+      settings.customLists.length === 0 &&
+      settings.userFilters === '' &&
+      Object.keys(settings.lists).length === 0
+    )
+      return
+    this.browser.state.settings.blocking = {
+      ...settings,
+      level: 'off',
+      lists: {},
+      customLists: [],
+      userFilters: '',
+      autoUpdate: false
+    }
+    this.browser.state.commitVolatile()
+    this.browser.blocking.onSettingsChanged()
   }
 
   /** The enabled extensions, loaded one after the other (the startup's and each new session's loop). */
@@ -1830,19 +1944,10 @@ export class ExtensionService implements ExtensionHost {
           .catch(() => undefined)
       }, 400)
     })
-    // A blur closes a popup the user can see and has clicked away from. While the framed view is
-    // still hidden the chrome takes focus on purpose (the layout that hides the page behind the
-    // frame's capture focuses it), and the renderer handles clicks outside the frame itself;
-    // `resizePopup` hands focus back when it shows the view. A popup focused again by the time
-    // the timer fires stays as well.
-    wc.on('blur', () =>
-      setTimeout(() => {
-        const popup = this.popup
-        if (!popup || popup.view !== view || !popup.shown) return
-        if (wc.isDestroyed() || wc.isFocused()) return
-        this.closePopup()
-      }, 120)
-    )
+    // Blur alone does not close the popup: a page the popup is controlling may reload on a
+    // setting change (uBlock Origin Lite reloads the tab after a filtering-mode switch), and
+    // that reload takes the focus from the popup while the user is still inside it. Escape and
+    // the chrome layer's light dismiss (a press outside the frame) remain the ways out.
     // Escape closes the popup; every other key goes through the window's key table as a key of
     // the chrome (`extensionPopupKeys.ts`) – Ione's shortcuts, extension commands, and the
     // quit chord's hold, which a popup's ⌘Q would otherwise bypass on its way to the menu bar.

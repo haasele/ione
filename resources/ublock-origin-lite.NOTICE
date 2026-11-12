@@ -1,0 +1,8 @@
+uBlock Origin Lite
+Copyright (C) 2022-present Raymond Hill and contributors.
+GPL-3.0. Source: https://github.com/uBlockOrigin/uBOL-home
+
+Ione ships the unmodified chromium package (ublock-origin-lite.zip) and installs it
+as the built-in content blocker. Its own popup and dashboard are themed by Ione at
+runtime; the package files are not edited. The complete corresponding source is the
+release archive published at the URL above.

@@ -48,6 +48,18 @@ const ext = (over: Partial<ExtensionInfo>): ExtensionInfo => ({
   ...over
 })
 
+describe('actionIcon', () => {
+  it('keeps the built-in uBlock Origin Lite coloured while it is enabled', () => {
+    const ubo = ext({
+      name: 'uBlock Origin Lite',
+      icon: 'data:coloured',
+      action: { icon: 'data:grey-off' } as ExtensionInfo['action']
+    })
+    expect(actionIcon(ubo)).toBe('data:coloured')
+    expect(actionIcon({ ...ubo, enabled: false })).toBe('data:grey-off')
+  })
+})
+
 describe('fitToolbarActions', () => {
   const slot = TOOLBAR_BUTTON + TOOLBAR_GAP
 

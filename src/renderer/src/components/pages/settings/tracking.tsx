@@ -31,6 +31,60 @@ import { AddListForm, AddSiteForm, FiltersForm } from './trackingForms'
  */
 export function trackingGroups({ state, tab, set }: SectionContext): RowGroup[] {
   if (!state.capabilities.requestBlocking) return []
+  // The built-in uBlock Origin Lite is the blocker now: its own popup and dashboard are the
+  // controls, and the legacy list editor below only serves a host (or profile) without the
+  // bundled extension. Keep one place for the user to find it.
+  const ubo = state.extensions.find((extension) => extension.name === 'uBlock Origin Lite')
+  if (ubo) {
+    return [
+      {
+        id: 'ublock-origin-lite',
+        heading: 'uBlock Origin Lite',
+        description:
+          'Built into Ione. uBlock Origin Lite blocks ads, trackers, malware and more with its own filter lists and per-site modes.',
+        rows: [
+          {
+            kind: 'info',
+            id: 'ublock-origin-lite-status',
+            label: 'Status',
+            description: ubo.error
+              ? `Could not load: ${ubo.error}`
+              : ubo.enabled
+                ? 'Enabled and blocking requests.'
+                : 'Disabled. Turn it on to block ads and trackers.'
+          },
+          {
+            kind: 'action',
+            id: 'ublock-origin-lite-open',
+            label: 'Open uBlock Origin Lite settings',
+            description:
+              'Filter lists, the default mode, strict blocking and the rest of uBlock Origin Lite.',
+            button: 'Open',
+            onPress: () => run('extension.openOptions', { id: ubo.id })
+          },
+          ...(ubo.toolbarPinned
+            ? []
+            : [
+                {
+                  kind: 'action' as const,
+                  id: 'ublock-origin-lite-pin',
+                  label: 'Show uBlock Origin Lite in the toolbar',
+                  description: 'The toolbar button opens its per-site controls.',
+                  button: 'Pin',
+                  onPress: () => run('extension.setPinned', { id: ubo.id, pinned: true })
+                }
+              ]),
+          {
+            kind: 'info',
+            id: 'ublock-origin-lite-tip',
+            label: 'Per-site controls',
+            description:
+              'Use the uBlock Origin Lite button in the toolbar to choose a mode for the current site.'
+          }
+        ]
+      }
+    ]
+  }
   const b = state.settings.blocking
   const status = state.blocking
   const setB = (patch: Partial<BlockingSettings>): void => set({ blocking: { ...b, ...patch } })

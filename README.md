@@ -48,6 +48,10 @@ the Windows installer retires that older uninstall entry (its files are the ones
 replaces) and keeps the profile, while Android treats the new id as a separate app and cannot
 migrate the old app's private data.
 
+### Built-in content blocker
+
+Ione ships **uBlock Origin Lite** as a built-in extension and installs it on first launch. Its popup, dashboard and list controls are the blocker's UI; Ione gives them its material colours, rounded surfaces and motion at runtime, without modifying the GPL package. The old filter-list settings and their bundled lists are retired when the extension is present. The extension is pinned to the toolbar by default; disable or reconfigure it in Settings → Extensions or from its own dashboard.
+
 ### Automatic updates
 
 Ione checks for new releases on startup and every six hours (Settings → Updates: check now, pick

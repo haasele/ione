@@ -80,6 +80,10 @@ export function pinnedActions(extensions: readonly ExtensionInfo[]): ExtensionIn
 
 /** The icon the toolbar shows: the action's own icon first, then the manifest icon. */
 export function actionIcon(ext: ExtensionInfo): string | null {
+  // uBlock Origin Lite swaps its action icon to a grey 'off' image when a site is in its
+  // no-filtering mode. Ione's built-in blocker must not look disabled after the extension was
+  // switched off and on again: use its manifest icon while the extension is enabled.
+  if (ext.name === 'uBlock Origin Lite' && ext.enabled) return ext.icon ?? ext.action?.icon ?? null
   return ext.action?.icon ?? ext.icon
 }
 

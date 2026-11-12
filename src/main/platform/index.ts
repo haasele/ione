@@ -130,6 +130,7 @@ import { quitChordOf } from './devtoolsKeys'
 import { QUIT_HOLD_COVER_CHANNEL, primeChromeForRelease } from './quitHoldKeys'
 import createBackgroundWorker from './backgroundWorker?nodeWorker'
 import { ElectronBlocking, ElectronBundledLists, bundledListsDirectory } from './blocking'
+import { installUblockTheme } from './ublockTheme'
 import { supportsWindowMaterial } from './appShell'
 import { ElectronPrivacy } from './privacy'
 import { ContentRulesHandler, attachContentGuards } from './contentRules'
@@ -724,6 +725,11 @@ export class ElectronPlatform implements Platform {
     const extensionService = browser.extensions as ExtensionService
     extensionService.attachApi(extensionApi)
     extensionService.onChange((event) => extensionApi.registryChanged(event))
+    // The built-in blocker's own documents (popup, dashboard, matched rules) wear Ione's
+    // material vocabulary. The package stays untouched: a user-origin sheet is injected.
+    extensionService.onLoaded((ext) => {
+      if (ext.name === 'uBlock Origin Lite') installUblockTheme(ext.id)
+    })
     this.requestBlocking = new ElectronBlocking(browser, this.views, this.profileDir)
     this.requestBlocking.start()
     // How a download's request ends (a refusing status, a `net::` error) names the reason an
