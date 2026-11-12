@@ -556,6 +556,28 @@ export class ElectronTabView implements TabView {
    */
   private parked: number | null = null
   /**
+   * The parked view's page is held visible to Chromium by `setBackgroundThrottling(false)`
+   * while it stands at its corner (`park`): a `WebContentsView` moved almost wholly out of its
+   * window is an occlusion to Chromium's tracker, and the visibility update that follows tells
+   * the page (and every site pausing on `visibilitychange`) that it went away. With background
+   * throttling off Electron's renderer patch takes that update as `visible`, which is what
+   * parking is for – the page keeps its document and its media as a visible tab has them.
+   */
+  private parkedVisible = false
+  /**
+   * A page playing media keeps its document visible while it is not shown – parked under the
+   * chrome, or hidden as a background tab (a switch to another page, a chrome page tab such as
+   * Settings). Chromium keeps the media pipeline running for a hidden page, but a site that
+   * pauses on `visibilitychange` would stop it; the throttling-off patch is the media-preserving
+   * path (`applyThrottling`). Held only while media plays and the view is not shown, released
+   * when the media pauses or the page comes back.
+   */
+  private mediaVisible = false
+  /** Whether the page last reported media playing (`media-started-playing` / `media-paused`). */
+  private mediaPlaying = false
+  /** What `applyThrottling` last told the engine; the pages' web preferences start it on. */
+  private throttlingApplied: boolean | null = true
+  /**
    * The view's window is minimised or hidden (W6-F6): the engine's view is hidden to Chromium
    * whatever the core's layout says, so the page reads `document.visibilityState` `hidden` as a
    * Chrome tab does. A view PARKED under the chrome (W6-F5) is hidden for real too – parking
@@ -712,6 +734,10 @@ export class ElectronTabView implements TabView {
     wc.on('did-stop-loading', () => ev.onStopLoading())
     wc.on('did-navigate', (_e, url) => {
       this.navigatingUrl = null
+      // A new document starts with no media of the old one's: its hold goes with it (a page
+      // that starts playing reports `media-started-playing` again).
+      this.mediaPlaying = false
+      this.refreshMediaVisibility()
       ev.onNavigated(url, false, this.commitDetails(wc))
       this.fontsAfterNavigation()
     })
@@ -740,6 +766,9 @@ export class ElectronTabView implements TabView {
       // starts afresh for the renderer the page is reloaded into.
       this.hangRelayed = false
       this.hangMonitor.reset()
+      // The playing media went with the renderer too; a reload reports its own.
+      this.mediaPlaying = false
+      this.refreshMediaVisibility()
       ev.onCrashed(this.takeEndedByUser() ? 'ended' : details.reason, details.exitCode)
     })
     // Chromium's hang monitor speaks for the contents whose input went unanswered (tabs-45) –
@@ -750,8 +779,18 @@ export class ElectronTabView implements TabView {
     wc.on('unresponsive', () => this.relayHang(true))
     wc.on('responsive', () => this.relayHang(false))
     wc.on('audio-state-changed', (e) => ev.onAudioStateChanged(e.audible))
-    wc.on('media-started-playing', () => ev.onMediaStateChanged(true))
-    wc.on('media-paused', () => ev.onMediaStateChanged(false))
+    wc.on('media-started-playing', () => {
+      this.mediaPlaying = true
+      // A page that starts playing while hidden (a background tab, a parked page) is held
+      // visible from here on, so neither the engine's occlusion nor the hide pauses it.
+      this.refreshMediaVisibility()
+      ev.onMediaStateChanged(true)
+    })
+    wc.on('media-paused', () => {
+      this.mediaPlaying = false
+      this.refreshMediaVisibility()
+      ev.onMediaStateChanged(false)
+    })
     wc.on('enter-html-full-screen', () => ev.onEnterHtmlFullscreen())
     wc.on('leave-html-full-screen', () => ev.onLeaveHtmlFullscreen())
     wc.on('devtools-opened', () => {
@@ -1601,6 +1640,8 @@ export class ElectronTabView implements TabView {
         : false
     if (this.visible) this.enterWindow(win)
     else this.enterStage()
+    this.refreshMediaVisibility()
+    this.applyThrottling()
     this.refreshHangWatch()
   }
 
@@ -1710,6 +1751,8 @@ export class ElectronTabView implements TabView {
     this.staged = null
     this.stagedBox = null
     this.arrivesFromElsewhere = true
+    // A staged page playing media keeps its document visible as it goes hidden off the stage.
+    this.refreshMediaVisibility()
     this.view.setVisible(false)
     if (!stage.isDestroyed()) stage.contentView.removeChildView(this.view)
     this.owner.stageLeft(this)
@@ -1752,17 +1795,24 @@ export class ElectronTabView implements TabView {
    * speculation rule in a page loaded under Ione's omnibox dropdown (the address on the command
    * line, a fresh profile) never prefetched at all. A parked view keeps its size and stays shown
    * with one corner pixel in a corner of the window (`PARK_CORNERS`: the one pixel of it on
-   * screen), which Chromium counts as VISIBLE: the page keeps painting,
-   * `document.visibilityState` stays `visible`, its prefetches run, and the view comes back with
-   * `setVisible(true)` untouched, as Chrome's pages do from under a popup. The window's host ends
-   * the parking of a view the next layout with the chrome off the content leaves out
-   * (`hideParked`: a tab switched under the chrome). The page hidden by a tab switch, a chrome
-   * page tab or a move between windows (the chrome off the content) is hidden as before.
+   * screen), and the parking holds the page's background throttling off (`parkedVisible`):
+   * Chromium's occlusion tracker counts the move itself as an occlusion and tells the document
+   * it went away, while Electron's `allow_disabling_blink_scheduler_throttling_per_renderview`
+   * patch takes that visibility update as `visible` with the throttling off. So the page keeps
+   * painting, `document.visibilityState` stays `visible`, its media plays on, its prefetches
+   * run, and the view comes back with `setVisible(true)` untouched, as Chrome's pages do from
+   * under a popup. The window's host ends the parking of a view the next layout with the chrome
+   * off the content leaves out (`hideParked`: a tab switched under the chrome). The page hidden
+   * by a tab switch, a chrome page tab or a move between windows (the chrome off the content)
+   * is hidden as before – except a page playing media, which keeps its document visible while
+   * hidden (`mediaVisible`), so a site pausing on `visibilitychange` does not stop playback a
+   * background tab would have kept (Settings, another page).
    *
    * A page whose background throttling is off – an agent session's, the user looking at the
    * tab as the session prepared it (`setBackgroundThrottling(false)`) – is hidden with the
    * throttling on for the hide and off again after it (`hide`; the hide the chrome leaving the
-   * content leaves behind, `hideParked`, is the same hide and takes the same way). Electron's
+   * content leaves behind, `hideParked`, is the same hide and takes the same way), unless it is
+   * playing media: then the hide keeps the throttling off and the document visible. Electron's
    * `allow_disabling_blink_scheduler_throttling_per_renderview` patch takes every
    * page-visibility update as `visible` while throttling is off, so a plain hide would leave
    * the page reading `visible` to its scripts (`document.visibilityState`, `visibilitychange`)
@@ -1795,12 +1845,19 @@ export class ElectronTabView implements TabView {
         this.shownOnce = true
         if (parked) this.pointerBack()
       }
+      // The parking hold has nothing left to keep visible; the media hold is refreshed below.
+      // Released after the show, so no visibility update finds the page parked but unheld.
+      if (parked) this.holdParkedVisible(false)
     } else if (this.parkable(wasShown)) {
       this.park()
     } else {
-      if (this.parked !== null) this.unpark()
+      if (this.parked !== null) {
+        this.unpark()
+        this.holdParkedVisible(false)
+      }
       this.hide()
     }
+    this.refreshMediaVisibility()
     if (flipped) {
       this.refreshHangWatch()
       this.owner.visibilityChanged(this)
@@ -1810,13 +1867,18 @@ export class ElectronTabView implements TabView {
   /**
    * The engine's view down, then onto the stage if an agent drives the page (`enterStage`): the
    * hide of a tab switch, a chrome page tab or a move between windows (`setVisible`), and of the
-   * chrome leaving the content over a page switched away from under it (`hideParked`). A page whose
-   * throttling is off is hidden with the throttling on and given it back off after, whatever
-   * the hide did (a `finally`; the page gone meanwhile is left alone) – see `setVisible` for why.
+   * chrome leaving the content over a page switched away from under it (`hideParked`). A page
+   * playing media is hidden with its background throttling off, so Electron's patch keeps its
+   * document visible and the site does not pause a playback Chromium would have kept running
+   * (`mediaVisible`, `refreshMediaVisibility`); one whose throttling is off for any other reason
+   * is hidden with the throttling on and given it back off after, whatever the hide did (a
+   * `finally`; the page gone meanwhile is left alone) – see `setVisible` for why.
    */
   private hide(): void {
     const wc = this.wc
-    const held = !this.throttling && !wc.isDestroyed()
+    // Before the hide: the visibility update the hide brings is the one the patch rewrites.
+    this.refreshMediaVisibility()
+    const held = !this.throttling && !this.mediaVisible && !wc.isDestroyed()
     if (held) wc.setBackgroundThrottling(true)
     try {
       this.view.setVisible(false)
@@ -1866,6 +1928,10 @@ export class ElectronTabView implements TabView {
     } else {
       this.view.setVisible(this.visible)
     }
+    // A concealed window outranks both holds: its pages read `hidden` as Chrome's do (W6-F6).
+    // Back on screen, the holds stand again for whatever the core's layout left the view as.
+    this.refreshMediaVisibility()
+    this.applyThrottling()
     this.refreshHangWatch()
   }
 
@@ -1931,6 +1997,11 @@ export class ElectronTabView implements TabView {
     const rect = this.bounds
     if (!rect) return
     if (this.parked === null) this.parked = this.owner.claimParkingCorner(this)
+    // Before the move: the occlusion the move brings must find the page already held visible
+    // (`parkedVisible`), or Chromium tells the document it went away and a site pauses its
+    // video. A page whose throttling the session already holds off needs no word (the helper
+    // leaves it alone).
+    this.holdParkedVisible(true)
     const pointer = this.pointerOver(rect)
     this.view.setBounds(this.parkedBox(rect, this.parked))
     if (pointer) {
@@ -1942,6 +2013,66 @@ export class ElectronTabView implements TabView {
     this.parked = null
     this.owner.releaseParkingCorner(this)
     if (this.bounds) this.view.setBounds(this.bounds)
+  }
+
+  /**
+   * Hold the parked view's page visible to Chromium while it stands at its corner (`park`).
+   * The engine's view keeps its size and stays shown; only the corner pixel is inside the
+   * window, which Chromium's occlusion tracker counts as an occlusion – the page-visibility
+   * update that follows reads `hidden` to the document, and a site that pauses on
+   * `visibilitychange` stops a video Chrome would have kept playing. With background throttling
+   * off, Electron's `allow_disabling_blink_scheduler_throttling_per_renderview` patch takes the
+   * update as `visible`: the page keeps its document (and its media) as a tab under Chrome's
+   * own popup has them. The tradeoff is a parked page that is not throttled while an overlay is
+   * open – the same trade parking already makes for its painting and prefetches, and for the
+   * length of an overlay.
+   *
+   * Measured (Electron 44.11.1, Linux X11, a 30 s VP9/Opus file): parking with the throttling on
+   * reported `document.visibilityState` `hidden` and a page that pauses on the event stopped at
+   * t = 2.111 s; with the hold, the document stayed `visible`, `currentTime` ran on and both
+   * `webkitAudioDecodedByteCount` and `webkitVideoDecodedByteCount` grew. A `setVisible(false)`
+   * background hide behaved the same way.
+   */
+  private holdParkedVisible(hold: boolean): void {
+    if (hold === this.parkedVisible) return
+    this.parkedVisible = hold
+    this.applyThrottling()
+  }
+
+  /**
+   * Hold a page playing media visible while it is not shown – hidden as a background tab (a
+   * chrome page tab such as Settings, a switch to another page) or parked under the chrome.
+   * Chromium keeps a hidden page's media running, but its document reads `hidden`, and the
+   * sites that pause on `visibilitychange` stop the playback with it. Throttling off is the
+   * media-preserving path (`holdParkedVisible` has the mechanism); the hold lasts while media
+   * plays and the view is not in front, and is released when the media pauses or the page
+   * comes back. A playing page stays unthrottled meanwhile, the price Chrome pays for audible
+   * media and this browser pays for any playing media.
+   */
+  private refreshMediaVisibility(): void {
+    // A staged page is in no window of the user's: their window going away does not hide it
+    // (`applyWindowVisible` leaves the stage alone).
+    const concealed = this.windowConcealed && !this.staged
+    const hold = this.mediaPlaying && !this.visible && !concealed
+    if (hold === this.mediaVisible) return
+    this.mediaVisible = hold
+    this.applyThrottling()
+  }
+
+  /**
+   * Tell the engine whether it may throttle the page, as the session's setting says unless a
+   * hold keeps the page visible: a parked view (`parkedVisible`) or a page playing media that
+   * is not shown (`mediaVisible`). A concealed window outranks both (W6-F6): its pages read
+   * `hidden` whatever the layout left them as – a staged page does not, standing in no window
+   * of the user's. Deduplicated so a hold that changes nothing sends no word (the engine's
+   * `setBackgroundThrottling` is also how a hidden widget is shown as painting, `stagedFrame`).
+   */
+  private applyThrottling(force = false): void {
+    const concealed = this.windowConcealed && !this.staged
+    const wanted = this.throttling && !concealed && !this.parkedVisible && !this.mediaVisible
+    if (!force && wanted === this.throttlingApplied) return
+    this.throttlingApplied = wanted
+    if (!this.wc.isDestroyed()) this.wc.setBackgroundThrottling(wanted)
   }
 
   /** The view is back in its box from parking, shown: the pointer over it is the page's again. */
@@ -1996,6 +2127,7 @@ export class ElectronTabView implements TabView {
   hideParked(): void {
     if (this.parked === null) return
     this.unpark()
+    this.holdParkedVisible(false)
     this.hide()
   }
 
@@ -2830,7 +2962,9 @@ export class ElectronTabView implements TabView {
 
   setBackgroundThrottling(allowed: boolean): void {
     this.throttling = allowed
-    if (!this.wc.isDestroyed()) this.wc.setBackgroundThrottling(allowed)
+    // The session's setting is the baseline; a parked or playing-media page stays visible
+    // through it (`applyThrottling`).
+    this.applyThrottling()
   }
 
   /**
@@ -3006,7 +3140,6 @@ export class ElectronTabView implements TabView {
           resolve(image)
         })
       }
-      const unhide = (): void => wc.setBackgroundThrottling(this.throttling)
       const wait = (ms: number): void => {
         timer = setTimeout(() => {
           if (kicked || !this.staged || wc.isDestroyed()) {
@@ -3014,12 +3147,14 @@ export class ElectronTabView implements TabView {
             return
           }
           kicked = true
-          unhide()
+          this.applyThrottling(true)
           wait(STAGED_FRAME_RETRY_MS)
         }, ms)
       }
       try {
-        unhide()
+        // A call is the unhide even when the value does not change (`force`): a parked page's
+        // hold keeps its own word, and a page playing media stays visible on the stage.
+        this.applyThrottling(true)
         wc.beginFrameSubscription(false, (image) => finish(image))
       } catch {
         finish(null)

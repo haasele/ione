@@ -211,6 +211,11 @@ vi.mock('electron', async () => {
     getOSProcessId(): number {
       return this.pid
     }
+    /** The background throttling the engine was last told (`setBackgroundThrottling`). */
+    backgroundThrottling = true
+    setBackgroundThrottling(allowed: boolean): void {
+      this.backgroundThrottling = allowed
+    }
     isDestroyed(): boolean {
       return this.closed
     }
@@ -2415,6 +2420,73 @@ describe('a hidden page an agent drives and the stage', () => {
     }
     expect(() => view.setVisible(false)).toThrow('the engine balked')
     expect(log).toEqual(['throttling on', 'hidden', 'throttling off'])
+  })
+
+  it('keeps a page playing media visible to its document under chrome and on a chrome page tab, so a site pausing on `visibilitychange` does not stop it', () => {
+    const { window, create } = setup()
+    const view = create()
+    view.setBounds(box)
+    view.setVisible(true)
+    const log = engineLog(view)
+    const page = view.webContents
+    // A video is playing in front: nothing is held while the page shows.
+    page.emit('media-started-playing')
+    expect(log).toEqual([])
+    // The app menu / the uBO action popup opens over the page: the view is parked, and the
+    // document is held visible so the occlusion the move brings is not read as the tab going
+    // away (the probe's `visibilityState` stays `visible`, the video's clock runs on).
+    window.zen.contentHidden = true
+    view.setVisible(false)
+    expect(view.parkedCorner()).toBe(0)
+    expect(log).toEqual(['throttling off'])
+    // The overlay closes: the page is back in front, the hold released after the show.
+    window.zen.contentHidden = false
+    view.setVisible(true)
+    expect(log).toEqual(['throttling off', 'shown', 'throttling on'])
+    // Settings (a chrome page tab) takes the content: the media tab is hidden as a background
+    // tab, but its document stays visible and the playback continues.
+    log.length = 0
+    view.setVisible(false)
+    expect(log).toEqual(['throttling off', 'hidden'])
+    // The video pauses: the hold goes, and the background page reads hidden again.
+    page.emit('media-paused')
+    expect(log).toEqual(['throttling off', 'hidden', 'throttling on'])
+    // Back in front: the page shows, and nothing more is said.
+    view.setVisible(true)
+    expect(log).toEqual(['throttling off', 'hidden', 'throttling on', 'shown'])
+  })
+
+  it('takes the media hold when a hidden page starts playing, and gives it back when the media pauses', () => {
+    const { create } = setup()
+    const view = create()
+    view.setBounds(box)
+    view.setVisible(true)
+    const log = engineLog(view)
+    const page = view.webContents
+    // A background tab (another page, a chrome page tab) with nothing playing: hidden plainly.
+    view.setVisible(false)
+    expect(log).toEqual(['hidden'])
+    // A video starts in the hidden page: its document is held visible from here on.
+    page.emit('media-started-playing')
+    expect(log).toEqual(['hidden', 'throttling off'])
+    // It pauses: the background page reads hidden again.
+    page.emit('media-paused')
+    expect(log).toEqual(['hidden', 'throttling off', 'throttling on'])
+  })
+
+  it('holds every parked page visible to Chromium, playing media or not: parking is the document’s guarantee', () => {
+    const { window, create } = setup()
+    const view = create()
+    view.setBounds(box)
+    view.setVisible(true)
+    const log = engineLog(view)
+    window.zen.contentHidden = true
+    view.setVisible(false)
+    expect(view.parkedCorner()).toBe(0)
+    expect(log).toEqual(['throttling off'])
+    window.zen.contentHidden = false
+    view.setVisible(true)
+    expect(log).toEqual(['throttling off', 'shown', 'throttling on'])
   })
 
   it('leaves a page parked under a chrome cover where it is, and stages it once the cover lifts without the layout showing it', () => {
