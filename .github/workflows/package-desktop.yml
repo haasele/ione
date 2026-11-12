@@ -59,6 +59,9 @@ permissions:
 env:
   PACKAGE_VERSION: ${{ inputs.version }}
   RELEASE_TAG: ${{ inputs.tag }}
+  # Typechecking the renderer tree needs more than Node's 2 GB default on the Intel macOS
+  # runner; V8 aborts with "Ineffective mark-compacts near heap limit" without this.
+  NODE_OPTIONS: --max-old-space-size=4096
 
 jobs:
   validate:
