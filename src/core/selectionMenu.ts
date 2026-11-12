@@ -271,11 +271,11 @@ export class SelectionMenuService {
 
   /**
    * Whether this host shows the mini menu: `capabilities.selectionMenu`, and the setting on
-   * (`Settings.showSelectionMenu`; absent reads as on).
+   * (`Settings.showSelectionMenu`; off unless explicitly enabled).
    */
   get available(): boolean {
     const { capabilities, settings } = this.browser.state
-    return capabilities.selectionMenu === true && settings.showSelectionMenu !== false
+    return capabilities.selectionMenu === true && settings.showSelectionMenu === true
   }
 
   /**

@@ -315,7 +315,8 @@ export const DEFAULT_SETTINGS: Settings = {
   warnBeforeQuitting: true,
   caretBrowsing: false,
   caretBrowsingConfirm: true,
-  showSelectionMenu: true,
+  // Opt-in: the mini menu over selected text stays quiet until the user asks for it.
+  showSelectionMenu: false,
   crashRestore: 'ask',
   askWhereToSave: false,
   onboardingDone: false,

@@ -1,0 +1,136 @@
+name: Nightly desktop and Android builds
+
+# Every push to main is packaged as `<package.json base>-nightly.<run number>` and published as a
+# GitHub prerelease, so it never becomes the repository's "latest" release (the stable channel
+# reads releases/latest) while the beta channel's release-list check still finds it.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Derive nightly version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      androidVersionCode: ${{ steps.version.outputs.android_version_code }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Derive the nightly version and Android versionCode
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -e "
+            const match = /^(\d+)\.(\d+)\.(\d+)/.exec(require('./package.json').version)
+            if (!match) { console.error('package.json version is not semver'); process.exit(1) }
+            process.stdout.write(match[0] + '-nightly.' + process.env.GITHUB_RUN_NUMBER)
+          ")
+          # Same integer base as android/app/build.gradle.kts, minus the channel digits (99 for
+          # a stable release). Nightlies get 1..98, so each run increases the versionCode while
+          # the stable release of the same version (base + 99) can still upgrade in place.
+          android_version_code=$(NIGHTLY_VERSION="$version" node -e "
+            const match = /^(\d+)\.(\d+)\.(\d+)/.exec(process.env.NIGHTLY_VERSION)
+            if (!match) { console.error('nightly version is not semver'); process.exit(1) }
+            const base = Number(match[1]) * 1000000 + Number(match[2]) * 10000 + Number(match[3]) * 100
+            const code = base + 1 + (Number(process.env.GITHUB_RUN_NUMBER) % 98)
+            if (code >= base + 99) { console.error('nightly versionCode reached the stable code'); process.exit(1) }
+            process.stdout.write(String(code))
+          ")
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "android_version_code=$android_version_code"
+          } >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Package
+    needs: prepare
+    uses: ./.github/workflows/package-desktop.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      tag: ${{ needs.prepare.outputs.tag }}
+      prerelease: true
+      androidVersionCode: ${{ needs.prepare.outputs.androidVersionCode }}
+    secrets: inherit
+
+  release:
+    name: Publish nightly prerelease
+    needs: [prepare, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ione-*
+          path: release
+          merge-multiple: true
+
+      - name: Write SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          mapfile -d '' files < <(
+            find . -maxdepth 1 -type f \
+              ! -name 'SHA256SUMS.txt' \
+              ! -name 'update-manifest.json' \
+              ! -name 'update-manifest.json.sig' \
+              -printf '%f\0' | LC_ALL=C sort -z
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no files to checksum"
+            exit 1
+          fi
+          sha256sum -- "${files[@]}" > SHA256SUMS.txt
+
+      - name: Generate update-manifest.json
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REPOSITORY: haasele/ione
+          COMMIT: ${{ github.sha }}
+          PRERELEASE: 'true'
+          DIST_DIR: release
+          UPDATE_MANIFEST_SIGNING_KEY: ${{ secrets.UPDATE_MANIFEST_SIGNING_KEY }}
+        run: node .github/scripts/update-manifest.mjs
+
+      - name: Create or update the nightly prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --draft \
+              --prerelease \
+              --latest=false \
+              --generate-notes \
+              --title "Ione $VERSION (nightly)"
+          fi
+          gh release upload "$TAG" release/* --clobber
+          gh release edit "$TAG" --draft=false --prerelease --latest=false

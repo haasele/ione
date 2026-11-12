@@ -46,6 +46,32 @@ describe('the Ione layout migration', () => {
   })
 })
 
+describe('the selection mini menu default migration', () => {
+  const loaded = (version: number, showSelectionMenu?: boolean): BrowserState =>
+    state(
+      fakeIo(
+        JSON.stringify({
+          version,
+          settings:
+            showSelectionMenu === undefined ? {} : { showSelectionMenu },
+          tabs: [],
+          spaces: [],
+          window: null
+        })
+      )
+    )
+
+  it('is off for fresh and pre-v8 profiles, and on only when a v8 profile says so', () => {
+    expect(DEFAULT_SETTINGS.showSelectionMenu).toBe(false)
+    // The old build wrote its `true` default into every profile; that is not a choice.
+    expect(loaded(7, true).settings.showSelectionMenu).toBe(false)
+    expect(loaded(7, false).settings.showSelectionMenu).toBe(false)
+    expect(loaded(8, true).settings.showSelectionMenu).toBe(true)
+    expect(loaded(8, false).settings.showSelectionMenu).toBe(false)
+    expect(loaded(8).settings.showSelectionMenu).toBe(false)
+  })
+})
+
 describe('BrowserState commits', () => {
   it('persists a commit even when a volatile commit was scheduled first in the same tick', async () => {
     const io = fakeIo()

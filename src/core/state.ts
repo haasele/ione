@@ -232,7 +232,7 @@ export interface PersistedWindow {
  * rail's Expand on hover on by default (a stored value is a choice from v6 on).
  */
 export interface Persisted {
-  version: 1 | 2 | 3 | 4 | 5 | 6 | 7
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
   spaces: Space[]
   tabs: Tab[]
   essentialTabIds: string[]
@@ -321,8 +321,11 @@ export interface Persisted {
  * v6 turns the rail's Expand on hover on by default: the settings are written whole, so a
  * profile from before v6 holds the old default (`false`) whether or not the user ever saw the
  * row, and `applyPersisted` reads that write-back as no choice; from v6 on a stored value is one.
+ * v8 makes the selection mini menu opt-in: profiles written before it stored the old default
+ * (`true`) whole, so that value is reset once rather than read as a choice; from v8 on only an
+ * explicit `true` enables it.
  */
-export const PERSISTED_VERSION = 7
+export const PERSISTED_VERSION = 8
 
 export type StateListener = () => void
 
@@ -765,7 +768,7 @@ export class BrowserState {
   /** Load the profile from disk (or create the first-run defaults). */
   load(): void {
     const data = this.store.readSync()
-    if (data && [1, 2, 3, 4, 5, 6, 7].includes(data.version)) {
+    if (data && [1, 2, 3, 4, 5, 6, 7, 8].includes(data.version)) {
       this.applyPersisted(data)
       // Profiles from before the marker count as clean; only an explicit false is a crash.
       this.uncleanExit = data.cleanExit === false
@@ -892,6 +895,13 @@ export class BrowserState {
     // From v6 on the stored value is the user's, off only where the profile says so.
     this.settings.sidebarExpandOnHover =
       data.version >= 6 ? data.settings?.sidebarExpandOnHover !== false : true
+    // The selection mini menu is opt-in since v8. Older profiles stored the old default (`true`)
+    // as part of every write, so that value is not a choice and is reset once; from v8 on only an
+    // explicit `true` turns it on.
+    this.settings.showSelectionMenu =
+      data.version >= 8
+        ? data.settings?.showSelectionMenu === true
+        : DEFAULT_SETTINGS.showSelectionMenu
     // On only when the profile says so (settings-116): an older profile, or anything but a
     // boolean, reads off – Chrome's default.
     this.settings.useSystemAccent = data.settings?.useSystemAccent === true

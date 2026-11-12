@@ -4697,7 +4697,7 @@ export class Browser {
       fonts: JSON.stringify(s.fonts),
       languages: s.languages.join(','),
       caretBrowsing: s.caretBrowsing === true,
-      selectionMenu: s.showSelectionMenu !== false,
+      selectionMenu: s.showSelectionMenu === true,
       proxy: JSON.stringify(s.proxy)
     }
     for (const [key, value] of Object.entries(patch)) {
@@ -4868,7 +4868,7 @@ export class Browser {
       before.glance !== s.glanceEnabled ||
       before.trigger !== s.glanceTrigger ||
       before.thirdParty !== s.thirdPartyOnPinned ||
-      before.selectionMenu !== (s.showSelectionMenu !== false)
+      before.selectionMenu !== (s.showSelectionMenu === true)
     ) {
       this.tabs.broadcastPageFlags()
     }
@@ -4904,7 +4904,7 @@ export class Browser {
     if (before.fonts !== JSON.stringify(s.fonts)) this.pageFonts.onSettingsChanged()
     if (before.languages !== s.languages.join(',')) this.languages.onSettingsChanged()
     if (before.caretBrowsing !== (s.caretBrowsing === true)) this.caretBrowsing.onSettingsChanged()
-    if (before.selectionMenu !== (s.showSelectionMenu !== false))
+    if (before.selectionMenu !== (s.showSelectionMenu === true))
       this.selectionMenu.onSettingsChanged()
     if (before.proxy !== JSON.stringify(s.proxy)) this.platform.sessions.applyUserProxy?.(s.proxy)
     this.state.commit()

@@ -18,10 +18,26 @@ import {
 import {
   ANDROID,
   DESKTOP,
-  pageHarness,
+  pageHarness as basePageHarness,
   type HarnessOptions,
   type PageHarness
 } from './menusFixture'
+
+/**
+ * The mini menu is opt-in, so its suite starts every harness with the setting on. Default-off
+ * and profile-migration behaviour are covered in `state.test.ts` and `sections.test.ts`.
+ */
+const pageHarness = (
+  capabilities?: Parameters<typeof basePageHarness>[0],
+  options?: HarnessOptions
+): PageHarness => {
+  const h = basePageHarness(capabilities, options)
+  h.browser.handleCommand(h.win, 'settings.update', { showSelectionMenu: true })
+  // The update broadcasts a page-flag change to the tab the harness already created; the tests
+  // count the flags they ask for themselves.
+  h.viewCalls.length = 0
+  return h
+}
 
 /*
  * The mini menu's model (CT-39, `core/selectionMenu`): the page's settled selection becomes
@@ -503,6 +519,18 @@ describe('the pill on the popup surface', () => {
     expect(h.popupCalls.at(-1)).toMatchObject({ width: 500 + PAD * 2, height: 46 + PAD * 2 })
     h.browser.handleCommand(h.win, 'selectionMenu.dismiss', { tabId: h.tabId })
     expect(h.popupCalls.at(-1)).toBeNull()
+  })
+
+  it('is off until the opt-in setting is turned on', () => {
+    const h = basePageHarness()
+    layout(h)
+    expect(h.browser.state.settings.showSelectionMenu).toBe(false)
+    expect(h.browser.selectionMenu.available).toBe(false)
+    report(h, 'quantum foam')
+    expect(model(h)).toBeNull()
+    h.browser.handleCommand(h.win, 'settings.update', { showSelectionMenu: true })
+    report(h, 'quantum foam')
+    expect(model(h)?.text).toBe('quantum foam')
   })
 
   it('is off with the setting, a standing menu going as it is turned off', () => {

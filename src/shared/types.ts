@@ -3614,7 +3614,7 @@ export interface Settings {
    * The mini menu comes up over text selected in a page (CT-39; Edge's Appearance › "Show mini
    * menu when selecting text"): Copy, Search, Define, Translate, Listen as chips over the
    * selection (`UIState.selectionMenu`). Hosts with `capabilities.selectionMenu` alone read it;
-   * absent in profiles from before it existed (read as true).
+   * off by default, and absent in profiles from before it existed (read as false).
    */
   showSelectionMenu?: boolean
   /** After an unclean exit: offer the last session's pages, bring them back, or start fresh. */

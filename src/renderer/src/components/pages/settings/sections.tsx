@@ -785,8 +785,8 @@ function lookSection({
               } satisfies SettingsRow
             ]
           : []),
-        // Edge's "Show mini menu when selecting text" (Settings › Appearance › Context menus;
-        // CT-39, `Settings.showSelectionMenu`, on by default – an absent value reads as on): the
+        // Edge's "Show mini menu when selecting text" (Settings › Appearance; CT-39,
+        // `Settings.showSelectionMenu`, off by default – an absent value reads as off): the
         // pill of chips – Copy, Search, Define, Translate, Read aloud – over a settled text
         // selection. Desktop hosts with the popup surface alone (`capabilities.selectionMenu`),
         // in the desktop and the tablet layouts – a desktop host at a tablet width still runs
@@ -797,11 +797,17 @@ function lookSection({
                 kind: 'switch',
                 id: 'show-selection-menu',
                 label: 'Show the mini menu when text is selected',
+                description:
+                  'Copy, search, define, translate or listen to selected text from a floating bar. Off by default.',
                 keywords: [
                   'mini menu',
                   'selection',
+                  'selection bar',
+                  'floating bar',
                   'select text',
                   'selected text',
+                  'toolbar',
+                  'turn off',
                   'copy',
                   'search',
                   'define',
@@ -810,7 +816,7 @@ function lookSection({
                   'context menu'
                 ],
                 layouts: ['desktop', 'tablet'],
-                checked: s.showSelectionMenu !== false,
+                checked: s.showSelectionMenu === true,
                 onChange: (v) => set({ showSelectionMenu: v })
               } satisfies SettingsRow
             ]

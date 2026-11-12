@@ -1,113 +1,140 @@
+<p align="center">
+  <img src="logo/ione-transp.svg" alt="Ione" width="112">
+</p>
+
 # Ione
 
-Ione is a port of [Zen Browser](https://zen-browser.app)'s user experience to the Chromium
-engine. Zen itself is a Firefox (Gecko) fork; this project rebuilds its distinctive UI and
-behaviours on Blink/V8, so pages render exactly as they do in Chrome while the browser chrome is
-Zen's. The current reference is **Zen 1.22b** (September 2026).
+[![Latest release](https://img.shields.io/github/v/release/haasele/ione?label=latest&sort=semver)](https://github.com/haasele/ione/releases/latest)
+[![Release](https://github.com/haasele/ione/actions/workflows/release-desktop.yml/badge.svg)](https://github.com/haasele/ione/actions/workflows/release-desktop.yml)
+[![Nightly](https://img.shields.io/github/actions/workflow/status/haasele/ione/nightly.yml?label=Nightly&branch=main)](https://github.com/haasele/ione/actions/workflows/nightly.yml)
 
-Ione continues the browser originally built as **Zenium** by
-[BenItBuhner](https://github.com/BenItBuhner); the original releases are
-[here](https://github.com/BenItBuhner/Zenium/releases). See [Credits](#credits).
+Ione brings [Zen Browser](https://zen-browser.app)'s user experience to the Chromium engine. Zen
+is a Firefox (Gecko) fork; Ione rebuilds its chrome and behaviours on Blink/V8, so pages render as
+they do in Chrome while the browser UI stays Zen's. The reference is **Zen 1.22b** (September
+2026).
 
-It ships as a desktop app (Electron, Linux/Windows/macOS) and as an Android app (the system
-WebView) that share the browser core and the whole React chrome. On a phone the chrome becomes a
-bottom bar with the sidebar in a drawer; on a tablet, or a phone in a Samsung DeX session with a
-mouse, it is the desktop layout.
+It runs as a desktop app (Electron; Linux, Windows and macOS) and as an Android app (the system
+WebView). Both share the browser core and the React chrome. On phones the chrome becomes a bottom
+bar with the sidebar in a drawer; tablets and phones in a Samsung DeX session with a pointer use
+the desktop layout.
 
-> This is an independent port and is not affiliated with the Zen Browser team.
+Ione continues the browser originally built as **Zenium** by **BenItBuhner**; see
+[Credits](#credits). It is an independent project and is not affiliated with the Zen Browser team.
 
 ## Download
 
-[![Latest release](https://img.shields.io/github/v/release/haasele/ione?label=latest&sort=semver)](https://github.com/haasele/ione/releases/latest)
-[![Release](https://github.com/haasele/ione/actions/workflows/release.yml/badge.svg)](https://github.com/haasele/ione/actions/workflows/release.yml)
-[![CI](https://github.com/haasele/ione/actions/workflows/ci.yml/badge.svg)](https://github.com/haasele/ione/actions/workflows/ci.yml)
+Stable releases are tagged `v<version>` and built by
+[release-desktop.yml](https://github.com/haasele/ione/actions/workflows/release-desktop.yml).
+Every push to `main` also produces a nightly prerelease from
+[nightly.yml](https://github.com/haasele/ione/actions/workflows/nightly.yml); nightlies use a
+version like `v<version>-nightly.<run>`, are marked as pre-releases and never become the
+repository's "latest" release. Both channels build the same package set.
 
-Every release on the [releases page](https://github.com/haasele/ione/releases) ships the
-same set of packages, built by GitHub Actions from the tagged commit:
+| Platform         | Packages                                                                                                                                                                                                   |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Windows 10 / 11  | `ione-<version>-x64-setup.exe` (NSIS), `ione-<version>-x64.msi`, `ione-<version>-x64-portable.zip`                                                                                                          |
+| macOS            | `ione-<version>-x64.dmg`, `ione-<version>-arm64.dmg`; updater ZIPs `ione-<version>-x64.zip`, `ione-<version>-arm64.zip`                                                                                       |
+| Linux            | `ione-<version>-x86_64.AppImage`, `ione_<version>_amd64.deb`, `ione-<version>-x86_64.rpm`, `ione-<version>-x86_64.flatpak`, `install.sh`                                                                      |
+| Android 8.0+     | `ione-<version>.apk`                                                                                                                                                                                |
 
-| Platform        | Packages                                                                                            |
-| --------------- | --------------------------------------------------------------------------------------------------- |
-| Windows 10 / 11 | `ione-<version>-x64-setup.exe`, `…-arm64-setup.exe`                                               |
-| macOS           | `ione-<version>-arm64.dmg` (Apple Silicon), `…-x64.dmg` (Intel)                                   |
-| Linux           | `ione-<version>-x86_64.AppImage`, `…-arm64.AppImage`, `ione_<version>_amd64.deb`, `…_arm64.deb` |
-| Android 8.0+    | `ione-<version>.apk`                                                                              |
+Windows and Linux packages are x64 only. macOS ships separate Intel (x64) and Apple Silicon
+(arm64) builds.
 
-Each release also carries `SHA256SUMS.txt` and a build provenance attestation for every file
-(`gh attestation verify <file> --repo haasele/ione`), and its notes explain the first-launch
-steps a platform needs when a package is not code-signed. Pre-releases (`x.y.z-beta.n`) are marked
-as such and never become the "latest" release.
+Each release also carries `SHA256SUMS.txt`, `update-manifest.json` (with an optional
+`update-manifest.json.sig`) and the `latest*.yml` feeds used by the updater. The manifest lists
+the packages the in-app updater can apply, with their size and SHA-256; `SHA256SUMS.txt` covers
+the published files (packages, feeds and `install.sh`):
 
-The app shipped as **Zen** (packages `zen-chromium-*`) up to v0.2.0 and as **Zenium** after it.
-Ione takes over either profile on its first launch (the `Zen` and `Zenium` user-data directories
-become `Ione`, and a `zen-sync` / `zenium-sync` folder becomes `ione-sync`); the Windows installer
-and the `.deb` remove the old installations, macOS users delete the old `Zen.app` / `Zenium.app`
-themselves, and on Android Ione is a new app that installs alongside Zen (uninstall Zen
-afterwards). On Linux the old `zen-chromium` command stays available as an alias of `ione` for one
-release. Ione itself used the application id `io.github.benitbuhner.ione` before `dev.haasele.ione`;
-the Windows installer retires that older uninstall entry (its files are the ones the new install
-replaces) and keeps the profile, while Android treats the new id as a separate app and cannot
-migrate the old app's private data.
+```bash
+sha256sum -c SHA256SUMS.txt
+```
 
-### Built-in content blocker
+### Install
 
-Ione ships **uBlock Origin Lite** as a built-in extension and installs it on first launch. Its popup, dashboard and list controls are the blocker's UI; Ione gives them its material colours, rounded surfaces and motion at runtime, without modifying the GPL package. The old filter-list settings and their bundled lists are retired when the extension is present. The extension is pinned to the toolbar by default; disable or reconfigure it in Settings → Extensions or from its own dashboard.
+| Platform | First install                                                                                                                                                                                                                 |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Windows  | Run the NSIS `setup.exe` or the MSI. The portable ZIP can be extracted anywhere and run without installing.                                                                                                                    |
+| macOS    | Open the DMG and drag **Ione** to Applications. The ZIP is the updater package, not the first-install download.                                                                                                                |
+| Linux    | Run the AppImage, install the `.deb` with `apt`/`dpkg`, the `.rpm` with `dnf`/`rpm`, or the Flatpak with `flatpak install ./ione-<version>-x86_64.flatpak`. `install.sh` next to the packages performs a per-user AppImage install or installs the `.deb` and verifies `SHA256SUMS.txt` first. |
+| Android  | Open the APK and allow installation from that source. Android 8.0 (API 26) or newer is required.                                                                                                                              |
 
-**ieq**, the live audio equalizer, ships the same way: preinstalled and pinned to the toolbar, ready to EQ the audio of any page.
+Without the signing secrets below, Windows and Linux packages are unsigned and macOS builds are
+only ad-hoc signed. Windows SmartScreen and macOS Gatekeeper may therefore ask for confirmation
+on first launch; the checksums above let you verify the file you downloaded.
 
-### Automatic updates
+### Coming from Zen or Zenium
 
-Ione checks for new releases on startup and every six hours (Settings → Updates: check now, pick
-the stable or beta channel, turn background downloads off). Each release publishes an
-`update-manifest.json` – version, one entry per package with URL, size and SHA-256 – plus the
-`latest*.yml` feeds electron-updater reads. How the update is applied depends on the install:
+Ione inherits the old profile on first launch: the `Zen` and `Zenium` user-data directories become
+`Ione`, and a `zen-sync` / `zenium-sync` folder becomes `ione-sync`. The Windows installer removes
+the old Zenium and Zen installations but keeps their data; the `.deb` declares the old `zenium`
+and `zen-chromium` packages as replaced and conflicting. macOS users delete the old `Zen.app` /
+`Zenium.app` themselves. On Android, Ione installs alongside the old app; Android cannot migrate
+its private data, so uninstall the old app afterwards.
 
-| Install                     | Behaviour                                                                                                                                                  |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Windows installer, AppImage | Downloaded in the background (delta where possible), installed when Ione restarts                                                                        |
-| Debian package              | Downloaded in the background; installing runs `dpkg` through `pkexec` and asks for your password                                                           |
-| macOS                       | Unsigned builds cannot be swapped by Squirrel.Mac: Ione downloads and verifies the DMG and opens it for you to drag over. Signed builds install in place |
-| Android                     | Ione downloads and verifies the APK and hands it to the package installer; upgrades in place only with the same signing key and applicationId            |
+The `.deb` also keeps `zenium` and `zen-chromium` as command aliases of `ione` for one release.
+Ione itself used the application id `io.github.benitbuhner.ione` before `dev.haasele.ione`: the
+Windows installer retires that older uninstall entry while keeping the profile, and Android treats
+the new id as a separate app that cannot read the old app's private data.
 
-Every download is checked against the manifest's SHA-256 (electron-updater additionally checks its
-own SHA-512). When the maintainers configure `UPDATE_MANIFEST_SIGNING_KEY`, manifests are signed
-with ed25519 and every build from that release on refuses unsigned or mismatching manifests.
+## Bundled extensions
+
+- **uBlock Origin Lite** is the built-in content blocker, installed and pinned on first launch.
+  Its popup, dashboard and list controls are the blocker's own UI, restyled at runtime to match
+  Ione; the old filter-list settings and bundled lists are retired when the extension is present.
+  Disable or reconfigure it in Settings → Extensions or from its dashboard.
+- **ieq**, the live audio equalizer, is preinstalled and pinned to the toolbar, ready to EQ the
+  audio of any page.
+
+## Automatic updates
+
+Ione checks releases in `haasele/ione` on startup and every six hours. Settings → Updates offers
+a manual check, a stable or beta channel, and a background-download switch. The stable channel
+reads GitHub's latest stable release; the beta channel also considers pre-releases, including
+nightly builds. Nightly builds are therefore opt-in: choose the beta channel to receive them.
+
+Every release publishes `update-manifest.json` (version, package URLs, sizes and SHA-256 hashes)
+and the `latest*.yml` feeds read by electron-updater. How an update is applied depends on the
+install:
+
+| Install                        | Behaviour                                                                                                                                                              |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Windows NSIS installer         | Downloaded in the background and installed when Ione restarts.                                                                                                        |
+| AppImage                       | Downloaded in the background; the new image replaces the old one when Ione restarts.                                                                                   |
+| Debian package                 | Downloaded in the background; installing runs `dpkg` through `pkexec` and asks for your password.                                                                     |
+| macOS                          | Downloaded and verified, then the app bundle is swapped on restart when its folder is writable. From a disk image or an unwritable folder, Ione opens the new DMG.     |
+| Android                        | Ione downloads and verifies the APK and hands it to the package installer; upgrades in place only with the same signing key and applicationId.                        |
+| rpm, Flatpak                   | Not updated in place; update with your package manager or from the release page.                                                                                      |
+| Portable ZIP                   | Not updated in place; download the new ZIP from the release page.                                                                                                     |
+
+Every update download is checked against the manifest's SHA-256, and electron-updater
+additionally checks its own SHA-512. When `UPDATE_MANIFEST_SIGNING_KEY` is configured, releases
+also publish an ed25519 signature for the manifest. A build can only enforce that signature if it
+was compiled with the matching public key; otherwise the manifest is accepted on HTTPS plus its
+checksums.
 
 ## What is ported
 
-| Zen feature                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Status in this port   |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
-| Vertical tabs sidebar (single / multiple / collapsed toolbar layouts, tabs on the right, resizable, collapsible to icons, 1.22 squircle chrome and larger sidebar type)                                                                                                                                                                                                                                                                                         | Done                  |
-| Zen-style centered titlebar – Back / Forward / Reload on the left, the address pill centered (640 max), extension actions and the menu on the right; the default layout on a fresh profile, also used by the horizontal tab strip                                                                                                                                                                                                                                 | Done                  |
-| Window transparency – Appearance › Window transparency (Off / Translucent / Transparent) opens the frameless window clear so Wayland compositors (Hyprland, niri, KWin) own the blur behind the chrome; applies to new windows                                                                                                                                                                                                                                   | Done (this port only) |
-| Brand and app icon – the radar mark from the new SVG sources in `logo/`, generated into the desktop icon, Windows ICO, macOS ICNS/Dock and Android adaptive icon in Black, White and Transparent treatments | Done (this port only) |
-| Window chrome – window buttons at the trailing end of the centered titlebar; Appearance › Use system window controls opens new Linux windows with the desktop’s native frame (no server-side buttons under niri or Hyprland) | Done (this port only) |
-| **Spaces** – icons, per-space gradient themes, default containers, slide animation, space switcher, Space Routing ("Add Route for Domain"), "Create New Space" shortcut, open a space in a new window                                                                                                                                                                                                                                                           | Done                  |
-| **Essentials** – favicon tile grid at the top, container-specific, max count                                                                                                                                                                                                                                                                                                                                                                                    | Done                  |
-| Pinned tabs – reset to pinned URL, "close" resets/unloads/switches (all seven Zen behaviours), "Edit pinned tab…" URL editor, rename (double-click), "Change Icon…" emoji picker                                                                                                                                                                                                                                                                                | Done                  |
-| Folders – create, rename, collapse, unpack/delete, drag tabs in, "Move to folder…"                                                                                                                                                                                                                                                                                                                                                                              | Done                  |
-| **Live Folders** – GitHub pull requests (with draft filter) / GitHub issues / RSS & Atom feeds / REST endpoints with a field mapping (Zen's local schema for localhost); 15 min – 8 h refresh, dismissed items never return, folder context menu                                                                                                                                                                                                                | Done                  |
-| **Split View** – grid / vertical / horizontal, up to 4 tabs, resizable gutters, unsplit one or all, drag a tab onto the page edge to split, "Split link in new tab", Alt+click a tab to split it with (or separate it from) the active tab, Ctrl/Shift+click to select several tabs and open them in a split (or pin / move / folder / unload / close them together)                                                                                            | Done                  |
-| **Compact Mode** – hide sidebar and/or toolbar, edge-hover reveal (tracks the real cursor, so it works over pages and window borders), persistent floating sidebar (Ctrl+Alt+S), per window                                                                                                                                                                                                                                                                     | Done                  |
-| **Glance** – Alt/Ctrl/Shift+click preview over the current page, close / expand (Ctrl+O) / split, third-party links on pinned tabs open their own tab, fullscreen inside a Glance expands it                                                                                                                                                                                                                                                                    | Done                  |
-| **Window sync** – any number of windows share the same tabs, spaces, folders and split views; a tab selected in two windows keeps one live page and shows a dimmed preview in the window that does not hold it (focus brings it over); "Sync only pinned tabs in spaces" mode; every window is restored on the space it was in                                                                                                                                  | Done                  |
-| **Blank windows** (Ctrl+Shift+N, `--blank-window`) – an independent, temporary tab list that inherits the container of the space it was opened from, with "Move to…" to bring the tabs back                                                                                                                                                                                                                                                                     | Done                  |
-| **Private windows** (Ctrl+Shift+P, `--private-window`) – in-memory session, private space, no history / suggestions, purple chrome; wiped when the last private window closes                                                                                                                                                                                                                                                                                   | Done                  |
-| **Boosts** – per-site colour tint, fonts and text size, "zap element" picker, force dark mode, custom CSS; site-control button in the address bar, "New Boost" URL-bar command, page context-menu submenu, list in Settings                                                                                                                                                                                                                                     | Done                  |
-| **Reader View** (Ctrl+Alt+R) – Mozilla Readability, `zen://reader` with font size / serif–sans / light–sepia–dark / width controls, address-bar indicator when a page is readable                                                                                                                                                                                                                                                                               | Done                  |
-| **Cross-device sync** – Zen 1.22's "Sync your Spaces across devices" for a browser without Mozilla accounts: devices exchange end-to-end encrypted (scrypt + AES-256-GCM) record sets through any folder your cloud drive or Syncthing keeps in sync; spaces, folders, pinned tabs, Essentials, (optionally) open tabs, containers, bookmarks, settings, shortcuts and Boosts; last-writer-wins per record, merge prompt on first join, device list, "Sync now" | Done                  |
-| **Extensions** (Ctrl+Shift+A) – load unpacked Chrome extensions into every container, remembered across restarts, toolbar buttons with popups; the API surface is Electron's (content scripts, storage, webRequest, scripting, DevTools panels)                                                                                                                                                                                                                 | Done                  |
-| **Mods** – custom CSS for the browser chrome (Zen's `chrome.css` mods / `userChrome.css`): new, import from file or URL, toggle, edit live                                                                                                                                                                                                                                                                                                                      | Done                  |
-| Zen URL bar – floating, inline autofill, history / bookmarks / open tabs ("Switch to Tab") / spaces / Command Bar actions / live search suggestions, `` ` `` space-only mode, `@engine` keywords, draft text remembered                                                                                                                                                                                                                                         | Done                  |
-| Theme picker – colour wheel dots, harmony algorithms, monochrome, opacity, texture, rotation, presets                                                                                                                                                                                                                                                                                                                                                           | Done                  |
-| Keyboard shortcuts – Zen's default table (from `ZenKeyboardShortcuts.mjs`, schema v20), fully rebindable with conflict detection                                                                                                                                                                                                                                                                                                                                | Done                  |
-| Tab unloading (inactivity timeout, excluded domains, unload tab / space / other spaces)                                                                                                                                                                                                                                                                                                                                                                         | Done                  |
-| **Resource governor** – memory / CPU / GPU budgets the browser never exceeds: purge → throttle → freeze → unload ladders, live-page cap, queued background loads, battery / idle / suspend awareness, Chromium & V8 startup switches, live meters in Settings                                                                                                                                                                                                   | Done (this port only) |
-| **AI agents (MCP server)** – a built-in Model Context Protocol server lets any local AI agent drive the browser with no extension: Playwright-style tools plus `ione_*` tools, foreground (labelled cursor) and background modes, per-tab indicators, several agents at once, loopback-only with an approval prompt                                                                                                                                              | Done (this port only) |
-| Containers – isolated cookie sessions per container, per-space defaults, "Open in New Container Tab", icons and colours, reorderable (1.22)                                                                                                                                                                                                                                                                                                                     | Done                  |
-| History, bookmarks, downloads (saved to the Downloads folder with Firefox-style unique names, or "always ask"), find in page, screenshots, save page, print, view source, zoom (1.21 fine steps), mute, PiP, multiple media controls in the sidebar                                                                                                                                                                                                             | Done                  |
-| Native context menus for pages, tabs (incl. Share ▸ Copy Link / Email Link), spaces, folders and the new-tab button; permission prompts remembered per site; `window.open` popups                                                                                                                                                                                                                                                                               | Done                  |
-| Onboarding – look, search engine (Google / DuckDuckGo / Ecosia), Essentials, feature tour (Spaces, Compact Mode, Glance & Split, Boosts, Live Folders), sync, shortcuts                                                                                                                                                                                                                                                                                         | Done                  |
-| Things a Chromium port cannot mirror: Mozilla account sign-in, Firefox add-ons (AMO), Gecko-only engine features (Firefox Translations, PDF merging, QWAC display)                                                                                                                                                                                                                                                                                              | Not applicable        |
+Ione tracks Zen 1.22b. Features implemented in the shared core work on both desktop and Android;
+host-only items are marked.
+
+| Area                        | What is included                                                                                                                                                                                                                                                                                                                                                           |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Layout                      | Vertical tab sidebar (single, multiple and collapsed layouts; right side, resizable, icon-collapse); Zen-style centered titlebar with Back / Forward / Reload, a centered address pill, extension actions and the menu; horizontal tab strip on request. Window transparency and native system window controls are desktop-only.                                               |
+| Compact Mode                | Hide the sidebar and/or toolbar, reveal on edge hover, persistent floating sidebar (Ctrl+Alt+S), per window.                                                                                                                                                                                                                                                                 |
+| Spaces                      | Icons, per-space gradient themes, default containers, slide animation, space switcher, Space Routing ("Add Route for Domain"), "Create New Space" and opening a space in a new window.                                                                                                                                                                                       |
+| Essentials and pinned tabs  | Favicon tile grid at the top of the sidebar, container-specific Essentials; pinned tabs reset to their URL, unload/switch on close, a URL editor, rename by double-click and an emoji icon picker.                                                                                                                                                                           |
+| Folders and Live Folders    | Create, rename, collapse, unpack and delete folders; drag tabs in. Live Folders read GitHub pull requests (with draft filter), GitHub issues, RSS/Atom feeds or REST endpoints with a field mapping, refresh every 15 minutes to 8 hours, and remember dismissed items.                                                                                                      |
+| Split View and Glance       | Grid, vertical and horizontal splits for up to four tabs with resizable gutters; drag onto a page edge, "Split link in new tab", Alt+click a tab, or Ctrl/Shift+click several tabs to open them in a split. Glance previews a link over the current page and can expand into a tab or a split.                                                                                |
+| Windows and sessions        | Desktop-only window sync: any number of windows can share the same tabs, spaces, folders and splits; blank windows (Ctrl+Shift+N) and private windows (Ctrl+Shift+P) are independent and never persisted. Every synced window is restored in the space it was in.                                                                                                           |
+| Boosts and Reader View      | Per-site colour tint, fonts, text size, "zap element", force dark mode and custom CSS; Reader View (Ctrl+Alt+R) uses Mozilla Readability with theme, width and type controls.                                                                                                                                                                                               |
+| URL bar, themes, shortcuts  | Floating URL bar with inline autofill, history/bookmarks/open-tab suggestions, space-only mode, `@engine` keywords and remembered drafts; theme picker with colour wheels, harmony algorithms and presets; Zen's shortcut table, fully rebindable with conflict detection.                                                                                                    |
+| Containers and browsing     | Isolated cookie sessions per container with per-space defaults; history, bookmarks, downloads (Firefox-style unique names or "always ask"), find in page, screenshots, save page, print, view source, zoom, mute, PiP and sidebar media controls; native context menus, remembered permission prompts and `window.open` popups.                                                |
+| Extensions and Mods         | Chrome extensions (Ctrl+Shift+A on desktop) load unpacked or from the Chrome Web Store into every container, with content scripts, storage, webRequest, scripting, runtime messaging, toolbar buttons and DevTools panels (desktop). Mods add custom CSS to the browser chrome.                                                                                                |
+| Cross-device sync           | Settings → Sync exchanges end-to-end encrypted record sets (scrypt + AES-256-GCM) through a folder your cloud drive or Syncthing already syncs, or a WebDAV server. Spaces, folders, pinned tabs, Essentials, optional open tabs, containers, bookmarks, settings, shortcuts and Boosts are covered; Android picks its folder with the system file picker.                                                                                     |
+| Resource governor           | Desktop-only memory, CPU and GPU budgets with purge → throttle → freeze → unload ladders, a live-page cap, queued background loads, battery/idle/suspend awareness and live meters in Settings.                                                                                                                                                                               |
+| AI agents (MCP server)      | A loopback MCP server that lets local agents drive the browser with Playwright-style `browser_*` tools plus `ione_*` tools, foreground/background modes, per-agent tab groups and an approval prompt.                                                                                                                                                                          |
+| Onboarding                  | First-run flow for look, search engine, Essentials, the feature tour, sync and shortcuts.                                                                                                                                                                                                                                                                                    |
+| Not applicable              | Mozilla account sign-in, Firefox add-ons (AMO) and Gecko-only engine features such as Firefox Translations, PDF merging and QWAC display.                                                                                                                                                                                                                                    |
 
 ## Architecture
 
@@ -140,112 +167,73 @@ android/      Android host, Kotlin side (Gradle project): one WebView per tab, d
 ```
 
 Every page is a host-owned web view (`WebContentsView` on Electron, `WebView` on Android). The
-React chrome of each window measures where its content area is and reports view rectangles; the
-core positions the views attached to that window. Chrome overlays (URL bar, panels, Glance frame,
-the phone drawer, menus) hide the live views and show a dimmed snapshot of the page behind them,
-which is how Zen's "dim the page" look is reproduced – the same mechanism renders the preview of a
-tab shown in another window.
+React chrome measures where its content area is and reports view rectangles; the core positions
+the views attached to that window. Chrome overlays (URL bar, panels, Glance frame, the phone
+drawer, menus) hide the live views and show a dimmed snapshot of the page behind them, which is
+how Zen's "dim the page" look is reproduced – the same mechanism renders the preview of a tab
+shown in another window.
 
 All browser state lives in the core and is shared by every synced window; each window receives its
-own snapshot (its selection, Glance, find bar, compact state) and only sends commands over
+own snapshot (selection, Glance, find bar, compact state) and only sends commands over
 `window.zen` (Electron: IPC through the preload; Android: a direct in-process call, since core and
 chrome share the WebView). State is persisted atomically to `<userData>/ione/*.json` on desktop and
 `files/ione/*.json` on Android; blank and private windows are never persisted.
 
 Because the core and the chrome are shared, a feature landed for the desktop app is the same
-feature on Android; only the host adapters (`src/main/platform`, `src/android` + `android/`)
-know which platform they are on. Hosts declare what they cannot do (`HostCapabilities`): Android
-has one window, no extensions, no cross-device sync folder and no resource governor.
+feature on Android; only the host adapters (`src/main/platform`, `src/android` + `android/`) know
+which platform they are on. Hosts declare what they cannot do (`HostCapabilities`): Android has
+one window and no resource governor.
 
 ### Resource governor
 
-Settings → Resources sets budgets for the whole browser (every Chromium process together):
-memory in MB or as a share of installed RAM, CPU as a share of all cores, and GPU-process memory.
-Every few seconds the governor samples `app.getAppMetrics()`, attributes each process to the tabs
-that own it (shared renderers are split evenly, out-of-process iframes count towards their tab)
-and, when a budget is exceeded, escalates cheapest-first through Chromium's own lifecycle
-machinery (reached over the DevTools protocol):
+Settings → Resources sets budgets for the whole browser: memory in MB or as a share of installed
+RAM, CPU as a share of all cores, and GPU-process memory. Every few seconds the governor samples
+`app.getAppMetrics()`, attributes each process to the tabs that own it, and escalates
+cheapest-first through Chromium's own lifecycle machinery:
 
-- **memory** – V8 low-memory GC + browser-wide memory-pressure purge → unload hidden pages by
-  score (cost × time out of sight) → purge visible pages (strict) → reload the active page when it
-  alone busts the budget (extreme)
-- **CPU** – throttle hidden pages 4× / 8× / 16× (`Emulation.setCPUThrottlingRate`) → freeze
-  (`Page.setWebLifecycleState`) → unload pages that keep burning CPU while frozen; pages are also
-  told they have proportionally fewer cores (`navigator.hardwareConcurrency`)
-- **GPU** – pause muted background media → purge → unload one hidden page per cycle
+- **Memory** – V8 low-memory GC and a memory-pressure purge, then unload hidden pages by score,
+  purge visible pages, and reload the active page if it alone busts the budget.
+- **CPU** – throttle hidden pages 4× / 8× / 16×, freeze them, then unload pages that keep burning
+  CPU while frozen; pages also see proportionally fewer cores.
+- **GPU** – pause muted background media, purge, then unload one hidden page per cycle.
 
-Independently of pressure, hidden pages are frozen after a timeout (and at once when the system is
-idle, the screen is locked or the machine suspends), unloaded after Zen's tab-unloading timeout,
-a hard cap on live pages is enforced, and background loads queue up instead of all starting at
-once. Budgets shrink on battery. Pages playing audio, excluded domains and pages with DevTools open
-are never touched; pinned tabs and Essentials can be protected too. The process profile (renderer
-process limit, per-page V8 heap cap, low-end-device mode, no back/forward cache, no prerendering,
-raster threads, GPU mode) becomes Chromium command-line switches at the next launch. A page that
-grows past its heap cap – or any hidden page whose renderer dies – is unloaded, not left as an error
-page. `ZEN_GOVERNOR_LOG=1` prints one diagnostic line per sample. The governor is desktop-only;
-Android relies on the system's own memory management.
+Hidden pages are frozen after a timeout and immediately when the system is idle, locked or
+suspending, and are unloaded after Zen's tab-unloading timeout. A live-page cap is enforced and
+background loads queue instead of all starting at once. Budgets shrink on battery. Pages playing
+audio, excluded domains and pages with DevTools open are never touched; pinned tabs and Essentials
+can be protected too. The process profile becomes Chromium command-line switches at the next
+launch; `ZEN_GOVERNOR_LOG=1` prints one diagnostic line per sample. The governor is desktop-only;
+Android relies on the system's memory management.
 
 ### AI agents (MCP server)
 
 Settings → AI Agents turns on a built-in [Model Context Protocol](https://modelcontextprotocol.io)
-server so any local AI agent can control the browser directly — no extension, plugin or CDP
-bridge. It reuses the same command surface the chrome uses, so it works identically on the desktop
-app and the Android WebView host.
+server so any local AI agent can control the browser without an extension or CDP bridge. It
+listens on `http://127.0.0.1:<port>/mcp` (Streamable HTTP):
 
-- **Connect over HTTP:** the server listens on `http://127.0.0.1:<port>/mcp` (Streamable HTTP, the
-  transport every modern MCP client speaks). Point a client at it:
+```json
+{ "mcpServers": { "ione": { "url": "http://127.0.0.1:41735/mcp" } } }
+```
 
-  ```json
-  { "mcpServers": { "ione": { "url": "http://127.0.0.1:41735/mcp" } } }
-  ```
+Clients that launch a command can use the stdio shim, which relays to the running browser:
 
-- **Connect over stdio:** clients that launch a command can use the shim, which relays to the
-  running browser (the `.deb` keeps the old `zen-chromium` command as an alias for one release):
+```json
+{ "mcpServers": { "ione": { "command": "ione", "args": ["--mcp"] } } }
+```
 
-  ```json
-  { "mcpServers": { "ione": { "command": "ione", "args": ["--mcp"] } } }
-  ```
-
-- **Tools:** the `ione_*` browser tools (the former `zen_*` names still route to them for
-  old skills). The vocabulary agents already know from Playwright MCP — `browser_navigate`,
-  `browser_navigate_back`, `browser_navigate_forward`, `browser_reload`, `browser_snapshot` (an
-  accessibility tree whose elements carry `[ref=eN]` handles), `browser_click` and
-  `browser_hover` (by ref, CSS selector, `text=…` or raw `x`/`y` viewport coordinates),
-  `browser_type`, `browser_press_key`, `browser_scroll`, `browser_select_option`,
-  `browser_wait_for`, `browser_take_screenshot` (viewport, `fullPage` or one element),
-  `browser_tabs` (list / new / close / move; `select`, `group` and `ungroup` stay as deprecated
-  aliases), `browser_read_page`, `browser_evaluate` — plus a small Zen layer: `ione_status`,
-  `ione_session` (status / end / rename), `ione_groups` (list / create / rename / close / adopt),
-  `ione_mode`, `ione_spaces`, `ione_history`, and the `ione://status`, `ione://tabs`,
-  `ione://tabs?scope=all` and `ione://tab/<id>/text` resources. Every page tool names the tab
-  it acts on with `tabId` (a tab id or a unique prefix of one – there is no current tab, and list
-  positions are refused because they shift under other agents). Arguments accept the usual
-  synonyms (`ref`/`selector` for `target`, `function` for `expression`, `folder` for `groupId`),
-  and every error says what would have worked.
-- **Foreground / background:** each agent chooses a mode with `ione_mode`. Foreground brings its tab
-  in front of you before every action and shows a labelled, coloured cursor; background drives its
-  own tabs without changing what you are looking at. The screen is a lease: while one agent has
-  acted in the foreground within the last 20 s, another agent's foreground calls run in the
-  background and its results say so. Agent-driven tabs are protected from the resource governor
-  while an agent holds them.
-- **Many agents, one browser:** every connection is its own session with a distinct colour and
-  identity, and it works in tab groups of its own – a home group named after the agent in a shared
-  `Agents` space that appears on demand (or a space of its own), never in your spaces. A tab is an
-  agent's because it sits in one of its groups; a coloured robot badge marks those tabs and a pill
-  shows how many agents are active. Another live agent's tabs cannot be addressed at all; your own
-  tabs need `allowForeign: true`, which never makes them the agent's, and your Essentials and
-  pinned tabs are never closed, moved or grouped. When an agent disconnects its groups stay open as
-  orphaned groups (`[orphaned, was "…"]`) for you to keep or for another agent to adopt with
-  `ione_groups adopt`; `ione_session {action: "end", closeTabs: true}` cleans up instead. When you
-  close or move an agent's tab, its next result starts with a notice saying so.
-- **Security:** loopback-only by default (local-network access is opt-in); `Origin` and `Host` are
-  validated to defeat DNS-rebinding; a new agent triggers an allow/deny prompt unless it presents
-  the connection token; private windows are never exposed and running scripts in pages
-  (`browser_evaluate`) is a toggle. The endpoint and token are shown in Settings → AI Agents.
+The tool set combines Playwright-style `browser_*` tools (navigate, snapshot, click, type, press
+key, scroll, select, wait, screenshot, tabs, read page, evaluate) with `ione_*` tools for status,
+sessions, groups, modes, spaces and history, plus `ione://` resources. Every page tool names its
+tab with `tabId`. Foreground agents bring their tab forward and show a labelled cursor; background
+agents drive their own tabs without changing what you are looking at. Each connection gets its own
+session and tab groups, and agent tabs are protected from the resource governor while held. The
+server is loopback-only by default, validates `Origin` and `Host` against DNS rebinding, asks for
+approval unless the client presents the connection token, never exposes private windows, and
+requires a toggle before `browser_evaluate` can run scripts in pages.
 
 ## Running it
 
-Requirements: Node 22+, Bun 1.4+ (the package manager and script runner).
+Requirements: Node 22.23.4+ and Bun 1.4+ (the package manager and script runner).
 
 ```bash
 bun install
@@ -261,6 +249,8 @@ bun run test         # vitest unit tests
 bun run check        # all of the above
 bun run build        # production bundle in out/
 bun run build:linux  # packaged app via electron-builder (also build:win / build:mac)
+bun run build:android            # debug APK
+bun run build:android:release    # release APK (R8)
 ```
 
 On a headless Linux box run with a display, e.g. `xvfb-run -a bun run dev`. Command-line flags:
@@ -269,20 +259,19 @@ switches: `--kiosk` (browser windows fullscreen without the chrome; F11 and Esc 
 `--user-data-dir=<path>` (the profile directory; one instance per directory, so two profiles run
 side by side), `--restore-last-session` (the last session comes back whatever "Restore previous
 session" says), `--start-maximized`; `--profile-directory=<name>` is accepted and ignored, Ione
-keeping one profile per user data directory. A second `ione` on the same profile hands its URLs
+keeping one profile per user-data directory. A second `ione` on the same profile hands its URLs
 and window flags to the running one; its `--kiosk`, `--start-maximized` and
 `--restore-last-session` change nothing there, as in Chrome.
 
 ## Setting up sync
 
-Zen syncs Spaces through a Mozilla account. A Chromium port has no access to Firefox Sync, so
-this build brings its own transport: Settings → Sync → choose a folder that is already synced
-between your computers (Dropbox, iCloud Drive, Google Drive, OneDrive, Nextcloud, Syncthing…) and
-a passphrase. Each device writes one AES-256-GCM encrypted file (`ione-sync/<device>.zensync`) into
-that folder; the folder never holds anything readable without the passphrase. Joining a folder
-that already has data asks whether to merge or keep only the joining device's data, just like Zen
-1.22. Conflicts resolve last-writer-wins per record (a space, a folder, a pinned tab, the settings
-blob, …), with edits stamped when they happen.
+Zen syncs Spaces through a Mozilla account. A Chromium port has no access to Firefox Sync, so Ione
+brings its own transport: Settings → Sync → choose a folder that is already synced between your
+computers (Dropbox, iCloud Drive, Google Drive, OneDrive, Nextcloud, Syncthing…) and a passphrase.
+Each device writes one AES-256-GCM encrypted file (`ione-sync/<device>.zensync`) into that folder;
+the folder never holds anything readable without the passphrase. Joining a folder that already has
+data asks whether to merge or keep only the joining device's data, just like Zen 1.22. Conflicts
+resolve last-writer-wins per record, with edits stamped when they happen.
 
 ## Android
 
@@ -299,13 +288,13 @@ bun run build:android:release    # release APK (R8) → android/app/build/output
 Or use Android Studio: open `android/`; the Gradle build runs the Vite build first (pass
 `-PskipWeb` to skip it when the assets are already built).
 
-The APK (applicationId `dev.haasele.ione`) is named after the version
-(`ione-<version>-release.apk`), its `versionName` is the
-`package.json` version and its `versionCode` is derived from it (`major·1000000 + minor·10000 +
-patch·100 + channel`, where a pre-release such as `-beta.2` sorts below the final release; pass
-`-PversionCode=…` or set `ZEN_ANDROID_VERSION_CODE` to override). A release build is signed with
-the keystore given by the environment or by Gradle properties (for example in
-`~/.gradle/gradle.properties`):
+The release APK (applicationId `dev.haasele.ione`) is staged as `ione-<version>.apk`; its
+`versionName` is the `package.json` version and its `versionCode` is derived from it
+(`major·1000000 + minor·10000 + patch·100 + channel`, where a pre-release such as `-beta.2` sorts
+below the final release; pass `-PversionCode=…` or set `ZEN_ANDROID_VERSION_CODE` to override). A
+release build is signed with the keystore given by the environment or by Gradle properties (for
+example in `~/.gradle/gradle.properties`). In CI the keystore is supplied as the
+`ANDROID_KEYSTORE_BASE64` secret and decoded to a temporary file:
 
 | Environment variable            | Gradle property                |                                  |
 | ------------------------------- | ------------------------------ | -------------------------------- |
@@ -317,7 +306,7 @@ the keystore given by the environment or by Gradle properties (for example in
 Without a keystore the release APK (like every debug build) is signed with the committed CI debug
 key `android/ci-debug.keystore` (alias and password `ione-ci-debug`). It is a debug key that
 anyone can sign with, but it is the same key everywhere, so debug-keyed builds – CI artifacts,
-local builds, GitHub releases made without the keystore secrets – upgrade each other in place,
+local builds and GitHub releases made without the keystore secrets – upgrade each other in place,
 including through the in-app updater. Moving to the project release key later means one final
 uninstall for those installs.
 
@@ -326,7 +315,7 @@ Developing the mobile chrome without a device:
 ```bash
 bun run dev:android              # http://localhost:41734 – the Android chrome in a desktop
                                  # browser with iframes as tabs (use DevTools device emulation)
-./gradlew installDebug -PdevServer=http://10.0.2.2:41734/   # emulator loads the dev server
+cd android && ./gradlew installDebug -PdevServer=http://10.0.2.2:41734/   # emulator loads the dev server
 ```
 
 Debug builds expose the chrome WebView (browser core + UI) and every tab in `chrome://inspect`.
@@ -344,18 +333,19 @@ switches layouts live.
 
 ### Feature parity on Android
 
-Everything in the table above that lives in the core works identically: Spaces, Essentials,
-pinned tabs, folders, Split View (grid / vertical / horizontal, resizable gutters), Glance
-(from the long-press link menu, or Alt/Ctrl/Shift+tap with a keyboard), the URL bar and its
-suggestions, Space Routing, containers (WebView profiles), themes, shortcuts, tab unloading,
-history, bookmarks, downloads (Android's download manager – no pause/resume), find in page,
-screenshots (to Downloads), save page (web archive), print, zoom, permissions remembered per
-site, `window.open` popups, session restore.
+Everything in the feature table that lives in the core works identically, including: Spaces,
+Essentials, pinned tabs, folders, Split View (grid / vertical / horizontal, resizable gutters),
+Glance (from the long-press link menu, or Alt/Ctrl/Shift+tap with a keyboard), the URL bar and
+its suggestions, Space Routing, containers (WebView profiles), themes, shortcuts, tab unloading,
+history, bookmarks,
+downloads (Android's download manager – no pause/resume), find in page, screenshots (to Downloads),
+save page (web archive), print, zoom, permissions remembered per site, `window.open` popups and
+session restore.
 
 Not available on Android: developer tools for pages (use `chrome://inspect`), view-source,
-Picture-in-Picture, window controls, Compact Mode's hover reveal (tap the edge instead), tab
-drag & drop with a finger (use the tab menu), per-tab mute is best-effort (mutes the page's
-media elements).
+Picture-in-Picture, window controls, Compact Mode's hover reveal (tap the edge instead), tab drag
+& drop with a finger (use the tab menu), per-tab mute is best-effort (mutes the page's media
+elements).
 
 ## Default shortcuts (Linux/Windows – Cmd replaces Ctrl on macOS)
 
@@ -387,63 +377,59 @@ field, where they stay the caret's line-start / line-end keys as in Chrome.
 ## Releasing
 
 The version in `package.json` is the single source of truth: the desktop About dialog reads it,
-the Android `versionName` / `versionCode` are derived from it, and a release tag must be `v` +
-that version (the Release workflow refuses anything else).
+the Android `versionName` / `versionCode` are derived from it, and a release tag must be `v` plus
+that version. `release-desktop.yml` refuses a tag that does not match.
 
-1. Run the **Prepare release** workflow (Actions → Prepare release → Run workflow) and pick a
-   bump: `patch`, `minor`, `major`, a `pre*` bump with a pre-release identifier (`preminor` +
-   `beta` turns `0.1.0` into `0.2.0-beta.0`), or `custom` with an exact version. It runs the
-   checks, commits `chore(release): vX.Y.Z` with the updated `package.json` / `bun.lock`,
-   tags the commit and starts the **Release** workflow. The equivalent from a checkout is
-   `bun run release -- minor` (also `patch`, `major`, `preminor --preid beta`, `prerelease`, or an
-   exact version; `--dry-run` previews): it checks that `main` is clean and up to date, bumps,
-   commits, tags and pushes.
-2. **Release** validates the tag, runs `bun run check`, builds every package in parallel (Linux
-   x64 + arm64, Windows x64 + arm64, macOS x64 + arm64, Android), assembles `update-manifest.json`
-   (signed when `UPDATE_MANIFEST_SIGNING_KEY` exists), the `latest*.yml` updater feeds,
-   `SHA256SUMS.txt` and the notes (download table, per-platform install and update steps, changes
-   since the previous release), and publishes them as a GitHub release with build provenance
-   attestations. The release is a draft until every package is in place, so a failed job never
-   leaves a half-published release: fix and re-run the failed jobs, or dispatch **Release** again
-   with the tag. Versions with a pre-release suffix are published as pre-releases.
-3. Dispatching **Release** from a branch with _dry run_ enabled builds everything and keeps the
-   packages as workflow artifacts without publishing – the way to test packaging changes. Pull
-   requests that touch the pipeline (`release.yml`, `.github/scripts`, `electron-builder.yml`,
-   `build/`) run the same dry run automatically.
+Stable release:
 
-**CI** (`.github/workflows/ci.yml`) runs on every push and pull request: typecheck, lint, tests,
-an unpacked Linux electron-builder run, an Android debug APK (kept as a workflow artifact for a
-week) and actionlint over the workflows themselves. Dependabot keeps the GitHub Actions and package
-dependencies current.
+1. Bump the version in `package.json` and commit the change to `main`.
+2. Tag the commit `v<version>` and push the tag.
+3. `release-desktop.yml` validates the tag, runs the shared packaging workflow, generates
+   `update-manifest.json` (plus `.sig` when `UPDATE_MANIFEST_SIGNING_KEY` is set),
+   `SHA256SUMS.txt` and the `latest*.yml` feeds, and publishes the GitHub release. A version with a
+   pre-release suffix is published as a pre-release.
+4. `workflow_dispatch` runs the same builds without publishing, which is the way to test packaging
+   changes.
 
-Code signing is optional and switched on by adding repository secrets; without them the packages
-are built unsigned and the release notes tell users how to open them:
+Nightly release: `.github/workflows/nightly.yml` runs on every push to `main` and on
+`workflow_dispatch`. It strips any existing pre-release suffix from the `package.json` version,
+builds `v<version>-nightly.<run>`, and publishes it as a GitHub pre-release with the same package
+set and updater metadata. Nightlies never become the repository's "latest" release and are only
+offered to clients on the beta update channel.
+
+Both workflows call the same reusable packaging workflow, so the Windows, macOS, Linux and Android
+artifacts stay in sync.
+
+Code signing is optional and switched on by adding repository secrets; without them Windows and
+Linux packages are unsigned and macOS builds are ad-hoc signed:
 
 | Secrets                                                                                             | Effect                                                                                                                                     |
 | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `MAC_CERTIFICATE_P12_BASE64`, `MAC_CERTIFICATE_PASSWORD`                                            | Sign the macOS app with a Developer ID Application certificate (`base64 -w0 certificate.p12`)                                              |
+| `CSC_LINK`, `CSC_KEY_PASSWORD`                                                                      | Sign the macOS app with a Developer ID Application certificate (`base64 -w0 certificate.p12`)                                              |
 | `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`                                          | Notarize the signed macOS app                                                                                                              |
-| `WINDOWS_CERTIFICATE_P12_BASE64`, `WINDOWS_CERTIFICATE_PASSWORD`                                    | Authenticode-sign the Windows installers                                                                                                   |
-| `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` | Sign the APK with a release keystore (`base64 -w0 release.keystore`); until then it is signed with the committed CI debug key (`android/ci-debug.keystore`), which upgrades other CI-debug-keyed builds in place but is not a release key |
+| `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD`                                                              | Authenticode-sign the Windows installers                                                                                                   |
+| `ANDROID_KEYSTORE_BASE64`, `ZEN_ANDROID_KEYSTORE_PASSWORD`, `ZEN_ANDROID_KEY_ALIAS`, `ZEN_ANDROID_KEY_PASSWORD` | Sign the APK with a release keystore (the base64 keystore is decoded to a temporary file for the build); until then it is signed with the committed CI debug key (`android/ci-debug.keystore`), which upgrades other CI-debug-keyed builds in place but is not a release key |
+| `UPDATE_MANIFEST_SIGNING_KEY`                                                                       | Sign `update-manifest.json` with the ed25519 private key (base64 or PEM)                                                                   |
 
 ## Credits
 
-Ione continues the browser originally built as **Zenium** by
-[BenItBuhner](https://github.com/BenItBuhner). Huge thanks for the original port of Zen's
-experience to Chromium and for the work this tree builds on. The original release archive lives
-at [github.com/BenItBuhner/Zenium/releases](https://github.com/BenItBuhner/Zenium/releases).
+Ione continues the browser originally built as **Zenium** by **BenItBuhner**; thanks for the
+original port of Zen's experience to Chromium and for the work this tree builds on.
 
-Zen itself is made by the [Zen Browser](https://zen-browser.app) team; Ione is an independent
-port and is not affiliated with either project.
+Zen itself is made by the [Zen Browser](https://zen-browser.app) team. Ione is an independent port
+and is not affiliated with the Zen Browser team or the original Zenium project.
 
 ## Notes
 
+- The selection mini menu (Copy, Search, Define, Translate, Listen) is off by default. Turn it
+  on in Settings → Look and Feel → Appearance → **Show the mini menu when text is selected**.
 - The Glance trigger (Alt+click) can be swallowed by desktop environments that use Alt+click to
   move windows; change the trigger in Settings → Look and Feel → Glance if that happens.
 - Ctrl+Alt+←/→ are also common desktop-workspace shortcuts on Linux; rebind them if your window
   manager grabs them first.
 - Zen 1.21 lets you drag the window from empty space at the top of a web page. Pages here are
   native child views, so the chrome cannot intercept those drags; use the sidebar / toolbar.
-- Extensions use Electron's Chrome-extension support, which covers content scripts, `storage`,
-  `webRequest`, `scripting`, `runtime` messaging and DevTools panels but not the full Chrome API;
-  extensions that rely on unsupported APIs will report errors in the Add-ons manager.
+- On desktop, extensions use Electron's Chrome-extension support; Android runs them in the
+  chrome's WebView host. Coverage includes content scripts, `storage`, `webRequest`, `scripting`,
+  `runtime` messaging and (on desktop) DevTools panels, but not the full Chrome API; extensions
+  that rely on unsupported APIs will report errors in the Add-ons manager.

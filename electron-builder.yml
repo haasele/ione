@@ -47,7 +47,8 @@ publish:
   repo: ione
   releaseType: release
 # Every artifact name carries the CPU architecture so that the x64 and arm64 builds of one release
-# can sit next to each other on the GitHub release page (see .github/workflows/release.yml).
+# can sit next to each other on the GitHub release page (see
+# .github/workflows/release-desktop.yml).
 win:
   executableName: ione
   # One installer/archive per architecture. Build one arch per electron-builder invocation

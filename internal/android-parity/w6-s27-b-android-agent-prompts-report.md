@@ -8,7 +8,7 @@ stackedOn: 745
 
 # W6-S27-b — Android: file chooser, client certificate, downloads' Save As and print through `agentPrompts`
 
-PR: https://github.com/BenItBuhner/Ione/pull/755 (draft, base `main`).
+PR: #755 (draft, base `main`; historical, in the former upstream repository).
 
 The task said to stack on `cursor/mcp-native-prompts-5c87` (#745). #745 merged to `main` while this
 was being built and its branch was deleted, so the PR is opened against `main` with `main` merged in
@@ -123,7 +123,7 @@ Local, on the tree with `main` merged (`944196b87`, after #743/#752):
 | `bunx vitest run src/android/__tests__/agentPrompts.test.ts src/android/__tests__/views.test.ts`                                                         | 28 passed                                                             |
 | `cd android && ANDROID_HOME=$HOME/android-sdk ./gradlew testDebugUnitTest assembleDebug compileDebugAndroidTestKotlin -PskipWeb --no-daemon` (CI's set) | BUILD SUCCESSFUL; `AgentPromptsTest` tests=10 failures=0 errors=0     |
 
-CI (PR #755, head `944196b87`): run [36840613003](https://github.com/BenItBuhner/Ione/actions/runs/36840613003)
+CI (PR #755, head `944196b87`): run 36840613003 (historical upstream)
 — Typecheck, lint, test / Android debug APK / Desktop boot smoke (Linux) / Bundle on a case-insensitive
 filesystem / Accounts backend and website / Workflow lint (actionlint): all pass.
 
@@ -230,7 +230,7 @@ PR files); `bunx vitest run src/android/__tests__/agentPrompts.test.ts src/andro
 src/android/__tests__/platformAgentPrompts.test.ts` 37 passed; `cd android && ./gradlew :app:testDebugUnitTest
 -PskipWeb --no-daemon` BUILD SUCCESSFUL, `AgentPromptsTest` tests=14 failures=0 (SDK ad hoc under `/tmp/android-sdk`,
 no `local.properties`); full `bun run test` 1153 files / 16259 tests passed, full `testDebugUnitTest` 0 failures.
-CI: run [36851638723](https://github.com/BenItBuhner/Ione/actions/runs/36851638723) on `925161d9c` (the second
+CI: run 36851638723 (historical upstream) on `925161d9c` (the second
 `main` merge, code as folded) – all six jobs pass; so did run 36847972983 on `6aa54bddf` (first report commit). Runs
 36847606927 and 36849298590 were superseded by the pushes that followed them. The commit correcting this paragraph
 touches only this report.
