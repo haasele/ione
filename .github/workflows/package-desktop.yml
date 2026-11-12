@@ -97,8 +97,11 @@ jobs:
           # Both macOS architectures are built in one job on purpose: electron-builder then
           # writes a single latest-mac.yml that lists the x64 and arm64 zips, which the
           # updater needs. Separate jobs would overwrite each other's feed.
+          # An Intel runner cross-builds both architectures. The default `macos-15` label
+          # points at arm64 runners, which GitHub cancels after long capacity queues ("The job
+          # was not acquired by Runner of type hosted"); this job builds x64 and arm64 anyway.
           - name: macOS x64 + arm64
-            os: macos-15
+            os: macos-15-intel
             platform: mac
     steps:
       - name: Check out
