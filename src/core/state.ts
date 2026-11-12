@@ -934,6 +934,9 @@ export class BrowserState {
         : DEFAULT_SETTINGS.windowTransparency
     // Native frame on/off: a profile from before the key, or anything but a boolean, reads off.
     this.settings.nativeWindowControls = data.settings?.nativeWindowControls === true
+    // Automatic picture-in-picture is opt-in: a profile from before the key, or anything but a
+    // boolean, reads off.
+    this.settings.autoPictureInPicture = data.settings?.autoPictureInPicture === true
     this.settings.toolbarPins = sanitizeToolbarPins(data.settings?.toolbarPins)
     this.settings.devtoolsDock = sanitizeDevtoolsDock(
       data.settings?.devtoolsDock,

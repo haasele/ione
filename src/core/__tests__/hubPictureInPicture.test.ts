@@ -342,6 +342,7 @@ describe('the toast event and the first automatic entry’s toast (MW-28)', () =
   it('tells the site’s first automatic entry once, "Turn off for this site" denies the site through the permissions service and brings the video back, and the memory holds across a restart', async () => {
     const io = memoryIo()
     const f = fixture('none', io)
+    f.browser.state.settings.autoPictureInPicture = true
     const { tab, win } = videoTab(f)
     f.browser.popups.activate(tab.id)
     // Away to another tab: the video goes into the small window, and the toast says so.

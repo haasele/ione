@@ -308,6 +308,8 @@ export const DEFAULT_SETTINGS: Settings = {
   containerSpecificEssentials: true,
   essentialsMax: 12,
   newTabPosition: 'end',
+  // Opt-in: automatic picture-in-picture stays quiet until the user asks for it.
+  autoPictureInPicture: false,
   startup: { mode: 'continue', pages: [] },
   warnOnCloseWindow: true,
   warnBeforeQuitting: true,

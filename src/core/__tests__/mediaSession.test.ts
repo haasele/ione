@@ -99,6 +99,8 @@ function harness(
     pictureInPicture?: boolean
     /** The host has the chrome's media hub, with this linger (ms) for a paused session (the desktop); absent for the phone. */
     mediaHub?: number
+    /** The profile's opt-in for automatic picture-in-picture; true for the feature's own tests. */
+    autoPip?: boolean
   } = {}
 ): Harness {
   const views = new Map<string, FakeView>()
@@ -143,7 +145,10 @@ function harness(
       mediaSession: host,
       mediaHub: options.mediaHub === undefined ? undefined : { inactiveAfterMs: options.mediaHub }
     },
-    state: { capabilities: { pictureInPicture: options.pictureInPicture ?? true } },
+    state: {
+      capabilities: { pictureInPicture: options.pictureInPicture ?? true },
+      settings: { autoPictureInPicture: options.autoPip ?? true }
+    },
     tabs: {
       allViews: () => views.entries(),
       view: (id: string) => views.get(id),
@@ -1085,6 +1090,19 @@ describe('automatic picture-in-picture (MW-28)', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('stays quiet for a profile that has not opted in', async () => {
+    h = harness({ host: false, autoPip: false })
+    h.addTab('film', 'https://video.example/watch', 'A film')
+    h.addTab('docs', 'https://docs.example/', 'Docs')
+    h.activated.add('film')
+    win = h.addWindow('w1', ['film'])
+    play(h, 'film', video())
+    h.show(win, ['docs'])
+    await settle()
+    expect(entered('film')).toBe(0)
+    expect(h.service.autoPictureInPictureTab).toBeNull()
   })
 
   it('puts the playing video into the small window when its tab leaves the screen, and brings it back on return', async () => {

@@ -7072,6 +7072,30 @@ describe('CT-07 / CT-19: the Spell check group of Languages on a phone', () => {
   })
 })
 
+describe('automatic picture-in-picture is opt-in', () => {
+  it('ships off and turns on from Tab Management', () => {
+    expect(DEFAULT_SETTINGS.autoPictureInPicture).toBe(false)
+    const desktop = state({
+      platform: 'linux',
+      capabilities: { ...ANDROID, windows: true, pictureInPicture: true }
+    })
+    const c = context(desktop)
+    const tabs = buildSection(PAGE.sections.find((x) => x.id === 'tabs')!, c.ctx)
+    const auto = row(tabs, 'auto-picture-in-picture')
+    if (auto.kind !== 'switch') throw new Error('not a switch')
+    expect(auto.label).toBe('Open videos in picture-in-picture automatically')
+    expect(auto.checked).toBe(false)
+    auto.onChange(true)
+    expect(c.patches).toEqual([{ autoPictureInPicture: true }])
+    // The phone host has its own automatic entry; the desktop row is not offered there.
+    const phone = buildSection(
+      PAGE.sections.find((x) => x.id === 'tabs')!,
+      context().ctx
+    )
+    expect(findRow(phone.groups, 'auto-picture-in-picture')).toBeNull()
+  })
+})
+
 describe('CT-22: sleeping tabs in Tab Management on a phone, in Edge’s words', () => {
   it('has the switch and the 30 s to 12 h ladder, dependent on the switch', () => {
     const c = context()

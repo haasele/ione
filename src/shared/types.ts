@@ -3574,6 +3574,14 @@ export interface Settings {
   essentialsMax: number
   newTabPosition: NewTabPosition
   /**
+   * Desktop: let a playing video move into its floating small window by itself when its tab
+   * leaves the screen or Ione loses the focus. Off by default (the user asked for automatic PiP
+   * to be opt-in); the site's `auto-picture-in-picture` permission still has to allow it. Read by
+   * `MediaSessionService.autoPipSupported`. Device-local: whether a machine's window manager and
+   * workflow want the floating video is that machine's choice.
+   */
+  autoPictureInPicture: boolean
+  /**
    * Chrome's Settings › On startup (settings-47): what the first window of a run opens on – the
    * New Tab page, the last session's pages ("Continue where you left off"), or a fixed set of
    * pages. Replaces the 0.4.x `restoreSession` switch, folded in on load (`applyPersisted`:

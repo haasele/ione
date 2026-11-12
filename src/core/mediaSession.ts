@@ -827,9 +827,10 @@ export class MediaSessionService {
 
   /**
    * `win` shows other tabs than a moment ago (the active tab changed, the space switched, a
-   * split formed or a tab moved windows: `TabManager` says so after every such change). A tab
-   * that left the screen everywhere while an eligible video played goes into the small window
-   * without a click, as Chrome's automatic picture-in-picture does when the tab is hidden; the
+   * split formed or a tab moved windows: `TabManager` says so after every such change). When
+   * the profile opted in (`Settings.autoPictureInPicture`, off by default), a tab that left
+   * the screen everywhere while an eligible video played goes into the small window without a
+   * click; the
    * tab in front again, its video comes back to the page. Eligibility is Chrome's rule as the
    * hub sees it ({@link eligibleForAuto}): a video playing with a media session, on a page the
    * user interacted with, not private, the site's `auto-picture-in-picture` setting allowing.
@@ -917,6 +918,9 @@ export class MediaSessionService {
    */
   private autoPipSupported(): boolean {
     return (
+      // Opt-in: the setting ships off, so a tab switch or a blur never opens a floating video
+      // until the user asks for it.
+      this.browser.state.settings.autoPictureInPicture === true &&
       !this.browser.platform.mediaSession?.enterPictureInPicture &&
       this.browser.state.capabilities.pictureInPicture
     )

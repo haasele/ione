@@ -54,7 +54,13 @@ function tab(id: string): Tab {
     splitGroupId: null,
     createdAt: 0,
     lastActiveAt: 0,
-    errorCode: null
+    errorCode: null,
+    bookmarked: false,
+    readerable: false,
+    blockedCount: 0,
+    openerTabId: null,
+    fromIntent: false,
+    webApp: null
   }
 }
 

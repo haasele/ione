@@ -290,6 +290,7 @@ describe('collectLocal', () => {
       'nativeWindowControls',
       'bookmarkRowSortOrder',
       'bookmarkRowDisplay',
+      'autoPictureInPicture',
       'iph',
       'clearBrowsingDataRange',
       'proxy'

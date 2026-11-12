@@ -1952,6 +1952,28 @@ function tabsSection({ state, set }: SectionContext): RowGroup[] {
           ],
           onChange: (v) => set({ newTabPosition: v })
         }),
+        ...(windows && state.capabilities.pictureInPicture
+          ? [
+              {
+                kind: 'switch',
+                id: 'auto-picture-in-picture',
+                label: 'Open videos in picture-in-picture automatically',
+                description:
+                  'When a video is playing and you switch tabs or leave Ione, it moves to a small floating window. Off: the video stays in its tab. The site’s Automatic picture-in-picture permission still has to allow it.',
+                keywords: [
+                  'pip',
+                  'floating',
+                  'video',
+                  'switch tabs',
+                  'minimise',
+                  'minimize',
+                  'background'
+                ],
+                checked: s.autoPictureInPicture,
+                onChange: (v) => set({ autoPictureInPicture: v })
+              } satisfies SettingsRow
+            ]
+          : []),
         {
           kind: 'switch',
           id: 'tab-separator',

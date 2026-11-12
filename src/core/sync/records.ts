@@ -695,6 +695,8 @@ export const DEVICE_LOCAL_SETTINGS = [
   'nativeWindowControls',
   'bookmarkRowSortOrder',
   'bookmarkRowDisplay',
+  // Automatic picture-in-picture is this desktop's window behaviour, not another device's.
+  'autoPictureInPicture',
   'iph',
   'clearBrowsingDataRange',
   // Named servers and their passwords are this machine's (Settings › System).
