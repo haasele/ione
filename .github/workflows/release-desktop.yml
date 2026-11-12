@@ -1,0 +1,280 @@
+name: Release desktop packages
+
+# Builds the desktop packages for every supported OS/architecture, keeps them as workflow
+# artifacts, and (for v* tags only) attaches them to the GitHub release. Ordinary pushes and
+# pull requests never reach the publish job; use workflow_dispatch to test packaging on a
+# branch without creating a release.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Least privilege: build jobs only read the repository. The release job below raises this
+# to contents: write for the tag upload.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read package.json version and check the tag
+        id: version
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME must be v$version (the version in package.json)"
+            exit 1
+          fi
+
+  build:
+    name: ${{ matrix.name }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-24.04
+            platform: linux
+          - name: Windows x64
+            os: windows-2022
+            platform: win
+          # Both macOS architectures are built in one job on purpose: electron-builder then
+          # writes a single latest-mac.yml that lists the x64 and arm64 zips, which the
+          # updater needs. Separate jobs would overwrite each other's feed.
+          - name: macOS x64 + arm64
+            os: macos-15
+            platform: mac
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Cache Bun's install cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-bun-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Linux packaging tools
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm flatpak flatpak-builder
+          # electron-builder's flatpak target installs the runtime, SDK and Electron base
+          # app into the per-user flatpak installation, so the remote must exist first.
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive --no-deps --arch=x86_64 flathub \
+            org.freedesktop.Platform//24.08 \
+            org.freedesktop.Sdk//24.08 \
+            org.electronjs.Electron2.BaseApp//24.08
+
+      - name: Build application
+        run: bun run build
+
+      - name: Package Linux
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: bunx electron-builder --linux --x64 --publish never
+
+      - name: Package Windows
+        if: matrix.platform == 'win'
+        env:
+          # Windows-only certificate secrets. Empty values are ignored by electron-builder's
+          # Windows signer, so unsigned builds still work.
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: bunx electron-builder --win --x64 --publish never
+
+      - name: Configure macOS signing
+        if: matrix.platform == 'mac'
+        shell: bash
+        env:
+          CSC_LINK_SECRET: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD_SECRET: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID_SECRET: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD_SECRET: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID_SECRET: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Only export the variables that are actually configured. An empty CSC_LINK makes
+          # electron-builder try to import an empty keychain entry instead of skipping signing.
+          if [ -n "$CSC_LINK_SECRET" ]; then
+            echo "CSC_LINK=$CSC_LINK_SECRET" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$CSC_KEY_PASSWORD_SECRET" ]; then
+            echo "CSC_KEY_PASSWORD=$CSC_KEY_PASSWORD_SECRET" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$APPLE_ID_SECRET" ]; then
+            echo "APPLE_ID=$APPLE_ID_SECRET" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$APPLE_APP_SPECIFIC_PASSWORD_SECRET" ]; then
+            echo "APPLE_APP_SPECIFIC_PASSWORD=$APPLE_APP_SPECIFIC_PASSWORD_SECRET" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$APPLE_TEAM_ID_SECRET" ]; then
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID_SECRET" >> "$GITHUB_ENV"
+          fi
+
+      - name: Package macOS
+        if: matrix.platform == 'mac'
+        shell: bash
+        run: bunx electron-builder --mac --x64 --arm64 --publish never
+
+      - name: Stage install.sh
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          cp build/linux/install.sh dist/install.sh
+          chmod +x dist/install.sh
+
+      - name: Upload Linux packages
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ione-linux-x64-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+            dist/*.flatpak
+            dist/install.sh
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Linux updater metadata
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ione-linux-x64-feed-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/latest-linux.yml
+            dist/*.blockmap
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload Windows packages
+        if: matrix.platform == 'win'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ione-windows-x64-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/*-x64-setup.exe
+            dist/*-x64.msi
+            dist/*-x64-portable.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Windows updater metadata
+        if: matrix.platform == 'win'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ione-windows-x64-feed-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/latest.yml
+            dist/*.blockmap
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload macOS x64 packages
+        if: matrix.platform == 'mac'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ione-macos-x64-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/*-x64.dmg
+            dist/*-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload macOS arm64 packages
+        if: matrix.platform == 'mac'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ione-macos-arm64-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/*-arm64.dmg
+            dist/*-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload macOS updater metadata
+        if: matrix.platform == 'mac'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ione-macos-feed-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/latest-mac.yml
+            dist/*.blockmap
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    # workflow_dispatch runs stop at the artifacts; only a v* tag publishes.
+    if: github.ref_type == 'tag'
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ione-*
+          path: release
+          merge-multiple: true
+
+      - name: Write SHA256SUMS.txt
+        shell: bash
+        run: |
+          cd release
+          sha256sum ./* > SHA256SUMS.txt
+
+      - name: Create or update the tagged release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            args=(--draft --generate-notes --title "Ione $VERSION" --verify-tag)
+            case "$VERSION" in
+              *-*) args+=(--prerelease) ;;
+            esac
+            gh release create "$TAG" "${args[@]}"
+          fi
+          gh release upload "$TAG" release/* --clobber
+          gh release edit "$TAG" --draft=false

@@ -50,10 +50,16 @@ publish:
 # can sit next to each other on the GitHub release page (see .github/workflows/release.yml).
 win:
   executableName: ione
-  # One NSIS installer per architecture. Build one arch per electron-builder invocation
-  # (--x64 / --arm64); asking for both at once merges them into a single installer.
+  # One installer/archive per architecture. Build one arch per electron-builder invocation
+  # (--x64 / --arm64); asking for both at once merges the NSIS installers into one.
+  # `zip` is the portable build: electron-builder's ArchiveTarget packs the unpacked app
+  # directory, not the NSIS installer (see .github/workflows/release-desktop.yml).
   target:
     - nsis
+    - msi
+    - zip
+  # Only the `zip` target inherits this pattern: `nsis` and `msi` override it below.
+  artifactName: ${name}-${version}-${arch}-portable.${ext}
 nsis:
   artifactName: ${name}-${version}-${arch}-setup.${ext}
   shortcutName: ${productName}
@@ -63,6 +69,14 @@ nsis:
   # program. The include removes the old installation silently and keeps its user data for the
   # app to migrate on first launch (src/main/platform/legacyPaths.ts).
   include: build/installer.nsh
+# MSI for environments that deploy browsers through Group Policy / Intune / SCCM. Assisted
+# (non-one-click) UI so the user can pick the install location; per-user by default like NSIS.
+msi:
+  artifactName: ${name}-${version}-${arch}.${ext}
+  oneClick: false
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  runAfterFinish: true
 mac:
   target:
     - target: dmg
@@ -129,6 +143,8 @@ linux:
   target:
     - AppImage
     - deb
+    - rpm
+    - flatpak
   maintainer: Bennett Buhner <136861830+BenItBuhner@users.noreply.github.com>
   category: Network
   # Existing types only (no mime-info file of our own); `protocols` above adds the URL schemes.
@@ -175,6 +191,41 @@ deb:
   # package names) kept for one release so agent configs that launch them with --mcp keep working.
   afterInstall: build/linux/after-install.sh
   afterRemove: build/linux/after-remove.sh
+rpm:
+  artifactName: ${name}-${version}-${arch}.${ext}
+  # fpm's rpm defaults (gtk3, nss, libnotify, …) already cover Electron; the repo's deb
+  # aliases (zenium/zen-chromium) are deb-only and do not apply here.
+flatpak:
+  artifactName: ${name}-${version}-${arch}.${ext}
+  # The Flatpak id is the top-level appId (dev.haasele.ione); the target filters it to
+  # the reverse-DNS form Flatpak requires.
+  # Flathub's shared runtime/base pair. Keep the three versions in lockstep: the Electron2
+  # BaseApp is built against the matching org.freedesktop.Platform/Sdk branch.
+  runtime: org.freedesktop.Platform
+  runtimeVersion: '24.08'
+  sdk: org.freedesktop.Sdk
+  base: org.electronjs.Electron2.BaseApp
+  baseVersion: '24.08'
+  # zypak's wrapper picks the Wayland flags when the session is Wayland; X11 still works
+  # through the fallback socket. The permissions below are what a browser needs: network,
+  # display, audio, GPU, and the home directory (downloads, file pickers, uploads).
+  useWaylandFlags: true
+  finishArgs:
+    - --share=network
+    - --socket=wayland
+    - --socket=fallback-x11
+    - --share=ipc
+    - --device=dri
+    - --socket=pulseaudio
+    - --filesystem=home
+    - --filesystem=xdg-download
+    - --talk-name=org.freedesktop.Notifications
+    - --talk-name=org.freedesktop.ScreenSaver
+    - --talk-name=org.freedesktop.secrets
+    # mpris-service publishes org.mpris.MediaPlayer2.ione (plus .instanceNNN for a second
+    # running copy) for desktop media controls.
+    - --own-name=org.mpris.MediaPlayer2.ione
+    - --own-name=org.mpris.MediaPlayer2.ione.*
 appImage:
   artifactName: ${name}-${version}-${arch}.${ext}
 npmRebuild: false
