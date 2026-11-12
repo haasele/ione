@@ -3,6 +3,7 @@ import type { HostCapabilities, Platform as Os } from '../../shared/types'
 import { Browser } from '../browser'
 import type {
   AppHost,
+  EditCommand,
   KeyEventInput,
   Platform,
   StoreIO,
@@ -40,7 +41,7 @@ function stub<T extends object>(overrides: Partial<T> = {}): T {
   })
 }
 
-function fakePlatform(io: StoreIO, os: Os): Platform {
+function fakePlatform(io: StoreIO, os: Os, edits: EditCommand[]): Platform {
   const capabilities = stub<HostCapabilities>({
     windows: true,
     updates: false,
@@ -69,7 +70,8 @@ function fakePlatform(io: StoreIO, os: Os): Platform {
         stub<TabView>({
           isDestroyed: () => false,
           isVisible: () => true,
-          getZoom: () => 1
+          getZoom: () => 1,
+          editCommand: (command) => void edits.push(command)
         })
     }),
     menus: stub(),
@@ -84,13 +86,13 @@ function fakePlatform(io: StoreIO, os: Os): Platform {
   }
 }
 
-function start(os: Os = 'darwin'): {
+function start(os: Os = 'darwin', edits: EditCommand[] = []): {
   browser: Browser
   win: ZenWindow
   tabId: string
   ran: string[]
 } {
-  const browser = new Browser(fakePlatform(memoryIo(), os))
+  const browser = new Browser(fakePlatform(memoryIo(), os, edits))
   browser.start()
   const win = browser.allWindows()[0] as ZenWindow
   const tab = browser.tabs.createTab({ url: 'https://example.com/', active: true }, win)
@@ -161,6 +163,41 @@ describe('⌘← and ⌘→ from a page on macOS', () => {
     browser.tabs.closeTab(other, false, win)
     browser.keys.setEditing(tabId, false)
     expect(browser.keys['editing'].size).toBe(0)
+  })
+})
+
+describe('clipboard chords from a page', () => {
+  it('copy with Ctrl+C or Ctrl+Shift+C, and paste with Ctrl+V or Ctrl+Shift+V, in the focused frame', () => {
+    const edits: EditCommand[] = []
+    const { browser, win, tabId, ran } = start('linux', edits)
+    expect(browser.keys.handle(press('c', { control: true }), tabId, win)).toBe(true)
+    expect(browser.keys.handle(press('C', { control: true, shift: true }), tabId, win)).toBe(true)
+    expect(browser.keys.handle(press('v', { control: true }), tabId, win)).toBe(true)
+    expect(browser.keys.handle(press('V', { control: true, shift: true }), tabId, win)).toBe(true)
+    expect(edits).toEqual(['copy', 'copy', 'paste', 'paste'])
+    // Shift+C is the page's copy, not Inspect Element, while a page has the keyboard.
+    expect(ran).toEqual([])
+  })
+
+  it('uses Command on macOS and leaves Ctrl to the page', () => {
+    const edits: EditCommand[] = []
+    const { browser, win, tabId } = start('darwin', edits)
+    expect(browser.keys.handle(press('c', { meta: true }), tabId, win)).toBe(true)
+    expect(browser.keys.handle(press('V', { meta: true, shift: true }), tabId, win)).toBe(true)
+    expect(browser.keys.handle(press('c', { control: true }), tabId, win)).toBe(false)
+    expect(edits).toEqual(['copy', 'paste'])
+  })
+
+  it('leaves the chrome and Alt chords to the document', () => {
+    const edits: EditCommand[] = []
+    const { browser, win, tabId, ran } = start('linux', edits)
+    expect(browser.keys.handle(press('c', { control: true }), null, win)).toBe(false)
+    expect(browser.keys.handle(press('v', { control: true }), null, win)).toBe(false)
+    // Ctrl+Alt+C is Copy Current URL in the Chrome preset; the page clipboard leaves it be.
+    expect(browser.keys.handle(press('c', { control: true, alt: true }), tabId, win)).toBe(true)
+    expect(browser.keys.handle(press('z', { control: true, alt: true }), tabId, win)).toBe(false)
+    expect(ran).toEqual(['tab.copyUrl'])
+    expect(edits).toEqual([])
   })
 })
 

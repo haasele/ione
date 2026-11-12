@@ -421,6 +421,8 @@ and is not affiliated with the Zen Browser team or the original Zenium project.
 
 ## Notes
 
+- In a page, Ctrl+C or Ctrl+Shift+C copies the selection and Ctrl+V or Ctrl+Shift+V pastes
+  (Command replaces Ctrl on macOS); the page context menu offers the same actions.
 - The selection mini menu (Copy, Search, Define, Translate, Listen) is off by default. Turn it
   on in Settings → Look and Feel → Appearance → **Show the mini menu when text is selected**.
 - The Glance trigger (Alt+click) can be swallowed by desktop environments that use Alt+click to

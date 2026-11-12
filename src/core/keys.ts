@@ -1,7 +1,8 @@
 import { isModifierKey, matchShortcut } from '../shared/shortcuts'
 import { pageWindowAction } from './actions'
 import type { Browser } from './browser'
-import type { KeyEventInput } from './platform'
+import type { EditCommand, KeyEventInput } from './platform'
+import type { Platform as PlatformOs } from '../shared/types'
 import type { ZenWindow } from './window'
 
 /**
@@ -38,6 +39,20 @@ export class KeyboardHandler {
     // The Settings recorder owns the chrome's keys while it listens: the chord it records must
     // not also run (BUG-044). Pages keep their shortcuts; the recorder has no focus there.
     if (win.recordingShortcut && sourceTabId === null) return false
+
+    // Editing chords belong to the page's focused frame, not to the chrome's shortcut table:
+    // Ctrl/Cmd+C and Ctrl/Cmd+Shift+C copy its selection, Ctrl/Cmd+V and Ctrl/Cmd+Shift+V paste
+    // into its field (the same `editCommand` the page menu's Cut/Copy/Paste rows use). Handling
+    // them here also gives Shift+C its copy meaning on a page, where Ctrl+Shift+C is Chrome's
+    // Inspect Element chord; the shortcut table would otherwise consume it first.
+    if (sourceTabId !== null) {
+      const command = clipboardEditCommand(input, this.browser.platform.info.os)
+      const view = command ? this.browser.tabs.view(sourceTabId) : undefined
+      if (command && view?.editCommand) {
+        view.editCommand(command)
+        return true
+      }
+    }
 
     const shortcut = matchShortcut(this.browser.state.shortcuts, input)
     if (shortcut) {
@@ -114,6 +129,21 @@ function isCaretChord(input: KeyEventInput): boolean {
     input.key === 'ArrowUp' ||
     input.key === 'ArrowDown'
   )
+}
+
+/**
+ * The page editing command a clipboard chord asks for: the platform accelerator (Ctrl outside
+ * macOS, Command on it) with C or V, Shift or not. Alt is never one of them – Ctrl+Alt+C is
+ * Copy Current URL in the Zen preset, and Ctrl+Alt+V belongs to the page.
+ */
+function clipboardEditCommand(input: KeyEventInput, os: PlatformOs): EditCommand | null {
+  if (input.alt) return null
+  const accel = os === 'darwin' ? input.meta && !input.control : input.control && !input.meta
+  if (!accel) return null
+  const key = input.key.toLowerCase()
+  if (key === 'c') return 'copy'
+  if (key === 'v') return 'paste'
+  return null
 }
 
 const REPEATABLE = new Set([
