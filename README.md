@@ -52,6 +52,8 @@ migrate the old app's private data.
 
 Ione ships **uBlock Origin Lite** as a built-in extension and installs it on first launch. Its popup, dashboard and list controls are the blocker's UI; Ione gives them its material colours, rounded surfaces and motion at runtime, without modifying the GPL package. The old filter-list settings and their bundled lists are retired when the extension is present. The extension is pinned to the toolbar by default; disable or reconfigure it in Settings → Extensions or from its own dashboard.
 
+**ieq**, the live audio equalizer, ships the same way: preinstalled and pinned to the toolbar, ready to EQ the audio of any page.
+
 ### Automatic updates
 
 Ione checks for new releases on startup and every six hours (Settings → Updates: check now, pick

@@ -58,8 +58,19 @@ html, body {
   min-height: 0;
   overflow-x: hidden;
 }
+html:has(#dashboard-nav) {
+  min-height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+/* The dashboard document scrolls, not a fixed box: sections keep their full height and the
+   sticky header pins to the viewport because the body is not itself a scroll container. */
 body:has(#dashboard-nav) {
+  box-sizing: border-box;
+  width: 100%;
   min-height: 100vh;
+  height: auto;
+  overflow: visible !important;
 }
 body {
   background:
@@ -119,14 +130,20 @@ html#uBO-popup-panel body {
   height: auto !important;
 }
 html#uBO-popup-panel {
+  overflow: hidden !important;
   background: transparent !important;
 }
+/* The popup is the document: its height comes from the content the host measures, never from a
+   fixed box. Border-box and one padding value keep the two gutters equal and the slider's 100%
+   inside the sheet, so no axis gains a scrollbar. */
 html#uBO-popup-panel body {
   position: relative;
+  box-sizing: border-box;
+  width: 100%;
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 10px 10px 6px !important;
+  padding: 10px !important;
   overflow: hidden !important;
   animation: ione-ubo-sheet-in 340ms cubic-bezier(.16,1,.3,1) both;
 }
@@ -145,6 +162,9 @@ html#uBO-popup-panel body::before {
 html#uBO-popup-panel main {
   display: flex;
   flex-direction: column;
+  align-self: stretch !important;
+  width: 100%;
+  min-width: 0;
   gap: 2px;
   padding: 0;
 }
@@ -197,14 +217,16 @@ html#uBO-popup-panel main {
 #filteringModeText > span:nth-of-type(2) { color: var(--accent-surface-1) !important; }
 .filteringModeSlider {
   --filtering-mode-button-size: 54px;
+  --filtering-mode-thumb-inset: 4px;
   --filtering-mode-slider-background: color-mix(in srgb, var(--surface-2) 80%, transparent);
   align-self: stretch !important;
   box-sizing: border-box;
   width: 100% !important;
   max-width: 100%;
+  min-width: 0;
   height: 62px;
-  margin: 0 2px 10px !important;
-  padding: 4px;
+  margin: 0 0 10px !important;
+  padding: 0;
   border: 0;
   border-radius: 999px;
   background: color-mix(in srgb, var(--surface-2) 74%, transparent);
@@ -243,21 +265,35 @@ html#uBO-popup-panel main {
   background: color-mix(in srgb, var(--accent-surface-3) 60%, var(--surface-1));
   opacity: .9;
 }
+/* The thumb covers one whole segment: a quarter of the track, its left edge on the matching
+   dot's segment boundary. On a 198px track the quarters are 49.5px and the left edges are
+   0/49.5/99/148.5; the visible pill is inset 4px inside that hit area. */
 .filteringModeButton {
-  width: 26px !important;
-  height: 26px !important;
-  border-radius: 999px !important;
-  background: transparent;
+  top: 0 !important;
+  bottom: 0;
+  left: 0 !important;
+  width: 25% !important;
+  height: auto !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  cursor: grab;
   z-index: 10;
-  top: 50% !important;
-  transform: translateY(-50%);
+  transform: none;
   transition: left 380ms cubic-bezier(.34,1.56,.64,1);
 }
-.filteringModeSlider[data-level="0"] .filteringModeButton { left: calc(12.5% - 13px) !important; }
-.filteringModeSlider[data-level="1"] .filteringModeButton { left: calc(37.5% - 13px) !important; }
-.filteringModeSlider[data-level="2"] .filteringModeButton { left: calc(62.5% - 13px) !important; }
-.filteringModeSlider[data-level="3"] .filteringModeButton { left: calc(87.5% - 13px) !important; }
+.filteringModeSlider.moving .filteringModeButton { cursor: grabbing; }
+.filteringModeSlider[data-level="0"] .filteringModeButton { left: 0 !important; }
+.filteringModeSlider[data-level="1"] .filteringModeButton { left: 25% !important; }
+.filteringModeSlider[data-level="2"] .filteringModeButton { left: 50% !important; }
+.filteringModeSlider[data-level="3"] .filteringModeButton { left: 75% !important; }
 .filteringModeButton > div {
+  position: absolute;
+  inset: var(--filtering-mode-thumb-inset);
+  width: auto !important;
+  height: auto !important;
   border: 0;
   border-radius: 999px;
   background: linear-gradient(145deg, var(--accent-surface-1), var(--accent-surface-3)) !important;
@@ -373,6 +409,8 @@ body:has(#dashboard-nav) > * {
   box-sizing: border-box;
   width: min(760px, calc(100% - 32px));
   max-width: 100%;
+  min-width: 0;
+  flex-shrink: 0;
 }
 header {
   position: sticky;
@@ -436,6 +474,8 @@ body[data-pane="settings"] > section[data-pane="settings"] {
   display: flex;
   flex-direction: column;
   gap: 0;
+  container-type: inline-size;
+  container-name: ione-settings;
 }
 /* The dashboard's mode choice is a segmented tonal control: the active stop itself grows a
    pill, so the indicator can never drift from the dots and never spills out of a card. */
@@ -470,58 +510,65 @@ h3 {
   font-weight: 650 !important;
 }
 body > section > div > p { max-width: 68ch; margin: 0 0 14px; }
+/* Mode cards: one full-width horizontal row unless the page is genuinely wide, then three
+   equal-height columns. The row/grid choice watches the settings pane's own width, so a narrow
+   document in a wide window never falls back to the broken two-plus-one shape. Descriptions
+   keep their natural height; nothing is clipped to force a card size. */
 #defaultFilteringMode {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-auto-flow: row !important;
+  grid-template-columns: minmax(0, 1fr) !important;
   gap: 10px;
+  width: 100%;
+  min-width: 0;
   margin-top: 14px;
   align-items: stretch;
 }
-#defaultFilteringMode > * { min-width: 0; }
-@media (max-width: 780px) {
-  #defaultFilteringMode { grid-template-columns: 1fr !important; }
-  #defaultFilteringMode > :nth-child(3) { grid-column: auto !important; }
-  .filteringModeCard {
-    display: grid !important;
-    height: auto !important;
-    min-height: 88px;
-    grid-template-columns: auto 148px minmax(0, 1fr);
-    align-items: center;
-    gap: 14px;
-    padding: 12px 14px !important;
-  }
-  .filteringModeCard > div { padding: 0 !important; }
-  .filteringModeCard > div:nth-of-type(2) { width: 148px; }
-  .filteringModeCard > div:nth-of-type(3) {
-    border-top: 0 !important;
-    max-height: 46px;
-    overflow: hidden;
-    font-size: 11.5px !important;
-  }
-}
-@media (max-width: 560px) {
-  .filteringModeCard {
-    grid-template-columns: auto minmax(0, 1fr);
-  }
-  .filteringModeCard > div:nth-of-type(2) { grid-column: 1 / -1; grid-row: 2; width: 100%; }
-  .filteringModeCard > div:nth-of-type(3) { grid-column: 1 / -1; grid-row: 3; max-height: none; }
+#defaultFilteringMode > * {
+  min-width: 0;
+  max-width: 100%;
 }
 .filteringModeCard {
-  display: flex;
+  display: grid !important;
+  box-sizing: border-box;
+  width: 100%;
   min-width: 0;
-  flex-direction: column;
-  gap: 12px;
-  height: 100%;
+  max-width: 100%;
+  height: auto !important;
+  min-height: 88px;
+  grid-template-columns: minmax(0, 22%) minmax(150px, 198px) minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
   margin: 0 !important;
-  padding: 14px !important;
+  padding: 12px 14px !important;
   border: 0 !important;
   border-radius: 26px !important;
   background: color-mix(in srgb, var(--surface-1) 78%, transparent) !important;
   box-shadow: 0 1px 0 rgb(255 255 255 / .035) inset;
-  transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+  transition: transform 160ms ease, background 160ms ease;
 }
+.filteringModeCard > div {
+  min-width: 0;
+  max-width: 100%;
+  padding: 0 !important;
+  overflow-wrap: break-word;
+}
+.filteringModeCard > div:nth-of-type(2) {
+  display: block !important;
+  width: 100%;
+  min-width: 0;
+}
+.filteringModeCard > div:nth-of-type(3) {
+  border-top: 0 !important;
+  max-height: none !important;
+  overflow: visible !important;
+  color: var(--ink-3) !important;
+  font-size: 11.5px !important;
+  line-height: 1.45;
+}
+body:has(#dashboard-nav) .filteringModeSlider { margin: 0 !important; }
 .filteringModeCard:hover {
-  transform: translateY(-3px) scale(1.012);
+  transform: translateY(-2px);
   background: color-mix(in srgb, var(--accent-surface-2) 5%, var(--surface-1)) !important;
 }
 .filteringModeCard:has(input:checked) {
@@ -530,8 +577,27 @@ body > section > div > p { max-width: 68ch; margin: 0 0 14px; }
     inset 0 0 0 2px color-mix(in srgb, var(--accent-surface-2) 70%, transparent),
     0 12px 26px color-mix(in srgb, var(--accent-surface-3) 16%, transparent);
 }
-.filteringModeCard > div:last-child { color: var(--ink-3) !important; font-size: 11.5px; line-height: 1.45; }
-.filteringModeCard > div:nth-of-type(2) { display: none; }
+@media (min-width: 781px) {
+  @container ione-settings (min-width: 720px) {
+    #defaultFilteringMode { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
+    .filteringModeCard {
+      display: flex !important;
+      height: 100% !important;
+      min-height: 0;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 12px;
+      padding: 14px !important;
+    }
+    .filteringModeCard > div:nth-of-type(2) { width: 100%; }
+  }
+}
+@container ione-settings (max-width: 560px) {
+  .filteringModeCard {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 10px;
+  }
+}
 #lists .listEntry {
   border: 0 !important;
   border-radius: 14px !important;

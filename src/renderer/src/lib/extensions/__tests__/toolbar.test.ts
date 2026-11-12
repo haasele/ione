@@ -49,14 +49,37 @@ const ext = (over: Partial<ExtensionInfo>): ExtensionInfo => ({
 })
 
 describe('actionIcon', () => {
-  it('keeps the built-in uBlock Origin Lite coloured while it is enabled', () => {
+  const action = (icon: string | null): NonNullable<ExtensionInfo['action']> => ({
+    badgeText: '',
+    badgeBackgroundColor: null,
+    badgeTextColor: null,
+    title: '',
+    icon,
+    popup: 'popup.html',
+    enabled: true
+  })
+
+  it("shows the icon the action set for the tab, uBlock Origin Lite's grey off icon included", () => {
     const ubo = ext({
       name: 'uBlock Origin Lite',
       icon: 'data:coloured',
-      action: { icon: 'data:grey-off' } as ExtensionInfo['action']
+      action: action('data:grey-off')
     })
-    expect(actionIcon(ubo)).toBe('data:coloured')
+    // A no-filtering site: the action's per-tab grey icon wins over the manifest's coloured one.
+    expect(actionIcon(ubo)).toBe('data:grey-off')
+    // A filtering site: the action carries the coloured icon, and it is the one shown.
+    expect(actionIcon({ ...ubo, action: action('data:coloured-action') })).toBe(
+      'data:coloured-action'
+    )
+    // Disabling is the toolbar's filter (`actionable`); the icon itself does not flip.
     expect(actionIcon({ ...ubo, enabled: false })).toBe('data:grey-off')
+  })
+
+  it('falls back to the manifest icon, then to nothing', () => {
+    expect(actionIcon(ext({ name: 'Dark Reader' }))).toBe('data:manifest')
+    expect(actionIcon(ext({ action: action(null) }))).toBe('data:manifest')
+    expect(actionIcon(ext({ icon: null }))).toBeNull()
+    expect(actionIcon(ext({ icon: null, action: action(null) }))).toBeNull()
   })
 })
 

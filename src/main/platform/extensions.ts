@@ -222,6 +222,12 @@ const NO_UPDATE_INFO: UpdateInfo = {
  * `chrome.permissions` call moved an extension's origins. `ExtensionApiHost` is one.
  */
 export type AttachedApi = ExtensionApiHooks & {
+  /**
+   * The chrome.* action layer's per-extension state. Its record must not outlive the extension:
+   * a re-enable starts from the manifest's icon again, never from the tab overrides of the run
+   * before it.
+   */
+  readonly action: { forget(extensionId: string): void }
   readonly store: Pick<ApiStore, 'grants'>
   readonly permissions: Pick<PermissionsApi, 'onOriginsChanged' | 'noteManifestHostGrants'>
 }
@@ -246,10 +252,6 @@ export type AttachedApi = ExtensionApiHooks & {
  * Hook points for the chrome.* API layer: `onLoaded` / `onUnloaded` fire per session, and
  * `loaded(id)` looks up a running extension.
  */
-/** The built-in content blocker's package and the name that keeps its sideload id stable. */
-const BUNDLED_UBOLITE_NAME = 'uBlock Origin Lite'
-const BUNDLED_UBOLITE_FILE = 'ublock-origin-lite.zip'
-
 /** The bundled file in a development run, an installed app, or an AppImage's mount. */
 function bundledResource(name: string): string | null {
   const roots = [
@@ -264,6 +266,22 @@ function bundledResource(name: string): string | null {
   }
   return null
 }
+
+/**
+ * A package the app ships in `resources/`: `packageFromZip` derives its stable sideload id from
+ * the manifest `name`, and `legacyBlocker` marks the content blocker whose lists replace Ione's.
+ */
+interface BundledPackage {
+  readonly file: string
+  readonly name: string
+  readonly legacyBlocker: boolean
+}
+
+/** uBlock Origin Lite is the built-in content blocker; ieq equalizes the audio of any page. */
+const BUNDLED_PACKAGES: readonly BundledPackage[] = [
+  { file: 'ublock-origin-lite.zip', name: 'uBlock Origin Lite', legacyBlocker: true },
+  { file: 'ieq.zip', name: 'ieq', legacyBlocker: false }
+]
 
 export class ExtensionService implements ExtensionHost {
   /** `<userData>/extensions`: where store and file installs live. */
@@ -311,6 +329,11 @@ export class ExtensionService implements ExtensionHost {
     wc: WebContents
     win: ZenWindow
     shown: boolean
+    /** The page under the popup when it opened (null without one): what a reload is judged by. */
+    tabId: string | null
+    url: string | null
+    /** The page's document generation then; a committed reload moves it, a dismissal does not. */
+    generation: number
   } | null = null
   private checking: Promise<void> | null = null
   private updateTimer: ReturnType<typeof setInterval> | null = null
@@ -424,17 +447,31 @@ export class ExtensionService implements ExtensionHost {
   }
 
   /**
-   * The built-in uBlock Origin Lite: the app ships its package and installs it here on first
-   * launch (and again after an app update). The package is unsigned, so its id comes from the
-   * stable package name (`packageFromZip`); the extension's storage and its per-site modes stay
-   * with that id across updates. It is enabled and pinned to the toolbar, as a browser's own
-   * blocker is. A profile that has not opted in keeps the legacy rule sets off (State's v8
-   * migration); this extension is the blocker from here on.
+   * The packages the app ships: uBlock Origin Lite, the content blocker, and ieq, the audio
+   * equalizer. Each is installed here on first launch (and again after an app update). A package
+   * is unsigned, so its id comes from the stable manifest name (`packageFromZip`); its storage
+   * and per-site modes stay with that id across updates. Both are enabled and pinned to the
+   * toolbar, as a browser's own extensions are, and allowed in private windows. Only the blocker
+   * turns the profile's legacy rule sets off (State's v8 migration); ieq never touches them.
+   * Packages seed on their own: a missing or invalid one logs once and stops neither the other
+   * package nor the app.
    */
   private async seedBundled(): Promise<void> {
-    const zipPath = bundledResource(BUNDLED_UBOLITE_FILE)
+    // uBlock Origin Lite first: the legacy-list cleanup belongs to it, not to a later package.
+    for (const bundled of BUNDLED_PACKAGES) await this.seedBundledPackage(bundled)
+  }
+
+  /**
+   * One bundled package, by the file in `resources/` and the manifest name that keeps its
+   * sideload id stable: installed silently when absent or newer than the record, else the
+   * record is kept (never downgraded) and its enable switch and toolbar pin restored. A failure
+   * stays with its package: a missing file, an unreadable zip, or a package that carries another
+   * name is warned about once and skipped.
+   */
+  private async seedBundledPackage(bundled: BundledPackage): Promise<void> {
+    const zipPath = bundledResource(bundled.file)
     if (!zipPath) {
-      console.warn(`[zen] extensions: bundled ${BUNDLED_UBOLITE_FILE} not found`)
+      console.warn(`[zen] extensions: bundled ${bundled.name} not found (${bundled.file})`)
       return
     }
     try {
@@ -443,9 +480,9 @@ export class ExtensionService implements ExtensionHost {
         locale: app.getLocale(),
         chromiumVersion: process.versions.chrome
       })
-      if (pkg.manifest.name !== BUNDLED_UBOLITE_NAME) {
+      if (pkg.manifest.name !== bundled.name) {
         console.warn(
-          `[zen] extensions: ${BUNDLED_UBOLITE_FILE} is ${pkg.manifest.name}, not ${BUNDLED_UBOLITE_NAME}; skipped`
+          `[zen] extensions: ${bundled.file} is ${pkg.manifest.name}, not ${bundled.name}; skipped`
         )
         return
       }
@@ -453,18 +490,8 @@ export class ExtensionService implements ExtensionHost {
       // Do not downgrade a package a newer build already installed (an older app opened on a
       // profile that a newer one updated); an equal version is already in place.
       if (existing && existing.version >= pkg.version) {
-        this.disableLegacyBlocker()
-        if (!existing.enabled) {
-          existing.enabled = true
-          existing.enabledAt = Date.now()
-          await this.load(existing)
-        }
-        if (!existing.toolbarPinned) {
-          existing.toolbarPinned = true
-          existing.toolbarPinnedAt = Date.now()
-          this.persist()
-          this.browser.state.commitVolatile()
-        }
+        if (bundled.legacyBlocker) this.disableLegacyBlocker()
+        await this.restoreBundled(existing)
         return
       }
       const outcome = await this.installPackage(
@@ -477,15 +504,34 @@ export class ExtensionService implements ExtensionHost {
         outcome.record.enabledAt = Date.now()
         outcome.record.toolbarPinned = true
         outcome.record.toolbarPinnedAt = Date.now()
-        // A content blocker is one of the few extensions that belongs in private windows too.
+        // The blocker and the equalizer both belong in private windows: the one filters there,
+        // the other follows the page's audio there.
         outcome.record.allowPrivate = true
         this.persist()
         this.browser.state.commitVolatile()
-        this.disableLegacyBlocker()
-        console.log(`[zen] extensions: bundled ${BUNDLED_UBOLITE_NAME} ${pkg.version} at ${pkg.id}`)
+        if (bundled.legacyBlocker) this.disableLegacyBlocker()
+        console.log(`[zen] extensions: bundled ${bundled.name} ${pkg.version} at ${pkg.id}`)
       }
     } catch (error) {
-      console.warn('[zen] extensions: could not install the bundled uBlock Origin Lite:', error)
+      console.warn(`[zen] extensions: could not install the bundled ${bundled.name}:`, error)
+    }
+  }
+
+  /**
+   * A bundled package already at the version the app ships, or newer: the record is kept as it
+   * is, but switched back on and pinned to the toolbar when either went missing.
+   */
+  private async restoreBundled(record: ExtensionRecord): Promise<void> {
+    if (!record.enabled) {
+      record.enabled = true
+      record.enabledAt = Date.now()
+      await this.load(record)
+    }
+    if (!record.toolbarPinned) {
+      record.toolbarPinned = true
+      record.toolbarPinnedAt = Date.now()
+      this.persist()
+      this.browser.state.commitVolatile()
     }
   }
 
@@ -756,6 +802,10 @@ export class ExtensionService implements ExtensionHost {
   }
 
   private unload(record: ExtensionRecord): void {
+    // A fresh load starts from the manifest, not from a per-tab icon this run set: the
+    // chrome.* action record goes with the extension, also before an engine unload event
+    // reaches the API layer (and for a record whose load already failed).
+    this.api?.action.forget(record.id)
     const ext = this.loadedById.get(record.id)
     if (!ext) return
     for (const [, ses] of this.sessions.persistent()) {
@@ -1270,7 +1320,7 @@ export class ExtensionService implements ExtensionHost {
     // commit and writes no tombstone (`SyncEngine.sources`), and the applier drops any record
     // for it handed over before now, so nothing puts the landing back.
     if (record.pendingApproval && extensionStoreOf(record.source)) this.sync.declined(record.id)
-    if (this.popup?.id === record.id) this.closePopup()
+    if (this.popup?.id === record.id) this.discardPopup()
     this.unload(record)
     this.registry.extensions = this.registry.extensions.filter((r) => r !== record)
     this.errors.delete(record.id)
@@ -1358,7 +1408,7 @@ export class ExtensionService implements ExtensionHost {
     record.enabledAt = clock
     if (enabled) await this.load(record)
     else {
-      if (this.popup?.id === record.id) this.closePopup()
+      if (this.popup?.id === record.id) this.discardPopup()
       this.unload(record)
     }
     this.persist()
@@ -1451,7 +1501,7 @@ export class ExtensionService implements ExtensionHost {
     record.allowFileAccess = allow
     this.persist()
     if (record.enabled) {
-      if (this.popup?.id === record.id) this.closePopup()
+      if (this.popup?.id === record.id) this.discardPopup()
       this.unload(record)
       await this.load(record)
     }
@@ -1520,7 +1570,7 @@ export class ExtensionService implements ExtensionHost {
   async reload(id: string): Promise<void> {
     const record = this.record(id)
     if (!record) return
-    if (this.popup?.id === record.id) this.closePopup()
+    if (this.popup?.id === record.id) this.discardPopup()
     this.unload(record)
     if (record.source === 'unpacked') {
       const manifest = readManifest(record.path)
@@ -1871,7 +1921,7 @@ export class ExtensionService implements ExtensionHost {
   // ---------------------------------------------------------------------------
 
   openPopup(id: string, anchor: Rect, win: ZenWindow, frame?: PopupFrame): void {
-    this.closePopup()
+    this.discardPopup()
     const record = this.record(id) ?? this.registry.extensions.find((r) => r.path === id)
     const ext = record ? this.loadedById.get(record.id) : undefined
     if (!record || !ext) return
@@ -1908,7 +1958,17 @@ export class ExtensionService implements ExtensionHost {
     }
     bw.contentView.addChildView(view)
     const wc = view.webContents
-    this.popup = { id: record.id, view, wc, win, shown: !frame }
+    const page = this.browser.tabs.activeTabFor(win)
+    this.popup = {
+      id: record.id,
+      view,
+      wc,
+      win,
+      shown: !frame,
+      tabId: page?.id ?? null,
+      url: page?.url ?? null,
+      generation: page?.documentGeneration ?? 0
+    }
     const report = (width: number, height: number): void => {
       if (this.popup?.view !== view) return
       const size = {
@@ -1946,8 +2006,9 @@ export class ExtensionService implements ExtensionHost {
     })
     // Blur alone does not close the popup: a page the popup is controlling may reload on a
     // setting change (uBlock Origin Lite reloads the tab after a filtering-mode switch), and
-    // that reload takes the focus from the popup while the user is still inside it. Escape and
-    // the chrome layer's light dismiss (a press outside the frame) remain the ways out.
+    // that reload takes the focus from the popup while the user is still inside it. The core's
+    // navigation close is held back for that one commit too (`closePopup` / `reloadUnderPopup`).
+    // Escape and the chrome layer's light dismiss (a press outside the frame) remain the ways out.
     // Escape closes the popup; every other key goes through the window's key table as a key of
     // the chrome (`extensionPopupKeys.ts`) – Ione's shortcuts, extension commands, and the
     // quit chord's hold, which a popup's ⌘Q would otherwise bypass on its way to the menu bar.
@@ -1972,15 +2033,15 @@ export class ExtensionService implements ExtensionHost {
         windowFor: () => win,
         browser: this.browser,
         opened: () => {
-          if (this.popup?.view === view) this.closePopup()
+          if (this.popup?.view === view) this.discardPopup()
         },
-        fellBack: () => this.closePopup()
+        fellBack: () => this.discardPopup()
       })
     )
     // The document closed itself (`window.close()`, as Chrome's popups may): the popup is over
     // for the chrome and for `action.openPopup`, which Chrome refuses while one shows.
     wc.on('destroyed', () => {
-      if (this.popup?.view === view) this.closePopup()
+      if (this.popup?.view === view) this.discardPopup()
     })
     void wc
       .loadURL(`chrome-extension://${ext.id}/${popupPath.replace(/^\/+/, '')}`)
@@ -2001,8 +2062,48 @@ export class ExtensionService implements ExtensionHost {
     if (visible) wc.focus()
   }
 
-  /** `reason` is `'escape'` for the key the document trapped: the renderer returns focus to the anchor. */
+  /**
+   * Close the open popup: the renderer's light dismiss (a press outside, a wheel, a resize), the
+   * core's navigation close, or a command that wants the chrome clear.
+   *
+   * The one close that is not a dismissal is the reload of the page the popup sits over. uBlock
+   * Origin Lite's popup reloads its tab when the user picks another filtering mode, and that
+   * commit must leave the popup up – the click was the user's, inside the popup, and Chrome keeps
+   * its popup through a page reload. `reloadUnderPopup` recognises exactly that commit; the
+   * popup's own teardown paths call `discardPopup` directly, and Escape names its reason so the
+   * guard cannot hold it back.
+   */
   closePopup(reason?: 'escape'): void {
+    if (reason === undefined && this.reloadUnderPopup()) return
+    this.discardPopup(reason)
+  }
+
+  /**
+   * Whether a close arriving now is the reload of the popup's own page. The tab's document
+   * generation moves at a committed new document (never at a same-document change or a
+   * dismissal), and the URL staying put tells a reload from a navigation to another page. The
+   * generation is advanced with the admit, so only the close that follows that commit is held
+   * back: Escape, a press outside, or a later reload all act normally. Without an active page
+   * of the popup's window there is nothing to keep the popup for.
+   */
+  private reloadUnderPopup(): boolean {
+    const popup = this.popup
+    if (!popup?.tabId || !popup.win.alive) return false
+    if (this.browser.tabs.activeTabFor(popup.win)?.id !== popup.tabId) return false
+    const tab = this.browser.tabs.tab(popup.tabId)
+    if (!tab) return false
+    const generation = tab.documentGeneration ?? 0
+    if (generation === popup.generation || tab.url !== popup.url) return false
+    popup.generation = generation
+    return true
+  }
+
+  /**
+   * Close the popup whatever its page did: Escape, a replaced popup, an extension reload or
+   * removal, the document closing itself. `reason` is `'escape'` for the key the document
+   * trapped: the renderer returns focus to the anchor.
+   */
+  private discardPopup(reason?: 'escape'): void {
     if (!this.popup) return
     const { id, view, wc, win } = this.popup
     this.popup = null

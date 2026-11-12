@@ -78,12 +78,13 @@ export function pinnedActions(extensions: readonly ExtensionInfo[]): ExtensionIn
   return actionable(extensions).filter((e) => e.toolbarPinned)
 }
 
-/** The icon the toolbar shows: the action's own icon first, then the manifest icon. */
+/**
+ * The icon the toolbar shows: the action's own icon first, then the manifest icon. The action
+ * is authoritative because it carries the tab's state too – uBlock Origin Lite swaps in its grey
+ * `icon_*_off` images for a no-filtering site, and the toolbar must show that rather than the
+ * coloured manifest icon.
+ */
 export function actionIcon(ext: ExtensionInfo): string | null {
-  // uBlock Origin Lite swaps its action icon to a grey 'off' image when a site is in its
-  // no-filtering mode. Ione's built-in blocker must not look disabled after the extension was
-  // switched off and on again: use its manifest icon while the extension is enabled.
-  if (ext.name === 'uBlock Origin Lite' && ext.enabled) return ext.icon ?? ext.action?.icon ?? null
   return ext.action?.icon ?? ext.icon
 }
 

@@ -35,7 +35,19 @@ interface ActionRecord {
   /** What the manifest declares; a global value set to null falls back to it. */
   defaults: ActionValues
   global: ActionValues
-  perTab: Map<number, Partial<ActionValues>>
+  perTab: Map<number, TabValues>
+}
+
+/** The values a tab overrides, and the document they were written under. */
+interface TabValues {
+  /**
+   * `Tab.documentGeneration` at the last write. Chrome clears a tab's action state when its
+   * document commits (`ExtensionAction::ClearAllValuesForTab`), so an override outlives neither
+   * the page it was set for nor a reload of it – uBlock Origin Lite's grey off icon gives way to
+   * the manifest icon again when a no-filtering site is put back into a filtering mode.
+   */
+  generation: number
+  values: Partial<ActionValues>
 }
 
 const DEFAULT_BADGE_BACKGROUND: ColorArray = [0, 0, 0, 0]
@@ -98,8 +110,27 @@ export class ActionApi {
 
   private effective(ext: LoadedExtension, tabId: number | undefined): ActionValues {
     const record = this.record(ext)
-    const tab = tabId === undefined ? undefined : record.perTab.get(tabId)
+    const tab = this.tabValues(record, tabId)
     return tab ? { ...record.global, ...tab } : record.global
+  }
+
+  /**
+   * The per-tab values that still apply, dropping the ones written for an older document.
+   * Chrome clears these on navigation itself; expiring them on read is the same answer without
+   * a navigation hook, and it cannot miss the clear for a tab reported by another session.
+   */
+  private tabValues(
+    record: ActionRecord,
+    tabId: number | undefined
+  ): Partial<ActionValues> | undefined {
+    if (tabId === undefined) return undefined
+    const entry = record.perTab.get(tabId)
+    if (!entry) return undefined
+    if (entry.generation < (this.host.model.zenTab(tabId)?.documentGeneration ?? 0)) {
+      record.perTab.delete(tabId)
+      return undefined
+    }
+    return entry.values
   }
 
   private tabIdOf(details: unknown): number | undefined {
@@ -122,11 +153,19 @@ export class ActionApi {
     if (tabId === undefined) {
       record.global[key] = value === null ? record.defaults[key] : value
     } else {
-      const tab = record.perTab.get(tabId) ?? {}
+      const generation = this.host.model.zenTab(tabId)?.documentGeneration ?? 0
+      const entry = record.perTab.get(tabId)
+      // A write after a navigation starts the tab over, as Chrome's clear on commit does.
+      const tab = entry && entry.generation >= generation ? entry.values : {}
       if (value === null) delete tab[key]
       else tab[key] = value
       if (Object.keys(tab).length === 0) record.perTab.delete(tabId)
-      else record.perTab.set(tabId, tab)
+      else {
+        record.perTab.set(tabId, {
+          generation: Math.max(generation, entry?.generation ?? generation),
+          values: tab
+        })
+      }
     }
     this.host.commitUi()
   }
