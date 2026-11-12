@@ -16,7 +16,12 @@ describe('privilegedSchemes', () => {
     for (const scheme of schemes) expect(scheme.privileges?.standard).toBe(true)
     // zen:// is a secure origin pages may fetch from; nothing more than standard is claimed for
     // chrome-extension:// (the engine already gives it the rest).
-    expect(schemes[0].privileges).toMatchObject({ secure: true, supportFetchAPI: true })
+    expect(schemes[0].privileges).toMatchObject({
+      secure: true,
+      supportFetchAPI: true,
+      // The Essentials canvas reads cached favicons through this scheme.
+      corsEnabled: true
+    })
     expect(schemes[2].privileges).toEqual({ standard: true })
   })
 

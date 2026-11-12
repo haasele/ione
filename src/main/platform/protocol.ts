@@ -29,7 +29,7 @@ export function privilegedSchemes(): CustomScheme[] {
   return [
     {
       scheme: ZEN_SCHEME,
-      privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: false }
+      privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true }
     },
     EXTENSION_RESOURCE_SCHEME_PRIVILEGES,
     { scheme: CHROME_EXTENSION_SCHEME, privileges: { standard: true } }

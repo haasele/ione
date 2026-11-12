@@ -138,7 +138,9 @@ export class ElectronWindow implements WindowHost {
     // window opts into the same frame with Settings › Appearance › Use system window controls
     // (Linux only; macOS and Windows already draw their own controls over the frameless chrome).
     const pageWindow = init.chrome === 'page'
-    const nativeFrame = process.platform === 'linux' && init.nativeWindowControls
+    // Transparency needs a frameless window; it wins over the native frame when both are asked for.
+    const nativeFrame =
+      process.platform === 'linux' && init.nativeWindowControls && init.transparency === 'off'
     const framed = pageWindow || nativeFrame
     this.framed = framed
     let initial = init.bounds
@@ -174,8 +176,9 @@ export class ElectronWindow implements WindowHost {
     const isMac = process.platform === 'darwin'
     // A see-through window (Settings › Appearance › Window transparency) lets the compositor show
     // and blur what is behind the chrome. Only frameless windows can be transparent, so a page
-    // window or a native-framed one stays opaque. Mica and transparency both show the
-    // desktop through the chrome by different means: a transparent window has no material.
+    // window stays opaque and the native frame yields to transparency (`nativeFrame` above).
+    // Mica and transparency both show the desktop through the chrome by different means: a
+    // transparent window has no material.
     const transparent = !framed && init.transparency !== 'off'
     const mica = !transparent && init.material === 'mica' && process.platform === 'win32'
     // Popups and app windows are as small as the page (or the app) wants, within reason.

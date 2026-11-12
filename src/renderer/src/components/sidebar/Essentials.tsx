@@ -92,10 +92,12 @@ function EssentialTile({
 }): JSX.Element {
   const selected = uiStore.use((s) => s.selectedTabIds.includes(tab.id))
   const tabIndex = useStripTabIndex(`tile:${tab.id}`, active)
-  // Zen's coloured posters: the tile's gradient comes from the page's favicon, and the icon
-  // itself draws over it. A page with no readable icon keeps the neutral window fill.
+  // Zen's coloured posters: the active tile's gradient comes from the page's favicon, and the
+  // icon itself draws over it. Every other tile keeps the neutral window fill; a page with no
+  // readable icon keeps it even when active.
   const favicon = useFaviconSrc(tab.favicon)
-  const tint = useFaviconGradient(favicon)
+  const gradient = useFaviconGradient(favicon)
+  const tint = active ? gradient : null
   // The tile's audio disc at its corner while the tab plays; the seat's attention dot yields to
   // it (one disc per icon, §9.29) and comes back when the sound stops or is muted.
   const playing = tab.audible && !tab.muted

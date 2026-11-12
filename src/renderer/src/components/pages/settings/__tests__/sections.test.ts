@@ -2977,7 +2977,7 @@ describe('the section model', () => {
     if (r.kind !== 'value') throw new Error('not a value row')
     expect(r.label).toBe('Window transparency')
     expect(r.description).toBe(
-      'Let the compositor show what is behind the window. Applies to new windows; restart Ione to apply it to the main window.'
+      'Let the compositor show what is behind the window. Applies to new windows; restart Ione to apply it to the main window. Uses Ione’s own frame, so system window controls are available only when transparency is off.'
     )
     expect(r.options.map((o) => o.label)).toEqual(['Off', 'Translucent', 'Transparent'])
     expect(r.value).toBe('translucent')
@@ -2989,12 +2989,41 @@ describe('the section model', () => {
       expect(r.options.find((o) => o.value === value)?.label, value).toBe(label)
     }
     r.onChange('transparent')
-    expect(c.patches).toEqual([{ windowTransparency: 'transparent' }])
+    expect(c.patches).toEqual([
+      { windowTransparency: 'transparent', nativeWindowControls: false }
+    ])
     // The WebView's window is the activity's: Android has no see-through frame to offer.
     const phone = context(state())
     expect(
       findRow(buildSection(PAGE.sections[0], phone.ctx).groups, 'window-transparency')
     ).toBeNull()
+  })
+
+  it('makes system window controls and transparency exclude each other', () => {
+    // A see-through window is frameless, so the native frame yields while transparency is on.
+    // Turning on system controls turns transparency off, and choosing any transparency clears
+    // the native frame, so the row's checkmark describes the window the host will create.
+    const desktop = state(
+      {
+        platform: 'linux',
+        capabilities: {
+          ...ANDROID,
+          nativeWindowControls: true,
+          windowTransparency: true
+        }
+      },
+      { nativeWindowControls: true, windowTransparency: 'translucent' }
+    )
+    const c = context(desktop)
+    const look = buildSection(PAGE.sections[0], { ...c.ctx, formFactor: 'desktop' })
+    const nativeRow = row(look, 'native-window-controls')
+    if (nativeRow.kind !== 'switch') throw new Error('not a switch')
+    expect(nativeRow.checked).toBe(false)
+    expect(nativeRow.description).toContain('Available only with Window transparency off')
+    nativeRow.onChange(true)
+    expect(c.patches).toEqual([
+      { nativeWindowControls: true, windowTransparency: 'off' }
+    ])
   })
 
   it('keeps a shell’s controls to its layout: the phone bar’s rows never reach the desktop page or its search (BUG-055)', () => {

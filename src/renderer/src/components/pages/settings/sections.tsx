@@ -777,10 +777,11 @@ function lookSection({
                 id: 'native-window-controls',
                 label: 'Use system window controls',
                 description:
-                  'New windows get your desktop’s own frame and buttons; restart Ione to apply it to the main window. Compositors without server-side decorations (niri, Hyprland) show none; their own shortcuts manage the window.',
+                  'New windows get your desktop’s own frame and buttons; restart Ione to apply it to the main window. Available only with Window transparency off: transparency needs Ione’s own frameless window. Compositors without server-side decorations (niri, Hyprland) show none; their own shortcuts manage the window.',
                 keywords: ['titlebar', 'title bar', 'window buttons', 'decorations', 'wayland', 'hyprland', 'niri', 'minimise', 'minimize', 'close'],
-                checked: s.nativeWindowControls,
-                onChange: (v: boolean) => set({ nativeWindowControls: v })
+                checked: s.nativeWindowControls && s.windowTransparency === 'off',
+                onChange: (v: boolean) =>
+                  set({ nativeWindowControls: v, ...(v ? { windowTransparency: 'off' } : {}) })
               } satisfies SettingsRow
             ]
           : []),
@@ -836,7 +837,8 @@ function lookSection({
       choice<WindowTransparency>({
         id: 'window-transparency',
         label: 'Window transparency',
-        description: 'Let the compositor show what is behind the window. Applies to new windows; restart Ione to apply it to the main window.',
+        description:
+          'Let the compositor show what is behind the window. Applies to new windows; restart Ione to apply it to the main window. Uses Ione’s own frame, so system window controls are available only when transparency is off.',
         keywords: [
           'transparent',
           'translucent',
@@ -853,7 +855,11 @@ function lookSection({
           { value: 'translucent', label: 'Translucent' },
           { value: 'transparent', label: 'Transparent' }
         ],
-        onChange: (v) => set({ windowTransparency: v })
+        onChange: (v) =>
+          set({
+            windowTransparency: v,
+            ...(v !== 'off' ? { nativeWindowControls: false } : {})
+          })
       })
     )
   }

@@ -366,7 +366,8 @@ export class ZenWindow {
       kind: this.kind,
       chrome: this.chrome,
       material: this.material,
-      nativeFrame: this.nativeWindowControls,
+      // Transparency needs the host's frameless window; the custom controls come back with it.
+      nativeFrame: this.nativeWindowControls && this.transparency === 'off',
       maximized: alive ? this.host.isMaximized() : this.initialMaximized,
       fullscreen: alive ? this.host.isFullScreen() : false,
       focused: alive ? this.host.isFocused() : false,
