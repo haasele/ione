@@ -182,7 +182,7 @@ html#uBO-popup-panel main {
 }
 /* The filtering selector: a tonal track and an expressive thumb that springs between stops. */
 #filteringModeText {
-  margin: 2px 0 12px !important;
+  margin: 2px 0 8px !important;
   color: var(--ink-3) !important;
   text-align: center;
 }
@@ -203,7 +203,7 @@ html#uBO-popup-panel main {
   width: 100% !important;
   max-width: 100%;
   height: 62px;
-  margin: 0 2px 14px !important;
+  margin: 0 2px 10px !important;
   padding: 4px;
   border: 0;
   border-radius: 999px;
@@ -244,17 +244,19 @@ html#uBO-popup-panel main {
   opacity: .9;
 }
 .filteringModeButton {
-  width: 48px;
-  height: 48px;
-  border-radius: 999px;
+  width: 26px !important;
+  height: 26px !important;
+  border-radius: 999px !important;
   background: transparent;
   z-index: 10;
+  top: 50% !important;
+  transform: translateY(-50%);
   transition: left 380ms cubic-bezier(.34,1.56,.64,1);
 }
-.filteringModeSlider[data-level="0"] .filteringModeButton { left: 4px; }
-.filteringModeSlider[data-level="1"] .filteringModeButton { left: calc(25% - 2px); }
-.filteringModeSlider[data-level="2"] .filteringModeButton { left: calc(50% - 2px); }
-.filteringModeSlider[data-level="3"] .filteringModeButton { left: calc(75% - 2px); }
+.filteringModeSlider[data-level="0"] .filteringModeButton { left: calc(12.5% - 13px) !important; }
+.filteringModeSlider[data-level="1"] .filteringModeButton { left: calc(37.5% - 13px) !important; }
+.filteringModeSlider[data-level="2"] .filteringModeButton { left: calc(62.5% - 13px) !important; }
+.filteringModeSlider[data-level="3"] .filteringModeButton { left: calc(87.5% - 13px) !important; }
 .filteringModeButton > div {
   border: 0;
   border-radius: 999px;
@@ -435,27 +437,30 @@ body[data-pane="settings"] > section[data-pane="settings"] {
   flex-direction: column;
   gap: 0;
 }
-/* The choice's thumb stays on the dashboard as a soft tonal pill behind the selected stop:
-   it shows the current mode without the 54 px square spilling out of a card. */
-body:has(#dashboard-nav) .filteringModeButton {
-  display: block !important;
-  top: 50% !important;
-  width: calc(25% - 10px) !important;
-  height: 38px !important;
-  border-radius: 999px !important;
-  background: color-mix(in srgb, var(--accent-surface-2) 24%, transparent) !important;
-  transform: translateY(-50%);
-  transition: left 380ms cubic-bezier(.34,1.56,.64,1);
+/* The dashboard's mode choice is a segmented tonal control: the active stop itself grows a
+   pill, so the indicator can never drift from the dots and never spills out of a card. */
+body:has(#dashboard-nav) .filteringModeButton { display: none !important; }
+body:has(#dashboard-nav) .filteringModeSlider span[data-level] {
+  position: relative;
 }
-body:has(#dashboard-nav) .filteringModeSlider[data-level="0"] .filteringModeButton { left: 4px !important; }
-body:has(#dashboard-nav) .filteringModeSlider[data-level="1"] .filteringModeButton { left: calc(25% + 2px) !important; }
-body:has(#dashboard-nav) .filteringModeSlider[data-level="2"] .filteringModeButton { left: calc(50% + 2px) !important; }
-body:has(#dashboard-nav) .filteringModeSlider[data-level="3"] .filteringModeButton { left: calc(75% + 2px) !important; }
-body:has(#dashboard-nav) .filteringModeButton > div {
-  background: transparent !important;
-  border: 0 !important;
-  box-shadow: none !important;
-  transform: none !important;
+body:has(#dashboard-nav) .filteringModeSlider span[data-level]::before {
+  content: '';
+  position: absolute;
+  inset: 7px 3px;
+  border-radius: 999px;
+  background: transparent;
+  transition: background 220ms cubic-bezier(.16,1,.3,1), box-shadow 220ms ease;
+}
+body:has(#dashboard-nav) .filteringModeSlider[data-level="0"] span[data-level="0"]::before,
+body:has(#dashboard-nav) .filteringModeSlider[data-level="1"] span[data-level="1"]::before,
+body:has(#dashboard-nav) .filteringModeSlider[data-level="2"] span[data-level="2"]::before,
+body:has(#dashboard-nav) .filteringModeSlider[data-level="3"] span[data-level="3"]::before {
+  background: color-mix(in srgb, var(--accent-surface-2) 24%, transparent);
+  box-shadow: 0 1px 0 rgb(255 255 255 / .05) inset;
+}
+body:has(#dashboard-nav) .filteringModeSlider span[data-level]::after {
+  position: relative;
+  z-index: 1;
 }
 body > section > div:nth-child(2) { animation-delay: 45ms; }
 body > section > div:nth-child(3) { animation-delay: 90ms; }
@@ -467,21 +472,46 @@ h3 {
 body > section > div > p { max-width: 68ch; margin: 0 0 14px; }
 #defaultFilteringMode {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin-top: 14px;
-  align-items: start;
+  align-items: stretch;
 }
 #defaultFilteringMode > * { min-width: 0; }
 @media (max-width: 780px) {
-  #defaultFilteringMode { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
-  #defaultFilteringMode > :nth-child(3) { grid-column: span 2 !important; }
+  #defaultFilteringMode { grid-template-columns: 1fr !important; }
+  #defaultFilteringMode > :nth-child(3) { grid-column: auto !important; }
+  .filteringModeCard {
+    display: grid !important;
+    height: auto !important;
+    min-height: 88px;
+    grid-template-columns: auto 148px minmax(0, 1fr);
+    align-items: center;
+    gap: 14px;
+    padding: 12px 14px !important;
+  }
+  .filteringModeCard > div { padding: 0 !important; }
+  .filteringModeCard > div:nth-of-type(2) { width: 148px; }
+  .filteringModeCard > div:nth-of-type(3) {
+    border-top: 0 !important;
+    max-height: 46px;
+    overflow: hidden;
+    font-size: 11.5px !important;
+  }
+}
+@media (max-width: 560px) {
+  .filteringModeCard {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .filteringModeCard > div:nth-of-type(2) { grid-column: 1 / -1; grid-row: 2; width: 100%; }
+  .filteringModeCard > div:nth-of-type(3) { grid-column: 1 / -1; grid-row: 3; max-height: none; }
 }
 .filteringModeCard {
   display: flex;
   min-width: 0;
   flex-direction: column;
   gap: 12px;
+  height: 100%;
   margin: 0 !important;
   padding: 14px !important;
   border: 0 !important;
